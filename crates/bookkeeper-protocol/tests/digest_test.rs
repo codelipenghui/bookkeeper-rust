@@ -16,7 +16,7 @@ fn crc32c_digest_round_trip() {
     let metadata = build_metadata(1, 0, -1, 11);
     let payload = b"hello world";
     let digest = dm.compute(&metadata, payload);
-    assert_eq!(digest.len(), 8);
+    assert_eq!(digest.len(), 4);  // Was 8, now 4
     assert!(dm.verify(&metadata, payload, &digest));
 }
 

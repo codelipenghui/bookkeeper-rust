@@ -58,12 +58,14 @@ fn entry_format_layout() {
         .length(4)
         .payload(payload)
         .build();
-    assert_eq!(entry.len(), 44);
+    // 32 metadata + 4 CRC32C digest + 4 payload = 40 (was 44)
+    assert_eq!(entry.len(), 40);
     assert_eq!(i64::from_be_bytes(entry[0..8].try_into().unwrap()), 100);
     assert_eq!(i64::from_be_bytes(entry[8..16].try_into().unwrap()), 5);
     assert_eq!(i64::from_be_bytes(entry[16..24].try_into().unwrap()), 4);
     assert_eq!(i64::from_be_bytes(entry[24..32].try_into().unwrap()), 4);
-    assert_eq!(&entry[40..44], b"test");
+    // Payload at offset 32 + 4 (digest) = 36
+    assert_eq!(&entry[36..40], b"test");
 }
 
 #[test]

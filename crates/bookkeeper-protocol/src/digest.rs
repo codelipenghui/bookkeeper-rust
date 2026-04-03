@@ -12,7 +12,8 @@ pub enum DigestType {
 impl DigestType {
     pub fn digest_length(&self) -> usize {
         match self {
-            Self::Crc32 | Self::Crc32c => 8,
+            Self::Crc32 => 8,      // stored as i64 via writeLong
+            Self::Crc32c => 4,     // stored as i32 via writeInt
             Self::HmacSha1 => 20,
             Self::Dummy => 0,
         }
@@ -51,11 +52,19 @@ impl DigestManager {
             DigestType::Crc32c => {
                 let mut crc = crc32c::crc32c(metadata);
                 crc = crc32c::crc32c_append(crc, payload);
-                (crc as i64).to_be_bytes().to_vec()
+                (crc as i32).to_be_bytes().to_vec()  // 4 bytes, not 8
             }
             DigestType::HmacSha1 => {
+                use sha1::Digest;  // Need the Digest trait for SHA1 hashing
                 type HmacSha1 = Hmac<Sha1>;
-                let mut mac = HmacSha1::new_from_slice(&self.password)
+
+                // Java derives HMAC key as: SHA1("mac" + password)
+                let mut key_hasher = Sha1::new();
+                key_hasher.update(b"mac");
+                key_hasher.update(&self.password);
+                let derived_key = key_hasher.finalize();
+
+                let mut mac = HmacSha1::new_from_slice(&derived_key)
                     .expect("HMAC accepts any key length");
                 mac.update(metadata);
                 mac.update(payload);

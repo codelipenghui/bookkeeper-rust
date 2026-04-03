@@ -9,7 +9,7 @@ fn entry_round_trip_crc32c() {
     let entry_bytes = EntryBuilder::new(&dm)
         .ledger_id(42).entry_id(7).lac(-1).length(11)
         .payload(payload.clone()).build();
-    assert_eq!(entry_bytes.len(), 32 + 8 + 11);
+    assert_eq!(entry_bytes.len(), 32 + 4 + 11);
     let parsed = bookkeeper_protocol::entry::parse_entry(&dm, &entry_bytes).unwrap();
     assert_eq!(parsed.ledger_id, 42);
     assert_eq!(parsed.entry_id, 7);
