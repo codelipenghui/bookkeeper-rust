@@ -247,6 +247,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bookkeeper-config"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bookkeeper-metadata"
 version = "0.1.0"
 dependencies = [
