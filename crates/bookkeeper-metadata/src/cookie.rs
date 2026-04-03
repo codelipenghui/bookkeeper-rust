@@ -37,17 +37,17 @@ impl Cookie {
     /// Serialize to the v5 cookie format: version line + protobuf text format.
     pub fn serialize(&self) -> String {
         let mut s = format!("{}\n", CURRENT_COOKIE_LAYOUT_VERSION);
-        s.push_str(&format!("bookie_host: \"{}\"\n", self.bookie_id));
-        s.push_str(&format!("journal_dir: \"{}\"\n", self.journal_dirs));
-        s.push_str(&format!("ledger_dirs: \"{}\"\n", self.ledger_dirs));
+        s.push_str(&format!("bookieHost: \"{}\"\n", self.bookie_id));
+        s.push_str(&format!("journalDir: \"{}\"\n", self.journal_dirs));
+        s.push_str(&format!("ledgerDirs: \"{}\"\n", self.ledger_dirs));
         if let Some(ref id) = self.instance_id {
             if !id.is_empty() {
-                s.push_str(&format!("instance_id: \"{}\"\n", id));
+                s.push_str(&format!("instanceId: \"{}\"\n", id));
             }
         }
         if let Some(ref dirs) = self.index_dirs {
             if !dirs.is_empty() {
-                s.push_str(&format!("index_dirs: \"{}\"\n", dirs));
+                s.push_str(&format!("indexDirs: \"{}\"\n", dirs));
             }
         }
         s
@@ -146,21 +146,21 @@ fn parse_proto_text_cookie(text: &str) -> Result<Cookie, MetadataError> {
 
     for line in text.lines() {
         let line = line.trim();
-        if let Some(val) = extract_proto_text_field(line, "bookie_host") {
+        if let Some(val) = extract_proto_text_field(line, "bookieHost") {
             bookie_id = val;
-        } else if let Some(val) = extract_proto_text_field(line, "journal_dir") {
+        } else if let Some(val) = extract_proto_text_field(line, "journalDir") {
             journal_dirs = val;
-        } else if let Some(val) = extract_proto_text_field(line, "ledger_dirs") {
+        } else if let Some(val) = extract_proto_text_field(line, "ledgerDirs") {
             ledger_dirs = val;
-        } else if let Some(val) = extract_proto_text_field(line, "instance_id") {
+        } else if let Some(val) = extract_proto_text_field(line, "instanceId") {
             if !val.is_empty() { instance_id = Some(val); }
-        } else if let Some(val) = extract_proto_text_field(line, "index_dirs") {
+        } else if let Some(val) = extract_proto_text_field(line, "indexDirs") {
             if !val.is_empty() { index_dirs = Some(val); }
         }
     }
 
     if bookie_id.is_empty() {
-        return Err(MetadataError::SerializationError("missing bookie_host in cookie".into()));
+        return Err(MetadataError::SerializationError("missing bookieHost in cookie".into()));
     }
 
     Ok(Cookie { bookie_id, journal_dirs, ledger_dirs, instance_id, index_dirs })

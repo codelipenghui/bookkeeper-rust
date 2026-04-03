@@ -94,15 +94,21 @@ fn to_proto(md: &LedgerMetadata) -> bookkeeper_proto::LedgerMetadataFormat {
         }
     }).collect();
 
+    let (proto_digest_type, proto_password) = if let Some(pw) = md.password() {
+        (digest_type, Some(pw.to_vec()))
+    } else {
+        (None, None)
+    };
+
     bookkeeper_proto::LedgerMetadataFormat {
         quorum_size: md.write_quorum_size(),
         ensemble_size: md.ensemble_size(),
         length: md.length().unwrap_or(0),
-        last_entry_id: md.last_entry_id(),
+        last_entry_id: Some(md.last_entry_id().unwrap_or(-1)),
         state,
         segment: segments,
-        digest_type,
-        password: md.password().map(|p| p.to_vec()),
+        digest_type: proto_digest_type,
+        password: proto_password,
         ack_quorum_size: Some(md.ack_quorum_size()),
         ctime: if md.store_ctime() { Some(md.ctime()) } else { None },
         custom_metadata,
