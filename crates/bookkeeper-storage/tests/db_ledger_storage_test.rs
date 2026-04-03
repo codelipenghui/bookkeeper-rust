@@ -71,3 +71,17 @@ fn delete_ledger() {
     storage.delete_ledger(1).unwrap();
     assert!(!storage.ledger_exists(1).unwrap());
 }
+
+#[test]
+fn concurrent_add_during_flush() {
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    // Add entry, then flush
+    storage.add_entry(&make_entry(1, 0, -1, b"before")).unwrap();
+    storage.flush().unwrap();
+    // Add another entry after flush
+    storage.add_entry(&make_entry(1, 1, 0, b"after")).unwrap();
+    // Both should be retrievable
+    assert!(storage.get_entry(1, 0).is_ok());
+    assert!(storage.get_entry(1, 1).is_ok());
+}

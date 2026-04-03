@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use bytes::Bytes;
+use parking_lot::RwLock;
 use crate::cache::write_cache::WriteCache;
 use crate::cache::read_cache::ReadCache;
 use crate::entry_log::format::{self as elf, EntryLogHeader, EntryLocation, LOGFILE_HEADER_SIZE};
@@ -14,11 +15,13 @@ use crate::ledger_storage::LedgerStorage;
 const DEFAULT_WRITE_CACHE_SIZE: usize = 64 * 1024 * 1024; // 64MB
 const DEFAULT_READ_CACHE_SIZE: usize = 64 * 1024 * 1024;  // 64MB
 const READ_CACHE_SEGMENTS: usize = 4;
+const MAX_ENTRY_LOG_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
 
 pub struct DbLedgerStorage {
     #[allow(dead_code)]
     base_dir: PathBuf,
-    write_cache: WriteCache,
+    write_cache: RwLock<WriteCache>,
+    write_cache_being_flushed: RwLock<WriteCache>,
     read_cache: ReadCache,
     entry_location_index: EntryLocationIndex,
     ledger_index: LedgerMetadataIndex,
@@ -42,7 +45,8 @@ impl DbLedgerStorage {
 
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
-            write_cache: WriteCache::new(DEFAULT_WRITE_CACHE_SIZE),
+            write_cache: RwLock::new(WriteCache::new(DEFAULT_WRITE_CACHE_SIZE)),
+            write_cache_being_flushed: RwLock::new(WriteCache::new(DEFAULT_WRITE_CACHE_SIZE)),
             read_cache: ReadCache::new(DEFAULT_READ_CACHE_SIZE, READ_CACHE_SEGMENTS),
             entry_location_index,
             ledger_index,
@@ -79,8 +83,16 @@ impl DbLedgerStorage {
     }
 
     fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError> {
-        let log_id = self.current_log_id.lock().unwrap();
+        let mut log_id = self.current_log_id.lock().unwrap();
         let mut log_offset = self.current_log_offset.lock().unwrap();
+
+        // Rotate to new log file if current exceeds size limit
+        let encoded_size = 4 + entry.len();
+        if *log_offset + encoded_size as u64 > MAX_ENTRY_LOG_SIZE {
+            *log_id += 1;
+            *log_offset = LOGFILE_HEADER_SIZE as u64;
+        }
+
         self.ensure_entry_log_exists(*log_id)?;
 
         let path = self.entry_log_path(*log_id);
@@ -97,20 +109,23 @@ impl DbLedgerStorage {
     }
 
     fn read_entry_from_log(&self, location: u64) -> Result<Vec<u8>, StorageError> {
+        use std::io::{Read, Seek, SeekFrom};
         let loc = EntryLocation::from_u64(location);
         let path = self.entry_log_path(loc.log_id());
-        let data = fs::read(&path)?;
-        let pos = loc.position() as usize;
-        if pos < 4 || pos > data.len() {
+        let mut file = fs::File::open(&path)?;
+        let pos = loc.position() as u64;
+        if pos < 4 {
             return Err(StorageError::CorruptData("invalid entry position".into()));
         }
-        // Read 4-byte size at (pos - 4), then read size bytes at pos
-        let size_pos = pos - 4;
-        let size = i32::from_be_bytes(data[size_pos..size_pos + 4].try_into().unwrap()) as usize;
-        if pos + size > data.len() {
-            return Err(StorageError::CorruptData("entry extends past end of log".into()));
-        }
-        Ok(data[pos..pos + size].to_vec())
+        // Read 4-byte size at (pos - 4)
+        file.seek(SeekFrom::Start(pos - 4))?;
+        let mut size_buf = [0u8; 4];
+        file.read_exact(&mut size_buf)?;
+        let size = i32::from_be_bytes(size_buf) as usize;
+        // Read entry data at pos
+        let mut entry = vec![0u8; size];
+        file.read_exact(&mut entry)?;
+        Ok(entry)
     }
 }
 
@@ -133,21 +148,33 @@ impl LedgerStorage for DbLedgerStorage {
             self.ledger_index.update_lac(ledger_id, lac).ok();
         }
 
-        // Add to write cache
-        self.write_cache.put(ledger_id, entry_id, entry)?;
-        Ok(())
+        // Try write cache
+        {
+            let cache = self.write_cache.read();
+            if cache.put(ledger_id, entry_id, entry).is_ok() {
+                return Ok(());
+            }
+        }
+        // Cache full — flush and retry
+        self.flush()?;
+        let cache = self.write_cache.read();
+        cache.put(ledger_id, entry_id, entry)
     }
 
     fn get_entry(&self, ledger_id: i64, entry_id: i64) -> Result<Bytes, StorageError> {
-        // 1. Check read cache
+        // 1. Check active write cache (most recent writes)
+        if let Some(data) = self.write_cache.read().get(ledger_id, entry_id) {
+            return Ok(Bytes::from(data));
+        }
+        // 2. Check write cache being flushed
+        if let Some(data) = self.write_cache_being_flushed.read().get(ledger_id, entry_id) {
+            return Ok(Bytes::from(data));
+        }
+        // 3. Check read cache
         if let Some(data) = self.read_cache.get(ledger_id, entry_id) {
             return Ok(Bytes::from(data));
         }
-        // 2. Check write cache
-        if let Some(data) = self.write_cache.get(ledger_id, entry_id) {
-            return Ok(Bytes::from(data));
-        }
-        // 3. Check RocksDB index → entry log file
+        // 4. Check RocksDB index → entry log file
         if let Some(location) = self.entry_location_index.get(ledger_id, entry_id)? {
             let data = self.read_entry_from_log(location)?;
             self.read_cache.put(ledger_id, entry_id, &data);
@@ -170,15 +197,41 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn set_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(), StorageError> {
-        self.ledger_index.set(ledger_id, false, Some(master_key), None)
+        match self.ledger_index.get(ledger_id)? {
+            Some(existing) => {
+                self.ledger_index.set(
+                    ledger_id,
+                    existing.fenced,
+                    Some(master_key),
+                    existing.lac,
+                )
+            }
+            None => {
+                self.ledger_index.set(ledger_id, false, Some(master_key), None)
+            }
+        }
     }
 
     fn get_last_add_confirmed(&self, ledger_id: i64) -> Result<i64, StorageError> {
-        // Check write cache first for the most recent entry's LAC field
-        if let Some(entry_id) = self.write_cache.last_entry_id(ledger_id) {
-            if let Some(data) = self.write_cache.get(ledger_id, entry_id) {
-                if data.len() >= 24 {
-                    return Ok(i64::from_be_bytes(data[16..24].try_into().unwrap()));
+        // Check active write cache first for the most recent entry's LAC field
+        {
+            let cache = self.write_cache.read();
+            if let Some(entry_id) = cache.last_entry_id(ledger_id) {
+                if let Some(data) = cache.get(ledger_id, entry_id) {
+                    if data.len() >= 24 {
+                        return Ok(i64::from_be_bytes(data[16..24].try_into().unwrap()));
+                    }
+                }
+            }
+        }
+        // Check write cache being flushed
+        {
+            let cache = self.write_cache_being_flushed.read();
+            if let Some(entry_id) = cache.last_entry_id(ledger_id) {
+                if let Some(data) = cache.get(ledger_id, entry_id) {
+                    if data.len() >= 24 {
+                        return Ok(i64::from_be_bytes(data[16..24].try_into().unwrap()));
+                    }
                 }
             }
         }
@@ -201,7 +254,17 @@ impl LedgerStorage for DbLedgerStorage {
 
     fn flush(&self) -> Result<(), StorageError> {
         let _lock = self.flush_mutex.lock().unwrap();
-        let entries = self.write_cache.sorted_entries();
+
+        // Swap: active → being_flushed, being_flushed (cleared) → active
+        {
+            let mut active = self.write_cache.write();
+            let mut flushing = self.write_cache_being_flushed.write();
+            std::mem::swap(&mut *active, &mut *flushing);
+        }
+        // Now: write_cache is empty (new writes go here), write_cache_being_flushed has old data
+
+        let flushing = self.write_cache_being_flushed.read();
+        let entries = flushing.sorted_entries();
         let mut batch = Vec::new();
         for (ledger_id, entry_id, entry_data) in &entries {
             let location = self.write_entry_to_log(entry_data)?;
@@ -212,7 +275,8 @@ impl LedgerStorage for DbLedgerStorage {
         }
         self.entry_location_index.flush()?;
         self.ledger_index.flush()?;
-        self.write_cache.clear();
+        drop(flushing);
+        self.write_cache_being_flushed.write().clear();
         Ok(())
     }
 
