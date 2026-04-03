@@ -1,17 +1,28 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use bookkeeper_protocol::constants::MASTER_KEY_LENGTH;
 use bookkeeper_protocol::digest::{DigestManager, DigestType};
 use crate::bookie_connection::{BookieConnection, ClientError};
 use crate::distribution::RoundRobinDistributionSchedule;
 use crate::read_handle::ReadHandle;
 use crate::write_handle::WriteHandle;
 
+fn derive_master_key(password: &[u8]) -> [u8; 20] {
+    use sha1::Digest;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(b"ledger");
+    hasher.update(password);
+    let result = hasher.finalize();
+    let mut key = [0u8; 20];
+    key.copy_from_slice(&result);
+    key
+}
+
 /// Minimal BookKeeper client for creating, writing, and reading ledgers.
 /// Uses a fixed set of bookie addresses (no ZK discovery in this phase).
 pub struct BookKeeperClient {
     bookie_addrs: Vec<String>,
-    connections: Vec<BookieConnection>,
+    connections: Vec<Arc<tokio::sync::Mutex<BookieConnection>>>,
 }
 
 impl BookKeeperClient {
@@ -29,14 +40,14 @@ impl BookKeeperClient {
                 let addr: SocketAddr = addr_str.parse()
                     .map_err(|e| ClientError::Protocol(format!("bad address '{addr_str}': {e}")))?;
                 let conn = BookieConnection::connect(addr).await?;
-                self.connections.push(conn);
+                self.connections.push(Arc::new(tokio::sync::Mutex::new(conn)));
             }
         }
         Ok(())
     }
 
-    pub fn connections_mut(&mut self) -> &mut [BookieConnection] {
-        &mut self.connections
+    pub fn connections(&self) -> &[Arc<tokio::sync::Mutex<BookieConnection>>] {
+        &self.connections
     }
 
     /// Create a new ledger with the given parameters. Returns a WriteHandle.
@@ -62,10 +73,7 @@ impl BookKeeperClient {
         let schedule = RoundRobinDistributionSchedule::new(ensemble_size, write_quorum, ack_quorum);
         let dm = DigestManager::new(digest_type).with_password(password);
 
-        let mut master_key = [0u8; MASTER_KEY_LENGTH];
-        // Derive master key from password (simplified — use first 20 bytes or pad)
-        let key_bytes = std::cmp::min(password.len(), MASTER_KEY_LENGTH);
-        master_key[..key_bytes].copy_from_slice(&password[..key_bytes]);
+        let master_key = derive_master_key(password);
 
         Ok(WriteHandle::new(ledger_id, ensemble, schedule, dm, master_key))
     }
@@ -84,9 +92,7 @@ impl BookKeeperClient {
         let schedule = RoundRobinDistributionSchedule::new(ensemble_size, write_quorum, ack_quorum);
         let dm = DigestManager::new(digest_type).with_password(password);
 
-        let mut master_key = [0u8; MASTER_KEY_LENGTH];
-        let key_bytes = std::cmp::min(password.len(), MASTER_KEY_LENGTH);
-        master_key[..key_bytes].copy_from_slice(&password[..key_bytes]);
+        let master_key = derive_master_key(password);
 
         ReadHandle::new(ledger_id, ensemble, schedule, dm, master_key)
     }

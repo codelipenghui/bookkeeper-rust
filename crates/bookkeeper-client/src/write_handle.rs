@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bytes::{BufMut, Bytes, BytesMut};
 
 use bookkeeper_protocol::constants::*;
@@ -49,11 +51,11 @@ impl WriteHandle {
         &self.ensemble
     }
 
-    /// Append an entry. Builds the entry with digest, sends to write quorum,
-    /// waits for ack quorum, advances LAC. Returns the entry ID.
+    /// Append an entry. Builds the entry with digest, sends to write quorum
+    /// bookies in parallel, waits for ack quorum, advances LAC. Returns the entry ID.
     pub async fn append(
         &mut self,
-        conns: &mut [BookieConnection],
+        conns: &[Arc<tokio::sync::Mutex<BookieConnection>>],
         payload: &[u8],
     ) -> Result<i64, ClientError> {
         let entry_id = self.last_add_pushed + 1;
@@ -65,9 +67,9 @@ impl WriteHandle {
 
         // Determine write set
         let write_set = self.schedule.write_set(entry_id);
-        let mut ack_set = self.schedule.new_ack_set();
 
-        // Send to each bookie in write set
+        // Send to all bookies in parallel
+        let mut futures = Vec::new();
         for &bookie_idx in &write_set {
             if bookie_idx >= conns.len() {
                 return Err(ClientError::Protocol(format!(
@@ -75,15 +77,23 @@ impl WriteHandle {
                     conns.len()
                 )));
             }
-            let resp = conns[bookie_idx]
-                .send_add_entry(0, self.master_key, entry_bytes.clone())
-                .await?;
+            let conn = conns[bookie_idx].clone();
+            let entry = entry_bytes.clone();
+            let mk = self.master_key;
+            futures.push(tokio::spawn(async move {
+                let mut conn = conn.lock().await;
+                conn.send_add_entry(0, mk, entry).await
+            }));
+        }
 
-            match resp {
-                V2Response::Add { error_code, .. } => {
+        // Collect results
+        let mut ack_set = self.schedule.new_ack_set();
+        for (i, future) in futures.into_iter().enumerate() {
+            let bookie_idx = write_set[i];
+            match future.await {
+                Ok(Ok(V2Response::Add { error_code, .. })) => {
                     if error_code == V2_EOK {
                         if ack_set.complete_bookie(bookie_idx) {
-                            // Quorum reached
                             self.last_add_confirmed = entry_id;
                             return Ok(entry_id);
                         }
@@ -95,13 +105,24 @@ impl WriteHandle {
                         }
                     }
                 }
-                _ => {
-                    return Err(ClientError::Protocol("unexpected response type".into()));
+                Ok(Ok(_)) => {
+                    if ack_set.fail_bookie(bookie_idx) {
+                        return Err(ClientError::Protocol("unexpected response type".into()));
+                    }
+                }
+                Ok(Err(e)) => {
+                    if ack_set.fail_bookie(bookie_idx) {
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    if ack_set.fail_bookie(bookie_idx) {
+                        return Err(ClientError::Protocol(format!("task panic: {e}")));
+                    }
                 }
             }
         }
 
-        // If we get here, we sent to all bookies but didn't reach quorum
         if ack_set.is_quorum_reached() {
             self.last_add_confirmed = entry_id;
             Ok(entry_id)
