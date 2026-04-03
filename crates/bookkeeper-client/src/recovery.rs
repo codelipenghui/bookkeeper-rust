@@ -64,6 +64,7 @@ impl RecoveryHandle {
     pub async fn fence(
         &mut self,
         conns: &[Arc<Mutex<BookieConnection>>],
+        last_ensemble_entry_id: i64,
     ) -> Result<i64, ClientError> {
         let write_quorum = self.schedule.write_quorum_size();
         let mut max_lac: i64 = -1;
@@ -115,8 +116,8 @@ impl RecoveryHandle {
             )));
         }
 
-        self.recovery_lac = max_lac;
-        Ok(max_lac)
+        self.recovery_lac = std::cmp::max(max_lac, last_ensemble_entry_id - 1);
+        Ok(self.recovery_lac)
     }
 
     /// Phase 2: Forward read from recovery_lac+1 to find the true last entry.
@@ -220,7 +221,7 @@ impl RecoveryHandle {
             let mk = self.master_key;
             futures.push((bookie_idx, tokio::spawn(async move {
                 let mut conn = conn.lock().await;
-                conn.send_add_entry(FLAG_RECOVERY_ADD, mk, entry).await
+                conn.send_add_entry(FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY, mk, entry).await
             })));
         }
 
@@ -252,5 +253,109 @@ impl RecoveryHandle {
     /// Returns (lastEntryId, totalLength) for metadata update.
     pub fn close(&self, last_entry_id: i64) -> Result<(i64, i64), ClientError> {
         Ok((last_entry_id, self.total_length))
+    }
+
+    /// Run the complete recovery protocol: fence → forward read with re-replication → close.
+    /// Returns (lastEntryId, totalLength) for metadata update.
+    pub async fn recover(
+        &mut self,
+        conns: &[Arc<Mutex<BookieConnection>>],
+        last_ensemble_entry_id: i64,
+    ) -> Result<(i64, i64), ClientError> {
+        // Phase 1: Fence
+        let recovery_lac = self.fence(conns, last_ensemble_entry_id).await?;
+
+        // Phase 2+3: Forward read with re-replication
+        let mut last_entry = recovery_lac;
+        let mut entry_id = recovery_lac + 1;
+
+        // Compute total_length from entries already confirmed (up to recovery_lac)
+        if recovery_lac >= 0 {
+            let write_set = self.schedule.write_set(recovery_lac);
+            for &bookie_idx in &write_set {
+                if bookie_idx >= conns.len() { continue; }
+                let mut conn = conns[bookie_idx].lock().await;
+                match conn.send_read_entry(0, self.ledger_id, recovery_lac, None).await {
+                    Ok(bookkeeper_protocol::v2::response::V2Response::Read { error_code, data, .. }) => {
+                        if error_code == bookkeeper_protocol::constants::V2_EOK {
+                            if let Some(d) = data {
+                                if let Ok(entry) = bookkeeper_protocol::entry::parse_entry(&self.digest_manager, d) {
+                                    self.total_length = entry.length;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        loop {
+            let write_set = self.schedule.write_set(entry_id);
+            let mut entry_data: Option<bytes::Bytes> = None;
+
+            // Try to read from any bookie in write set
+            for &bookie_idx in &write_set {
+                if bookie_idx >= conns.len() { continue; }
+                let mut conn = conns[bookie_idx].lock().await;
+                match conn.send_read_entry(0, self.ledger_id, entry_id, None).await {
+                    Ok(bookkeeper_protocol::v2::response::V2Response::Read { error_code, data, .. }) => {
+                        if error_code == bookkeeper_protocol::constants::V2_EOK {
+                            if let Some(d) = data {
+                                if let Ok(entry) = bookkeeper_protocol::entry::parse_entry(&self.digest_manager, d.clone()) {
+                                    self.total_length = entry.length;
+                                    entry_data = Some(d);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+
+            match entry_data {
+                Some(data) => {
+                    // Re-replicate: send recovery add to ensure write quorum
+                    // The entry data is the raw entry bytes from the bookie
+                    let mut ack_set = self.schedule.new_ack_set();
+                    let mut futures = Vec::new();
+                    for &bookie_idx in &write_set {
+                        if bookie_idx >= conns.len() { continue; }
+                        let conn = conns[bookie_idx].clone();
+                        let entry = data.clone();
+                        let mk = self.master_key;
+                        futures.push(tokio::spawn(async move {
+                            let mut conn = conn.lock().await;
+                            conn.send_add_entry(
+                                bookkeeper_protocol::constants::FLAG_RECOVERY_ADD | bookkeeper_protocol::constants::FLAG_HIGH_PRIORITY,
+                                mk, entry,
+                            ).await
+                        }));
+                    }
+                    for (i, future) in futures.into_iter().enumerate() {
+                        let bidx = write_set[i];
+                        match future.await {
+                            Ok(Ok(bookkeeper_protocol::v2::response::V2Response::Add { error_code, .. })) => {
+                                if error_code == bookkeeper_protocol::constants::V2_EOK {
+                                    ack_set.complete_bookie(bidx);
+                                } else {
+                                    ack_set.fail_bookie(bidx);
+                                }
+                            }
+                            _ => { ack_set.fail_bookie(bidx); }
+                        }
+                    }
+                    // Even if quorum not fully reached, entry was found so advance
+                    last_entry = entry_id;
+                    entry_id += 1;
+                }
+                None => break, // No more entries
+            }
+        }
+
+        self.last_entry_found = last_entry;
+        Ok((last_entry, self.total_length))
     }
 }
