@@ -13,3 +13,6 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 zookeeper-client = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
