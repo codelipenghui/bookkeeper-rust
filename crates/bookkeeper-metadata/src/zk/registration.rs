@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use tokio::sync::OnceCell;
 use zookeeper_client as zk;
 use crate::ledger_metadata::MetadataError;
 use crate::service_info::BookieServiceInfo;
@@ -8,6 +9,7 @@ use crate::zk_path::ZkPaths;
 pub struct ZkRegistrationManager {
     client: zk::Client,
     paths: ZkPaths,
+    parents_ensured: OnceCell<()>,
 }
 
 impl ZkRegistrationManager {
@@ -15,7 +17,7 @@ impl ZkRegistrationManager {
         let client = zk::Client::connect(connect_string).await
             .map_err(|e| MetadataError::ConnectionError(format!("ZK connect: {e}")))?;
         let paths = ZkPaths::new(ledger_root);
-        Ok(Self { client, paths })
+        Ok(Self { client, paths, parents_ensured: OnceCell::new() })
     }
 
     pub fn paths(&self) -> &ZkPaths {
@@ -43,7 +45,7 @@ impl ZkRegistrationManager {
 #[async_trait]
 impl RegistrationManager for ZkRegistrationManager {
     async fn register_bookie(&self, bookie_id: &str, read_only: bool, info: &BookieServiceInfo) -> Result<(), MetadataError> {
-        self.ensure_parent_paths().await?;
+        self.parents_ensured.get_or_try_init(|| self.ensure_parent_paths()).await?;
         let data = info.to_protobuf_bytes();
         let path = if read_only {
             self.paths.bookie_readonly_registration(bookie_id)
@@ -149,13 +151,10 @@ impl RegistrationManager for ZkRegistrationManager {
         }
 
         // Create root paths
-        self.ensure_path_exists(self.paths.root()).await?;
-        self.ensure_path_exists(self.paths.available()).await?;
-        self.ensure_path_exists(self.paths.available_readonly()).await?;
-        self.ensure_path_exists(self.paths.cookies()).await?;
+        self.ensure_parent_paths().await?;
 
         // Create LAYOUT — Java format: "{layoutFormatVersion}\n{class}:{managerVersion}"
-        let layout_data = format!("{}\n{}:{}", 2, layout.manager_factory_class, layout.manager_version);
+        let layout_data = layout.serialize();
         let persistent_options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
         self.client.create(self.paths.layout(), layout_data.as_bytes(), &persistent_options).await
             .map_err(|e| MetadataError::ConnectionError(format!("create layout: {e}")))?;

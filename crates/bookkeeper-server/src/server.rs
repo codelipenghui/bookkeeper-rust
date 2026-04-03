@@ -107,16 +107,18 @@ impl BookieServer {
     }
 
     /// Update ZK registration when bookie state changes (e.g., to/from read-only).
-    pub async fn update_registration(&self, read_only: bool) {
+    pub async fn update_registration(&self, read_only: bool) -> Result<(), Box<dyn std::error::Error>> {
         if let Some((ref reg_mgr, ref bookie_id)) = self.zk_reg {
-            // Unregister from the opposite path
-            let _ = reg_mgr.unregister_bookie(bookie_id, !read_only).await;
-            // Register under the correct path
+            use bookkeeper_metadata::traits::RegistrationManager;
+            reg_mgr.unregister_bookie(bookie_id, !read_only).await
+                .map_err(|e| format!("unregister from old path: {e}"))?;
             let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
                 bookie_id, &self.local_addr.ip().to_string(), self.local_addr.port(),
             );
-            let _ = reg_mgr.register_bookie(bookie_id, read_only, &info).await;
+            reg_mgr.register_bookie(bookie_id, read_only, &info).await
+                .map_err(|e| format!("register on new path: {e}"))?;
         }
+        Ok(())
     }
 
     pub async fn shutdown(self) {
@@ -134,7 +136,7 @@ impl BookieServer {
 }
 
 async fn validate_cookie(
-    zk_reg: &bookkeeper_metadata::zk::registration::ZkRegistrationManager,
+    zk_reg: &dyn bookkeeper_metadata::traits::RegistrationManager,
     bookie_id: &str,
     config: &BookieConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {

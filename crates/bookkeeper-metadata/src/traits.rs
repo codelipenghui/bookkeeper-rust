@@ -4,6 +4,8 @@ use crate::ledger_metadata::{LedgerMetadata, MetadataError};
 use crate::versioned::Versioned;
 use crate::service_info::BookieServiceInfo;
 
+const LAYOUT_FORMAT_VERSION: i32 = 2;
+
 /// The primary interface for ledger metadata operations.
 /// All write operations use compare-and-swap via the version parameter.
 #[async_trait]
@@ -44,6 +46,31 @@ pub trait LedgerIdGenerator: Send + Sync {
 pub struct LedgerLayout {
     pub manager_factory_class: String,
     pub manager_version: i32,
+}
+
+impl LedgerLayout {
+    pub fn serialize(&self) -> String {
+        format!("{}\n{}:{}", LAYOUT_FORMAT_VERSION, self.manager_factory_class, self.manager_version)
+    }
+
+    pub fn deserialize(data: &str) -> Result<Self, MetadataError> {
+        let mut lines = data.lines();
+        // Line 1: layout format version (skip)
+        let _format_version = lines.next()
+            .ok_or_else(|| MetadataError::SerializationError("empty layout".into()))?;
+        // Line 2: "{class}:{version}"
+        let class_version = lines.next()
+            .ok_or_else(|| MetadataError::SerializationError("missing class:version in layout".into()))?;
+        let (class, version_str) = class_version.rsplit_once(':')
+            .ok_or_else(|| MetadataError::SerializationError(
+                format!("invalid layout format, expected 'class:version' got '{class_version}'")))?;
+        let version: i32 = version_str.parse()
+            .map_err(|e| MetadataError::SerializationError(format!("invalid layout version: {e}")))?;
+        Ok(LedgerLayout {
+            manager_factory_class: class.to_string(),
+            manager_version: version,
+        })
+    }
 }
 
 /// Manages the cluster metadata layout.
