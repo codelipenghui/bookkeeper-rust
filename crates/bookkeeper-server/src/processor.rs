@@ -71,8 +71,10 @@ impl RequestProcessor {
             let _ = self.storage.set_fenced(ledger_id);
         }
 
-        // Set master key on first write
-        let _ = self.storage.set_master_key(ledger_id, master_key);
+        // Check master key (stores on first write, validates on subsequent writes)
+        if let Err(e) = self.storage.check_master_key(ledger_id, master_key) {
+            return self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id);
+        }
 
         // Write to storage
         match self.storage.add_entry(&entry_data) {
@@ -86,9 +88,28 @@ impl RequestProcessor {
     }
 
     fn handle_read_entry(&self, flags: u16, ledger_id: i64, entry_id: i64, master_key: Option<[u8; MASTER_KEY_LENGTH]>) -> V2Response {
+        // Check readable state
+        if !self.state.is_readable() {
+            return V2Response::Read {
+                error_code: BKError::ReadOnly.to_v2_code(),
+                ledger_id,
+                entry_id,
+                data: None,
+            };
+        }
+
         // Handle fencing
         if flags & FLAG_DO_FENCING != 0 {
-            if let Some(_key) = master_key {
+            if let Some(key) = master_key {
+                // Validate master key before fencing
+                if let Err(e) = self.storage.check_master_key(ledger_id, &key) {
+                    return V2Response::Read {
+                        error_code: self.storage_error_to_bk(&e).to_v2_code(),
+                        ledger_id,
+                        entry_id,
+                        data: None,
+                    };
+                }
                 let _ = self.storage.set_fenced(ledger_id);
             }
         }
@@ -178,6 +199,17 @@ impl RequestProcessor {
     }
 
     fn handle_batch_read(&self, flags: u16, ledger_id: i64, start_entry_id: i64, request_id: i64, max_count: i32, max_size: i64) -> V2Response {
+        // Check readable state
+        if !self.state.is_readable() {
+            return V2Response::BatchRead {
+                error_code: BKError::ReadOnly.to_v2_code(),
+                ledger_id,
+                entry_id: start_entry_id,
+                request_id,
+                entries: vec![],
+            };
+        }
+
         // Handle fencing
         if flags & FLAG_DO_FENCING != 0 {
             let _ = self.storage.set_fenced(ledger_id);
@@ -226,6 +258,7 @@ impl RequestProcessor {
             bookkeeper_storage::StorageError::LedgerNotFound(_) => BKError::NoLedger,
             bookkeeper_storage::StorageError::Fenced(_) => BKError::Fenced,
             bookkeeper_storage::StorageError::StorageFull => BKError::ReadOnly,
+            bookkeeper_storage::StorageError::Unauthorized(_) => BKError::Unauthorized,
             _ => BKError::Io,
         }
     }

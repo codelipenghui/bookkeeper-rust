@@ -179,3 +179,60 @@ fn get_bookie_info() {
         _ => panic!("expected GetBookieInfo response"),
     }
 }
+
+#[test]
+fn master_key_mismatch_rejected() {
+    let (processor, _dir) = setup();
+    // Write with key A
+    let entry_data = make_entry(1, 0, -1, b"hello");
+    processor.process_request(V2Request::AddEntry {
+        flags: 0, master_key: [1u8; 20],
+        entry_data: Bytes::from(entry_data),
+    });
+    // Write with key B — should be rejected
+    let entry_data2 = make_entry(1, 1, 0, b"world");
+    let resp = processor.process_request(V2Request::AddEntry {
+        flags: 0, master_key: [2u8; 20],
+        entry_data: Bytes::from(entry_data2),
+    });
+    match resp {
+        V2Response::Add { error_code, .. } => {
+            assert_eq!(error_code, bookkeeper_common::error::BKError::Unauthorized.to_v2_code());
+        }
+        _ => panic!("expected Add response"),
+    }
+}
+
+#[test]
+fn fencing_with_wrong_key_rejected() {
+    let (processor, _dir) = setup();
+    // Write with key A
+    let entry_data = make_entry(1, 0, -1, b"hello");
+    processor.process_request(V2Request::AddEntry {
+        flags: 0, master_key: [1u8; 20],
+        entry_data: Bytes::from(entry_data),
+    });
+    // Try to fence with key B — should fail
+    let resp = processor.process_request(V2Request::ReadEntry {
+        flags: FLAG_DO_FENCING, ledger_id: 1, entry_id: 0,
+        master_key: Some([2u8; 20]),
+    });
+    match resp {
+        V2Response::Read { error_code, .. } => {
+            assert_eq!(error_code, bookkeeper_common::error::BKError::Unauthorized.to_v2_code());
+        }
+        _ => panic!("expected Read response"),
+    }
+    // Ledger should NOT be fenced
+    let entry_data3 = make_entry(1, 1, 0, b"still works");
+    let resp2 = processor.process_request(V2Request::AddEntry {
+        flags: 0, master_key: [1u8; 20],
+        entry_data: Bytes::from(entry_data3),
+    });
+    match resp2 {
+        V2Response::Add { error_code, .. } => {
+            assert_eq!(error_code, V2_EOK);
+        }
+        _ => panic!("expected Add response"),
+    }
+}

@@ -203,6 +203,29 @@ impl LedgerStorage for DbLedgerStorage {
         }
     }
 
+    fn check_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(), StorageError> {
+        match self.ledger_index.get(ledger_id)? {
+            Some(data) => {
+                // Ledger exists — check key
+                if let Some(stored_key) = &data.master_key {
+                    if stored_key != master_key {
+                        return Err(StorageError::Unauthorized(ledger_id));
+                    }
+                }
+                // No key stored yet — store it
+                if data.master_key.is_none() {
+                    self.set_master_key(ledger_id, master_key)?;
+                }
+                Ok(())
+            }
+            None => {
+                // Ledger doesn't exist — create with key
+                self.ledger_index.set(ledger_id, false, Some(master_key), None)?;
+                Ok(())
+            }
+        }
+    }
+
     fn get_last_add_confirmed(&self, ledger_id: i64) -> Result<i64, StorageError> {
         // Check active write cache first for the most recent entry's LAC field
         {

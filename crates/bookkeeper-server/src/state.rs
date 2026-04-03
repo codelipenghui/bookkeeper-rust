@@ -35,19 +35,28 @@ impl BookieStateManager {
     }
 
     pub fn transition_to(&self, new_state: BookieState) -> bool {
-        let current = self.state();
-        let allowed = match (current, new_state) {
-            (BookieState::ShuttingDown, _) => false,
-            (_, BookieState::ShuttingDown) => true,
-            (BookieState::Starting, BookieState::Running) => true,
-            (BookieState::Running, BookieState::ReadOnly) => true,
-            (BookieState::ReadOnly, BookieState::Running) => true,
-            _ => false,
-        };
-        if allowed {
-            self.state.store(new_state as u8, Ordering::SeqCst);
+        loop {
+            let current_val = self.state.load(Ordering::SeqCst);
+            let current = BookieState::from_u8(current_val);
+            let allowed = match (current, new_state) {
+                (BookieState::ShuttingDown, _) => false,
+                (_, BookieState::ShuttingDown) => true,
+                (BookieState::Starting, BookieState::Running) => true,
+                (BookieState::Running, BookieState::ReadOnly) => true,
+                (BookieState::ReadOnly, BookieState::Running) => true,
+                _ => false,
+            };
+            if !allowed {
+                return false;
+            }
+            match self.state.compare_exchange(
+                current_val, new_state as u8,
+                Ordering::SeqCst, Ordering::SeqCst
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue, // State changed concurrently, retry
+            }
         }
-        allowed
     }
 
     pub fn is_writable(&self) -> bool {

@@ -16,4 +16,6 @@ pub enum StorageError {
     StorageFull,
     #[error("RocksDB error: {0}")]
     RocksDb(String),
+    #[error("unauthorized access to ledger {0}")]
+    Unauthorized(i64),
 }

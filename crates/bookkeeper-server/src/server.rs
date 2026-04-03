@@ -22,6 +22,7 @@ pub struct BookieServer {
     shutdown_tx: watch::Sender<bool>,
     // Join handle for the accept loop task
     accept_handle: tokio::task::JoinHandle<()>,
+    storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
 }
 
 impl BookieServer {
@@ -45,6 +46,7 @@ impl BookieServer {
         state.transition_to(BookieState::Running);
 
         // Create request processor
+        let storage_for_shutdown = storage.clone();
         let processor = Arc::new(RequestProcessor::new(storage, state.clone()));
 
         // Shutdown channel
@@ -65,6 +67,7 @@ impl BookieServer {
             local_addr,
             shutdown_tx,
             accept_handle,
+            storage: storage_for_shutdown,
         })
     }
 
@@ -77,6 +80,8 @@ impl BookieServer {
         let _ = self.shutdown_tx.send(true);
         // Wait for the accept loop to finish
         let _ = self.accept_handle.await;
+        // Flush storage to persist any pending data
+        let _ = self.storage.flush();
     }
 }
 

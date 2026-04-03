@@ -21,6 +21,10 @@ pub trait LedgerStorage: Send + Sync {
     /// Set the master key for a ledger.
     fn set_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(), StorageError>;
 
+    /// Check the master key for a ledger. On first call, stores the key.
+    /// On subsequent calls, compares with stored key. Returns Err if mismatch.
+    fn check_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(), StorageError>;
+
     /// Get the last add confirmed for a ledger.
     fn get_last_add_confirmed(&self, ledger_id: i64) -> Result<i64, StorageError>;
 
