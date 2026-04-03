@@ -4,10 +4,13 @@
 
 ## 1. Transport Layer
 
-- **Protocol**: TCP with persistent connections
-- **Framing**: Length-prefixed. Each message is preceded by a 4-byte big-endian integer representing the payload length (NOT including the 4-byte length field itself).
-- **Max frame size**: Configurable via `nettyMaxFrameSizeBytes` (default: 5 MB for client, configurable for server)
-- **Byte order**: Big-endian throughout (network byte order)
+* **Protocol**: TCP with persistent connections
+
+* **Framing**: Length-prefixed. Each message is preceded by a 4-byte big-endian integer representing the payload length (NOT including the 4-byte length field itself).
+
+* **Max frame size**: Configurable via `nettyMaxFrameSizeBytes` (default: 5 MB for client, configurable for server)
+
+* **Byte order**: Big-endian throughout (network byte order)
 
 ```
 ┌────────────────┬────────────────────────────────┐
@@ -20,19 +23,24 @@
 
 Three protocol versions exist. The version is determined by client configuration, NOT negotiated dynamically.
 
-| Version | Encoding | Configuration |
-|---------|----------|---------------|
-| v1 | Binary, fixed header | Legacy, `useV2WireProtocol=true` |
-| v2 | Binary, extended header | `useV2WireProtocol=true` (CURRENT_PROTOCOL_VERSION=2) |
-| v3 | Protobuf | `useV2WireProtocol=false` (default) |
+| Version | Encoding                | Configuration                                           |
+| ------- | ----------------------- | ------------------------------------------------------- |
+| v1      | Binary, fixed header    | Legacy, `useV2WireProtocol=true`                        |
+| v2      | Binary, extended header | `useV2WireProtocol=true` (CURRENT\_PROTOCOL\_VERSION=2) |
+| v3      | Protobuf                | `useV2WireProtocol=false` (default)                     |
 
 **Version selection logic**:
-- Default: v3 (protobuf)
-- If `useV2WireProtocol=true`: v2 binary, except:
-  - If TLS enabled: first message (START_TLS) uses v3, then downgrades to v2
-  - Fallback: if protobuf parse fails, fall back to v2 decode
+
+* Default: v3 (protobuf)
+
+* If `useV2WireProtocol=true`: v2 binary, except:
+
+  * If TLS enabled: first message (START\_TLS) uses v3, then downgrades to v2
+
+  * Fallback: if protobuf parse fails, fall back to v2 decode
 
 **Constants**:
+
 ```
 CURRENT_PROTOCOL_VERSION = 2
 LOWEST_COMPAT_PROTOCOL_VERSION = 0
@@ -55,28 +63,29 @@ Special case: if version == 0, the entire int32 is treated as the opCode (backwa
 
 ### 3.2 Operation Codes (Pre-v3)
 
-| OpCode | Value | Description |
-|--------|-------|-------------|
-| ADDENTRY | 1 | Write entry |
-| READENTRY | 2 | Read entry |
-| AUTH | 3 | Authentication |
-| READ_LAC | 4 | Read Last Add Confirmed |
-| WRITE_LAC | 5 | Write Last Add Confirmed |
-| GET_BOOKIE_INFO | 6 | Get bookie info |
-| BATCH_READ_ENTRY | 7 | Batch read entries |
+| OpCode             | Value | Description              |
+| ------------------ | ----- | ------------------------ |
+| ADDENTRY           | 1     | Write entry              |
+| READENTRY          | 2     | Read entry               |
+| AUTH               | 3     | Authentication           |
+| READ\_LAC          | 4     | Read Last Add Confirmed  |
+| WRITE\_LAC         | 5     | Write Last Add Confirmed |
+| GET\_BOOKIE\_INFO  | 6     | Get bookie info          |
+| BATCH\_READ\_ENTRY | 7     | Batch read entries       |
 
 ### 3.3 Flags (16-bit)
 
-| Flag | Value | Used With |
-|------|-------|-----------|
-| FLAG_NONE | 0x0000 | Any |
-| FLAG_DO_FENCING | 0x0001 | READENTRY |
-| FLAG_RECOVERY_ADD | 0x0002 | ADDENTRY |
-| FLAG_HIGH_PRIORITY | 0x0004 | Any |
+| Flag                 | Value  | Used With |
+| -------------------- | ------ | --------- |
+| FLAG\_NONE           | 0x0000 | Any       |
+| FLAG\_DO\_FENCING    | 0x0001 | READENTRY |
+| FLAG\_RECOVERY\_ADD  | 0x0002 | ADDENTRY  |
+| FLAG\_HIGH\_PRIORITY | 0x0004 | Any       |
 
 ### 3.4 Request Formats (Pre-v3)
 
-**ADD_ENTRY Request**:
+**ADD\_ENTRY Request**:
+
 ```
 Offset  Size    Field
 0       4       Packet Header (version=2, opCode=1, flags)
@@ -86,7 +95,8 @@ Offset  Size    Field
 40      ...     Entry data (see Entry Wire Format, Section 6)
 ```
 
-**READ_ENTRY Request**:
+**READ\_ENTRY Request**:
+
 ```
 Offset  Size    Field
 0       4       Packet Header (version=2, opCode=2, flags)
@@ -94,16 +104,19 @@ Offset  Size    Field
 8       8       Entry ID (int64)
 16      20      Master Key (only if FLAG_DO_FENCING set)
 ```
-- Special entry ID: `-1` (LAST_ADD_CONFIRMED) means "read the LAC"
+
+* Special entry ID: `-1` (LAST\_ADD\_CONFIRMED) means "read the LAC"
 
 **AUTH Request**:
+
 ```
 Offset  Size    Field
 0       4       Packet Header (version=2, opCode=3, flags=0)
 4       N       AuthMessage (protobuf serialized)
 ```
 
-**WRITE_LAC Request**:
+**WRITE\_LAC Request**:
+
 ```
 Offset  Size    Field
 0       4       Packet Header (version=2, opCode=5, flags=0)
@@ -113,22 +126,26 @@ Offset  Size    Field
 40      N       LAC digest data (ledgerId + lac + digest)
 ```
 
-**READ_LAC Request**:
+**READ\_LAC Request**:
+
 ```
 Offset  Size    Field
 0       4       Packet Header (version=2, opCode=4, flags=0)
 4       8       Ledger ID (int64)
 ```
 
-**GET_BOOKIE_INFO Request**:
+**GET\_BOOKIE\_INFO Request**:
+
 ```
 Offset  Size    Field
 0       4       Packet Header (version=2, opCode=6, flags)
 4       8       Requested info mask (int64)
 ```
+
 Flags in the mask: `FREE_DISK_SPACE=1<<0`, `TOTAL_DISK_SPACE=1<<1`
 
-**BATCH_READ_ENTRY Request**:
+**BATCH\_READ\_ENTRY Request**:
+
 ```
 Offset  Size    Field
 0       4       Packet Header (version=2, opCode=7, flags)
@@ -141,6 +158,7 @@ Offset  Size    Field
 ### 3.5 Response Formats (Pre-v3)
 
 All pre-v3 responses share a common 24-byte header:
+
 ```
 Offset  Size    Field
 0       4       Packet Header (version|opCode|flags)
@@ -149,44 +167,51 @@ Offset  Size    Field
 16      8       Entry ID (int64)
 ```
 
-**ADD_ENTRY Response** (24 bytes total):
+**ADD\_ENTRY Response** (24 bytes total):
+
 ```
 [24-byte common header]
 No additional payload.
 ```
 
-**READ_ENTRY Response**:
+**READ\_ENTRY Response**:
+
 ```
 [24-byte common header]
 24      N       Entry data (if status == EOK)
 ```
 
 **AUTH Response**:
+
 ```
 [24-byte common header]  (ledgerId=0, entryId=0)
 24      N       AuthMessage (protobuf)
 ```
 
-**WRITE_LAC Response** (24 bytes total):
+**WRITE\_LAC Response** (24 bytes total):
+
 ```
 [24-byte common header]
 ```
 
-**READ_LAC Response**:
+**READ\_LAC Response**:
+
 ```
 [24-byte common header]
 24      N1      Last LAC data (explicit LAC bytes)
 24+N1   N2      LAC from last entry (entry bytes with piggyback LAC)
 ```
 
-**GET_BOOKIE_INFO Response**:
+**GET\_BOOKIE\_INFO Response**:
+
 ```
 [24-byte common header]
 24      8       Free disk space (int64)
 32      8       Total disk space (int64)
 ```
 
-**BATCH_READ_ENTRY Response**:
+**BATCH\_READ\_ENTRY Response**:
+
 ```
 [24-byte common header]
 24      8       Request ID (int64)
@@ -396,6 +421,7 @@ enum StatusCode {
 ```
 
 Note: Pre-v3 uses different error code values:
+
 ```
 EOK = 0
 ENOLEDGER = 1
@@ -409,7 +435,7 @@ EREADONLY = 105
 ETOOMANYREQUESTS = 106
 ```
 
-## 5. TLS Handshake (START_TLS)
+## 5. TLS Handshake (START\_TLS)
 
 1. Client sends `StartTLSRequest` (v3 protobuf, even if v2 is configured)
 2. Server responds with `StartTLSResponse` + status `EOK`
@@ -419,7 +445,7 @@ ETOOMANYREQUESTS = 106
 
 ## 6. Entry Wire Format
 
-The entry as transmitted in ADD_ENTRY body and returned in READ_ENTRY body:
+The entry as transmitted in ADD\_ENTRY body and returned in READ\_ENTRY body:
 
 ```
 Offset  Size    Field
@@ -432,27 +458,32 @@ Offset  Size    Field
 ```
 
 **Digest sizes**:
-| Type | MacCodeLength | Storage Size | Notes |
-|------|--------------|--------------|-------|
-| CRC32 | 4 bytes | 8 bytes (stored as int64) | Java CRC32 |
-| CRC32C | 4 bytes | 8 bytes (stored as int64) | Hardware-accelerated |
-| HMAC_SHA1 | 20 bytes | 20 bytes | Keyed with ledger password |
-| DUMMY | 0 bytes | 0 bytes | No integrity check |
+
+| Type       | MacCodeLength | Storage Format                    | Notes                      |
+| ---------- | ------------- | --------------------------------- | -------------------------- |
+| CRC32      | 8 bytes       | 8 bytes (stored as int64 via writeLong) | Java CRC32           |
+| CRC32C     | 4 bytes       | 4 bytes (stored as int32 via writeInt)  | Hardware-accelerated  |
+| HMAC\_SHA1 | 20 bytes      | 20 bytes                          | Key = SHA1("mac" + password) |
+| DUMMY      | 0 bytes       | 0 bytes                           | No integrity check         |
 
 **Digest computation**:
+
 1. Initialize digest with algorithm-specific state
 2. Update with metadata bytes: `ledgerId(8) + entryId(8) + LAC(8) + length(8)` = 32 bytes
 3. Update with payload bytes
 4. Write digest value at offset 32
 
-**METADATA_LENGTH** = 32 bytes (the 4 int64 fields before digest)
+**METADATA\_LENGTH** = 32 bytes (the 4 int64 fields before digest)
 
 ## 7. Master Key
 
-- **Length**: Fixed at 20 bytes (`MASTER_KEY_LENGTH = 20`)
-- **Derivation**: Generated by `MacDigestManager` regardless of actual digest type
-- **Purpose**: Used for entry-level authentication — bookie validates master key on writes
-- **Empty password optimization**: An all-zero or static master key is used for empty passwords
+* **Length**: Fixed at 20 bytes (`MASTER_KEY_LENGTH = 20`)
+
+* **Derivation**: Generated by `MacDigestManager` regardless of actual digest type
+
+* **Purpose**: Used for entry-level authentication — bookie validates master key on writes
+
+* **Empty password optimization**: An all-zero or static master key is used for empty passwords
 
 ## 8. Authentication Flow
 
@@ -467,14 +498,21 @@ Offset  Size    Field
 ## 9. Connection Lifecycle
 
 ### 9.1 Client Side (PerChannelBookieClient)
-- States: `DISCONNECTED → CONNECTING → CONNECTED → CLOSED` (also `START_TLS` transient state)
-- Lazy connection: established on first request
-- Request/response correlation:
-  - v2: `(ledgerId, entryId, opType)` tuple
-  - v3: `txnId` (monotonically increasing uint64)
-- Reconnection on channel failure with pending ops re-queued
+
+* States: `DISCONNECTED → CONNECTING → CONNECTED → CLOSED` (also `START_TLS` transient state)
+
+* Lazy connection: established on first request
+
+* Request/response correlation:
+
+  * v2: `(ledgerId, entryId, opType)` tuple
+
+  * v3: `txnId` (monotonically increasing uint64)
+
+* Reconnection on channel failure with pending ops re-queued
 
 ### 9.2 Special Values
+
 ```
 INVALID_ENTRY_ID = -1
 LAST_ADD_CONFIRMED = -1  // Special entryId in READ_ENTRY: returns current LAC
