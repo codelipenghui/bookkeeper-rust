@@ -5,10 +5,10 @@ use std::io::Write;
 
 #[test]
 fn parse_properties_basic() {
-    let text = "bookiePort=3181\njournaDirectory=/data/journal\n# comment\n\n";
+    let text = "bookiePort=3181\njournalDirectory=/data/journal\n# comment\n\n";
     let props = parse_properties(text);
     assert_eq!(props.get("bookiePort"), Some(&"3181".to_string()));
-    assert_eq!(props.get("journaDirectory"), Some(&"/data/journal".to_string()));
+    assert_eq!(props.get("journalDirectory"), Some(&"/data/journal".to_string()));
     assert_eq!(props.len(), 2);
 }
 

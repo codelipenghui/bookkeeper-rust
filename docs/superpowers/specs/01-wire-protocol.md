@@ -4,6 +4,8 @@
 
 ## 1. Transport Layer
 
+<br />
+
 * **Protocol**: TCP with persistent connections
 
 * **Framing**: Length-prefixed. Each message is preceded by a 4-byte big-endian integer representing the payload length (NOT including the 4-byte length field itself).
@@ -459,12 +461,12 @@ Offset  Size    Field
 
 **Digest sizes**:
 
-| Type       | MacCodeLength | Storage Format                    | Notes                      |
-| ---------- | ------------- | --------------------------------- | -------------------------- |
-| CRC32      | 8 bytes       | 8 bytes (stored as int64 via writeLong) | Java CRC32           |
-| CRC32C     | 4 bytes       | 4 bytes (stored as int32 via writeInt)  | Hardware-accelerated  |
-| HMAC\_SHA1 | 20 bytes      | 20 bytes                          | Key = SHA1("mac" + password) |
-| DUMMY      | 0 bytes       | 0 bytes                           | No integrity check         |
+| Type       | MacCodeLength | Storage Size              | Notes                      |
+| ---------- | ------------- | ------------------------- | -------------------------- |
+| CRC32      | 4 bytes       | 8 bytes (stored as int64) | Java CRC32                 |
+| CRC32C     | 4 bytes       | 8 bytes (stored as int64) | Hardware-accelerated       |
+| HMAC\_SHA1 | 20 bytes      | 20 bytes                  | Keyed with ledger password |
+| DUMMY      | 0 bytes       | 0 bytes                   | No integrity check         |
 
 **Digest computation**:
 

@@ -10,7 +10,7 @@
 
 **Spec references:** `docs/superpowers/specs/01-wire-protocol.md`, `docs/superpowers/specs/2026-04-02-bookkeeper-spec-design.md` §3.2 (entry format)
 
----
+***
 
 ## File Structure
 
@@ -50,20 +50,27 @@ bookkeeper-rust/
     └── wire_compat.rs                      # Wire compatibility integration tests
 ```
 
----
+***
 
 ### Task 1: Initialize Cargo Workspace
 
 **Files:**
-- Create: `Cargo.toml`
-- Create: `crates/bookkeeper-proto/Cargo.toml`
-- Create: `crates/bookkeeper-common/Cargo.toml`
-- Create: `crates/bookkeeper-protocol/Cargo.toml`
-- Create: `crates/bookkeeper-proto/src/lib.rs`
-- Create: `crates/bookkeeper-common/src/lib.rs`
-- Create: `crates/bookkeeper-protocol/src/lib.rs`
 
-- [ ] **Step 1: Create workspace root Cargo.toml**
+* Create: `Cargo.toml`
+
+* Create: `crates/bookkeeper-proto/Cargo.toml`
+
+* Create: `crates/bookkeeper-common/Cargo.toml`
+
+* Create: `crates/bookkeeper-protocol/Cargo.toml`
+
+* Create: `crates/bookkeeper-proto/src/lib.rs`
+
+* Create: `crates/bookkeeper-common/src/lib.rs`
+
+* Create: `crates/bookkeeper-protocol/src/lib.rs`
+
+* [ ] **Step 1: Create workspace root Cargo.toml**
 
 ```toml
 [workspace]
@@ -96,7 +103,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 ```
 
-- [ ] **Step 2: Create bookkeeper-proto Cargo.toml**
+* [ ] **Step 2: Create bookkeeper-proto Cargo.toml**
 
 ```toml
 [package]
@@ -112,7 +119,7 @@ prost = { workspace = true }
 prost-build = { workspace = true }
 ```
 
-- [ ] **Step 3: Create bookkeeper-common Cargo.toml**
+* [ ] **Step 3: Create bookkeeper-common Cargo.toml**
 
 ```toml
 [package]
@@ -125,7 +132,7 @@ license.workspace = true
 thiserror = { workspace = true }
 ```
 
-- [ ] **Step 4: Create bookkeeper-protocol Cargo.toml**
+* [ ] **Step 4: Create bookkeeper-protocol Cargo.toml**
 
 ```toml
 [package]
@@ -149,63 +156,74 @@ tokio-util = { workspace = true }
 tokio = { workspace = true }
 ```
 
-- [ ] **Step 5: Create minimal lib.rs stubs**
+* [ ] **Step 5: Create minimal lib.rs stubs**
 
 `crates/bookkeeper-proto/src/lib.rs`:
+
 ```rust
 // Generated protobuf code will be included here
 ```
 
 `crates/bookkeeper-common/src/lib.rs`:
+
 ```rust
 pub mod error;
 pub mod types;
 ```
 
 `crates/bookkeeper-common/src/error.rs`:
+
 ```rust
 // Placeholder — populated in Task 3
 ```
 
 `crates/bookkeeper-common/src/types.rs`:
+
 ```rust
 // Placeholder — populated in Task 3
 ```
 
 `crates/bookkeeper-protocol/src/lib.rs`:
+
 ```rust
 pub mod constants;
 ```
 
 `crates/bookkeeper-protocol/src/constants.rs`:
+
 ```rust
 // Placeholder — populated in Task 4
 ```
 
-- [ ] **Step 6: Verify workspace builds**
+* [ ] **Step 6: Verify workspace builds**
 
 Run: `cargo check`
 Expected: Compiles with no errors
 
-- [ ] **Step 7: Commit**
+* [ ] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml crates/
 git commit -m "feat: initialize Cargo workspace with proto, common, protocol crates"
 ```
 
----
+***
 
 ### Task 2: Set Up Protobuf Codegen
 
 **Files:**
-- Create: `crates/bookkeeper-proto/proto/BookkeeperProtocol.proto`
-- Create: `crates/bookkeeper-proto/proto/DataFormats.proto`
-- Create: `crates/bookkeeper-proto/proto/DbLedgerStorageDataFormats.proto`
-- Create: `crates/bookkeeper-proto/build.rs`
-- Modify: `crates/bookkeeper-proto/src/lib.rs`
 
-- [ ] **Step 1: Copy proto files from Java project**
+* Create: `crates/bookkeeper-proto/proto/BookkeeperProtocol.proto`
+
+* Create: `crates/bookkeeper-proto/proto/DataFormats.proto`
+
+* Create: `crates/bookkeeper-proto/proto/DbLedgerStorageDataFormats.proto`
+
+* Create: `crates/bookkeeper-proto/build.rs`
+
+* Modify: `crates/bookkeeper-proto/src/lib.rs`
+
+* [ ] **Step 1: Copy proto files from Java project**
 
 ```bash
 cp /Users/lipenghui/Github/apache/bookkeeper/bookkeeper-proto/src/main/proto/BookkeeperProtocol.proto crates/bookkeeper-proto/proto/
@@ -213,7 +231,7 @@ cp /Users/lipenghui/Github/apache/bookkeeper/bookkeeper-proto/src/main/proto/Dat
 cp /Users/lipenghui/Github/apache/bookkeeper/bookkeeper-proto/src/main/proto/DbLedgerStorageDataFormats.proto crates/bookkeeper-proto/proto/
 ```
 
-- [ ] **Step 2: Create build.rs**
+* [ ] **Step 2: Create build.rs**
 
 ```rust
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -229,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-- [ ] **Step 3: Write lib.rs with generated module includes**
+* [ ] **Step 3: Write lib.rs with generated module includes**
 
 ```rust
 /// BookKeeper wire protocol messages (BookkeeperProtocol.proto).
@@ -252,40 +270,49 @@ pub use bk_protocol::*;
 
 Note: Since all three proto files use `syntax = "proto2"` with no `package` directive, prost generates them all into a single `_.rs` file in `OUT_DIR`. All messages are accessible directly from the crate root.
 
-- [ ] **Step 4: Verify proto codegen builds**
+* [ ] **Step 4: Verify proto codegen builds**
 
 Run: `cargo build -p bookkeeper-proto`
 Expected: Compiles, generates Rust structs for all protobuf messages
 
-- [ ] **Step 5: Verify key types exist**
+* [ ] **Step 5: Verify key types exist**
 
 Run: `cargo doc -p bookkeeper-proto --no-deps --open`
 Check that these types are generated:
-- `Request`, `Response`, `BkPacketHeader`
-- `ReadRequest`, `AddRequest`, `ReadResponse`, `AddResponse`
-- `LedgerMetadataFormat`, `CookieFormat`, `BookieServiceInfoFormat`
-- `LedgerData` (from DbLedgerStorageDataFormats)
-- `StatusCode`, `OperationType`, `ProtocolVersion` enums
 
-- [ ] **Step 6: Commit**
+* `Request`, `Response`, `BkPacketHeader`
+
+* `ReadRequest`, `AddRequest`, `ReadResponse`, `AddResponse`
+
+* `LedgerMetadataFormat`, `CookieFormat`, `BookieServiceInfoFormat`
+
+* `LedgerData` (from DbLedgerStorageDataFormats)
+
+* `StatusCode`, `OperationType`, `ProtocolVersion` enums
+
+* [ ] **Step 6: Commit**
 
 ```bash
 git add crates/bookkeeper-proto/
 git commit -m "feat: add protobuf codegen for BookKeeper protocol and data formats"
 ```
 
----
+***
 
 ### Task 3: Common Types and Errors
 
 **Files:**
-- Modify: `crates/bookkeeper-common/src/types.rs`
-- Modify: `crates/bookkeeper-common/src/error.rs`
-- Create: `crates/bookkeeper-common/tests/types_test.rs`
 
-- [ ] **Step 1: Write failing test for BookieId**
+* Modify: `crates/bookkeeper-common/src/types.rs`
+
+* Modify: `crates/bookkeeper-common/src/error.rs`
+
+* Create: `crates/bookkeeper-common/tests/types_test.rs`
+
+* [ ] **Step 1: Write failing test for BookieId**
 
 `crates/bookkeeper-common/tests/types_test.rs`:
+
 ```rust
 use bookkeeper_common::types::BookieId;
 
@@ -310,12 +337,12 @@ fn bookie_id_parse_invalid() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+* [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bookkeeper-common`
 Expected: FAIL — types not defined yet
 
-- [ ] **Step 3: Implement types.rs**
+* [ ] **Step 3: Implement types.rs**
 
 ```rust
 use std::fmt;
@@ -372,12 +399,12 @@ impl FromStr for BookieId {
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+* [ ] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p bookkeeper-common`
 Expected: All 3 tests pass
 
-- [ ] **Step 5: Write error.rs**
+* [ ] **Step 5: Write error.rs**
 
 ```rust
 use thiserror::Error;
@@ -486,26 +513,27 @@ impl BKError {
 }
 ```
 
-- [ ] **Step 6: Verify everything builds and tests pass**
+* [ ] **Step 6: Verify everything builds and tests pass**
 
 Run: `cargo test -p bookkeeper-common`
 Expected: All tests pass
 
-- [ ] **Step 7: Commit**
+* [ ] **Step 7: Commit**
 
 ```bash
 git add crates/bookkeeper-common/
 git commit -m "feat: add common types (BookieId, LedgerId) and BKError with v2/v3 code conversion"
 ```
 
----
+***
 
 ### Task 4: Protocol Constants
 
 **Files:**
-- Modify: `crates/bookkeeper-protocol/src/constants.rs`
 
-- [ ] **Step 1: Write constants.rs**
+* Modify: `crates/bookkeeper-protocol/src/constants.rs`
+
+* [ ] **Step 1: Write constants.rs**
 
 ```rust
 /// Pre-v3 binary protocol constants from BookieProtocol.java.
@@ -565,29 +593,32 @@ pub const BOOKIE_INFO_TOTAL_DISK_CAPACITY: i64 = 0x02;
 pub const V2_RESPONSE_HEADER_SIZE: usize = 24;
 ```
 
-- [ ] **Step 2: Verify builds**
+* [ ] **Step 2: Verify builds**
 
 Run: `cargo check -p bookkeeper-protocol`
 Expected: Compiles
 
-- [ ] **Step 3: Commit**
+* [ ] **Step 3: Commit**
 
 ```bash
 git add crates/bookkeeper-protocol/src/constants.rs
 git commit -m "feat: add protocol constants (opcodes, flags, error codes, sizes)"
 ```
 
----
+***
 
 ### Task 5: Digest Computation
 
 **Files:**
-- Create: `crates/bookkeeper-protocol/src/digest.rs`
-- Create: `crates/bookkeeper-protocol/tests/digest_test.rs`
 
-- [ ] **Step 1: Write failing tests for digest computation**
+* Create: `crates/bookkeeper-protocol/src/digest.rs`
+
+* Create: `crates/bookkeeper-protocol/tests/digest_test.rs`
+
+* [ ] **Step 1: Write failing tests for digest computation**
 
 `crates/bookkeeper-protocol/tests/digest_test.rs`:
+
 ```rust
 use bookkeeper_protocol::digest::{DigestManager, DigestType};
 
@@ -649,12 +680,12 @@ fn build_metadata(ledger_id: i64, entry_id: i64, lac: i64, length: i64) -> [u8; 
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+* [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: FAIL — digest module doesn't exist
 
-- [ ] **Step 3: Implement digest.rs**
+* [ ] **Step 3: Implement digest.rs**
 
 ```rust
 use hmac::{Hmac, Mac};
@@ -745,37 +776,41 @@ impl DigestManager {
 }
 ```
 
-- [ ] **Step 4: Add digest module to lib.rs**
+* [ ] **Step 4: Add digest module to lib.rs**
 
 Update `crates/bookkeeper-protocol/src/lib.rs`:
+
 ```rust
 pub mod constants;
 pub mod digest;
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+* [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: All 5 digest tests pass
 
-- [ ] **Step 6: Commit**
+* [ ] **Step 6: Commit**
 
 ```bash
 git add crates/bookkeeper-protocol/
 git commit -m "feat: add digest computation (CRC32, CRC32C, HMAC-SHA1, DUMMY)"
 ```
 
----
+***
 
 ### Task 6: Entry Format
 
 **Files:**
-- Create: `crates/bookkeeper-protocol/src/entry.rs`
-- Create: `crates/bookkeeper-protocol/tests/entry_test.rs`
 
-- [ ] **Step 1: Write failing tests for entry serialization**
+* Create: `crates/bookkeeper-protocol/src/entry.rs`
+
+* Create: `crates/bookkeeper-protocol/tests/entry_test.rs`
+
+* [ ] **Step 1: Write failing tests for entry serialization**
 
 `crates/bookkeeper-protocol/tests/entry_test.rs`:
+
 ```rust
 use bookkeeper_protocol::digest::{DigestManager, DigestType};
 use bookkeeper_protocol::entry::EntryBuilder;
@@ -845,12 +880,12 @@ fn entry_corrupt_digest_detected() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+* [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: FAIL — entry module doesn't exist
 
-- [ ] **Step 3: Implement entry.rs**
+* [ ] **Step 3: Implement entry.rs**
 
 ```rust
 use bytes::{BufMut, Bytes, BytesMut};
@@ -961,39 +996,44 @@ pub enum EntryError {
 }
 ```
 
-- [ ] **Step 4: Add entry module and thiserror dep to lib.rs**
+* [ ] **Step 4: Add entry module and thiserror dep to lib.rs**
 
 Update `crates/bookkeeper-protocol/src/lib.rs`:
+
 ```rust
 pub mod constants;
 pub mod digest;
 pub mod entry;
 ```
 
-- [ ] **Step 5: Run tests**
+* [ ] **Step 5: Run tests**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: All entry + digest tests pass
 
-- [ ] **Step 6: Commit**
+* [ ] **Step 6: Commit**
 
 ```bash
 git add crates/bookkeeper-protocol/
 git commit -m "feat: add entry format serialization/deserialization with digest verification"
 ```
 
----
+***
 
 ### Task 7: Pre-v3 Packet Header
 
 **Files:**
-- Create: `crates/bookkeeper-protocol/src/v2/mod.rs`
-- Create: `crates/bookkeeper-protocol/src/v2/header.rs`
-- Create: `crates/bookkeeper-protocol/tests/v2_header_test.rs`
 
-- [ ] **Step 1: Write failing test for packet header**
+* Create: `crates/bookkeeper-protocol/src/v2/mod.rs`
+
+* Create: `crates/bookkeeper-protocol/src/v2/header.rs`
+
+* Create: `crates/bookkeeper-protocol/tests/v2_header_test.rs`
+
+* [ ] **Step 1: Write failing test for packet header**
 
 `crates/bookkeeper-protocol/tests/v2_header_test.rs`:
+
 ```rust
 use bookkeeper_protocol::v2::header::PacketHeader;
 
@@ -1038,14 +1078,15 @@ fn round_trip() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+* [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: FAIL — v2 module doesn't exist
 
-- [ ] **Step 3: Implement header.rs**
+* [ ] **Step 3: Implement header.rs**
 
 `crates/bookkeeper-protocol/src/v2/header.rs`:
+
 ```rust
 /// Pre-v3 packet header: version(8) | opcode(8) | flags(16), packed into a u32.
 ///
@@ -1100,6 +1141,7 @@ impl PacketHeader {
 ```
 
 `crates/bookkeeper-protocol/src/v2/mod.rs`:
+
 ```rust
 pub mod header;
 pub mod request;
@@ -1109,18 +1151,21 @@ pub mod response;
 Create empty stubs for now:
 
 `crates/bookkeeper-protocol/src/v2/request.rs`:
+
 ```rust
 // Populated in Task 8
 ```
 
 `crates/bookkeeper-protocol/src/v2/response.rs`:
+
 ```rust
 // Populated in Task 9
 ```
 
-- [ ] **Step 4: Add v2 module to lib.rs**
+* [ ] **Step 4: Add v2 module to lib.rs**
 
 Update `crates/bookkeeper-protocol/src/lib.rs`:
+
 ```rust
 pub mod constants;
 pub mod digest;
@@ -1128,29 +1173,32 @@ pub mod entry;
 pub mod v2;
 ```
 
-- [ ] **Step 5: Run tests**
+* [ ] **Step 5: Run tests**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: All tests pass
 
-- [ ] **Step 6: Commit**
+* [ ] **Step 6: Commit**
 
 ```bash
 git add crates/bookkeeper-protocol/
 git commit -m "feat: add pre-v3 packet header encode/decode"
 ```
 
----
+***
 
 ### Task 8: Pre-v3 Request Codec
 
 **Files:**
-- Modify: `crates/bookkeeper-protocol/src/v2/request.rs`
-- Create: `crates/bookkeeper-protocol/tests/v2_request_test.rs`
 
-- [ ] **Step 1: Write failing test for ADD_ENTRY request encoding**
+* Modify: `crates/bookkeeper-protocol/src/v2/request.rs`
+
+* Create: `crates/bookkeeper-protocol/tests/v2_request_test.rs`
+
+* [ ] **Step 1: Write failing test for ADD\_ENTRY request encoding**
 
 `crates/bookkeeper-protocol/tests/v2_request_test.rs`:
+
 ```rust
 use bookkeeper_protocol::v2::request::{V2Request, encode_request, decode_request};
 use bytes::{Bytes, BytesMut};
@@ -1242,12 +1290,12 @@ fn get_bookie_info_round_trip() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+* [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: FAIL
 
-- [ ] **Step 3: Implement request.rs**
+* [ ] **Step 3: Implement request.rs**
 
 ```rust
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -1453,29 +1501,32 @@ pub enum RequestDecodeError {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+* [ ] **Step 4: Run tests**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: All tests pass
 
-- [ ] **Step 5: Commit**
+* [ ] **Step 5: Commit**
 
 ```bash
 git add crates/bookkeeper-protocol/
 git commit -m "feat: add pre-v3 request encode/decode for all operation types"
 ```
 
----
+***
 
 ### Task 9: Pre-v3 Response Codec
 
 **Files:**
-- Modify: `crates/bookkeeper-protocol/src/v2/response.rs`
-- Create: `crates/bookkeeper-protocol/tests/v2_response_test.rs`
 
-- [ ] **Step 1: Write failing test for response encoding**
+* Modify: `crates/bookkeeper-protocol/src/v2/response.rs`
+
+* Create: `crates/bookkeeper-protocol/tests/v2_response_test.rs`
+
+* [ ] **Step 1: Write failing test for response encoding**
 
 `crates/bookkeeper-protocol/tests/v2_response_test.rs`:
+
 ```rust
 use bookkeeper_protocol::v2::response::{V2Response, encode_response, decode_response};
 use bytes::Bytes;
@@ -1540,12 +1591,12 @@ fn read_response_error() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+* [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: FAIL
 
-- [ ] **Step 3: Implement response.rs**
+* [ ] **Step 3: Implement response.rs**
 
 ```rust
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -1775,29 +1826,32 @@ pub enum ResponseDecodeError {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+* [ ] **Step 4: Run tests**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: All tests pass
 
-- [ ] **Step 5: Commit**
+* [ ] **Step 5: Commit**
 
 ```bash
 git add crates/bookkeeper-protocol/
 git commit -m "feat: add pre-v3 response encode/decode for all operation types"
 ```
 
----
+***
 
 ### Task 10: V3 Protobuf Request/Response Wrappers
 
 **Files:**
-- Create: `crates/bookkeeper-protocol/src/v3.rs`
-- Create: `crates/bookkeeper-protocol/tests/v3_test.rs`
 
-- [ ] **Step 1: Write failing test for v3 encode/decode**
+* Create: `crates/bookkeeper-protocol/src/v3.rs`
+
+* Create: `crates/bookkeeper-protocol/tests/v3_test.rs`
+
+* [ ] **Step 1: Write failing test for v3 encode/decode**
 
 `crates/bookkeeper-protocol/tests/v3_test.rs`:
+
 ```rust
 use bookkeeper_protocol::v3::{encode_v3_request, decode_v3_request, encode_v3_response, decode_v3_response};
 use bookkeeper_proto::{OperationType, ProtocolVersion, StatusCode};
@@ -1859,12 +1913,12 @@ fn v3_read_response_round_trip() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+* [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: FAIL
 
-- [ ] **Step 3: Implement v3.rs**
+* [ ] **Step 3: Implement v3.rs**
 
 ```rust
 use bytes::{BufMut, BytesMut};
@@ -1899,9 +1953,10 @@ pub fn decode_v3_response(data: &[u8]) -> Result<Response, prost::DecodeError> {
 }
 ```
 
-- [ ] **Step 4: Add v3 module to lib.rs**
+* [ ] **Step 4: Add v3 module to lib.rs**
 
 Update `crates/bookkeeper-protocol/src/lib.rs`:
+
 ```rust
 pub mod constants;
 pub mod digest;
@@ -1910,29 +1965,32 @@ pub mod v2;
 pub mod v3;
 ```
 
-- [ ] **Step 5: Run tests**
+* [ ] **Step 5: Run tests**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: All tests pass
 
-- [ ] **Step 6: Commit**
+* [ ] **Step 6: Commit**
 
 ```bash
 git add crates/bookkeeper-protocol/
 git commit -m "feat: add v3 protobuf request/response encode/decode wrappers"
 ```
 
----
+***
 
 ### Task 11: TCP Framing Codec
 
 **Files:**
-- Create: `crates/bookkeeper-protocol/src/framing.rs`
-- Create: `crates/bookkeeper-protocol/tests/framing_test.rs`
 
-- [ ] **Step 1: Write failing test for framing codec**
+* Create: `crates/bookkeeper-protocol/src/framing.rs`
+
+* Create: `crates/bookkeeper-protocol/tests/framing_test.rs`
+
+* [ ] **Step 1: Write failing test for framing codec**
 
 `crates/bookkeeper-protocol/tests/framing_test.rs`:
+
 ```rust
 use bookkeeper_protocol::framing::BookieCodec;
 use bytes::{BufMut, BytesMut};
@@ -2000,12 +2058,12 @@ fn decode_multiple_frames() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+* [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: FAIL
 
-- [ ] **Step 3: Implement framing.rs**
+* [ ] **Step 3: Implement framing.rs**
 
 ```rust
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -2079,9 +2137,10 @@ impl Encoder<Bytes> for BookieCodec {
 }
 ```
 
-- [ ] **Step 4: Add framing module to lib.rs**
+* [ ] **Step 4: Add framing module to lib.rs**
 
 Update `crates/bookkeeper-protocol/src/lib.rs`:
+
 ```rust
 pub mod constants;
 pub mod digest;
@@ -2091,30 +2150,32 @@ pub mod v2;
 pub mod v3;
 ```
 
-- [ ] **Step 5: Run tests**
+* [ ] **Step 5: Run tests**
 
 Run: `cargo test -p bookkeeper-protocol`
 Expected: All tests pass
 
-- [ ] **Step 6: Commit**
+* [ ] **Step 6: Commit**
 
 ```bash
 git add crates/bookkeeper-protocol/
 git commit -m "feat: add TCP length-prefixed framing codec (tokio-util)"
 ```
 
----
+***
 
 ### Task 12: Wire Compatibility Integration Tests
 
 **Files:**
-- Create: `tests/wire_compat.rs`
+
+* Create: `tests/wire_compat.rs`
 
 This task verifies that our codec can produce and parse byte sequences that match what the Java BookKeeper implementation would produce.
 
-- [ ] **Step 1: Write wire-level integration tests**
+* [ ] **Step 1: Write wire-level integration tests**
 
 `tests/wire_compat.rs`:
+
 ```rust
 //! Integration tests verifying wire format compatibility with Java BookKeeper.
 
@@ -2282,9 +2343,10 @@ fn full_stack_add_entry() {
 }
 ```
 
-- [ ] **Step 2: Add workspace-level test dependency**
+* [ ] **Step 2: Add workspace-level test dependency**
 
 Add to the root `Cargo.toml`:
+
 ```toml
 [dev-dependencies]
 bookkeeper-proto = { path = "crates/bookkeeper-proto" }
@@ -2294,37 +2356,38 @@ bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 ```
 
-- [ ] **Step 3: Run integration tests**
+* [ ] **Step 3: Run integration tests**
 
 Run: `cargo test --test wire_compat`
 Expected: All tests pass
 
-- [ ] **Step 4: Run full test suite**
+* [ ] **Step 4: Run full test suite**
 
 Run: `cargo test --workspace`
 Expected: All tests pass across all crates
 
-- [ ] **Step 5: Commit**
+* [ ] **Step 5: Commit**
 
 ```bash
 git add tests/ Cargo.toml
 git commit -m "feat: add wire compatibility integration tests for full protocol stack"
 ```
 
----
+***
 
 ## What's Next
 
 This plan covers **Phase 1: Foundation + Wire Protocol**. The remaining phases, each getting their own plan:
 
-| Phase | Scope | Depends On |
-|-------|-------|------------|
-| Phase 2 | Metadata (ZK integration, ledger metadata, cookies) | Phase 1 |
-| Phase 3 | Storage Engine (journal, DbLedgerStorage, RocksDB) | Phase 1 |
-| Phase 4 | Bookie Server (TCP server, request pipeline) | Phase 1, 2, 3 |
-| Phase 5 | Bookie Registration (ZK registration, discovery) | Phase 2 |
-| Phase 6 | Client Library (write/read paths, placement) | Phase 1, 2 |
-| Phase 7 | Replication & Recovery (auditor, worker) | Phase 4, 6 |
-| Phase 8 | Configuration (full config parsing) | Phase 1 |
-| Phase 9 | Admin HTTP API | Phase 4 |
-| Phase 10 | CLI Tools | Phase 4, 6 |
+| Phase    | Scope                                               | Depends On    |
+| -------- | --------------------------------------------------- | ------------- |
+| Phase 2  | Metadata (ZK integration, ledger metadata, cookies) | Phase 1       |
+| Phase 3  | Storage Engine (journal, DbLedgerStorage, RocksDB)  | Phase 1       |
+| Phase 4  | Bookie Server (TCP server, request pipeline)        | Phase 1, 2, 3 |
+| Phase 5  | Bookie Registration (ZK registration, discovery)    | Phase 2       |
+| Phase 6  | Client Library (write/read paths, placement)        | Phase 1, 2    |
+| Phase 7  | Replication & Recovery (auditor, worker)            | Phase 4, 6    |
+| Phase 8  | Configuration (full config parsing)                 | Phase 1       |
+| Phase 9  | Admin HTTP API                                      | Phase 4       |
+| Phase 10 | CLI Tools                                           | Phase 4, 6    |
+

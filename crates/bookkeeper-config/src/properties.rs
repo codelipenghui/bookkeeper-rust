@@ -9,9 +9,18 @@ pub fn parse_properties(text: &str) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
             continue;
         }
-        // Java Properties accepts both '=' and ':' as separators
-        let split = line.split_once('=').or_else(|| line.split_once(':'));
-        if let Some((key, value)) = split {
+        // Java Properties uses the first '=' or ':' (whichever comes first) as separator
+        let eq_pos = line.find('=');
+        let colon_pos = line.find(':');
+        let sep_pos = match (eq_pos, colon_pos) {
+            (Some(e), Some(c)) => Some(e.min(c)),
+            (Some(e), None) => Some(e),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        if let Some(pos) = sep_pos {
+            let key = &line[..pos];
+            let value = &line[pos + 1..];
             map.insert(key.trim().to_string(), value.trim().to_string());
         }
     }

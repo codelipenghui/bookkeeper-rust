@@ -37,13 +37,13 @@ impl ClientConfig {
         let mut config = Self::default();
         if let Some(v) = props.get("metadataServiceUri") { config.metadata_service_uri = Some(v.clone()); }
         if let Some(v) = props.get("zkTimeout") { if let Ok(n) = v.parse() { config.zk_timeout = n; } }
-        if let Some(v) = props.get("useV2WireProtocol") { config.use_v2_wire_protocol = v == "true"; }
+        if let Some(v) = props.get("useV2WireProtocol") { config.use_v2_wire_protocol = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("readTimeout") { if let Ok(n) = v.parse() { config.read_timeout = n; } }
         if let Some(v) = props.get("addEntryTimeout") { if let Ok(n) = v.parse() { config.add_entry_timeout = n; } }
         if let Some(v) = props.get("addEntryQuorumTimeout") { if let Ok(n) = v.parse() { config.add_entry_quorum_timeout = n; } }
         if let Some(v) = props.get("speculativeReadTimeout") { if let Ok(n) = v.parse() { config.speculative_read_timeout = n; } }
         if let Some(v) = props.get("numChannelsPerBookie") { if let Ok(n) = v.parse() { config.num_channels_per_bookie = n; } }
-        if let Some(v) = props.get("enableDigestTypeAutodetection") { config.enable_digest_type_autodetection = v == "true"; }
+        if let Some(v) = props.get("enableDigestTypeAutodetection") { config.enable_digest_type_autodetection = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("explicitLacIntervalMs") { if let Ok(n) = v.parse() { config.explicit_lac_interval_ms = n; } }
         config
     }

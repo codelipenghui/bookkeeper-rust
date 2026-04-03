@@ -135,33 +135,33 @@ impl ServerConfig {
         let mut config = Self::default();
         if let Some(v) = props.get("bookiePort") { if let Ok(n) = v.parse() { config.bookie_port = n; } }
         if let Some(v) = props.get("advertisedAddress") { config.advertised_address = Some(v.clone()); }
-        if let Some(v) = props.get("useHostNameAsBookieID") { config.use_hostname_as_bookie_id = v == "true"; }
-        if let Some(v) = props.get("useShortHostName") { config.use_short_hostname = v == "true"; }
+        if let Some(v) = props.get("useHostNameAsBookieID") { config.use_hostname_as_bookie_id = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("useShortHostName") { config.use_short_hostname = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("listeningInterface") { config.listening_interface = Some(v.clone()); }
-        if let Some(v) = props.get("allowLoopback") { config.allow_loopback = v == "true"; }
+        if let Some(v) = props.get("allowLoopback") { config.allow_loopback = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("journalDirectory") { config.journal_directory = v.clone(); }
         if let Some(v) = props.get("journalDirectories") { config.journal_directory = v.split('|').next().unwrap_or("").to_string(); }
         if let Some(v) = props.get("ledgerDirectories") { config.ledger_directories = v.split(',').map(|s| s.trim().to_string()).collect(); }
         if let Some(v) = props.get("indexDirectories") { config.index_directories = Some(v.split(',').map(|s| s.trim().to_string()).collect()); }
-        if let Some(v) = props.get("allowStorageExpansion") { config.allow_storage_expansion = v == "true"; }
+        if let Some(v) = props.get("allowStorageExpansion") { config.allow_storage_expansion = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("journalMaxSizeMB") { if let Ok(n) = v.parse() { config.journal_max_size_mb = n; } }
         if let Some(v) = props.get("journalMaxBackups") { if let Ok(n) = v.parse() { config.journal_max_backups = n; } }
-        if let Some(v) = props.get("journalSyncData") { config.journal_sync_data = v == "true"; }
-        if let Some(v) = props.get("journalAdaptiveGroupWrites") { config.journal_adaptive_group_writes = v == "true"; }
+        if let Some(v) = props.get("journalSyncData") { config.journal_sync_data = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("journalAdaptiveGroupWrites") { config.journal_adaptive_group_writes = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("journalMaxGroupWaitMSec") { if let Ok(n) = v.parse() { config.journal_max_group_wait_ms = n; } }
         if let Some(v) = props.get("journalBufferedWritesThreshold") { if let Ok(n) = v.parse() { config.journal_buffered_writes_threshold = n; } }
         if let Some(v) = props.get("journalBufferedEntriesThreshold") { if let Ok(n) = v.parse() { config.journal_buffered_entries_threshold = n; } }
         if let Some(v) = props.get("journalAlignmentSize") { if let Ok(n) = v.parse() { config.journal_alignment_size = n; } }
         if let Some(v) = props.get("journalFormatVersionToWrite") { if let Ok(n) = v.parse() { config.journal_format_version_to_write = n; } }
         if let Some(v) = props.get("logSizeLimit") { if let Ok(n) = v.parse() { config.log_size_limit = n; } }
-        if let Some(v) = props.get("entryLogPerLedgerEnabled") { config.entry_log_per_ledger_enabled = v == "true"; }
+        if let Some(v) = props.get("entryLogPerLedgerEnabled") { config.entry_log_per_ledger_enabled = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("dbStorage_writeCacheMaxSizeMb") { if let Ok(n) = v.parse() { config.db_storage_write_cache_max_size_mb = n; } }
         if let Some(v) = props.get("dbStorage_readAheadCacheMaxSizeMb") { if let Ok(n) = v.parse() { config.db_storage_read_cache_max_size_mb = n; } }
         if let Some(v) = props.get("dbStorage_rocksDB_writeBufferSizeMB") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_write_buffer_size_mb = n; } }
         if let Some(v) = props.get("dbStorage_rocksDB_blockSize") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_block_size = n; } }
         if let Some(v) = props.get("dbStorage_rocksDB_bloomFilterBitsPerKey") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_bloom_filter_bits_per_key = n; } }
-        if let Some(v) = props.get("serverTcpNoDelay") { config.server_tcp_no_delay = v == "true"; }
-        if let Some(v) = props.get("serverSockKeepalive") { config.server_sock_keepalive = v == "true"; }
+        if let Some(v) = props.get("serverTcpNoDelay") { config.server_tcp_no_delay = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("serverSockKeepalive") { config.server_sock_keepalive = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("nettyMaxFrameSizeBytes") { if let Ok(n) = v.parse() { config.max_frame_size = n; } }
         if let Some(v) = props.get("numAddWorkerThreads") { if let Ok(n) = v.parse() { config.num_add_worker_threads = n; } }
         if let Some(v) = props.get("numReadWorkerThreads") { if let Ok(n) = v.parse() { config.num_read_worker_threads = n; } }
@@ -169,18 +169,18 @@ impl ServerConfig {
         if let Some(v) = props.get("diskUsageWarnThreshold") { if let Ok(n) = v.parse() { config.disk_usage_warn_threshold = n; } }
         if let Some(v) = props.get("diskUsageLwmThreshold") { if let Ok(n) = v.parse() { config.disk_usage_lwm_threshold = n; } }
         if let Some(v) = props.get("diskCheckInterval") { if let Ok(n) = v.parse() { config.disk_check_interval = n; } }
-        if let Some(v) = props.get("readOnlyModeEnabled") { config.read_only_mode_enabled = v == "true"; }
+        if let Some(v) = props.get("readOnlyModeEnabled") { config.read_only_mode_enabled = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("minorCompactionInterval") { if let Ok(n) = v.parse() { config.minor_compaction_interval = n; } }
         if let Some(v) = props.get("minorCompactionThreshold") { if let Ok(n) = v.parse() { config.minor_compaction_threshold = n; } }
         if let Some(v) = props.get("majorCompactionInterval") { if let Ok(n) = v.parse() { config.major_compaction_interval = n; } }
         if let Some(v) = props.get("majorCompactionThreshold") { if let Ok(n) = v.parse() { config.major_compaction_threshold = n; } }
         if let Some(v) = props.get("gcWaitTime") { if let Ok(n) = v.parse() { config.gc_wait_time = n; } }
-        if let Some(v) = props.get("autoRecoveryDaemonEnabled") { config.auto_recovery_daemon_enabled = v == "true"; }
+        if let Some(v) = props.get("autoRecoveryDaemonEnabled") { config.auto_recovery_daemon_enabled = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("lostBookieRecoveryDelay") { if let Ok(n) = v.parse() { config.lost_bookie_recovery_delay = n; } }
         if let Some(v) = props.get("zkServers") { config.zk_servers = Some(v.clone()); }
         if let Some(v) = props.get("zkLedgersRootPath") { config.zk_ledger_root = v.clone(); }
         if let Some(v) = props.get("zkTimeout") { if let Ok(n) = v.parse() { config.zk_timeout = n; } }
-        if let Some(v) = props.get("httpServerEnabled") { config.http_server_enabled = v == "true"; }
+        if let Some(v) = props.get("httpServerEnabled") { config.http_server_enabled = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("httpServerPort") { if let Ok(n) = v.parse() { config.http_server_port = n; } }
         config
     }
