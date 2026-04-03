@@ -227,29 +227,24 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn get_last_add_confirmed(&self, ledger_id: i64) -> Result<i64, StorageError> {
-        // Check active write cache first for the most recent entry's LAC field
+        // Return the highest entry_id stored for this ledger. This represents the
+        // bookie's view of the last add confirmed: if entry N is durably stored,
+        // entries 0..=N are all considered confirmed on this bookie. This is the
+        // value returned during fencing reads (FLAG_DO_FENCING with LAST_ADD_CONFIRMED).
         {
             let cache = self.write_cache.read();
             if let Some(entry_id) = cache.last_entry_id(ledger_id) {
-                if let Some(data) = cache.get(ledger_id, entry_id) {
-                    if data.len() >= 24 {
-                        return Ok(i64::from_be_bytes(data[16..24].try_into().unwrap()));
-                    }
-                }
+                return Ok(entry_id);
             }
         }
         // Check write cache being flushed
         {
             let cache = self.write_cache_being_flushed.read();
             if let Some(entry_id) = cache.last_entry_id(ledger_id) {
-                if let Some(data) = cache.get(ledger_id, entry_id) {
-                    if data.len() >= 24 {
-                        return Ok(i64::from_be_bytes(data[16..24].try_into().unwrap()));
-                    }
-                }
+                return Ok(entry_id);
             }
         }
-        // Fall back to RocksDB ledger index
+        // Fall back to RocksDB ledger index (highest persisted LAC)
         match self.ledger_index.get(ledger_id)? {
             Some(data) => Ok(data.lac.unwrap_or(-1)),
             None => Err(StorageError::LedgerNotFound(ledger_id)),

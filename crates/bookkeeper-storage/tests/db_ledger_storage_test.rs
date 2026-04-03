@@ -48,8 +48,9 @@ fn last_add_confirmed() {
     storage.add_entry(&make_entry(1, 0, -1, b"a")).unwrap();
     storage.add_entry(&make_entry(1, 1, 0, b"b")).unwrap();
     storage.add_entry(&make_entry(1, 2, 1, b"c")).unwrap();
-    // LAC is the lac field from the latest entry: 1
-    assert_eq!(storage.get_last_add_confirmed(1).unwrap(), 1);
+    // get_last_add_confirmed returns the highest entry_id stored, which
+    // represents the bookie's view of the last add confirmed: entry 2.
+    assert_eq!(storage.get_last_add_confirmed(1).unwrap(), 2);
 }
 
 #[test]
