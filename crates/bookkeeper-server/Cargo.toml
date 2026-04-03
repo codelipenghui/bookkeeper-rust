@@ -9,6 +9,7 @@ bookkeeper-proto = { workspace = true }
 bookkeeper-common = { workspace = true }
 bookkeeper-protocol = { workspace = true }
 bookkeeper-storage = { workspace = true }
+bookkeeper-metadata = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

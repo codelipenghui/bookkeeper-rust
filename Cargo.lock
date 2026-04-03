@@ -236,6 +236,7 @@ dependencies = [
  "bytes",
  "prost",
  "thiserror 2.0.18",
+ "tokio",
  "uuid",
  "zookeeper-client",
 ]
@@ -270,6 +271,7 @@ name = "bookkeeper-server"
 version = "0.1.0"
 dependencies = [
  "bookkeeper-common",
+ "bookkeeper-metadata",
  "bookkeeper-proto",
  "bookkeeper-protocol",
  "bookkeeper-storage",

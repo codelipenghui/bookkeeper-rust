@@ -16,6 +16,9 @@ fn test_config(port: u16, ledger_dir: &str) -> BookieConfig {
         ledger_dirs: vec![ledger_dir.to_string()],
         journal_dir: ledger_dir.to_string(),
         max_frame_size: 5 * 1024 * 1024,
+        zk_connect: None,
+        zk_ledger_root: "/ledgers".to_string(),
+        bookie_id: None,
     }
 }
 

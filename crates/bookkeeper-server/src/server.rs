@@ -13,6 +13,8 @@ use bookkeeper_protocol::v2::request::decode_request;
 use bookkeeper_protocol::v2::response::encode_response;
 use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
 
+use bookkeeper_metadata::traits::RegistrationManager;
+
 use crate::config::BookieConfig;
 use crate::processor::RequestProcessor;
 use crate::state::{BookieState, BookieStateManager};
@@ -23,6 +25,7 @@ pub struct BookieServer {
     // Join handle for the accept loop task
     accept_handle: tokio::task::JoinHandle<()>,
     storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
+    zk_reg: Option<(bookkeeper_metadata::zk::registration::ZkRegistrationManager, String)>, // (manager, bookie_id)
 }
 
 impl BookieServer {
@@ -54,6 +57,31 @@ impl BookieServer {
 
         let max_frame_size = config.max_frame_size;
 
+        // Optionally register with ZooKeeper
+        let zk_reg = if let Some(ref zk_connect) = config.zk_connect {
+            let bookie_id = config.bookie_id.clone().unwrap_or_else(|| {
+                format!("{}:{}", local_addr.ip(), local_addr.port())
+            });
+            let reg_mgr = bookkeeper_metadata::zk::registration::ZkRegistrationManager::new(
+                zk_connect,
+                &config.zk_ledger_root,
+            )
+            .await
+            .map_err(|e| format!("ZK connect: {e}"))?;
+            let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
+                &bookie_id,
+                &local_addr.ip().to_string(),
+                local_addr.port(),
+            );
+            reg_mgr
+                .register_bookie(&bookie_id, false, &info)
+                .await
+                .map_err(|e| format!("ZK register: {e}"))?;
+            Some((reg_mgr, bookie_id))
+        } else {
+            None
+        };
+
         // Spawn accept loop
         let accept_handle = tokio::spawn(accept_loop(
             listener,
@@ -68,6 +96,7 @@ impl BookieServer {
             shutdown_tx,
             accept_handle,
             storage: storage_for_shutdown,
+            zk_reg,
         })
     }
 
@@ -80,6 +109,10 @@ impl BookieServer {
         let _ = self.shutdown_tx.send(true);
         // Wait for the accept loop to finish
         let _ = self.accept_handle.await;
+        // Unregister from ZooKeeper if configured
+        if let Some((reg_mgr, bookie_id)) = self.zk_reg {
+            let _ = reg_mgr.unregister_bookie(&bookie_id, false).await;
+        }
         // Flush storage to persist any pending data
         let _ = self.storage.flush();
     }
