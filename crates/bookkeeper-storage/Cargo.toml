@@ -1,0 +1,19 @@
+[package]
+name = "bookkeeper-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bookkeeper-proto = { workspace = true }
+bookkeeper-common = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+rocksdb = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
