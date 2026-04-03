@@ -9,6 +9,7 @@ members = [
     "crates/bookkeeper-server",
     "crates/bookkeeper-client",
     "crates/bookkeeper-config",
+    "crates/bookkeeper-cli",
 ]
 
 [workspace.package]
@@ -25,6 +26,9 @@ bookkeeper-storage = { path = "crates/bookkeeper-storage" }
 bookkeeper-server = { path = "crates/bookkeeper-server" }
 bookkeeper-client = { path = "crates/bookkeeper-client" }
 bookkeeper-config = { path = "crates/bookkeeper-config" }
+bookkeeper-cli = { path = "crates/bookkeeper-cli" }
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
 rand = "0.8"
 rocksdb = "0.22"
 parking_lot = "0.12"
