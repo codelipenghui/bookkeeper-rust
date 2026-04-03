@@ -27,6 +27,7 @@ async fn connect_and_add_entry() {
         zk_connect: None,
         zk_ledger_root: "/ledgers".to_string(),
         bookie_id: None,
+        http_port: None,
     };
     let server = BookieServer::start(config).await.unwrap();
     let addr = server.local_addr();
@@ -59,6 +60,7 @@ async fn connect_and_read_entry() {
         zk_connect: None,
         zk_ledger_root: "/ledgers".to_string(),
         bookie_id: None,
+        http_port: None,
     };
     let server = BookieServer::start(config).await.unwrap();
     let addr = server.local_addr();

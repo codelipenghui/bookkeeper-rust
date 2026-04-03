@@ -16,11 +16,13 @@ use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
 use bookkeeper_metadata::traits::RegistrationManager;
 
 use crate::config::BookieConfig;
+use crate::http_api;
 use crate::processor::RequestProcessor;
 use crate::state::{BookieState, BookieStateManager};
 
 pub struct BookieServer {
     local_addr: SocketAddr,
+    http_addr: Option<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
     // Join handle for the accept loop task
     accept_handle: tokio::task::JoinHandle<()>,
@@ -84,6 +86,20 @@ impl BookieServer {
         };
 
 
+        // Optionally start HTTP admin API server
+        let http_addr = if let Some(http_port) = config.http_port {
+            let http_state = http_api::HttpState { state_manager: state.clone() };
+            let router = http_api::create_router(http_state);
+            let http_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{http_port}")).await?;
+            let http_local_addr = http_listener.local_addr()?;
+            tokio::spawn(async move {
+                axum::serve(http_listener, router).await.ok();
+            });
+            Some(http_local_addr)
+        } else {
+            None
+        };
+
         // Spawn accept loop
         let accept_handle = tokio::spawn(accept_loop(
             listener,
@@ -95,6 +111,7 @@ impl BookieServer {
 
         Ok(BookieServer {
             local_addr,
+            http_addr,
             shutdown_tx,
             accept_handle,
             storage: storage_for_shutdown,
@@ -104,6 +121,10 @@ impl BookieServer {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    pub fn http_addr(&self) -> Option<SocketAddr> {
+        self.http_addr
     }
 
     /// Update ZK registration when bookie state changes (e.g., to/from read-only).

@@ -19,6 +19,7 @@ fn test_config(port: u16, ledger_dir: &str) -> BookieConfig {
         zk_connect: None,
         zk_ledger_root: "/ledgers".to_string(),
         bookie_id: None,
+        http_port: None,
     }
 }
 

@@ -16,9 +16,13 @@ tokio-util = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 prost = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

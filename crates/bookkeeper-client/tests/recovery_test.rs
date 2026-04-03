@@ -18,6 +18,7 @@ fn test_config(dir: &TempDir) -> BookieConfig {
         zk_connect: None,
         zk_ledger_root: "/ledgers".to_string(),
         bookie_id: None,
+        http_port: None,
     }
 }
 

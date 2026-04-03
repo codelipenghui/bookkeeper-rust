@@ -8,6 +8,7 @@ pub struct BookieConfig {
     pub zk_connect: Option<String>,   // ZK connection string, None = no ZK
     pub zk_ledger_root: String,       // ZK ledger root path
     pub bookie_id: Option<String>,    // Optional explicit bookie ID
+    pub http_port: Option<u16>,       // HTTP admin API port, None = disabled
 }
 
 impl Default for BookieConfig {
@@ -20,6 +21,7 @@ impl Default for BookieConfig {
             zk_connect: None,
             zk_ledger_root: "/ledgers".to_string(),
             bookie_id: None,
+            http_port: None,
         }
     }
 }
