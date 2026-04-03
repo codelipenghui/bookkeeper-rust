@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bookkeeper-proto",
+    "crates/bookkeeper-common",
+    "crates/bookkeeper-protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+bookkeeper-proto = { path = "crates/bookkeeper-proto" }
+bookkeeper-common = { path = "crates/bookkeeper-common" }
+bookkeeper-protocol = { path = "crates/bookkeeper-protocol" }
+
+bytes = "1"
+prost = "0.13"
+prost-build = "0.13"
+thiserror = "2"
+crc32fast = "1"
+crc32c = "0.6"
+hmac = "0.12"
+sha1 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }

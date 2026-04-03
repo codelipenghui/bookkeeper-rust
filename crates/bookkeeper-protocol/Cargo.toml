@@ -1,0 +1,19 @@
+[package]
+name = "bookkeeper-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bookkeeper-proto = { workspace = true }
+bookkeeper-common = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+crc32fast = { workspace = true }
+crc32c = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
