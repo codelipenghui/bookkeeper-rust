@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::digest::DigestManager;
@@ -132,23 +132,14 @@ impl WriteHandle {
     }
 
     fn build_entry(&self, entry_id: i64, payload: &[u8]) -> Bytes {
-        let digest_len = self.digest_manager.digest_type().digest_length();
-        let total = 32 + digest_len + payload.len();
-        let mut buf = BytesMut::with_capacity(total);
-
-        // Metadata (32 bytes)
-        buf.put_i64(self.ledger_id);
-        buf.put_i64(entry_id);
-        buf.put_i64(self.last_add_confirmed);
-        buf.put_i64(self.current_length);
-
-        // Digest
-        let metadata: [u8; 32] = buf[..32].try_into().unwrap();
-        let digest = self.digest_manager.compute(&metadata, payload);
-        buf.put_slice(digest.as_slice());
-
-        // Payload
-        buf.put_slice(payload);
-        buf.freeze()
+        use bookkeeper_protocol::entry::EntryBuilder;
+        EntryBuilder::new(&self.digest_manager)
+            .ledger_id(self.ledger_id)
+            .entry_id(entry_id)
+            .lac(self.last_add_confirmed)
+            .length(self.current_length)
+            .payload(Bytes::copy_from_slice(payload))
+            .build()
+            .freeze()
     }
 }

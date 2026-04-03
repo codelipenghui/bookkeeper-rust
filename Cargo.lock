@@ -232,6 +232,7 @@ dependencies = [
  "bytes",
  "prost",
  "rand",
+ "sha1",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -1,22 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bookkeeper_protocol::digest::{DigestManager, DigestType};
+use bookkeeper_protocol::digest::{DigestManager, DigestType, generate_master_key};
 use crate::bookie_connection::{BookieConnection, ClientError};
 use crate::distribution::RoundRobinDistributionSchedule;
 use crate::read_handle::ReadHandle;
 use crate::write_handle::WriteHandle;
-
-fn derive_master_key(password: &[u8]) -> [u8; 20] {
-    use sha1::Digest;
-    let mut hasher = sha1::Sha1::new();
-    hasher.update(b"ledger");
-    hasher.update(password);
-    let result = hasher.finalize();
-    let mut key = [0u8; 20];
-    key.copy_from_slice(&result);
-    key
-}
 
 /// Minimal BookKeeper client for creating, writing, and reading ledgers.
 /// Uses a fixed set of bookie addresses (no ZK discovery in this phase).
@@ -36,12 +25,14 @@ impl BookKeeperClient {
     /// Ensure connections to all bookies are established.
     pub async fn ensure_connections(&mut self) -> Result<(), ClientError> {
         if self.connections.is_empty() {
+            let mut conns = Vec::new();
             for addr_str in &self.bookie_addrs {
                 let addr: SocketAddr = addr_str.parse()
                     .map_err(|e| ClientError::Protocol(format!("bad address '{addr_str}': {e}")))?;
                 let conn = BookieConnection::connect(addr).await?;
-                self.connections.push(Arc::new(tokio::sync::Mutex::new(conn)));
+                conns.push(Arc::new(tokio::sync::Mutex::new(conn)));
             }
+            self.connections = conns;
         }
         Ok(())
     }
@@ -73,7 +64,7 @@ impl BookKeeperClient {
         let schedule = RoundRobinDistributionSchedule::new(ensemble_size, write_quorum, ack_quorum);
         let dm = DigestManager::new(digest_type).with_password(password);
 
-        let master_key = derive_master_key(password);
+        let master_key = generate_master_key(password);
 
         Ok(WriteHandle::new(ledger_id, ensemble, schedule, dm, master_key))
     }
@@ -87,13 +78,19 @@ impl BookKeeperClient {
         ack_quorum: usize,
         digest_type: DigestType,
         password: &[u8],
-    ) -> ReadHandle {
+    ) -> Result<ReadHandle, ClientError> {
+        if self.bookie_addrs.len() < ensemble_size {
+            return Err(ClientError::Protocol(format!(
+                "not enough bookies: need {ensemble_size}, have {}",
+                self.bookie_addrs.len()
+            )));
+        }
         let ensemble: Vec<String> = self.bookie_addrs[..ensemble_size].to_vec();
         let schedule = RoundRobinDistributionSchedule::new(ensemble_size, write_quorum, ack_quorum);
         let dm = DigestManager::new(digest_type).with_password(password);
 
-        let master_key = derive_master_key(password);
+        let master_key = generate_master_key(password);
 
-        ReadHandle::new(ledger_id, ensemble, schedule, dm, master_key)
+        Ok(ReadHandle::new(ledger_id, ensemble, schedule, dm, master_key))
     }
 }

@@ -37,7 +37,7 @@ async fn create_write_read_close() {
     assert_eq!(wh.last_add_confirmed(), 2);
 
     // Read entries
-    let rh = client.open_ledger(ledger_id, 1, 1, 1, DigestType::Crc32c, b"");
+    let rh = client.open_ledger(ledger_id, 1, 1, 1, DigestType::Crc32c, b"").unwrap();
     let data = rh.read_entry(client.connections(), 0).await.unwrap();
     assert_eq!(data, b"entry-0");
     let data = rh.read_entry(client.connections(), 2).await.unwrap();
@@ -61,7 +61,7 @@ async fn write_then_read_all() {
         wh.append(client.connections(), format!("data-{i}").as_bytes()).await.unwrap();
     }
 
-    let rh = client.open_ledger(ledger_id, 1, 1, 1, DigestType::Crc32c, b"");
+    let rh = client.open_ledger(ledger_id, 1, 1, 1, DigestType::Crc32c, b"").unwrap();
     let entries = rh.read_entries(client.connections(), 0, 4).await.unwrap();
     assert_eq!(entries.len(), 5);
     assert_eq!(entries[0], b"data-0");

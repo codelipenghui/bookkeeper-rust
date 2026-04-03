@@ -9,6 +9,7 @@ use crate::distribution::RoundRobinDistributionSchedule;
 
 pub struct ReadHandle {
     ledger_id: i64,
+    #[allow(dead_code)]
     ensemble: Vec<String>,
     schedule: RoundRobinDistributionSchedule,
     digest_manager: DigestManager,
@@ -37,26 +38,28 @@ impl ReadHandle {
         entry_id: i64,
     ) -> Result<Vec<u8>, ClientError> {
         let write_set = self.schedule.write_set(entry_id);
+        let mut last_error: Option<ClientError> = None;
 
         for &bookie_idx in &write_set {
             if bookie_idx >= conns.len() {
                 continue;
             }
             let mut conn = conns[bookie_idx].lock().await;
-            match conn.send_read_entry(0, self.ledger_id, entry_id, None).await {
+            match conn.send_read_entry(0, self.ledger_id, entry_id, Some(self.master_key)).await {
                 Ok(V2Response::Read { error_code, data, .. }) => {
                     if error_code == V2_EOK {
                         if let Some(entry_data) = data {
-                            // Verify digest
                             match parse_entry(&self.digest_manager, entry_data) {
                                 Ok(entry) => {
                                     if entry.ledger_id != self.ledger_id || entry.entry_id != entry_id {
-                                        continue; // wrong entry, try next bookie
+                                        last_error = Some(ClientError::Protocol("wrong entry".into()));
+                                        continue;
                                     }
                                     return Ok(entry.payload.to_vec());
                                 }
                                 Err(EntryError::DigestMismatch) => {
-                                    continue; // corrupted, try next bookie
+                                    last_error = Some(ClientError::Protocol("digest mismatch".into()));
+                                    continue;
                                 }
                                 Err(e) => {
                                     return Err(ClientError::Protocol(format!("entry parse: {e}")));
@@ -64,16 +67,21 @@ impl ReadHandle {
                             }
                         }
                     }
-                    // Non-EOK or no data — try next bookie
+                    last_error = Some(ClientError::Protocol(format!("bookie error: {error_code}")));
                 }
-                Ok(_) => continue,
-                Err(_) => continue, // connection error, try next bookie
+                Ok(_) => {
+                    last_error = Some(ClientError::Protocol("unexpected response".into()));
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
             }
         }
 
-        Err(ClientError::Protocol(format!(
+        Err(last_error.unwrap_or_else(|| ClientError::Protocol(format!(
             "entry not found: ledger={}, entry={}", self.ledger_id, entry_id
-        )))
+        ))))
     }
 
     /// Read a range of entries [first_entry..=last_entry].

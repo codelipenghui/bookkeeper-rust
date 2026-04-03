@@ -1,6 +1,24 @@
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
+/// Compute SHA1(pad + password). Used for master key and HMAC key derivation.
+/// Matches Java's MacDigestManager.genDigest().
+pub fn gen_digest(pad: &[u8], password: &[u8]) -> [u8; 20] {
+    use sha1::Digest;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(pad);
+    hasher.update(password);
+    let result = hasher.finalize();
+    let mut key = [0u8; 20];
+    key.copy_from_slice(&result);
+    key
+}
+
+/// Derive the master key from a password. Matches Java's DigestManager.generateMasterKey().
+pub fn generate_master_key(password: &[u8]) -> [u8; 20] {
+    gen_digest(b"ledger", password)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestType {
     Crc32,
@@ -62,13 +80,7 @@ impl DigestManager {
 
     pub fn with_password(mut self, password: &[u8]) -> Self {
         self.password = password.to_vec();
-        // Pre-derive HMAC key: SHA1("mac" + password), matching Java's MacDigestManager
-        use sha1::Digest;
-        let mut hasher = Sha1::new();
-        hasher.update(b"mac");
-        hasher.update(password);
-        let result = hasher.finalize();
-        self.hmac_key.copy_from_slice(&result);
+        self.hmac_key = gen_digest(b"mac", password);
         self
     }
 
