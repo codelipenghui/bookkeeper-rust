@@ -73,6 +73,7 @@ onWriteComplete(bookieIndex, status):
 ### 3.3 LAC Advancement
 
 LAC advances **in order** — `sendAddSuccessCallbacks()` processes the `pendingAddsQueue` sequentially:
+
 ```
 while pendingAddsQueue is not empty:
   head = pendingAddsQueue.peek()
@@ -88,10 +89,13 @@ This ensures LAC is monotonically increasing and gaps are never exposed to reade
 
 ### 3.4 Write Timeout
 
-- Timer runs at fixed interval, checks each PendingAddOp
-- If elapsed time > `addEntryQuorumTimeoutNanos`:
-  - Check if ack quorum is still achievable
-  - If not: fail the entry, trigger ensemble change or error
+* Timer runs at fixed interval, checks each PendingAddOp
+
+* If elapsed time > `addEntryQuorumTimeoutNanos`:
+
+  * Check if ack quorum is still achievable
+
+  * If not: fail the entry, trigger ensemble change or error
 
 ## 4. Ensemble Change
 
@@ -143,6 +147,7 @@ handleBookieFailure(failedBookies: Map<bookieIndex, bookieId>):
 ### 4.2 In-Flight Write Handling
 
 After ensemble change succeeds:
+
 ```
 for each pendingAdd in pendingAddsQueue:
   if pendingAdd.writeSet contains failedBookie:
@@ -187,6 +192,7 @@ Configurable via `speculativeReadTimeout` (default: disabled).
 ### 5.3 Digest Verification
 
 On every read response:
+
 ```
 verifyDigestAndReturnData(entryBody):
   1. Extract metadata: ledgerId(8) + entryId(8) + LAC(8) + length(8) from offset 0
@@ -238,6 +244,7 @@ class AckSet:
 ### 6.3 Segment Awareness
 
 The distribution schedule operates on ensemble **indices** (0 to ensembleSize-1), not bookie addresses. When looking up which bookie to contact:
+
 ```
 1. Find ensemble segment for entryId
 2. Get ensemble list for that segment
@@ -266,23 +273,31 @@ interface EnsemblePlacementPolicy:
 
 ### 7.2 RackAwareEnsemblePlacementPolicy (Default)
 
-- Distributes bookies across network racks for fault tolerance
-- Ensures minimum number of racks per write quorum: `minNumRacksPerWriteQuorum`
-- Uses `DNSToSwitchMapping` to resolve bookie → rack mapping
-- `newEnsemble()`: selects bookies from different racks, weighted by available capacity
-- `replaceBookie()`: finds replacement in a different rack from remaining ensemble members
-- `reorderReadSequence()`: prefers local rack, then bookies with lower latency
+* Distributes bookies across network racks for fault tolerance
+
+* Ensures minimum number of racks per write quorum: `minNumRacksPerWriteQuorum`
+
+* Uses `DNSToSwitchMapping` to resolve bookie → rack mapping
+
+* `newEnsemble()`: selects bookies from different racks, weighted by available capacity
+
+* `replaceBookie()`: finds replacement in a different rack from remaining ensemble members
+
+* `reorderReadSequence()`: prefers local rack, then bookies with lower latency
 
 ### 7.3 RegionAwareEnsemblePlacementPolicy
 
-- Extends rack-aware with region awareness
-- Distributes across regions first, then racks within regions
-- Configurable: `minNumRacksPerWriteQuorum` at region level
+* Extends rack-aware with region awareness
+
+* Distributes across regions first, then racks within regions
+
+* Configurable: `minNumRacksPerWriteQuorum` at region level
 
 ### 7.4 ZoneAwareEnsemblePlacementPolicy
 
-- Zone-based placement (e.g., availability zones)
-- Similar to rack-aware but with zone topology
+* Zone-based placement (e.g., availability zones)
+
+* Similar to rack-aware but with zone topology
 
 ## 8. Ledger Recovery (Client-Initiated)
 
@@ -369,24 +384,32 @@ disconnect():
 
 ### 10.2 Request/Response Correlation
 
-- **v2 protocol**: Correlation key = `(ledgerId, entryId, opType)` tuple
-- **v3 protocol**: Correlation key = `txnId` (monotonically increasing uint64, `AtomicLong`)
-- Pending operations stored in `ConcurrentHashMap<CompletionKey, CompletionValue>`
-- On response: lookup by key, invoke callback, remove from map
-- On timeout: fail pending operation, mark bookie as potentially unavailable
+* **v2 protocol**: Correlation key = `(ledgerId, entryId, opType)` tuple
+
+* **v3 protocol**: Correlation key = `txnId` (monotonically increasing uint64, `AtomicLong`)
+
+* Pending operations stored in `ConcurrentHashMap<CompletionKey, CompletionValue>`
+
+* On response: lookup by key, invoke callback, remove from map
+
+* On timeout: fail pending operation, mark bookie as potentially unavailable
 
 ### 10.3 Connection Pool
 
 `BookieClient` maintains a pool of `PerChannelBookieClient` instances:
-- Lazy creation: connections established on first request to a bookie
-- Configurable number of connections per bookie (`numChannelsPerBookie`)
-- Round-robin across connections for the same bookie
+
+* Lazy creation: connections established on first request to a bookie
+
+* Configurable number of connections per bookie (`numChannelsPerBookie`)
+
+* Round-robin across connections for the same bookie
 
 ## 11. Explicit LAC (Client Side)
 
 ### 11.1 Writer
 
 The writer periodically broadcasts its LAC to all bookies in the current ensemble:
+
 ```
 Every explicitLacIntervalMs:
   1. Compute LAC entry: ledgerId(8) + lac(8) + digest
@@ -396,6 +419,7 @@ Every explicitLacIntervalMs:
 ### 11.2 Reader (Tailing)
 
 For tailing reads (following a live writer):
+
 ```
 1. Send READ_LAC to bookies
 2. Take max of:
@@ -416,3 +440,4 @@ For tailing reads (following a live writer):
    b. Marks entries as dead
    c. Compaction reclaims space
 ```
+

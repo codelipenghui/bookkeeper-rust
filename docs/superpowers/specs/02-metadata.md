@@ -6,33 +6,39 @@
 
 ### 1.1 Fields
 
-| Field | Type | Required | Default | Constraints |
-|-------|------|----------|---------|-------------|
-| `ledgerId` | int64 | yes | — | >= 0 |
-| `metadataFormatVersion` | int32 | no | 3 | 1, 2, or 3 |
-| `ensembleSize` | int32 | no | 3 | >= writeQuorumSize |
-| `writeQuorumSize` | int32 | no | 3 | >= ackQuorumSize |
-| `ackQuorumSize` | int32 | no | 2 | >= 1 |
-| `state` | enum | no | OPEN | OPEN, IN_RECOVERY, CLOSED |
-| `lastEntryId` | int64 | conditional | -1 | Required if CLOSED |
-| `length` | int64 | conditional | 0 | Required if CLOSED |
-| `digestType` | enum | no | null | CRC32, CRC32C, HMAC, DUMMY |
-| `password` | bytes | no | empty | Must pair with digestType |
-| `ctime` | int64 | no | -1 | Creation timestamp ms |
-| `storeCtime` | bool | no | false | Whether to persist ctime |
-| `customMetadata` | map<string, bytes> | no | {} | Application metadata |
-| `cToken` | int64 | no | 0 | Creator token (v3+) |
-| `ensembles` | map<int64, list<BookieId>> | yes | — | >= 1 segment |
+| Field                   | Type                        | Required    | Default | Constraints                |
+| ----------------------- | --------------------------- | ----------- | ------- | -------------------------- |
+| `ledgerId`              | int64                       | yes         | —       | >= 0                       |
+| `metadataFormatVersion` | int32                       | no          | 3       | 1, 2, or 3                 |
+| `ensembleSize`          | int32                       | no          | 3       | >= writeQuorumSize         |
+| `writeQuorumSize`       | int32                       | no          | 3       | >= ackQuorumSize           |
+| `ackQuorumSize`         | int32                       | no          | 2       | >= 1                       |
+| `state`                 | enum                        | no          | OPEN    | OPEN, IN\_RECOVERY, CLOSED |
+| `lastEntryId`           | int64                       | conditional | -1      | Required if CLOSED         |
+| `length`                | int64                       | conditional | 0       | Required if CLOSED         |
+| `digestType`            | enum                        | no          | null    | CRC32, CRC32C, HMAC, DUMMY |
+| `password`              | bytes                       | no          | empty   | Must pair with digestType  |
+| `ctime`                 | int64                       | no          | -1      | Creation timestamp ms      |
+| `storeCtime`            | bool                        | no          | false   | Whether to persist ctime   |
+| `customMetadata`        | map\<string, bytes>         | no          | {}      | Application metadata       |
+| `cToken`                | int64                       | no          | 0       | Creator token (v3+)        |
+| `ensembles`             | map\<int64, list<BookieId>> | yes         | —       | >= 1 segment               |
 
 **State constraints**:
-- OPEN: `lastEntryId` and `length` not set
-- CLOSED: both `lastEntryId` and `length` must be set
-- IN_RECOVERY: transitional state, can move to CLOSED
+
+* OPEN: `lastEntryId` and `length` not set
+
+* CLOSED: both `lastEntryId` and `length` must be set
+
+* IN\_RECOVERY: transitional state, can move to CLOSED
 
 **Ensemble constraints**:
-- At least one segment
-- All segments have exactly `ensembleSize` members
-- Segments ordered by `firstEntryId`
+
+* At least one segment
+
+* All segments have exactly `ensembleSize` members
+
+* Segments ordered by `firstEntryId`
 
 ### 1.2 Protobuf Schema (DataFormats.proto)
 
@@ -81,12 +87,15 @@ message LedgerMetadataFormat {
 Three serialization versions exist. The format is determined by `metadataFormatVersion`.
 
 **Common header** (all versions):
+
 ```
 "BookieMetadataFormatVersion\t{version}\n"
 ```
+
 The header is UTF-8 text, terminated by newline. The version is a decimal integer (up to 10 digits).
 
 **Version 1** (text, legacy v4.0.x):
+
 ```
 BookieMetadataFormatVersion\t1\n
 {writeQuorumSize}\n
@@ -96,28 +105,36 @@ BookieMetadataFormatVersion\t1\n
 ...
 {lastEntryId}\t{state}
 ```
+
 State is `CLOSED` or `IN_RECOVERY`. If OPEN, no trailing line.
 
 **Version 2** (protobuf text format, v4.2.x+):
+
 ```
 BookieMetadataFormatVersion\t2\n
 {protobuf TextFormat of LedgerMetadataFormat}
 ```
 
 **Version 3** (protobuf binary, v4.9.x+, current default):
+
 ```
 BookieMetadataFormatVersion\t3\n
 {protobuf binary via writeDelimitedTo()}
 ```
+
 Note: `writeDelimitedTo` writes a varint-encoded size prefix followed by the protobuf bytes.
 
 ### 1.4 Versioned Metadata
 
 All metadata operations use optimistic concurrency control:
-- `Versioned<LedgerMetadata>` wraps metadata with a version object
-- The version is opaque — for ZK, it's the znode stat version (int32)
-- Updates require passing the current version — if it doesn't match, the operation fails with `BKMetadataVersionException`
-- This provides compare-and-swap semantics
+
+* `Versioned<LedgerMetadata>` wraps metadata with a version object
+
+* The version is opaque — for ZK, it's the znode stat version (int32)
+
+* Updates require passing the current version — if it doesn't match, the operation fails with `BKMetadataVersionException`
+
+* This provides compare-and-swap semantics
 
 ## 2. ZooKeeper Path Layout
 
@@ -125,30 +142,33 @@ All metadata operations use optimistic concurrency control:
 
 All paths are relative to the **ledger root** (default: `/ledgers`).
 
-| Path | Znode Type | Purpose |
-|------|-----------|---------|
-| `{root}/` | PERSISTENT | Ledger root |
-| `{root}/available/` | PERSISTENT | Parent for active bookies |
-| `{root}/available/{bookieId}` | EPHEMERAL | Writable bookie registration |
-| `{root}/available/readonly/` | PERSISTENT | Parent for read-only bookies |
-| `{root}/available/readonly/{bookieId}` | EPHEMERAL | Read-only bookie registration |
-| `{root}/cookies/` | PERSISTENT | Parent for bookie cookies |
-| `{root}/cookies/{bookieId}` | PERSISTENT | Bookie identity cookie |
-| `{root}/LAYOUT` | PERSISTENT | Metadata layout version |
-| `{root}/instanceid` | PERSISTENT | Cluster UUID |
-| `{root}/idgen/` | PERSISTENT | Legacy ledger ID generation |
-| `{root}/idgen-long/` | PERSISTENT | Long ledger ID generation |
-| `{root}/underreplication/` | PERSISTENT | Underreplication tracking root |
+| Path                                   | Znode Type | Purpose                        |
+| -------------------------------------- | ---------- | ------------------------------ |
+| `{root}/`                              | PERSISTENT | Ledger root                    |
+| `{root}/available/`                    | PERSISTENT | Parent for active bookies      |
+| `{root}/available/{bookieId}`          | EPHEMERAL  | Writable bookie registration   |
+| `{root}/available/readonly/`           | PERSISTENT | Parent for read-only bookies   |
+| `{root}/available/readonly/{bookieId}` | EPHEMERAL  | Read-only bookie registration  |
+| `{root}/cookies/`                      | PERSISTENT | Parent for bookie cookies      |
+| `{root}/cookies/{bookieId}`            | PERSISTENT | Bookie identity cookie         |
+| `{root}/LAYOUT`                        | PERSISTENT | Metadata layout version        |
+| `{root}/instanceid`                    | PERSISTENT | Cluster UUID                   |
+| `{root}/idgen/`                        | PERSISTENT | Legacy ledger ID generation    |
+| `{root}/idgen-long/`                   | PERSISTENT | Long ledger ID generation      |
+| `{root}/underreplication/`             | PERSISTENT | Underreplication tracking root |
 
 ### 2.2 Ledger Metadata Paths
 
 BookKeeper uses a hierarchical path structure to avoid having too many children in a single znode.
 
 **HierarchicalLedgerManager** uses a hybrid strategy:
-- For `ledgerId < Integer.MAX_VALUE` (2^31 - 1): 3-level (legacy) hierarchy
-- For `ledgerId >= Integer.MAX_VALUE`: 5-level (long) hierarchy
+
+* For `ledgerId < Integer.MAX_VALUE` (2^31 - 1): 3-level (legacy) hierarchy
+
+* For `ledgerId >= Integer.MAX_VALUE`: 5-level (long) hierarchy
 
 **3-Level (Legacy) Hierarchy**:
+
 ```
 Format ledger ID as 10-digit decimal: %010d
 Split into 3 parts: [0:2] / [2:6] / [6:10]
@@ -159,6 +179,7 @@ Example: ledgerId=12345678 → "0012345678" → {root}/00/1234/L5678
 ```
 
 **5-Level (Long) Hierarchy**:
+
 ```
 Format ledger ID as 19-digit decimal: %019d
 Split into 5 parts: [0:3] / [3:7] / [7:11] / [11:15] / [15:19]
@@ -174,7 +195,8 @@ Each ledger znode is PERSISTENT and contains serialized `LedgerMetadata` (see Se
 **Mechanism**: ZK sequential ephemeral znodes.
 
 **Algorithm**:
-1. Create EPHEMERAL_SEQUENTIAL znode at `{root}/{idGenZnode}/ID-`
+
+1. Create EPHEMERAL\_SEQUENTIAL znode at `{root}/{idGenZnode}/ID-`
 2. ZK appends a 10-digit zero-padded sequential number (e.g., `ID-0000000042`)
 3. Extract the number from the returned path
 4. Delete the ephemeral znode immediately
@@ -182,7 +204,7 @@ Each ledger znode is PERSISTENT and contains serialized `LedgerMetadata` (see Se
 
 **Path**: `{root}/idgen-long/ID-` for long IDs, `{root}/idgen/ID-` for legacy
 
-**Limit**: ~9 billion IDs (ZK sequential counter is a signed 32-bit integer internally, but the path allows up to 10 digits)
+**Limit**: \~9 billion IDs (ZK sequential counter is a signed 32-bit integer internally, but the path allows up to 10 digits)
 
 ## 4. Cookie Mechanism
 
@@ -195,16 +217,18 @@ Cookies prevent a bookie from accidentally starting with mismatched data directo
 **Current layout version**: 5
 
 **Fields**:
-| Field | Type | Description |
-|-------|------|-------------|
-| `layoutVersion` | int | Always 5 (current) |
-| `bookieId` | string | `{hostname}:{port}` or custom |
-| `journalDirs` | string | Comma-separated journal directories |
-| `ledgerDirs` | string | Tab-encoded: `{count}\t{dir1}\t{dir2}\t...` |
-| `instanceId` | string | Cluster UUID (optional) |
-| `indexDirs` | string | Tab-encoded like ledgerDirs (optional, defaults to ledgerDirs) |
+
+| Field           | Type   | Description                                                    |
+| --------------- | ------ | -------------------------------------------------------------- |
+| `layoutVersion` | int    | Always 5 (current)                                             |
+| `bookieId`      | string | `{hostname}:{port}` or custom                                  |
+| `journalDirs`   | string | Comma-separated journal directories                            |
+| `ledgerDirs`    | string | Tab-encoded: `{count}\t{dir1}\t{dir2}\t...`                    |
+| `instanceId`    | string | Cluster UUID (optional)                                        |
+| `indexDirs`     | string | Tab-encoded like ledgerDirs (optional, defaults to ledgerDirs) |
 
 **Serialization** (v5): Protobuf text format
+
 ```
 5
 bookie_host: "hostname:3181"
@@ -218,20 +242,27 @@ First line is the version number, followed by a protobuf text-format `CookieForm
 
 ### 4.3 Storage
 
-- **ZK**: `{root}/cookies/{bookieId}` — PERSISTENT znode, content is serialized cookie
-- **Local disk**: `{journalDir}/COOKIE` — file containing serialized cookie
+* **ZK**: `{root}/cookies/{bookieId}` — PERSISTENT znode, content is serialized cookie
+
+* **Local disk**: `{journalDir}/COOKIE` — file containing serialized cookie
 
 ### 4.4 Validation on Startup
 
 1. Read cookie from ZK
 2. Read cookie from local disk
 3. Compare:
-   - `layoutVersion` must match
-   - `bookieId` must match
-   - `journalDirs` must match
-   - `ledgerDirs` must match (or be a superset, for directory expansion)
-   - `indexDirs` must match (or be a superset)
-   - `instanceId` must match if both are non-null
+
+   * `layoutVersion` must match
+
+   * `bookieId` must match
+
+   * `journalDirs` must match
+
+   * `ledgerDirs` must match (or be a superset, for directory expansion)
+
+   * `indexDirs` must match (or be a superset)
+
+   * `instanceId` must match if both are non-null
 4. On mismatch: refuse to start (prevents data corruption)
 
 ## 5. LedgerManager Interface
@@ -295,6 +326,7 @@ The layout znode stores which LedgerManager implementation is in use.
 **Path**: `{root}/LAYOUT`
 
 **Operations**:
+
 ```
 interface LayoutManager:
     readLedgerLayout() → Optional<LedgerLayout>
@@ -303,8 +335,10 @@ interface LayoutManager:
 ```
 
 **LedgerLayout** contains:
-- Manager factory class name (e.g., `"HierarchicalLedgerManagerFactory"`)
-- Layout format version
+
+* Manager factory class name (e.g., `"HierarchicalLedgerManagerFactory"`)
+
+* Layout format version
 
 This ensures all clients/bookies agree on the metadata format.
 
@@ -323,6 +357,7 @@ This ensures all clients/bookies agree on the metadata format.
 ```
 
 **Hex hierarchy construction** (from 64-bit ledger ID):
+
 ```
 subdir1 = format("%04x", (ledgerId >> 48) & 0xFFFF)
 subdir2 = format("%04x", (ledgerId >> 32) & 0xFFFF)
@@ -334,6 +369,7 @@ path = {urLedgerPath}/{subdir1}/{subdir2}/{subdir3}/{subdir4}/urL{ledgerId}
 ### 8.2 Znode Content
 
 **Underreplicated ledger marker** (protobuf text format):
+
 ```protobuf
 message UnderreplicatedLedgerFormat {
     repeated string replica = 1;    // Missing replica bookie addresses
@@ -342,6 +378,7 @@ message UnderreplicatedLedgerFormat {
 ```
 
 **Lock znode** (protobuf text format):
+
 ```protobuf
 message LockDataFormat {
     optional string bookieId = 1;   // Bookie holding the lock (informational)
@@ -350,9 +387,15 @@ message LockDataFormat {
 
 ### 8.3 Operations
 
-- **Mark**: Create or update `urL{ledgerId}` znode with replica list
-- **Lock**: Create PERSISTENT `locks/urL{ledgerId}` (acts as a mutex)
-- **Process**: Read ledger marker, perform replication
-- **Release**: Delete lock znode
-- **Clear**: Delete ledger marker znode after successful replication
-- **Global disable**: A special znode can disable all replication cluster-wide
+* **Mark**: Create or update `urL{ledgerId}` znode with replica list
+
+* **Lock**: Create PERSISTENT `locks/urL{ledgerId}` (acts as a mutex)
+
+* **Process**: Read ledger marker, perform replication
+
+* **Release**: Delete lock znode
+
+* **Clear**: Delete ledger marker znode after successful replication
+
+* **Global disable**: A special znode can disable all replication cluster-wide
+

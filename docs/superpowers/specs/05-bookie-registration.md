@@ -21,14 +21,17 @@
 
 Registration znodes are **ephemeral** — they are automatically deleted by ZooKeeper when the bookie's session expires. This is the fundamental mechanism for failure detection:
 
-- Bookie crashes → ZK session expires → registration znode deleted → watchers notified
-- Other bookies/auditor detect the disappearance and trigger recovery
+* Bookie crashes → ZK session expires → registration znode deleted → watchers notified
+
+* Other bookies/auditor detect the disappearance and trigger recovery
 
 ### 1.3 Re-registration
 
 On ZK session reconnect (after temporary disconnection):
-- Bookie re-creates its ephemeral registration znode
-- If the session expired and a new session was created, the old znode is already gone
+
+* Bookie re-creates its ephemeral registration znode
+
+* If the session expired and a new session was created, the old znode is already gone
 
 ### 1.4 Read-Only Transition
 
@@ -38,6 +41,7 @@ On ZK session reconnect (after temporary disconnection):
 ```
 
 Reverse for recovery from read-only:
+
 ```
 1. Delete read-only registration: {root}/available/readonly/{bookieId}
 2. Create writable registration: {root}/available/{bookieId} (EPHEMERAL)
@@ -66,14 +70,22 @@ message BookieServiceInfoFormat {
 ### 2.2 Default Construction
 
 For a standard bookie, the service info contains:
-- One endpoint with:
-  - `id` = bookieId (e.g., `"hostname:3181"`)
-  - `port` = bookie port
-  - `host` = bookie hostname
-  - `protocol` = `"bookie-rpc"`
-  - `auth` = empty
-  - `extensions` = empty
-- `properties` = empty map
+
+* One endpoint with:
+
+  * `id` = bookieId (e.g., `"hostname:3181"`)
+
+  * `port` = bookie port
+
+  * `host` = bookie hostname
+
+  * `protocol` = `"bookie-rpc"`
+
+  * `auth` = empty
+
+  * `extensions` = empty
+
+* `properties` = empty map
 
 ### 2.3 Serialization
 
@@ -133,8 +145,10 @@ For historical reasons, some code paths use `BookieSocketAddress` which wraps a 
 ### 4.3 Address Resolution
 
 The client resolves `BookieId` strings to network addresses for TCP connections:
-- Default: parse as `{host}:{port}`, resolve hostname to IP
-- Custom: pluggable `BookieAddressResolver` for service mesh or DNS-based discovery
+
+* Default: parse as `{host}:{port}`, resolve hostname to IP
+
+* Custom: pluggable `BookieAddressResolver` for service mesh or DNS-based discovery
 
 ## 5. Cookie Validation (Detailed)
 
@@ -169,10 +183,10 @@ The client resolves `BookieId` strings to network addresses for TCP connections:
 
 ### 5.3 Cookie Storage Paths
 
-| Location | Path | Znode Type |
-|----------|------|-----------|
-| ZooKeeper | `{root}/cookies/{bookieId}` | PERSISTENT |
-| Local disk | `{journalDir}/COOKIE` | Regular file |
+| Location   | Path                        | Znode Type   |
+| ---------- | --------------------------- | ------------ |
+| ZooKeeper  | `{root}/cookies/{bookieId}` | PERSISTENT   |
+| Local disk | `{journalDir}/COOKIE`       | Regular file |
 
 ## 6. Layout Manager
 
@@ -192,8 +206,10 @@ interface LayoutManager:
 ### 6.3 LedgerLayout
 
 Contains:
-- `managerFactoryClass`: fully qualified class name (e.g., `"org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"`)
-- `managerVersion`: version number for the layout format
+
+* `managerFactoryClass`: fully qualified class name (e.g., `"org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"`)
+
+* `managerVersion`: version number for the layout format
 
 ### 6.4 ZK Path
 
@@ -202,6 +218,7 @@ Contains:
 ### 6.5 Validation
 
 On client/bookie startup:
+
 1. Read `{root}/LAYOUT`
 2. If exists: verify the configured `LedgerManager` matches what's stored
 3. If not exists: create with current config (first initialization)
@@ -220,6 +237,7 @@ A cluster-wide UUID that uniquely identifies the BookKeeper cluster. Used in coo
 ### 7.3 Generation
 
 Created during cluster initialization (`initNewCluster` or `metaformat`):
+
 ```
 instanceId = UUID.randomUUID().toString()
 create({root}/instanceid, instanceId, PERSISTENT)
@@ -242,6 +260,7 @@ create({root}/instanceid, instanceId, PERSISTENT)
 ### 8.2 nukeExistingCluster
 
 **Dangerous**: Destroys all metadata.
+
 ```
 1. Verify instance ID matches (safety check)
 2. Delete all ledger metadata znodes
@@ -253,8 +272,10 @@ create({root}/instanceid, instanceId, PERSISTENT)
 ### 8.3 metaformat
 
 Formats (reinitializes) the metadata service:
+
 ```
 1. If {root}/LAYOUT exists: delete it
 2. Store new LedgerLayout
 3. Optionally generate new instance ID
 ```
+

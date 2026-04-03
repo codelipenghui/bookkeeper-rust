@@ -6,11 +6,11 @@
 
 BookKeeper auto-recovery is a distributed system that detects and repairs underreplicated ledgers. It consists of three components:
 
-| Component | Role | Instances |
-|-----------|------|-----------|
-| Auditor | Detect underreplicated ledgers | Exactly 1 (leader-elected) |
-| ReplicationWorker | Repair underreplicated ledgers | One per bookie (with auto-recovery enabled) |
-| UnderreplicationManager | Track underreplicated ledgers | Shared state in ZK |
+| Component               | Role                           | Instances                                   |
+| ----------------------- | ------------------------------ | ------------------------------------------- |
+| Auditor                 | Detect underreplicated ledgers | Exactly 1 (leader-elected)                  |
+| ReplicationWorker       | Repair underreplicated ledgers | One per bookie (with auto-recovery enabled) |
+| UnderreplicationManager | Track underreplicated ledgers  | Shared state in ZK                          |
 
 Auto-recovery runs as a daemon alongside each bookie (or standalone). Only one auditor is active at a time (ZK leader election).
 
@@ -18,9 +18,11 @@ Auto-recovery runs as a daemon alongside each bookie (or standalone). Only one a
 
 ### 2.1 Leader Election
 
-- All bookies with auto-recovery enabled participate in auditor election
-- ZK-based leader election: only one auditor active cluster-wide
-- On leader failure: another bookie takes over
+* All bookies with auto-recovery enabled participate in auditor election
+
+* ZK-based leader election: only one auditor active cluster-wide
+
+* On leader failure: another bookie takes over
 
 ### 2.2 Audit Tasks
 
@@ -47,6 +49,7 @@ onBookieFailure(failedBookies):
 ```
 
 **Bookie check algorithm**:
+
 ```
 startBookieCheck():
   1. Get current available bookies from ZK
@@ -103,11 +106,15 @@ checkReplicas():
 
 ### 2.3 Lost Bookie Recovery Delay
 
-- Default: 1800 seconds (30 minutes) — configurable via `lostBookieRecoveryDelay`
-- Purpose: avoid unnecessary replication for transient failures (restarts, network blips)
-- Single bookie failure: wait the delay before triggering audit
-- Multiple simultaneous failures: trigger immediately (more likely to be a real problem)
-- Delay can be dynamically adjusted via admin HTTP API
+* Default: 1800 seconds (30 minutes) — configurable via `lostBookieRecoveryDelay`
+
+* Purpose: avoid unnecessary replication for transient failures (restarts, network blips)
+
+* Single bookie failure: wait the delay before triggering audit
+
+* Multiple simultaneous failures: trigger immediately (more likely to be a real problem)
+
+* Delay can be dynamically adjusted via admin HTTP API
 
 ### 2.4 Bookie Availability Monitoring
 
@@ -161,6 +168,7 @@ markLedgerReplicated(ledgerId):
 ### 3.4 Global Enable/Disable
 
 A special znode controls whether replication is enabled cluster-wide:
+
 ```
 isLedgerReplicationEnabled() → bool:
   Check existence of {root}/underreplication/disable znode
@@ -218,9 +226,11 @@ rereplicate(ledgerId):
 
 ### 4.3 Throttling
 
-- Replication rate can be limited to avoid overwhelming the cluster
-- Configurable backoff on failures
-- Exponential backoff with max retries (`NUM_OF_EXPONENTIAL_BACKOFF_RETRIALS`)
+* Replication rate can be limited to avoid overwhelming the cluster
+
+* Configurable backoff on failures
+
+* Exponential backoff with max retries (`NUM_OF_EXPONENTIAL_BACKOFF_RETRIALS`)
 
 ### 4.4 Failure Handling
 
@@ -278,16 +288,22 @@ Prevent two writers from writing to the same ledger simultaneously ("split-brain
 ### 5.3 Effect on Old Writer
 
 After fencing quorum is reached:
-- The old writer's subsequent `ADD_ENTRY` requests (without `FLAG_RECOVERY_ADD`) receive `EFENCED`
-- The old writer detects the fence and:
-  - Stops writing
-  - Fails pending writes to the application with `BKLedgerFencedException`
+
+* The old writer's subsequent `ADD_ENTRY` requests (without `FLAG_RECOVERY_ADD`) receive `EFENCED`
+
+* The old writer detects the fence and:
+
+  * Stops writing
+
+  * Fails pending writes to the application with `BKLedgerFencedException`
 
 ### 5.4 Recovery Add
 
 Entries written during recovery use `FLAG_RECOVERY_ADD`:
-- These are accepted even on fenced ledgers
-- This allows the recovery process to re-replicate entries and close the ledger
+
+* These are accepted even on fenced ledgers
+
+* This allows the recovery process to re-replicate entries and close the ledger
 
 ## 6. LAC Protocol (Detailed)
 
@@ -295,20 +311,24 @@ Entries written during recovery use `FLAG_RECOVERY_ADD`:
 
 Every interaction carries LAC information:
 
-**In ADD_ENTRY**: The entry itself contains the writer's current LAC at offset 16:
+**In ADD\_ENTRY**: The entry itself contains the writer's current LAC at offset 16:
+
 ```
 Entry: [ledgerId(8) | entryId(8) | LAC(8) | length(8) | digest | payload]
 ```
 
-**In READ_ENTRY response**: The bookie includes its known LAC for the ledger:
-- v2: LAC is embedded in the returned entry data (at offset 16)
-- v3: `maxLAC` field in `ReadResponse`, plus LAC in entry body
+**In READ\_ENTRY response**: The bookie includes its known LAC for the ledger:
+
+* v2: LAC is embedded in the returned entry data (at offset 16)
+
+* v3: `maxLAC` field in `ReadResponse`, plus LAC in entry body
 
 ### 6.2 Explicit LAC
 
 For readers that need timely LAC updates without reading entries:
 
-**Writer → Bookies** (WRITE_LAC):
+**Writer → Bookies** (WRITE\_LAC):
+
 ```
 Periodically (every explicitLacIntervalMs):
   1. Construct LAC entry:
@@ -317,7 +337,8 @@ Periodically (every explicitLacIntervalMs):
   3. Bookie stores explicit LAC value
 ```
 
-**Reader → Bookies** (READ_LAC):
+**Reader → Bookies** (READ\_LAC):
+
 ```
 1. Send READ_LAC to bookies in ensemble
 2. Bookie returns:
@@ -329,6 +350,7 @@ Periodically (every explicitLacIntervalMs):
 ### 6.3 Long-Poll LAC
 
 For tailing reads, the reader can long-poll for LAC advancement:
+
 ```
 Send READ_ENTRY or READ_LAC with:
   - previousLAC: the reader's current known LAC
@@ -344,6 +366,7 @@ Bookie behavior:
 ### 6.4 LAC in Recovery
 
 During recovery, the LAC determines the boundary between committed and uncommitted entries:
+
 ```
 recoveryLAC = max(
   LAC values from fencing reads across quorum,
