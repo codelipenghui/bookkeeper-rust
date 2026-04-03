@@ -1,0 +1,13 @@
+[package]
+name = "bookkeeper-metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bookkeeper-proto = { workspace = true }
+bookkeeper-common = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }

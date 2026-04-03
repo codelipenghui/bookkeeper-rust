@@ -4,6 +4,7 @@ members = [
     "crates/bookkeeper-proto",
     "crates/bookkeeper-common",
     "crates/bookkeeper-protocol",
+    "crates/bookkeeper-metadata",
 ]
 
 [workspace.package]
@@ -15,6 +16,8 @@ license = "Apache-2.0"
 bookkeeper-proto = { path = "crates/bookkeeper-proto" }
 bookkeeper-common = { path = "crates/bookkeeper-common" }
 bookkeeper-protocol = { path = "crates/bookkeeper-protocol" }
+bookkeeper-metadata = { path = "crates/bookkeeper-metadata" }
+async-trait = "0.1"
 
 bytes = "1"
 prost = "0.13"
