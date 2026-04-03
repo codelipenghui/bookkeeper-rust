@@ -4,24 +4,51 @@ use crate::v2::header::PacketHeader;
 
 #[derive(Debug, Clone)]
 pub enum V2Request {
-    AddEntry { flags: u16, master_key: [u8; MASTER_KEY_LENGTH], ledger_id: i64, entry_id: i64, entry_data: Bytes },
+    AddEntry { flags: u16, master_key: [u8; MASTER_KEY_LENGTH], entry_data: Bytes },
     ReadEntry { flags: u16, ledger_id: i64, entry_id: i64, master_key: Option<[u8; MASTER_KEY_LENGTH]> },
     Auth { payload: Bytes },
     WriteLac { ledger_id: i64, lac: i64, master_key: [u8; MASTER_KEY_LENGTH], body: Bytes },
     ReadLac { ledger_id: i64 },
     GetBookieInfo { flags: u16, requested: i64 },
-    BatchReadEntry { flags: u16, ledger_id: i64, start_entry_id: i64, max_count: i32, max_size: i64 },
+    BatchReadEntry { flags: u16, ledger_id: i64, start_entry_id: i64, request_id: i64, max_count: i32, max_size: i64 },
+}
+
+impl V2Request {
+    /// For AddEntry: peek at ledgerId from the entry data (first 8 bytes).
+    pub fn ledger_id(&self) -> Option<i64> {
+        match self {
+            V2Request::AddEntry { entry_data, .. } if entry_data.len() >= 8 => {
+                Some(i64::from_be_bytes(entry_data[0..8].try_into().unwrap()))
+            }
+            V2Request::ReadEntry { ledger_id, .. } => Some(*ledger_id),
+            V2Request::WriteLac { ledger_id, .. } => Some(*ledger_id),
+            V2Request::ReadLac { ledger_id, .. } => Some(*ledger_id),
+            V2Request::GetBookieInfo { .. } => None,
+            V2Request::BatchReadEntry { ledger_id, .. } => Some(*ledger_id),
+            _ => None,
+        }
+    }
+
+    /// For AddEntry: peek at entryId from the entry data (bytes 8..16).
+    pub fn entry_id(&self) -> Option<i64> {
+        match self {
+            V2Request::AddEntry { entry_data, .. } if entry_data.len() >= 16 => {
+                Some(i64::from_be_bytes(entry_data[8..16].try_into().unwrap()))
+            }
+            V2Request::ReadEntry { entry_id, .. } => Some(*entry_id),
+            V2Request::BatchReadEntry { start_entry_id, .. } => Some(*start_entry_id),
+            _ => None,
+        }
+    }
 }
 
 pub fn encode_request(req: &V2Request) -> BytesMut {
     match req {
-        V2Request::AddEntry { flags, master_key, ledger_id, entry_id, entry_data } => {
+        V2Request::AddEntry { flags, master_key, entry_data } => {
             let header = PacketHeader::new(CURRENT_PROTOCOL_VERSION, OP_ADD_ENTRY, *flags);
-            let mut buf = BytesMut::with_capacity(4 + MASTER_KEY_LENGTH + 16 + entry_data.len());
+            let mut buf = BytesMut::with_capacity(4 + MASTER_KEY_LENGTH + entry_data.len());
             buf.put_u32(header.to_u32());
             buf.put_slice(master_key);
-            buf.put_i64(*ledger_id);
-            buf.put_i64(*entry_id);
             buf.put_slice(entry_data);
             buf
         }
@@ -65,12 +92,13 @@ pub fn encode_request(req: &V2Request) -> BytesMut {
             buf.put_i64(*requested);
             buf
         }
-        V2Request::BatchReadEntry { flags, ledger_id, start_entry_id, max_count, max_size } => {
+        V2Request::BatchReadEntry { flags, ledger_id, start_entry_id, request_id, max_count, max_size } => {
             let header = PacketHeader::new(CURRENT_PROTOCOL_VERSION, OP_BATCH_READ_ENTRY, *flags);
-            let mut buf = BytesMut::with_capacity(32);
+            let mut buf = BytesMut::with_capacity(4 + 8 + 8 + 8 + 4 + 8);
             buf.put_u32(header.to_u32());
             buf.put_i64(*ledger_id);
             buf.put_i64(*start_entry_id);
+            buf.put_i64(*request_id);
             buf.put_i32(*max_count);
             buf.put_i64(*max_size);
             buf
@@ -85,13 +113,11 @@ pub fn decode_request(data: &[u8]) -> Result<V2Request, RequestDecodeError> {
     let flags = header.flags();
     match header.opcode() {
         OP_ADD_ENTRY => {
-            if buf.remaining() < MASTER_KEY_LENGTH + 16 { return Err(RequestDecodeError::TooShort); }
+            if buf.remaining() < MASTER_KEY_LENGTH { return Err(RequestDecodeError::TooShort); }
             let mut master_key = [0u8; MASTER_KEY_LENGTH];
             buf.copy_to_slice(&mut master_key);
-            let ledger_id = buf.get_i64();
-            let entry_id = buf.get_i64();
             let entry_data = Bytes::copy_from_slice(buf);
-            Ok(V2Request::AddEntry { flags, master_key, ledger_id, entry_id, entry_data })
+            Ok(V2Request::AddEntry { flags, master_key, entry_data })
         }
         OP_READ_ENTRY => {
             if buf.remaining() < 16 { return Err(RequestDecodeError::TooShort); }
@@ -125,12 +151,13 @@ pub fn decode_request(data: &[u8]) -> Result<V2Request, RequestDecodeError> {
             Ok(V2Request::GetBookieInfo { flags, requested: buf.get_i64() })
         }
         OP_BATCH_READ_ENTRY => {
-            if buf.remaining() < 28 { return Err(RequestDecodeError::TooShort); }
+            if buf.remaining() < 36 { return Err(RequestDecodeError::TooShort); }
             let ledger_id = buf.get_i64();
             let start_entry_id = buf.get_i64();
+            let request_id = buf.get_i64();
             let max_count = buf.get_i32();
             let max_size = buf.get_i64();
-            Ok(V2Request::BatchReadEntry { flags, ledger_id, start_entry_id, max_count, max_size })
+            Ok(V2Request::BatchReadEntry { flags, ledger_id, start_entry_id, request_id, max_count, max_size })
         }
         op => Err(RequestDecodeError::UnknownOpcode(op)),
     }

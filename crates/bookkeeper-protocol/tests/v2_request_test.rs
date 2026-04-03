@@ -3,15 +3,33 @@ use bytes::Bytes;
 
 #[test]
 fn add_entry_round_trip() {
-    let req = V2Request::AddEntry { flags: 0, master_key: [0u8; 20], ledger_id: 42, entry_id: 7, entry_data: Bytes::from_static(b"test entry data") };
+    // entry_data is the FULL entry bytes (ledgerId + entryId + lac + length + ...)
+    let mut entry_data = Vec::new();
+    entry_data.extend_from_slice(&42i64.to_be_bytes());  // ledgerId
+    entry_data.extend_from_slice(&7i64.to_be_bytes());   // entryId
+    entry_data.extend_from_slice(&(-1i64).to_be_bytes()); // lac
+    entry_data.extend_from_slice(&15i64.to_be_bytes());  // length
+    entry_data.extend_from_slice(b"test entry data");     // payload (no digest for simplicity)
+    let entry_data = Bytes::from(entry_data);
+
+    let req = V2Request::AddEntry {
+        flags: 0,
+        master_key: [0u8; 20],
+        entry_data: entry_data.clone(),
+    };
+
     let encoded = encode_request(&req);
     let decoded = decode_request(&encoded).unwrap();
-    match decoded {
-        V2Request::AddEntry { ledger_id, entry_id, entry_data, .. } => {
-            assert_eq!(ledger_id, 42); assert_eq!(entry_id, 7); assert_eq!(entry_data, &b"test entry data"[..]);
+
+    match &decoded {
+        V2Request::AddEntry { entry_data: data, .. } => {
+            assert_eq!(*data, entry_data);
         }
         _ => panic!("expected AddEntry"),
     }
+    // Test helper methods
+    assert_eq!(decoded.ledger_id(), Some(42));
+    assert_eq!(decoded.entry_id(), Some(7));
 }
 
 #[test]
@@ -41,4 +59,26 @@ fn get_bookie_info_round_trip() {
     let encoded = encode_request(&req);
     let decoded = decode_request(&encoded).unwrap();
     match decoded { V2Request::GetBookieInfo { requested, .. } => assert_eq!(requested, 0x03), _ => panic!() }
+}
+
+#[test]
+fn batch_read_round_trip() {
+    let req = V2Request::BatchReadEntry {
+        flags: 0,
+        ledger_id: 1,
+        start_entry_id: 0,
+        request_id: 12345,
+        max_count: 100,
+        max_size: 1048576,
+    };
+    let encoded = encode_request(&req);
+    let decoded = decode_request(&encoded).unwrap();
+    match decoded {
+        V2Request::BatchReadEntry { ledger_id, request_id, max_count, .. } => {
+            assert_eq!(ledger_id, 1);
+            assert_eq!(request_id, 12345);
+            assert_eq!(max_count, 100);
+        }
+        _ => panic!("expected BatchReadEntry"),
+    }
 }

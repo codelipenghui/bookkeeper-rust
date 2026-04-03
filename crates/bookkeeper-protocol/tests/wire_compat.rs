@@ -18,22 +18,37 @@ fn packet_header_java_compat() {
 #[test]
 fn add_entry_request_layout() {
     let master_key = [0xABu8; 20];
-    let entry_data = Bytes::from_static(b"DATA");
+    // Build entry_data as full entry bytes (starting with ledgerId, entryId)
+    let mut entry_data_vec = Vec::new();
+    entry_data_vec.extend_from_slice(&1i64.to_be_bytes());    // ledgerId
+    entry_data_vec.extend_from_slice(&0i64.to_be_bytes());    // entryId
+    entry_data_vec.extend_from_slice(&(-1i64).to_be_bytes()); // lac
+    entry_data_vec.extend_from_slice(&4i64.to_be_bytes());    // length
+    entry_data_vec.extend_from_slice(b"DATA");                 // payload
+    let entry_data = Bytes::from(entry_data_vec);
+
     let req = V2Request::AddEntry {
         flags: FLAG_RECOVERY_ADD,
         master_key,
-        ledger_id: 1,
-        entry_id: 0,
         entry_data: entry_data.clone(),
     };
+
     let buf = encode_request(&req);
-    assert_eq!(buf.len(), 44);
+    // Total: 4 header + 20 masterKey + 36 entryData = 60
+    assert_eq!(buf.len(), 4 + 20 + entry_data.len());
+
+    // Verify header: version=2, opcode=1, flags=0x0002
     let header_val = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     assert_eq!(header_val, 0x02010002);
+
+    // Verify master key at offset 4..24
     assert_eq!(&buf[4..24], &[0xAB; 20]);
+
+    // Verify ledgerId at offset 24..32 (from entry_data, not separate field)
     assert_eq!(i64::from_be_bytes(buf[24..32].try_into().unwrap()), 1);
+
+    // Verify entryId at offset 32..40
     assert_eq!(i64::from_be_bytes(buf[32..40].try_into().unwrap()), 0);
-    assert_eq!(&buf[40..], b"DATA");
 }
 
 #[test]
@@ -82,6 +97,8 @@ fn framing_round_trip() {
 fn full_stack_add_entry() {
     let dm = DigestManager::new(DigestType::Crc32c);
     let payload = Bytes::from_static(b"hello bookkeeper");
+
+    // Build entry
     let entry_bytes = EntryBuilder::new(&dm)
         .ledger_id(1)
         .entry_id(0)
@@ -89,23 +106,28 @@ fn full_stack_add_entry() {
         .length(16)
         .payload(payload)
         .build();
+
+    // Wrap in ADD_ENTRY request — entry_data is the FULL entry bytes
     let req = V2Request::AddEntry {
         flags: 0,
         master_key: [0u8; 20],
-        ledger_id: 1,
-        entry_id: 0,
         entry_data: entry_bytes.freeze(),
     };
     let req_bytes = encode_request(&req);
+
+    // Frame it
     let mut codec = BookieCodec::new(5 * 1024 * 1024);
     let mut wire = BytesMut::new();
     codec.encode(req_bytes.freeze(), &mut wire).unwrap();
+
+    // Decode frame
     let frame = codec.decode(&mut wire).unwrap().unwrap();
+
+    // Decode request
     let decoded_req = decode_request(&frame).unwrap();
     match decoded_req {
-        V2Request::AddEntry { ledger_id, entry_id, entry_data, .. } => {
-            assert_eq!(ledger_id, 1);
-            assert_eq!(entry_id, 0);
+        V2Request::AddEntry { entry_data, .. } => {
+            // Parse entry and verify digest
             let entry = parse_entry(&dm, &entry_data).unwrap();
             assert_eq!(entry.ledger_id, 1);
             assert_eq!(entry.payload, &b"hello bookkeeper"[..]);
