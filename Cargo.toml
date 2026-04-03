@@ -6,6 +6,7 @@ members = [
     "crates/bookkeeper-protocol",
     "crates/bookkeeper-metadata",
     "crates/bookkeeper-storage",
+    "crates/bookkeeper-server",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ bookkeeper-common = { path = "crates/bookkeeper-common" }
 bookkeeper-protocol = { path = "crates/bookkeeper-protocol" }
 bookkeeper-metadata = { path = "crates/bookkeeper-metadata" }
 bookkeeper-storage = { path = "crates/bookkeeper-storage" }
+bookkeeper-server = { path = "crates/bookkeeper-server" }
 rocksdb = "0.22"
 parking_lot = "0.12"
 dashmap = "6"

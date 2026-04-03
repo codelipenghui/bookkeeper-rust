@@ -1,0 +1,23 @@
+[package]
+name = "bookkeeper-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bookkeeper-proto = { workspace = true }
+bookkeeper-common = { workspace = true }
+bookkeeper-protocol = { workspace = true }
+bookkeeper-storage = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+prost = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

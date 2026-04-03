@@ -126,6 +126,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bookkeeper-server"
+version = "0.1.0"
+dependencies = [
+ "bookkeeper-common",
+ "bookkeeper-proto",
+ "bookkeeper-protocol",
+ "bookkeeper-storage",
+ "bytes",
+ "libc",
+ "parking_lot",
+ "prost",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "bookkeeper-storage"
 version = "0.1.0"
 dependencies = [
