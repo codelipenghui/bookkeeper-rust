@@ -20,12 +20,13 @@ impl V2Request {
             V2Request::AddEntry { entry_data, .. } if entry_data.len() >= 8 => {
                 Some(i64::from_be_bytes(entry_data[0..8].try_into().unwrap()))
             }
+            V2Request::AddEntry { .. } => None,
             V2Request::ReadEntry { ledger_id, .. } => Some(*ledger_id),
             V2Request::WriteLac { ledger_id, .. } => Some(*ledger_id),
             V2Request::ReadLac { ledger_id, .. } => Some(*ledger_id),
             V2Request::GetBookieInfo { .. } => None,
             V2Request::BatchReadEntry { ledger_id, .. } => Some(*ledger_id),
-            _ => None,
+            V2Request::Auth { .. } => None,
         }
     }
 
@@ -35,9 +36,13 @@ impl V2Request {
             V2Request::AddEntry { entry_data, .. } if entry_data.len() >= 16 => {
                 Some(i64::from_be_bytes(entry_data[8..16].try_into().unwrap()))
             }
+            V2Request::AddEntry { .. } => None,
             V2Request::ReadEntry { entry_id, .. } => Some(*entry_id),
+            V2Request::WriteLac { .. } => None,
+            V2Request::ReadLac { .. } => None,
+            V2Request::GetBookieInfo { .. } => None,
             V2Request::BatchReadEntry { start_entry_id, .. } => Some(*start_entry_id),
-            _ => None,
+            V2Request::Auth { .. } => None,
         }
     }
 }
@@ -106,17 +111,17 @@ pub fn encode_request(req: &V2Request) -> BytesMut {
     }
 }
 
-pub fn decode_request(data: &[u8]) -> Result<V2Request, RequestDecodeError> {
+pub fn decode_request(data: Bytes) -> Result<V2Request, RequestDecodeError> {
     if data.len() < 4 { return Err(RequestDecodeError::TooShort); }
     let mut buf = &data[..];
     let header = PacketHeader::from_u32(buf.get_u32());
     let flags = header.flags();
     match header.opcode() {
         OP_ADD_ENTRY => {
-            if buf.remaining() < MASTER_KEY_LENGTH { return Err(RequestDecodeError::TooShort); }
+            if data.len() < 4 + MASTER_KEY_LENGTH { return Err(RequestDecodeError::TooShort); }
             let mut master_key = [0u8; MASTER_KEY_LENGTH];
-            buf.copy_to_slice(&mut master_key);
-            let entry_data = Bytes::copy_from_slice(buf);
+            master_key.copy_from_slice(&data[4..4 + MASTER_KEY_LENGTH]);
+            let entry_data = data.slice(4 + MASTER_KEY_LENGTH..);
             Ok(V2Request::AddEntry { flags, master_key, entry_data })
         }
         OP_READ_ENTRY => {
@@ -131,15 +136,17 @@ pub fn decode_request(data: &[u8]) -> Result<V2Request, RequestDecodeError> {
             Ok(V2Request::ReadEntry { flags, ledger_id, entry_id, master_key })
         }
         OP_AUTH => {
-            Ok(V2Request::Auth { payload: Bytes::copy_from_slice(buf) })
+            let payload = data.slice(4..);
+            Ok(V2Request::Auth { payload })
         }
         OP_WRITE_LAC => {
-            if buf.remaining() < 16 + MASTER_KEY_LENGTH { return Err(RequestDecodeError::TooShort); }
-            let ledger_id = buf.get_i64();
-            let lac = buf.get_i64();
+            if data.len() < 4 + 16 + MASTER_KEY_LENGTH { return Err(RequestDecodeError::TooShort); }
+            let mut cursor = &data[4..];
+            let ledger_id = cursor.get_i64();
+            let lac = cursor.get_i64();
             let mut master_key = [0u8; MASTER_KEY_LENGTH];
-            buf.copy_to_slice(&mut master_key);
-            let body = Bytes::copy_from_slice(buf);
+            master_key.copy_from_slice(&data[20..20 + MASTER_KEY_LENGTH]);
+            let body = data.slice(4 + 16 + MASTER_KEY_LENGTH..);
             Ok(V2Request::WriteLac { ledger_id, lac, master_key, body })
         }
         OP_READ_LAC => {

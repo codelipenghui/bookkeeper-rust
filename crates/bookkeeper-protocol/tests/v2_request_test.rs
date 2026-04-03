@@ -19,7 +19,7 @@ fn add_entry_round_trip() {
     };
 
     let encoded = encode_request(&req);
-    let decoded = decode_request(&encoded).unwrap();
+    let decoded = decode_request(encoded.freeze()).unwrap();
 
     match &decoded {
         V2Request::AddEntry { entry_data: data, .. } => {
@@ -36,7 +36,7 @@ fn add_entry_round_trip() {
 fn read_entry_with_fencing() {
     let req = V2Request::ReadEntry { flags: 0x0001, ledger_id: 100, entry_id: 50, master_key: Some([1u8; 20]) };
     let encoded = encode_request(&req);
-    let decoded = decode_request(&encoded).unwrap();
+    let decoded = decode_request(encoded.freeze()).unwrap();
     match decoded {
         V2Request::ReadEntry { flags, ledger_id, entry_id, master_key } => {
             assert_eq!(flags, 0x0001); assert_eq!(ledger_id, 100); assert_eq!(entry_id, 50); assert!(master_key.is_some());
@@ -49,7 +49,7 @@ fn read_entry_with_fencing() {
 fn read_entry_no_fencing() {
     let req = V2Request::ReadEntry { flags: 0, ledger_id: 10, entry_id: 0, master_key: None };
     let encoded = encode_request(&req);
-    let decoded = decode_request(&encoded).unwrap();
+    let decoded = decode_request(encoded.freeze()).unwrap();
     match decoded { V2Request::ReadEntry { master_key, .. } => assert!(master_key.is_none()), _ => panic!() }
 }
 
@@ -57,7 +57,7 @@ fn read_entry_no_fencing() {
 fn get_bookie_info_round_trip() {
     let req = V2Request::GetBookieInfo { flags: 0, requested: 0x03 };
     let encoded = encode_request(&req);
-    let decoded = decode_request(&encoded).unwrap();
+    let decoded = decode_request(encoded.freeze()).unwrap();
     match decoded { V2Request::GetBookieInfo { requested, .. } => assert_eq!(requested, 0x03), _ => panic!() }
 }
 
@@ -72,7 +72,7 @@ fn batch_read_round_trip() {
         max_size: 1048576,
     };
     let encoded = encode_request(&req);
-    let decoded = decode_request(&encoded).unwrap();
+    let decoded = decode_request(encoded.freeze()).unwrap();
     match decoded {
         V2Request::BatchReadEntry { ledger_id, request_id, max_count, .. } => {
             assert_eq!(ledger_id, 1);

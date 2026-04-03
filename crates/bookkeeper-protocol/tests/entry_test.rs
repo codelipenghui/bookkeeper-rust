@@ -10,7 +10,7 @@ fn entry_round_trip_crc32c() {
         .ledger_id(42).entry_id(7).lac(-1).length(11)
         .payload(payload.clone()).build();
     assert_eq!(entry_bytes.len(), 32 + 4 + 11);
-    let parsed = bookkeeper_protocol::entry::parse_entry(&dm, &entry_bytes).unwrap();
+    let parsed = bookkeeper_protocol::entry::parse_entry(&dm, entry_bytes.freeze()).unwrap();
     assert_eq!(parsed.ledger_id, 42);
     assert_eq!(parsed.entry_id, 7);
     assert_eq!(parsed.lac, -1);
@@ -26,7 +26,7 @@ fn entry_round_trip_dummy() {
         .ledger_id(1).entry_id(0).lac(-1).length(4)
         .payload(payload.clone()).build();
     assert_eq!(entry_bytes.len(), 36);
-    let parsed = bookkeeper_protocol::entry::parse_entry(&dm, &entry_bytes).unwrap();
+    let parsed = bookkeeper_protocol::entry::parse_entry(&dm, entry_bytes.freeze()).unwrap();
     assert_eq!(parsed.payload, payload);
 }
 
@@ -38,6 +38,6 @@ fn entry_corrupt_digest_detected() {
         .payload(Bytes::from_static(b"hello")).build();
     let last = entry_bytes.len() - 1;
     entry_bytes[last] ^= 0xFF;
-    let result = bookkeeper_protocol::entry::parse_entry(&dm, &entry_bytes);
+    let result = bookkeeper_protocol::entry::parse_entry(&dm, entry_bytes.freeze());
     assert!(result.is_err());
 }

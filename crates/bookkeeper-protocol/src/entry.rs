@@ -46,7 +46,7 @@ impl<'a> EntryBuilder<'a> {
     }
 }
 
-pub fn parse_entry(dm: &DigestManager, data: &[u8]) -> Result<Entry, EntryError> {
+pub fn parse_entry(dm: &DigestManager, data: Bytes) -> Result<Entry, EntryError> {
     let digest_len = dm.digest_type().digest_length();
     let min_len = METADATA_LENGTH + digest_len;
     if data.len() < min_len {
@@ -58,11 +58,12 @@ pub fn parse_entry(dm: &DigestManager, data: &[u8]) -> Result<Entry, EntryError>
     let lac = i64::from_be_bytes(data[16..24].try_into().unwrap());
     let length = i64::from_be_bytes(data[24..32].try_into().unwrap());
     let digest = &data[METADATA_LENGTH..METADATA_LENGTH + digest_len];
-    let payload = &data[METADATA_LENGTH + digest_len..];
-    if !dm.verify(metadata, payload, digest) {
+    let payload_slice = &data[METADATA_LENGTH + digest_len..];
+    if !dm.verify(metadata, payload_slice, digest) {
         return Err(EntryError::DigestMismatch);
     }
-    Ok(Entry { ledger_id, entry_id, lac, length, payload: Bytes::copy_from_slice(payload) })
+    let payload = data.slice(METADATA_LENGTH + digest_len..);
+    Ok(Entry { ledger_id, entry_id, lac, length, payload })
 }
 
 #[derive(Debug, thiserror::Error)]

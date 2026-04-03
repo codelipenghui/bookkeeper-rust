@@ -1,7 +1,7 @@
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::v2::header::PacketHeader;
 use bookkeeper_protocol::v2::request::{V2Request, encode_request, decode_request};
-use bookkeeper_protocol::v2::response::{V2Response, encode_response, decode_response};
+use bookkeeper_protocol::v2::response::{V2Response, encode_response};
 use bookkeeper_protocol::framing::BookieCodec;
 use bookkeeper_protocol::digest::{DigestManager, DigestType};
 use bookkeeper_protocol::entry::{EntryBuilder, parse_entry};
@@ -73,7 +73,6 @@ fn entry_format_layout() {
         .length(4)
         .payload(payload)
         .build();
-    // 32 metadata + 4 CRC32C digest + 4 payload = 40 (was 44)
     assert_eq!(entry.len(), 40);
     assert_eq!(i64::from_be_bytes(entry[0..8].try_into().unwrap()), 100);
     assert_eq!(i64::from_be_bytes(entry[8..16].try_into().unwrap()), 5);
@@ -124,11 +123,11 @@ fn full_stack_add_entry() {
     let frame = codec.decode(&mut wire).unwrap().unwrap();
 
     // Decode request
-    let decoded_req = decode_request(&frame).unwrap();
+    let decoded_req = decode_request(frame.freeze()).unwrap();
     match decoded_req {
         V2Request::AddEntry { entry_data, .. } => {
             // Parse entry and verify digest
-            let entry = parse_entry(&dm, &entry_data).unwrap();
+            let entry = parse_entry(&dm, entry_data).unwrap();
             assert_eq!(entry.ledger_id, 1);
             assert_eq!(entry.payload, &b"hello bookkeeper"[..]);
         }
