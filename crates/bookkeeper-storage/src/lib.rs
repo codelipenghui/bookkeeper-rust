@@ -2,3 +2,6 @@ pub mod journal;
 pub mod entry_log;
 pub mod index;
 pub mod cache;
+pub mod checkpoint;
+pub mod ledger_storage;
+pub mod db_ledger_storage;
