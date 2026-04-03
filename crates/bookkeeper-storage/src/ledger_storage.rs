@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use crate::journal::format::StorageError;
+use crate::StorageError;
 
 /// The LedgerStorage trait defines the interface for bookie storage backends.
 pub trait LedgerStorage: Send + Sync {

@@ -1,6 +1,6 @@
 use std::path::Path;
 use rocksdb::{DB, Options, WriteBatch};
-use crate::journal::format::StorageError;
+use crate::StorageError;
 
 /// RocksDB-backed entry location index.
 /// Key: (ledgerId, entryId) as 16 bytes big-endian.

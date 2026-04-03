@@ -9,13 +9,19 @@ use crate::cache::read_cache::ReadCache;
 use crate::entry_log::format::{self as elf, EntryLogHeader, EntryLocation, LOGFILE_HEADER_SIZE};
 use crate::index::entry_location::EntryLocationIndex;
 use crate::index::ledger_index::LedgerMetadataIndex;
-use crate::journal::format::StorageError;
+use crate::StorageError;
 use crate::ledger_storage::LedgerStorage;
 
 const DEFAULT_WRITE_CACHE_SIZE: usize = 64 * 1024 * 1024; // 64MB
 const DEFAULT_READ_CACHE_SIZE: usize = 64 * 1024 * 1024;  // 64MB
 const READ_CACHE_SEGMENTS: usize = 4;
 const MAX_ENTRY_LOG_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
+const MAX_ENTRY_SIZE: usize = 100 * 1024 * 1024; // 100MB sanity limit
+
+struct EntryLogState {
+    log_id: u32,
+    offset: u64,
+}
 
 pub struct DbLedgerStorage {
     #[allow(dead_code)]
@@ -26,8 +32,7 @@ pub struct DbLedgerStorage {
     entry_location_index: EntryLocationIndex,
     ledger_index: LedgerMetadataIndex,
     entry_log_dir: PathBuf,
-    current_log_id: Mutex<u32>,
-    current_log_offset: Mutex<u64>,
+    log_state: Mutex<EntryLogState>,
     flush_mutex: Mutex<()>,
 }
 
@@ -51,8 +56,10 @@ impl DbLedgerStorage {
             entry_location_index,
             ledger_index,
             entry_log_dir,
-            current_log_id: Mutex::new(0),
-            current_log_offset: Mutex::new(LOGFILE_HEADER_SIZE as u64),
+            log_state: Mutex::new(EntryLogState {
+                log_id: 0,
+                offset: LOGFILE_HEADER_SIZE as u64,
+            }),
             flush_mutex: Mutex::new(()),
         })
     }
@@ -82,32 +89,6 @@ impl DbLedgerStorage {
         Ok(())
     }
 
-    fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError> {
-        let mut log_id = self.current_log_id.lock().unwrap();
-        let mut log_offset = self.current_log_offset.lock().unwrap();
-
-        // Rotate to new log file if current exceeds size limit
-        let encoded_size = 4 + entry.len();
-        if *log_offset + encoded_size as u64 > MAX_ENTRY_LOG_SIZE {
-            *log_id += 1;
-            *log_offset = LOGFILE_HEADER_SIZE as u64;
-        }
-
-        self.ensure_entry_log_exists(*log_id)?;
-
-        let path = self.entry_log_path(*log_id);
-        let encoded = elf::encode_entry_log_entry(entry);
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
-        file.write_all(&encoded)?;
-
-        // position points past the 4-byte size prefix to the actual entry data
-        let position = *log_offset + 4;
-        let location = EntryLocation::new(*log_id, position as u32).to_u64();
-        *log_offset += encoded.len() as u64;
-
-        Ok(location)
-    }
-
     fn read_entry_from_log(&self, location: u64) -> Result<Vec<u8>, StorageError> {
         use std::io::{Read, Seek, SeekFrom};
         let loc = EntryLocation::from_u64(location);
@@ -122,6 +103,10 @@ impl DbLedgerStorage {
         let mut size_buf = [0u8; 4];
         file.read_exact(&mut size_buf)?;
         let size = i32::from_be_bytes(size_buf) as usize;
+        if size > MAX_ENTRY_SIZE {
+            return Err(StorageError::CorruptData(
+                format!("entry size {} exceeds maximum {}", size, MAX_ENTRY_SIZE)));
+        }
         // Read entry data at pos
         let mut entry = vec![0u8; size];
         file.read_exact(&mut entry)?;
@@ -145,7 +130,13 @@ impl LedgerStorage for DbLedgerStorage {
 
         // Update LAC if valid
         if lac >= 0 {
-            self.ledger_index.update_lac(ledger_id, lac).ok();
+            if let Err(e) = self.ledger_index.update_lac(ledger_id, lac) {
+                // LAC update is best-effort during add_entry; LAC is also recoverable from entry data
+                // Only ignore LedgerNotFound; propagate other errors
+                if !matches!(e, StorageError::LedgerNotFound(_)) {
+                    return Err(e);
+                }
+            }
         }
 
         // Try write cache
@@ -253,6 +244,7 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn flush(&self) -> Result<(), StorageError> {
+        use std::io::BufWriter;
         let _lock = self.flush_mutex.lock().unwrap();
 
         // Swap: active → being_flushed, being_flushed (cleared) → active
@@ -261,15 +253,52 @@ impl LedgerStorage for DbLedgerStorage {
             let mut flushing = self.write_cache_being_flushed.write();
             std::mem::swap(&mut *active, &mut *flushing);
         }
-        // Now: write_cache is empty (new writes go here), write_cache_being_flushed has old data
 
         let flushing = self.write_cache_being_flushed.read();
         let entries = flushing.sorted_entries();
-        let mut batch = Vec::new();
-        for (ledger_id, entry_id, entry_data) in &entries {
-            let location = self.write_entry_to_log(entry_data)?;
-            batch.push((*ledger_id, *entry_id, location));
+        if entries.is_empty() {
+            drop(flushing);
+            self.write_cache_being_flushed.write().clear();
+            return Ok(());
         }
+
+        let mut batch = Vec::with_capacity(entries.len());
+        let flushing_data = flushing.data();
+
+        {
+            let mut log_state = self.log_state.lock().unwrap();
+            self.ensure_entry_log_exists(log_state.log_id)?;
+            let path = self.entry_log_path(log_state.log_id);
+            let mut writer = BufWriter::new(
+                fs::OpenOptions::new().create(true).append(true).open(&path)?
+            );
+
+            for &(ledger_id, entry_id, offset, size) in &entries {
+                let entry_data = &flushing_data[offset..offset + size];
+                let encoded_size = (4 + entry_data.len()) as u64;
+
+                if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
+                    writer.flush()?;
+                    drop(writer);
+                    log_state.log_id += 1;
+                    log_state.offset = LOGFILE_HEADER_SIZE as u64;
+                    self.ensure_entry_log_exists(log_state.log_id)?;
+                    let new_path = self.entry_log_path(log_state.log_id);
+                    writer = BufWriter::new(
+                        fs::OpenOptions::new().create(true).append(true).open(&new_path)?
+                    );
+                }
+
+                writer.write_all(&(entry_data.len() as i32).to_be_bytes())?;
+                writer.write_all(entry_data)?;
+                let position = log_state.offset + 4;
+                let location = EntryLocation::new(log_state.log_id, position as u32).to_u64();
+                batch.push((ledger_id, entry_id, location));
+                log_state.offset += encoded_size;
+            }
+            writer.flush()?;
+        }
+
         if !batch.is_empty() {
             self.entry_location_index.put_batch(&batch)?;
         }

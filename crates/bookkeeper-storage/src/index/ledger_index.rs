@@ -1,7 +1,7 @@
 use std::path::Path;
 use prost::Message;
 use rocksdb::{DB, Options};
-use crate::journal::format::StorageError;
+use crate::StorageError;
 
 /// Ledger metadata stored in the bookie's RocksDB.
 #[derive(Debug, Clone)]

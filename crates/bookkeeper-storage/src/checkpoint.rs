@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use crate::journal::format::{LastMark, StorageError};
+use crate::StorageError;
+use crate::journal::format::LastMark;
 
 const LAST_MARK_FILENAME: &str = ".lastMark";
 

@@ -1,4 +1,4 @@
-use crate::journal::format::StorageError;
+use crate::StorageError;
 
 pub const ENTRY_LOG_MAGIC: &[u8; 4] = b"BKLO";
 pub const LOGFILE_HEADER_SIZE: usize = 1024;

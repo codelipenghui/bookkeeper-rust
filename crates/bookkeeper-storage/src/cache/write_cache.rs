@@ -1,15 +1,21 @@
 use dashmap::DashMap;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use crate::journal::format::StorageError;
+use crate::StorageError;
 
 /// In-memory write cache with 64-byte aligned entries.
 pub struct WriteCache {
     max_size: usize,
-    data: Vec<u8>,
+    data: UnsafeCell<Vec<u8>>,
     offset: AtomicUsize,
     index: DashMap<(i64, i64), (usize, usize)>, // (ledgerId, entryId) → (offset, size)
     last_entry: DashMap<i64, i64>, // ledgerId → max entryId
 }
+
+// SAFETY: Concurrent writes go to non-overlapping regions via atomic offset.
+// Concurrent reads only access regions that were fully written (offset was committed to index).
+unsafe impl Send for WriteCache {}
+unsafe impl Sync for WriteCache {}
 
 const ALIGNMENT: usize = 64;
 
@@ -22,7 +28,7 @@ impl WriteCache {
         let aligned_max = align64(max_size);
         Self {
             max_size: aligned_max,
-            data: vec![0u8; aligned_max],
+            data: UnsafeCell::new(vec![0u8; aligned_max]),
             offset: AtomicUsize::new(0),
             index: DashMap::new(),
             last_entry: DashMap::new(),
@@ -36,11 +42,9 @@ impl WriteCache {
             self.offset.fetch_sub(aligned_size, Ordering::SeqCst);
             return Err(StorageError::StorageFull);
         }
-        // Safety: we have exclusive access to this range via atomic offset reservation.
-        // Each call gets a unique non-overlapping range, and the Vec is pre-allocated.
         unsafe {
-            let ptr = self.data.as_ptr().add(offset) as *mut u8;
-            std::ptr::copy_nonoverlapping(entry.as_ptr(), ptr, entry.len());
+            let data = &mut *self.data.get();
+            data[offset..offset + entry.len()].copy_from_slice(entry);
         }
         self.index.insert((ledger_id, entry_id), (offset, entry.len()));
         self.last_entry.entry(ledger_id)
@@ -52,7 +56,10 @@ impl WriteCache {
     pub fn get(&self, ledger_id: i64, entry_id: i64) -> Option<Vec<u8>> {
         self.index.get(&(ledger_id, entry_id)).map(|e| {
             let (offset, size) = *e.value();
-            self.data[offset..offset + size].to_vec()
+            unsafe {
+                let data = &*self.data.get();
+                data[offset..offset + size].to_vec()
+            }
         })
     }
 
@@ -71,13 +78,18 @@ impl WriteCache {
     }
 
     /// Return all entries sorted by (ledgerId, entryId) for flushing.
-    pub fn sorted_entries(&self) -> Vec<(i64, i64, Vec<u8>)> {
-        let mut entries: Vec<(i64, i64, Vec<u8>)> = self.index.iter().map(|e| {
+    pub fn sorted_entries(&self) -> Vec<(i64, i64, usize, usize)> {
+        let mut entries: Vec<(i64, i64, usize, usize)> = self.index.iter().map(|e| {
             let (ledger_id, entry_id) = *e.key();
             let (offset, size) = *e.value();
-            (ledger_id, entry_id, self.data[offset..offset + size].to_vec())
+            (ledger_id, entry_id, offset, size)
         }).collect();
-        entries.sort_by_key(|(lid, eid, _)| (*lid, *eid));
+        entries.sort_by_key(|(lid, eid, _, _)| (*lid, *eid));
         entries
+    }
+
+    /// Access the underlying data buffer.
+    pub fn data(&self) -> &[u8] {
+        unsafe { &*self.data.get() }
     }
 }

@@ -61,6 +61,10 @@ fn write_cache_sorted_entries() {
     assert_eq!(entries[1].1, 1);
     assert_eq!(entries[2].0, 2);
     assert_eq!(entries[2].1, 0);
+    // Verify data access through data()
+    let data = cache.data();
+    let (_, _, offset, size) = entries[0];
+    assert_eq!(&data[offset..offset + size], b"a0");
 }
 
 #[test]
