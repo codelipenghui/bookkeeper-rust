@@ -124,6 +124,7 @@ async fn handle_connection(
     let (mut reader, mut writer) = stream.into_split();
     let mut codec = BookieCodec::new(max_frame_size);
     let mut buf = BytesMut::with_capacity(4096);
+    let mut out = BytesMut::with_capacity(256);
 
     loop {
         // Try to decode a complete frame from the buffer first
@@ -132,11 +133,15 @@ async fn handle_connection(
                 // Decode the request from the frame
                 match decode_request(frame.freeze()) {
                     Ok(req) => {
-                        let resp = processor.process_request(req);
+                        let proc = processor.clone();
+                        let resp = match tokio::task::spawn_blocking(move || proc.process_request(req)).await {
+                            Ok(resp) => resp,
+                            Err(_) => break, // task panicked or cancelled
+                        };
                         let resp_bytes = encode_response(&resp);
 
                         // Encode the response with length-prefix framing
-                        let mut out = BytesMut::new();
+                        out.clear();
                         if codec
                             .encode(Bytes::from(resp_bytes.freeze()), &mut out)
                             .is_ok()

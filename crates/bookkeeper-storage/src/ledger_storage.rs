@@ -39,4 +39,8 @@ pub trait LedgerStorage: Send + Sync {
 
     /// Perform a checkpoint: flush and return completion.
     fn checkpoint(&self) -> Result<(), StorageError>;
+
+    /// Validate a ledger for writing: check existence, fencing, and master key in one operation.
+    /// Creates the ledger if it doesn't exist. Returns true if the ledger is fenced.
+    fn validate_for_write(&self, ledger_id: i64, master_key: &[u8]) -> Result<bool, StorageError>;
 }

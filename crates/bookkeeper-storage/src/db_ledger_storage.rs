@@ -123,7 +123,7 @@ impl LedgerStorage for DbLedgerStorage {
         let entry_id = Self::extract_entry_id(entry);
         let lac = Self::extract_lac(entry);
 
-        // Ensure ledger exists in index
+        // Ensure ledger exists in index (no-op if validate_for_write already created it)
         if self.ledger_index.get(ledger_id)?.is_none() {
             self.ledger_index.set(ledger_id, false, None, None)?;
         }
@@ -334,5 +334,27 @@ impl LedgerStorage for DbLedgerStorage {
 
     fn checkpoint(&self) -> Result<(), StorageError> {
         self.flush()
+    }
+
+    fn validate_for_write(&self, ledger_id: i64, master_key: &[u8]) -> Result<bool, StorageError> {
+        match self.ledger_index.get(ledger_id)? {
+            Some(data) => {
+                // Check master key
+                if let Some(stored_key) = &data.master_key {
+                    if stored_key != master_key {
+                        return Err(StorageError::Unauthorized(ledger_id));
+                    }
+                } else {
+                    // No key stored — store it (preserving existing fenced/lac)
+                    self.ledger_index.set(ledger_id, data.fenced, Some(master_key), data.lac)?;
+                }
+                Ok(data.fenced)
+            }
+            None => {
+                // Create new ledger with key
+                self.ledger_index.set(ledger_id, false, Some(master_key), None)?;
+                Ok(false)
+            }
+        }
     }
 }

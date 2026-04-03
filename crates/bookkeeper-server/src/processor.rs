@@ -27,7 +27,15 @@ impl RequestProcessor {
             V2Request::ReadEntry { flags, ledger_id, entry_id, master_key } => {
                 self.handle_read_entry(flags, ledger_id, entry_id, master_key)
             }
-            V2Request::WriteLac { ledger_id, lac, master_key: _, body: _ } => {
+            V2Request::WriteLac { ledger_id, lac, master_key, body: _ } => {
+                // Validate master key before writing LAC
+                if let Err(e) = self.storage.check_master_key(ledger_id, &master_key) {
+                    return V2Response::WriteLac {
+                        error_code: self.storage_error_to_bk(&e).to_v2_code(),
+                        ledger_id,
+                        entry_id: 0,
+                    };
+                }
                 self.handle_write_lac(ledger_id, lac)
             }
             V2Request::ReadLac { ledger_id } => {
@@ -46,7 +54,6 @@ impl RequestProcessor {
     }
 
     fn handle_add_entry(&self, flags: u16, master_key: &[u8; MASTER_KEY_LENGTH], entry_data: Bytes) -> V2Response {
-        // Extract ledger_id and entry_id from entry data (first 16 bytes)
         if entry_data.len() < 16 {
             return self.add_error_response(BKError::BadRequest, 0, 0);
         }
@@ -54,35 +61,30 @@ impl RequestProcessor {
         let entry_id = i64::from_be_bytes(entry_data[8..16].try_into().unwrap());
         let is_recovery = flags & FLAG_RECOVERY_ADD != 0;
 
-        // Check bookie is writable
         if !self.state.is_writable() {
             return self.add_error_response(BKError::ReadOnly, ledger_id, entry_id);
         }
 
-        // Check fencing (skip for recovery adds)
-        if !is_recovery {
-            if let Ok(fenced) = self.storage.is_fenced(ledger_id) {
-                if fenced {
+        // Single RocksDB read: validate existence + master key + get fenced status
+        match self.storage.validate_for_write(ledger_id, master_key) {
+            Ok(is_fenced) => {
+                if is_fenced && !is_recovery {
                     return self.add_error_response(BKError::Fenced, ledger_id, entry_id);
                 }
+                if is_recovery {
+                    if let Err(e) = self.storage.set_fenced(ledger_id) {
+                        // Best-effort fencing for recovery adds — only fail on serious errors
+                        if !matches!(e, bookkeeper_storage::StorageError::LedgerNotFound(_)) {
+                            return self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id);
+                        }
+                    }
+                }
             }
-        } else {
-            // Recovery add: set fenced flag on the ledger
-            let _ = self.storage.set_fenced(ledger_id);
+            Err(e) => return self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id),
         }
 
-        // Check master key (stores on first write, validates on subsequent writes)
-        if let Err(e) = self.storage.check_master_key(ledger_id, master_key) {
-            return self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id);
-        }
-
-        // Write to storage
         match self.storage.add_entry(&entry_data) {
-            Ok(()) => V2Response::Add {
-                error_code: V2_EOK,
-                ledger_id,
-                entry_id,
-            },
+            Ok(()) => V2Response::Add { error_code: V2_EOK, ledger_id, entry_id },
             Err(e) => self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id),
         }
     }
@@ -90,12 +92,7 @@ impl RequestProcessor {
     fn handle_read_entry(&self, flags: u16, ledger_id: i64, entry_id: i64, master_key: Option<[u8; MASTER_KEY_LENGTH]>) -> V2Response {
         // Check readable state
         if !self.state.is_readable() {
-            return V2Response::Read {
-                error_code: BKError::ReadOnly.to_v2_code(),
-                ledger_id,
-                entry_id,
-                data: None,
-            };
+            return self.read_error_response(BKError::ReadOnly, ledger_id, entry_id);
         }
 
         // Handle fencing
@@ -103,14 +100,11 @@ impl RequestProcessor {
             if let Some(key) = master_key {
                 // Validate master key before fencing
                 if let Err(e) = self.storage.check_master_key(ledger_id, &key) {
-                    return V2Response::Read {
-                        error_code: self.storage_error_to_bk(&e).to_v2_code(),
-                        ledger_id,
-                        entry_id,
-                        data: None,
-                    };
+                    return self.read_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id);
                 }
-                let _ = self.storage.set_fenced(ledger_id);
+                if let Err(e) = self.storage.set_fenced(ledger_id) {
+                    return self.read_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id);
+                }
             }
         }
 
@@ -126,12 +120,7 @@ impl RequestProcessor {
                     };
                 }
                 Err(_) => {
-                    return V2Response::Read {
-                        error_code: BKError::NoLedger.to_v2_code(),
-                        ledger_id,
-                        entry_id,
-                        data: None,
-                    };
+                    return self.read_error_response(BKError::NoLedger, ledger_id, entry_id);
                 }
             }
         }
@@ -144,12 +133,7 @@ impl RequestProcessor {
                 entry_id,
                 data: Some(data),
             },
-            Err(e) => V2Response::Read {
-                error_code: self.storage_error_to_bk(&e).to_v2_code(),
-                ledger_id,
-                entry_id,
-                data: None,
-            },
+            Err(e) => self.read_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id),
         }
     }
 
@@ -210,10 +194,9 @@ impl RequestProcessor {
             };
         }
 
-        // Handle fencing
-        if flags & FLAG_DO_FENCING != 0 {
-            let _ = self.storage.set_fenced(ledger_id);
-        }
+        // Note: batch_read does not fence — fencing requires master key auth
+        // which our v2 BatchReadEntry codec does not yet include.
+        let _ = flags; // suppress unused warning
 
         let mut entries = Vec::new();
         let mut total_size: i64 = 0;
@@ -250,6 +233,10 @@ impl RequestProcessor {
             ledger_id,
             entry_id,
         }
+    }
+
+    fn read_error_response(&self, err: BKError, ledger_id: i64, entry_id: i64) -> V2Response {
+        V2Response::Read { error_code: err.to_v2_code(), ledger_id, entry_id, data: None }
     }
 
     fn storage_error_to_bk(&self, err: &bookkeeper_storage::StorageError) -> BKError {
