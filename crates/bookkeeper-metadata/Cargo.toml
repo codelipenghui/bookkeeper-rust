@@ -11,3 +11,5 @@ prost = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+zookeeper-client = { workspace = true }
+uuid = { workspace = true }
