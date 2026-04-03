@@ -61,6 +61,8 @@ impl RecoveryHandle {
     /// Phase 1: Fence the ledger on all bookies.
     /// Sends FLAG_DO_FENCING read to each bookie, waits for write quorum responses.
     /// Returns the recovery LAC (max LAC across all fencing responses).
+    /// Also extracts total_length from the fencing response data when present,
+    /// eliminating the need for an O(N) pre-loop in forward_read().
     pub async fn fence(
         &mut self,
         conns: &[Arc<Mutex<BookieConnection>>],
@@ -95,12 +97,22 @@ impl RecoveryHandle {
         // Collect responses
         for future in futures {
             match future.await {
-                Ok(Ok(V2Response::Read { error_code, entry_id, .. })) => {
+                Ok(Ok(V2Response::Read { error_code, entry_id, data, .. })) => {
                     if error_code == V2_EOK || error_code == no_entry_code {
                         success_count += 1;
                         // entry_id contains the LAC for LAST_ADD_CONFIRMED reads
                         if entry_id > max_lac {
                             max_lac = entry_id;
+                        }
+                        // Extract total_length from the last confirmed entry data
+                        if error_code == V2_EOK {
+                            if let Some(entry_data) = data {
+                                if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
+                                    if entry.length > self.total_length {
+                                        self.total_length = entry.length;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -122,6 +134,8 @@ impl RecoveryHandle {
 
     /// Phase 2: Forward read from recovery_lac+1 to find the true last entry.
     /// Reads entries sequentially until ENOENTRY. Returns the last entry ID found.
+    /// Note: total_length for entries up to recovery_lac is obtained from fence().
+    /// This method only scans forward from recovery_lac+1.
     pub async fn forward_read(
         &mut self,
         conns: &[Arc<Mutex<BookieConnection>>],
@@ -129,31 +143,7 @@ impl RecoveryHandle {
     ) -> Result<i64, ClientError> {
         let mut last_entry = recovery_lac;
         let mut entry_id = recovery_lac + 1;
-        let mut total_length: i64 = 0;
 
-        // First, compute length of entries up to recovery_lac
-        for eid in 0..=recovery_lac {
-            let write_set = self.schedule.write_set(eid);
-            for &bookie_idx in &write_set {
-                if bookie_idx >= conns.len() {
-                    continue;
-                }
-                let mut conn = conns[bookie_idx].lock().await;
-                match conn.send_read_entry(0, self.ledger_id, eid, None).await {
-                    Ok(V2Response::Read { error_code, data, .. }) if error_code == V2_EOK => {
-                        if let Some(entry_data) = data {
-                            if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
-                                total_length = entry.length;
-                            }
-                        }
-                        break;
-                    }
-                    _ => continue,
-                }
-            }
-        }
-
-        // Now forward read from recovery_lac+1
         loop {
             let write_set = self.schedule.write_set(entry_id);
             let mut found = false;
@@ -168,7 +158,7 @@ impl RecoveryHandle {
                         if error_code == V2_EOK {
                             if let Some(entry_data) = data {
                                 if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
-                                    total_length = entry.length;
+                                    self.total_length = entry.length;
                                     last_entry = entry_id;
                                     found = true;
                                 }
@@ -181,18 +171,43 @@ impl RecoveryHandle {
             }
 
             if !found {
-                break; // No more entries
+                break;
             }
             entry_id += 1;
         }
 
+        // If no entries were found beyond recovery_lac (or total_length was not set
+        // by fence() because the bookie returns data:None for LAST_ADD_CONFIRMED reads),
+        // read the recovery_lac entry to obtain the cumulative length.
+        if self.total_length == 0 && recovery_lac >= 0 {
+            let write_set = self.schedule.write_set(recovery_lac);
+            for &bookie_idx in &write_set {
+                if bookie_idx >= conns.len() {
+                    continue;
+                }
+                let mut conn = conns[bookie_idx].lock().await;
+                match conn.send_read_entry(0, self.ledger_id, recovery_lac, None).await {
+                    Ok(V2Response::Read { error_code, data, .. }) if error_code == V2_EOK => {
+                        if let Some(entry_data) = data {
+                            if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
+                                self.total_length = entry.length;
+                            }
+                        }
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
         self.last_entry_found = last_entry;
-        self.total_length = total_length;
         Ok(last_entry)
     }
 
     /// Phase 3: Write a recovery entry with FLAG_RECOVERY_ADD.
-    /// Used to re-replicate entries that don't meet write quorum.
+    /// Builds a NEW entry from payload bytes (not re-sending raw bytes).
+    /// Note: `length` is set to `payload.len()` — use `recovery_add_raw` when
+    /// re-replicating existing entries where the cumulative length must be preserved.
     pub async fn recovery_add_entry(
         &self,
         conns: &[Arc<Mutex<BookieConnection>>],
@@ -249,113 +264,108 @@ impl RecoveryHandle {
         }
     }
 
+    /// Re-replicate an existing entry (raw bytes) with FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY.
+    /// Unlike `recovery_add_entry`, this sends the original entry bytes verbatim,
+    /// preserving the cumulative `length` field already embedded in the entry.
+    async fn recovery_add_raw(
+        &self,
+        conns: &[Arc<Mutex<BookieConnection>>],
+        entry_id: i64,
+        entry_data: Bytes,
+    ) -> Result<(), ClientError> {
+        let write_set = self.schedule.write_set(entry_id);
+        let mut ack_set = self.schedule.new_ack_set();
+
+        let mut futures = Vec::new();
+        for &bookie_idx in &write_set {
+            if bookie_idx >= conns.len() {
+                continue;
+            }
+            let conn = conns[bookie_idx].clone();
+            let entry = entry_data.clone();
+            let mk = self.master_key;
+            futures.push(tokio::spawn(async move {
+                let mut conn = conn.lock().await;
+                conn.send_add_entry(FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY, mk, entry).await
+            }));
+        }
+
+        for (i, future) in futures.into_iter().enumerate() {
+            let bookie_idx = write_set[i];
+            match future.await {
+                Ok(Ok(V2Response::Add { error_code, .. })) => {
+                    if error_code == V2_EOK {
+                        if ack_set.complete_bookie(bookie_idx) {
+                            return Ok(());
+                        }
+                    } else {
+                        ack_set.fail_bookie(bookie_idx);
+                    }
+                }
+                _ => {
+                    ack_set.fail_bookie(bookie_idx);
+                }
+            }
+        }
+
+        if ack_set.is_quorum_reached() {
+            Ok(())
+        } else {
+            Err(ClientError::Protocol(format!(
+                "recovery add quorum not reached for entry {entry_id}"
+            )))
+        }
+    }
+
     /// Phase 4: Close the ledger after recovery.
     /// Returns (lastEntryId, totalLength) for metadata update.
     pub fn close(&self, last_entry_id: i64) -> Result<(i64, i64), ClientError> {
         Ok((last_entry_id, self.total_length))
     }
 
-    /// Run the complete recovery protocol: fence → forward read with re-replication → close.
+    /// Run the complete recovery protocol: fence → forward read → re-replicate → close.
     /// Returns (lastEntryId, totalLength) for metadata update.
     pub async fn recover(
         &mut self,
         conns: &[Arc<Mutex<BookieConnection>>],
         last_ensemble_entry_id: i64,
     ) -> Result<(i64, i64), ClientError> {
-        // Phase 1: Fence
+        // Phase 1: Fence (also extracts total_length from fencing response data)
         let recovery_lac = self.fence(conns, last_ensemble_entry_id).await?;
 
-        // Phase 2+3: Forward read with re-replication
-        let mut last_entry = recovery_lac;
-        let mut entry_id = recovery_lac + 1;
+        // Phase 2: Forward read to find true last entry
+        let last_entry = self.forward_read(conns, recovery_lac).await?;
 
-        // Compute total_length from entries already confirmed (up to recovery_lac)
-        if recovery_lac >= 0 {
-            let write_set = self.schedule.write_set(recovery_lac);
+        // Phase 3: Re-replicate entries from recovery_lac+1 to last_entry.
+        // forward_read already verified these entries exist; now re-read and re-replicate
+        // to ensure write quorum on all bookies.
+        for eid in (recovery_lac + 1)..=last_entry {
+            // Read the entry from any bookie in the write set
+            let write_set = self.schedule.write_set(eid);
+            let mut entry_data: Option<Bytes> = None;
             for &bookie_idx in &write_set {
-                if bookie_idx >= conns.len() { continue; }
+                if bookie_idx >= conns.len() {
+                    continue;
+                }
                 let mut conn = conns[bookie_idx].lock().await;
-                match conn.send_read_entry(0, self.ledger_id, recovery_lac, None).await {
-                    Ok(bookkeeper_protocol::v2::response::V2Response::Read { error_code, data, .. }) => {
-                        if error_code == bookkeeper_protocol::constants::V2_EOK {
-                            if let Some(d) = data {
-                                if let Ok(entry) = bookkeeper_protocol::entry::parse_entry(&self.digest_manager, d) {
-                                    self.total_length = entry.length;
-                                }
-                            }
+                match conn.send_read_entry(0, self.ledger_id, eid, None).await {
+                    Ok(V2Response::Read { error_code, data, .. }) if error_code == V2_EOK => {
+                        if let Some(d) = data {
+                            entry_data = Some(d);
                             break;
                         }
                     }
                     _ => continue,
                 }
             }
-        }
 
-        loop {
-            let write_set = self.schedule.write_set(entry_id);
-            let mut entry_data: Option<bytes::Bytes> = None;
-
-            // Try to read from any bookie in write set
-            for &bookie_idx in &write_set {
-                if bookie_idx >= conns.len() { continue; }
-                let mut conn = conns[bookie_idx].lock().await;
-                match conn.send_read_entry(0, self.ledger_id, entry_id, None).await {
-                    Ok(bookkeeper_protocol::v2::response::V2Response::Read { error_code, data, .. }) => {
-                        if error_code == bookkeeper_protocol::constants::V2_EOK {
-                            if let Some(d) = data {
-                                if let Ok(entry) = bookkeeper_protocol::entry::parse_entry(&self.digest_manager, d.clone()) {
-                                    self.total_length = entry.length;
-                                    entry_data = Some(d);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    _ => continue,
-                }
-            }
-
-            match entry_data {
-                Some(data) => {
-                    // Re-replicate: send recovery add to ensure write quorum
-                    // The entry data is the raw entry bytes from the bookie
-                    let mut ack_set = self.schedule.new_ack_set();
-                    let mut futures = Vec::new();
-                    for &bookie_idx in &write_set {
-                        if bookie_idx >= conns.len() { continue; }
-                        let conn = conns[bookie_idx].clone();
-                        let entry = data.clone();
-                        let mk = self.master_key;
-                        futures.push(tokio::spawn(async move {
-                            let mut conn = conn.lock().await;
-                            conn.send_add_entry(
-                                bookkeeper_protocol::constants::FLAG_RECOVERY_ADD | bookkeeper_protocol::constants::FLAG_HIGH_PRIORITY,
-                                mk, entry,
-                            ).await
-                        }));
-                    }
-                    for (i, future) in futures.into_iter().enumerate() {
-                        let bidx = write_set[i];
-                        match future.await {
-                            Ok(Ok(bookkeeper_protocol::v2::response::V2Response::Add { error_code, .. })) => {
-                                if error_code == bookkeeper_protocol::constants::V2_EOK {
-                                    ack_set.complete_bookie(bidx);
-                                } else {
-                                    ack_set.fail_bookie(bidx);
-                                }
-                            }
-                            _ => { ack_set.fail_bookie(bidx); }
-                        }
-                    }
-                    // Even if quorum not fully reached, entry was found so advance
-                    last_entry = entry_id;
-                    entry_id += 1;
-                }
-                None => break, // No more entries
+            if let Some(data) = entry_data {
+                // Re-replicate with FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY
+                self.recovery_add_raw(conns, eid, data).await?;
             }
         }
 
-        self.last_entry_found = last_entry;
+        // Phase 4: Close
         Ok((last_entry, self.total_length))
     }
 }
