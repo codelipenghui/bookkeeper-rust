@@ -68,6 +68,7 @@ impl BookieServer {
             )
             .await
             .map_err(|e| format!("ZK connect: {e}"))?;
+            validate_cookie(&reg_mgr, &bookie_id, &config).await?;
             let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
                 &bookie_id,
                 &local_addr.ip().to_string(),
@@ -81,6 +82,7 @@ impl BookieServer {
         } else {
             None
         };
+
 
         // Spawn accept loop
         let accept_handle = tokio::spawn(accept_loop(
@@ -104,6 +106,19 @@ impl BookieServer {
         self.local_addr
     }
 
+    /// Update ZK registration when bookie state changes (e.g., to/from read-only).
+    pub async fn update_registration(&self, read_only: bool) {
+        if let Some((ref reg_mgr, ref bookie_id)) = self.zk_reg {
+            // Unregister from the opposite path
+            let _ = reg_mgr.unregister_bookie(bookie_id, !read_only).await;
+            // Register under the correct path
+            let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
+                bookie_id, &self.local_addr.ip().to_string(), self.local_addr.port(),
+            );
+            let _ = reg_mgr.register_bookie(bookie_id, read_only, &info).await;
+        }
+    }
+
     pub async fn shutdown(self) {
         // Signal the accept loop to stop
         let _ = self.shutdown_tx.send(true);
@@ -116,6 +131,71 @@ impl BookieServer {
         // Flush storage to persist any pending data
         let _ = self.storage.flush();
     }
+}
+
+async fn validate_cookie(
+    zk_reg: &bookkeeper_metadata::zk::registration::ZkRegistrationManager,
+    bookie_id: &str,
+    config: &BookieConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use bookkeeper_metadata::cookie::Cookie;
+
+    let journal_dir = std::path::Path::new(&config.journal_dir);
+    let disk_cookie_path = journal_dir.join("COOKIE");
+
+    // Read cookie from ZK
+    let zk_cookie = zk_reg.read_cookie(bookie_id).await
+        .map_err(|e| format!("read ZK cookie: {e}"))?;
+
+    // Read cookie from disk
+    let disk_cookie = if disk_cookie_path.exists() {
+        let data = std::fs::read_to_string(&disk_cookie_path)
+            .map_err(|e| format!("read disk cookie: {e}"))?;
+        Some(Cookie::deserialize(&data).map_err(|e| format!("parse disk cookie: {e}"))?)
+    } else {
+        None
+    };
+
+    match (zk_cookie, disk_cookie) {
+        (Some((zk_data, _version)), Some(disk_cookie)) => {
+            // Both exist — validate
+            let zk_str = String::from_utf8(zk_data)
+                .map_err(|e| format!("ZK cookie not UTF-8: {e}"))?;
+            let zk_cookie = Cookie::deserialize(&zk_str)
+                .map_err(|e| format!("parse ZK cookie: {e}"))?;
+            disk_cookie.validate_against(&zk_cookie)
+                .map_err(|e| format!("cookie validation failed: {e}"))?;
+        }
+        (None, None) => {
+            // First time — create cookie in both ZK and disk
+            let ledger_dirs: Vec<&str> = config.ledger_dirs.iter().map(|s| s.as_str()).collect();
+            let cookie = Cookie::new(
+                bookie_id,
+                &config.journal_dir,
+                &ledger_dirs,
+                zk_reg.get_cluster_instance_id().await
+                    .map_err(|e| format!("get instance id: {e}"))?
+                    .as_deref(),
+                None,
+            );
+            let cookie_str = cookie.serialize();
+            zk_reg.create_cookie(bookie_id, cookie_str.as_bytes()).await
+                .map_err(|e| format!("create ZK cookie: {e}"))?;
+            std::fs::create_dir_all(journal_dir)
+                .map_err(|e| format!("create journal dir: {e}"))?;
+            std::fs::write(&disk_cookie_path, &cookie_str)
+                .map_err(|e| format!("write disk cookie: {e}"))?;
+        }
+        (Some(_), None) => {
+            // ZK has cookie but disk doesn't — error
+            return Err("ZK cookie exists but disk cookie is missing".into());
+        }
+        (None, Some(_)) => {
+            // Disk has cookie but ZK doesn't — error
+            return Err("disk cookie exists but ZK cookie is missing".into());
+        }
+    }
+    Ok(())
 }
 
 async fn accept_loop(

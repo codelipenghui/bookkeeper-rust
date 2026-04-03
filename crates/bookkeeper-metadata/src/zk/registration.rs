@@ -140,14 +140,22 @@ impl RegistrationManager for ZkRegistrationManager {
     }
 
     async fn init_new_cluster(&self, layout: &LedgerLayout, instance_id: &str) -> Result<(), MetadataError> {
+        // Check if cluster already exists
+        match self.client.get_data(self.paths.layout()).await {
+            Ok(_) => return Err(MetadataError::InvalidConfig(
+                "cluster already initialized (LAYOUT exists)".into())),
+            Err(zk::Error::NoNode) => {} // Good — fresh cluster
+            Err(e) => return Err(MetadataError::ConnectionError(format!("check layout: {e}"))),
+        }
+
         // Create root paths
         self.ensure_path_exists(self.paths.root()).await?;
         self.ensure_path_exists(self.paths.available()).await?;
         self.ensure_path_exists(self.paths.available_readonly()).await?;
         self.ensure_path_exists(self.paths.cookies()).await?;
 
-        // Create LAYOUT
-        let layout_data = format!("{}\n{}", layout.manager_factory_class, layout.manager_version);
+        // Create LAYOUT — Java format: "{layoutFormatVersion}\n{class}:{managerVersion}"
+        let layout_data = format!("{}\n{}:{}", 2, layout.manager_factory_class, layout.manager_version);
         let persistent_options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
         self.client.create(self.paths.layout(), layout_data.as_bytes(), &persistent_options).await
             .map_err(|e| MetadataError::ConnectionError(format!("create layout: {e}")))?;
