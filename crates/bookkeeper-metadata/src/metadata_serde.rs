@@ -8,18 +8,17 @@ const LINE_SPLITTER: u8 = b'\n';
 /// Serialize LedgerMetadata to v3 binary protobuf format.
 /// Format: "BookieMetadataFormatVersion\t3\n" + varint-length-prefixed protobuf.
 pub fn serialize_metadata(md: &LedgerMetadata) -> Result<Vec<u8>, MetadataError> {
-    let mut buf = Vec::new();
+    // FIX 7: pre-compute proto first to know encoded_len for pre-sizing the buffer
+    let proto = to_proto(md);
+    let msg_len = proto.encoded_len();
+    let mut buf = Vec::with_capacity(VERSION_HEADER.len() + 2 + 10 + msg_len);
 
     // Write header
     buf.extend_from_slice(VERSION_HEADER);
     buf.extend_from_slice(b"3");
     buf.push(LINE_SPLITTER);
 
-    // Build protobuf
-    let proto = to_proto(md);
-
     // Write delimited (varint length prefix + message)
-    let msg_len = proto.encoded_len();
     prost::encode_length_delimiter(msg_len, &mut buf)
         .map_err(|e| MetadataError::SerializationError(e.to_string()))?;
     proto.encode(&mut buf)
@@ -61,7 +60,8 @@ fn parse_header(data: &[u8]) -> Result<(i32, &[u8]), MetadataError> {
 fn parse_v3(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError> {
     let proto = bookkeeper_proto::LedgerMetadataFormat::decode_length_delimited(body)
         .map_err(|e| MetadataError::SerializationError(format!("protobuf decode: {e}")))?;
-    from_proto(ledger_id, &proto)
+    // FIX 6: pass owned proto instead of a borrow
+    from_proto(ledger_id, proto)
 }
 
 fn to_proto(md: &LedgerMetadata) -> bookkeeper_proto::LedgerMetadataFormat {
@@ -116,7 +116,8 @@ fn to_proto(md: &LedgerMetadata) -> bookkeeper_proto::LedgerMetadataFormat {
     }
 }
 
-fn from_proto(ledger_id: i64, proto: &bookkeeper_proto::LedgerMetadataFormat) -> Result<LedgerMetadata, MetadataError> {
+// FIX 6: take ownership of proto to avoid clones on ensemble members and password
+fn from_proto(ledger_id: i64, proto: bookkeeper_proto::LedgerMetadataFormat) -> Result<LedgerMetadata, MetadataError> {
     use bookkeeper_proto::ledger_metadata_format as lmf;
 
     let mut builder = LedgerMetadataBuilder::new()
@@ -137,13 +138,13 @@ fn from_proto(ledger_id: i64, proto: &bookkeeper_proto::LedgerMetadataFormat) ->
         );
     }
 
-    // Ensembles
-    for seg in &proto.segment {
-        builder = builder.new_ensemble_entry(seg.first_entry_id, seg.ensemble_member.clone());
+    // Ensembles — consume the vec directly to avoid cloning each member
+    for seg in proto.segment {
+        builder = builder.new_ensemble_entry(seg.first_entry_id, seg.ensemble_member);
     }
 
-    // Digest
-    if let Some(password) = &proto.password {
+    // Digest — move password out of proto instead of cloning
+    if let Some(password) = proto.password {
         let digest_type = match proto.digest_type {
             Some(dt) if dt == lmf::DigestType::Crc32 as i32 => DigestType::Crc32,
             Some(dt) if dt == lmf::DigestType::Crc32c as i32 => DigestType::Crc32c,
@@ -151,7 +152,7 @@ fn from_proto(ledger_id: i64, proto: &bookkeeper_proto::LedgerMetadataFormat) ->
             Some(dt) if dt == lmf::DigestType::Dummy as i32 => DigestType::Dummy,
             _ => DigestType::Crc32,
         };
-        builder = builder.with_digest_type(digest_type).with_password(password.clone());
+        builder = builder.with_digest_type(digest_type).with_password(password);
     }
 
     // Ctime
@@ -162,9 +163,9 @@ fn from_proto(ledger_id: i64, proto: &bookkeeper_proto::LedgerMetadataFormat) ->
     // Custom metadata
     if !proto.custom_metadata.is_empty() {
         let mut map = std::collections::BTreeMap::new();
-        for entry in &proto.custom_metadata {
-            if let (Some(k), Some(v)) = (&entry.key, &entry.value) {
-                map.insert(k.clone(), v.clone());
+        for entry in proto.custom_metadata {
+            if let (Some(k), Some(v)) = (entry.key, entry.value) {
+                map.insert(k, v);
             }
         }
         builder = builder.with_custom_metadata(map);

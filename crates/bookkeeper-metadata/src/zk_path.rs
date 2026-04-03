@@ -35,29 +35,52 @@ pub fn underreplication_ledger_path(base: &str, ledger_id: i64) -> String {
 }
 
 /// Well-known ZK paths relative to the ledger root.
+/// All fixed paths are pre-computed at construction time.
 pub struct ZkPaths {
     root: String,
+    available: String,
+    available_readonly: String,
+    cookies: String,
+    layout: String,
+    instance_id: String,
+    idgen: String,
+    idgen_long: String,
+    underreplication: String,
 }
 
 impl ZkPaths {
     pub fn new(root: &str) -> Self {
-        Self { root: root.to_string() }
+        Self {
+            available: format!("{}/available", root),
+            available_readonly: format!("{}/available/readonly", root),
+            cookies: format!("{}/cookies", root),
+            layout: format!("{}/LAYOUT", root),
+            instance_id: format!("{}/instanceid", root),
+            idgen: format!("{}/idgen", root),
+            idgen_long: format!("{}/idgen-long", root),
+            underreplication: format!("{}/underreplication", root),
+            root: root.to_string(),
+        }
     }
 
     pub fn root(&self) -> &str { &self.root }
-    pub fn available(&self) -> String { format!("{}/available", self.root) }
-    pub fn available_readonly(&self) -> String { format!("{}/available/readonly", self.root) }
-    pub fn cookies(&self) -> String { format!("{}/cookies", self.root) }
-    pub fn cookie_path(&self, bookie_id: &str) -> String { format!("{}/cookies/{}", self.root, bookie_id) }
-    pub fn layout(&self) -> String { format!("{}/LAYOUT", self.root) }
-    pub fn instance_id(&self) -> String { format!("{}/instanceid", self.root) }
-    pub fn idgen(&self) -> String { format!("{}/idgen", self.root) }
-    pub fn idgen_long(&self) -> String { format!("{}/idgen-long", self.root) }
-    pub fn underreplication(&self) -> String { format!("{}/underreplication", self.root) }
+    pub fn available(&self) -> &str { &self.available }
+    pub fn available_readonly(&self) -> &str { &self.available_readonly }
+    pub fn cookies(&self) -> &str { &self.cookies }
+    pub fn layout(&self) -> &str { &self.layout }
+    pub fn instance_id(&self) -> &str { &self.instance_id }
+    pub fn idgen(&self) -> &str { &self.idgen }
+    pub fn idgen_long(&self) -> &str { &self.idgen_long }
+    pub fn underreplication(&self) -> &str { &self.underreplication }
+
+    // These must still allocate since they take dynamic parameters
+    pub fn cookie_path(&self, bookie_id: &str) -> String {
+        format!("{}/{}", self.cookies, bookie_id)
+    }
     pub fn bookie_registration(&self, bookie_id: &str) -> String {
-        format!("{}/available/{}", self.root, bookie_id)
+        format!("{}/{}", self.available, bookie_id)
     }
     pub fn bookie_readonly_registration(&self, bookie_id: &str) -> String {
-        format!("{}/available/readonly/{}", self.root, bookie_id)
+        format!("{}/{}", self.available_readonly, bookie_id)
     }
 }

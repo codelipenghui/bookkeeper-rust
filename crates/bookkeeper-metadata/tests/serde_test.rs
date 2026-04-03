@@ -1,5 +1,5 @@
 use bookkeeper_metadata::ledger_metadata::*;
-use bookkeeper_metadata::serde::{serialize_metadata, deserialize_metadata};
+use bookkeeper_metadata::metadata_serde::{serialize_metadata, deserialize_metadata};
 
 #[test]
 fn v3_round_trip_open_ledger() {

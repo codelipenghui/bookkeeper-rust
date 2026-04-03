@@ -35,19 +35,22 @@ impl Cookie {
     pub fn index_dirs(&self) -> Option<&str> { self.index_dirs.as_deref() }
 
     /// Serialize to the v5 cookie format: version line + protobuf text format.
+    /// FIX 4: use write! to avoid format! temporaries
     pub fn serialize(&self) -> String {
-        let mut s = format!("{}\n", CURRENT_COOKIE_LAYOUT_VERSION);
-        s.push_str(&format!("bookieHost: \"{}\"\n", self.bookie_id));
-        s.push_str(&format!("journalDir: \"{}\"\n", self.journal_dirs));
-        s.push_str(&format!("ledgerDirs: \"{}\"\n", self.ledger_dirs));
+        use std::fmt::Write;
+        let mut s = String::with_capacity(256);
+        writeln!(s, "{}", CURRENT_COOKIE_LAYOUT_VERSION).unwrap();
+        writeln!(s, "bookieHost: \"{}\"", self.bookie_id).unwrap();
+        writeln!(s, "journalDir: \"{}\"", self.journal_dirs).unwrap();
+        writeln!(s, "ledgerDirs: \"{}\"", self.ledger_dirs).unwrap();
         if let Some(ref id) = self.instance_id {
             if !id.is_empty() {
-                s.push_str(&format!("instanceId: \"{}\"\n", id));
+                writeln!(s, "instanceId: \"{}\"", id).unwrap();
             }
         }
         if let Some(ref dirs) = self.index_dirs {
             if !dirs.is_empty() {
-                s.push_str(&format!("indexDirs: \"{}\"\n", dirs));
+                writeln!(s, "indexDirs: \"{}\"", dirs).unwrap();
             }
         }
         s
@@ -146,16 +149,17 @@ fn parse_proto_text_cookie(text: &str) -> Result<Cookie, MetadataError> {
 
     for line in text.lines() {
         let line = line.trim();
+        // FIX 3: use extract_proto_text_field returning &str, call .to_string() only on success
         if let Some(val) = extract_proto_text_field(line, "bookieHost") {
-            bookie_id = val;
+            bookie_id = val.to_string();
         } else if let Some(val) = extract_proto_text_field(line, "journalDir") {
-            journal_dirs = val;
+            journal_dirs = val.to_string();
         } else if let Some(val) = extract_proto_text_field(line, "ledgerDirs") {
-            ledger_dirs = val;
+            ledger_dirs = val.to_string();
         } else if let Some(val) = extract_proto_text_field(line, "instanceId") {
-            if !val.is_empty() { instance_id = Some(val); }
+            if !val.is_empty() { instance_id = Some(val.to_string()); }
         } else if let Some(val) = extract_proto_text_field(line, "indexDirs") {
-            if !val.is_empty() { index_dirs = Some(val); }
+            if !val.is_empty() { index_dirs = Some(val.to_string()); }
         }
     }
 
@@ -166,11 +170,9 @@ fn parse_proto_text_cookie(text: &str) -> Result<Cookie, MetadataError> {
     Ok(Cookie { bookie_id, journal_dirs, ledger_dirs, instance_id, index_dirs })
 }
 
-fn extract_proto_text_field(line: &str, field_name: &str) -> Option<String> {
-    let prefix = format!("{}: \"", field_name);
-    if line.starts_with(&prefix) && line.ends_with('"') {
-        Some(line[prefix.len()..line.len() - 1].to_string())
-    } else {
-        None
-    }
+// FIX 3: zero-alloc field extraction — return &str slice into the input line
+fn extract_proto_text_field<'a>(line: &'a str, field_name: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(field_name)?;
+    let rest = rest.strip_prefix(": \"")?;
+    rest.strip_suffix('"')
 }

@@ -16,7 +16,7 @@ pub enum DigestType {
 }
 
 /// Immutable ledger metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LedgerMetadata {
     ledger_id: i64,
     metadata_format_version: i32,
@@ -54,8 +54,8 @@ impl LedgerMetadata {
 
     /// Get the ensemble responsible for the given entry ID.
     /// Returns the ensemble from the highest segment whose firstEntryId <= entryId.
-    pub fn ensemble_at(&self, entry_id: i64) -> Option<&Vec<String>> {
-        self.ensembles.range(..=entry_id).next_back().map(|(_, v)| v)
+    pub fn ensemble_at(&self, entry_id: i64) -> Option<&[String]> {
+        self.ensembles.range(..=entry_id).next_back().map(|(_, v)| v.as_slice())
     }
 }
 
@@ -188,4 +188,10 @@ pub enum MetadataError {
     SerializationError(String),
     #[error("unknown metadata version: {0}")]
     UnknownVersion(i32),
+    #[error("ledger not found: {0}")]
+    NotFound(i64),
+    #[error("version conflict: expected {expected}, got {actual}")]
+    VersionConflict { expected: i32, actual: i32 },
+    #[error("metadata store connection error: {0}")]
+    ConnectionError(String),
 }
