@@ -20,19 +20,55 @@ impl DigestType {
     }
 }
 
+/// Stack-allocated digest output (max 20 bytes for HMAC-SHA1).
+pub struct DigestOutput {
+    buf: [u8; 20],
+    len: u8,
+}
+
+impl DigestOutput {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::ops::Deref for DigestOutput {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DigestManager {
     digest_type: DigestType,
     password: Vec<u8>,
+    hmac_key: [u8; 20],  // cached SHA1("mac" + password), only used for HmacSha1
 }
 
 impl DigestManager {
     pub fn new(digest_type: DigestType) -> Self {
-        Self { digest_type, password: Vec::new() }
+        Self { digest_type, password: Vec::new(), hmac_key: [0u8; 20] }
     }
 
     pub fn with_password(mut self, password: &[u8]) -> Self {
         self.password = password.to_vec();
+        // Pre-derive HMAC key: SHA1("mac" + password), matching Java's MacDigestManager
+        use sha1::Digest;
+        let mut hasher = Sha1::new();
+        hasher.update(b"mac");
+        hasher.update(password);
+        let result = hasher.finalize();
+        self.hmac_key.copy_from_slice(&result);
         self
     }
 
@@ -40,38 +76,41 @@ impl DigestManager {
         self.digest_type
     }
 
-    pub fn compute(&self, metadata: &[u8; 32], payload: &[u8]) -> Vec<u8> {
+    fn derived_key(&self) -> &[u8; 20] {
+        &self.hmac_key
+    }
+
+    pub fn compute(&self, metadata: &[u8; 32], payload: &[u8]) -> DigestOutput {
+        let mut output = DigestOutput { buf: [0u8; 20], len: 0 };
         match self.digest_type {
             DigestType::Crc32 => {
                 let mut hasher = crc32fast::Hasher::new();
                 hasher.update(metadata);
                 hasher.update(payload);
-                let crc = hasher.finalize();
-                (crc as i64).to_be_bytes().to_vec()
+                let bytes = (hasher.finalize() as i64).to_be_bytes();
+                output.buf[..8].copy_from_slice(&bytes);
+                output.len = 8;
             }
             DigestType::Crc32c => {
                 let mut crc = crc32c::crc32c(metadata);
                 crc = crc32c::crc32c_append(crc, payload);
-                (crc as i32).to_be_bytes().to_vec()  // 4 bytes, not 8
+                let bytes = (crc as i32).to_be_bytes();
+                output.buf[..4].copy_from_slice(&bytes);
+                output.len = 4;
             }
             DigestType::HmacSha1 => {
-                use sha1::Digest;  // Need the Digest trait for SHA1 hashing
                 type HmacSha1 = Hmac<Sha1>;
-
-                // Java derives HMAC key as: SHA1("mac" + password)
-                let mut key_hasher = Sha1::new();
-                key_hasher.update(b"mac");
-                key_hasher.update(&self.password);
-                let derived_key = key_hasher.finalize();
-
-                let mut mac = HmacSha1::new_from_slice(&derived_key)
+                let mut mac = HmacSha1::new_from_slice(self.derived_key())
                     .expect("HMAC accepts any key length");
                 mac.update(metadata);
                 mac.update(payload);
-                mac.finalize().into_bytes().to_vec()
+                let result = mac.finalize().into_bytes();
+                output.buf.copy_from_slice(&result);
+                output.len = 20;
             }
-            DigestType::Dummy => Vec::new(),
+            DigestType::Dummy => {}
         }
+        output
     }
 
     pub fn verify(&self, metadata: &[u8; 32], payload: &[u8], expected: &[u8]) -> bool {
@@ -79,6 +118,6 @@ impl DigestManager {
             return true;
         }
         let computed = self.compute(metadata, payload);
-        computed == expected
+        computed.as_slice() == expected
     }
 }

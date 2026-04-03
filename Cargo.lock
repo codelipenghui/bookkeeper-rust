@@ -59,6 +59,7 @@ dependencies = [
  "hmac",
  "prost",
  "sha1",
+ "thiserror",
  "tokio",
  "tokio-util",
 ]

@@ -40,7 +40,7 @@ impl<'a> EntryBuilder<'a> {
         buf.put_i64(self.length);
         let metadata: [u8; 32] = buf[..32].try_into().unwrap();
         let digest = self.dm.compute(&metadata, &self.payload);
-        buf.put_slice(&digest);
+        buf.put_slice(digest.as_slice());
         buf.put_slice(&self.payload);
         buf
     }
