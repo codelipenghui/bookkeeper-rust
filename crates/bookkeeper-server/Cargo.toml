@@ -23,6 +23,8 @@ axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 zookeeper-client = { workspace = true }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

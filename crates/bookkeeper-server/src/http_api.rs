@@ -13,6 +13,7 @@ pub fn create_router(http_state: HttpState) -> Router {
         .route("/heartbeat", axum::routing::get(heartbeat))
         .route("/api/v1/bookie/is_ready", axum::routing::get(is_ready))
         .route("/api/v1/bookie/state", axum::routing::get(bookie_state))
+        .route("/metrics", axum::routing::get(prometheus_metrics))
         .with_state(http_state)
 }
 
@@ -37,6 +38,14 @@ struct BookieStateResponse {
     shutting_down: bool,
     #[serde(rename = "availableForHighPriorityWrites")]
     available_for_high_priority_writes: bool,
+}
+
+async fn prometheus_metrics() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        crate::metrics::encode_metrics(),
+    )
 }
 
 async fn bookie_state(State(state): State<HttpState>) -> Json<BookieStateResponse> {

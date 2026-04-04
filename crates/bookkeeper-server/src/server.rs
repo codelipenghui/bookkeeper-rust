@@ -54,6 +54,10 @@ impl BookieServer {
         // Create state manager and transition to Running
         let state = Arc::new(BookieStateManager::new());
         state.transition_to(BookieState::Running);
+        crate::metrics::BOOKIE_STATE.set(1); // 1 = writable/running
+
+        // Initialize Prometheus metrics
+        crate::metrics::register_metrics();
 
         // Create request processor
         let storage_for_shutdown = storage.clone();
@@ -372,12 +376,14 @@ async fn run_disk_monitor(
                 let current = state.state();
                 if any_full && current == BookieState::Running {
                     if state.transition_to(BookieState::ReadOnly) {
+                        crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
                         println!("Disk monitor: disk usage exceeds {:.0}% threshold, transitioning to READ-ONLY", threshold * 100.0);
                         update_zk_registration(&zk_info, true).await;
                     }
                 } else if total_usage < lwm_threshold && current == BookieState::ReadOnly && dir_count > 0 {
                     // Recover: total usage across all dirs is below LWM (matching Java)
                     if state.transition_to(BookieState::Running) {
+                        crate::metrics::BOOKIE_STATE.set(1); // 1 = writable
                         println!("Disk monitor: total disk usage ({:.1}%) below {:.0}% LWM, transitioning back to WRITABLE",
                             total_usage * 100.0, lwm_threshold * 100.0);
                         update_zk_registration(&zk_info, false).await;
