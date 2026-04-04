@@ -261,38 +261,63 @@ async fn handle_connection(
     let mut codec = BookieCodec::new(max_frame_size);
     let mut buf = BytesMut::with_capacity(4096);
     let mut out = BytesMut::with_capacity(256);
+    let mut is_v3: Option<bool> = None; // None = not yet detected
 
     loop {
         // Try to decode a complete frame from the buffer first
         match codec.decode(&mut buf) {
             Ok(Some(frame)) => {
-                // Decode the request from the frame
-                match decode_request(frame.freeze()) {
-                    Ok(req) => {
-                        let proc = processor.clone();
-                        let resp = match tokio::task::spawn_blocking(move || proc.process_request(req)).await {
-                            Ok(resp) => resp,
-                            Err(_) => break, // task panicked or cancelled
-                        };
-                        let resp_bytes = encode_response(&resp);
+                let frame_bytes = frame.freeze();
+                let response_bytes: Bytes;
 
-                        // Encode the response with length-prefix framing
-                        out.clear();
-                        if codec
-                            .encode(Bytes::from(resp_bytes.freeze()), &mut out)
-                            .is_ok()
-                        {
-                            if writer.write_all(&out).await.is_err() {
-                                break;
-                            }
-                        } else {
+                // Auto-detect protocol version on first frame
+                let use_v3 = is_v3.unwrap_or_else(|| {
+                    // Try V3 protobuf decode first (Java client defaults to V3)
+                    crate::v3_processor::try_decode_v3(&frame_bytes).is_some()
+                });
+
+                if use_v3 {
+                    is_v3 = Some(true);
+                    if let Some(v3_req) = crate::v3_processor::try_decode_v3(&frame_bytes) {
+                        let proc = processor.clone();
+                        let resp = match tokio::task::spawn_blocking(move || {
+                            crate::v3_processor::process_v3_request(&proc, v3_req)
+                        }).await {
+                            Ok(resp) => resp,
+                            Err(_) => break,
+                        };
+                        response_bytes = Bytes::from(resp);
+                    } else {
+                        // Sticky V3 connection but frame failed to decode — close
+                        break;
+                    }
+                } else {
+                    is_v3 = Some(false);
+                    match decode_request(frame_bytes) {
+                        Ok(req) => {
+                            let proc = processor.clone();
+                            let resp = match tokio::task::spawn_blocking(move || proc.process_request(req)).await {
+                                Ok(resp) => resp,
+                                Err(_) => break, // task panicked or cancelled
+                            };
+                            let resp_encoded = encode_response(&resp);
+                            response_bytes = resp_encoded.freeze();
+                        }
+                        Err(_) => {
+                            // Unknown or malformed request — close connection
                             break;
                         }
                     }
-                    Err(_) => {
-                        // Unknown or malformed request — close connection
+                }
+
+                // Encode the response with length-prefix framing
+                out.clear();
+                if codec.encode(response_bytes, &mut out).is_ok() {
+                    if writer.write_all(&out).await.is_err() {
                         break;
                     }
+                } else {
+                    break;
                 }
             }
             Ok(None) => {

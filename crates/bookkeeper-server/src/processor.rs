@@ -227,6 +227,10 @@ impl RequestProcessor {
         }
     }
 
+    pub fn force_flush(&self) -> Result<(), bookkeeper_storage::StorageError> {
+        self.storage.flush()
+    }
+
     fn add_error_response(&self, err: BKError, ledger_id: i64, entry_id: i64) -> V2Response {
         V2Response::Add {
             error_code: err.to_v2_code(),
