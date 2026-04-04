@@ -1,18 +1,15 @@
+use bookkeeper_config::server::ServerConfig;
 use bookkeeper_server::server::BookieServer;
-use bookkeeper_server::config::BookieConfig;
 use tempfile::TempDir;
 
-fn test_config(dir: &TempDir) -> BookieConfig {
-    BookieConfig {
-        port: 0,
-        ledger_dirs: vec![dir.path().to_string_lossy().to_string()],
-        journal_dir: dir.path().to_string_lossy().to_string(),
-        max_frame_size: 5 * 1024 * 1024,
-        zk_connect: None,
-        zk_ledger_root: "/ledgers".to_string(),
-        bookie_id: None,
-        http_port: Some(0), // OS-assigned HTTP port
-    }
+fn test_config(dir: &TempDir) -> ServerConfig {
+    let mut config = ServerConfig::default();
+    config.bookie_port = 0;
+    config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
+    config.journal_directory = dir.path().to_string_lossy().to_string();
+    config.http_server_enabled = true;
+    config.http_server_port = 0; // OS-assigned HTTP port
+    config
 }
 
 #[tokio::test]

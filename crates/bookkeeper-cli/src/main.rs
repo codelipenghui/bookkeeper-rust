@@ -38,16 +38,19 @@ enum Commands {
     },
     /// Start a bookie server (long-running)
     Serve {
-        /// Bookie port (0 = OS-assigned)
-        #[arg(long, default_value = "3181")]
-        port: u16,
-        /// Data directory
+        /// Path to bk_server.conf configuration file
+        #[arg(long, short = 'c')]
+        conf: Option<String>,
+        /// Override: bookie port
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override: data directory
         #[arg(long)]
         data_dir: Option<String>,
-        /// ZooKeeper connection string
+        /// Override: ZooKeeper connection string
         #[arg(long)]
         zk: Option<String>,
-        /// ZooKeeper ledger root path
+        /// Override: ZooKeeper ledger root path
         #[arg(long, default_value = "/ledgers")]
         ledger_root: String,
     },
@@ -72,8 +75,8 @@ async fn main() {
         Commands::Listbookies { zk, ledger_root, rw, ro, all } => {
             cmd_listbookies(&zk, &ledger_root, rw, ro, all).await
         }
-        Commands::Serve { port, data_dir, zk, ledger_root } => {
-            cmd_serve(port, data_dir, zk, ledger_root).await
+        Commands::Serve { conf, port, data_dir, zk, ledger_root } => {
+            cmd_serve(conf, port, data_dir, zk, ledger_root).await
         }
         Commands::Bookiesanity { entries, data_dir } => {
             cmd_bookiesanity(entries, data_dir).await
@@ -148,9 +151,9 @@ async fn cmd_bookiesanity(
     data_dir: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bookkeeper_client::client::BookKeeperClient;
+    use bookkeeper_config::server::ServerConfig;
     use bookkeeper_protocol::digest::DigestType;
     use bookkeeper_server::server::BookieServer;
-    use bookkeeper_server::config::BookieConfig;
 
     // Start a temporary bookie
     let _temp_dir;
@@ -162,16 +165,10 @@ async fn cmd_bookiesanity(
         }
     };
 
-    let config = BookieConfig {
-        port: 0,
-        ledger_dirs: vec![dir_path.clone()],
-        journal_dir: dir_path.clone(),
-        max_frame_size: 5 * 1024 * 1024,
-        zk_connect: None,
-        zk_ledger_root: "/ledgers".to_string(),
-        bookie_id: None,
-        http_port: None,
-    };
+    let mut config = ServerConfig::default();
+    config.bookie_port = 0;
+    config.ledger_directories = vec![dir_path.clone()];
+    config.journal_directory = dir_path.clone();
     let server = BookieServer::start(config).await?;
     let addr = server.local_addr();
     println!("Started temporary bookie at {addr}");
@@ -216,40 +213,47 @@ async fn cmd_bookiesanity(
 }
 
 async fn cmd_serve(
-    port: u16,
+    conf: Option<String>,
+    port: Option<u16>,
     data_dir: Option<String>,
     zk: Option<String>,
     ledger_root: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use bookkeeper_config::server::ServerConfig;
     use bookkeeper_server::server::BookieServer;
-    use bookkeeper_server::config::BookieConfig;
 
-    let _temp_dir;
-    let dir_path = match &data_dir {
-        Some(d) => d.clone(),
-        None => {
-            _temp_dir = tempfile::TempDir::new()?;
-            _temp_dir.path().to_string_lossy().to_string()
+    // Load config from file or use defaults
+    let mut config = match conf {
+        Some(ref path) => {
+            println!("Loading config from {path}");
+            ServerConfig::from_file(std::path::Path::new(path))?
         }
+        None => ServerConfig::default(),
     };
 
-    let config = BookieConfig {
-        port,
-        ledger_dirs: vec![dir_path.clone()],
-        journal_dir: dir_path.clone(),
-        max_frame_size: 5 * 1024 * 1024,
-        zk_connect: zk,
-        zk_ledger_root: ledger_root,
-        bookie_id: None,
-        http_port: None,
-    };
+    // Apply command-line overrides
+    if let Some(p) = port { config.bookie_port = p; }
+    if let Some(ref d) = data_dir {
+        config.ledger_directories = vec![d.clone()];
+        config.journal_directory = d.clone();
+    }
+    if let Some(ref z) = zk { config.zk_servers = Some(z.clone()); }
+    config.zk_ledger_root = ledger_root;
+
+    // Ensure directories exist
+    for dir in &config.ledger_directories {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(&config.journal_directory)?;
 
     let server = BookieServer::start(config).await?;
     let addr = server.local_addr();
     println!("Bookie started at {addr}");
+    if let Some(http) = server.http_addr() {
+        println!("HTTP admin at {http}");
+    }
     println!("Press Ctrl+C to stop.");
 
-    // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
     println!("\nShutting down...");
     server.shutdown().await;

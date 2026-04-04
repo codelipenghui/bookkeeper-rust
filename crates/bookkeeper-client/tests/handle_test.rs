@@ -5,22 +5,17 @@ use bookkeeper_client::bookie_connection::{BookieConnection, ClientError};
 use bookkeeper_client::distribution::RoundRobinDistributionSchedule;
 use bookkeeper_client::write_handle::WriteHandle;
 use bookkeeper_client::read_handle::ReadHandle;
+use bookkeeper_config::server::ServerConfig;
 use bookkeeper_protocol::digest::{DigestManager, DigestType};
 use bookkeeper_server::server::BookieServer;
-use bookkeeper_server::config::BookieConfig;
 use tempfile::TempDir;
 
-fn test_config(dir: &tempfile::TempDir) -> BookieConfig {
-    BookieConfig {
-        port: 0,
-        ledger_dirs: vec![dir.path().to_string_lossy().to_string()],
-        journal_dir: dir.path().to_string_lossy().to_string(),
-        max_frame_size: 5 * 1024 * 1024,
-        zk_connect: None,
-        zk_ledger_root: "/ledgers".to_string(),
-        bookie_id: None,
-        http_port: None,
-    }
+fn test_config(dir: &tempfile::TempDir) -> ServerConfig {
+    let mut config = ServerConfig::default();
+    config.bookie_port = 0;
+    config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
+    config.journal_directory = dir.path().to_string_lossy().to_string();
+    config
 }
 
 #[tokio::test]

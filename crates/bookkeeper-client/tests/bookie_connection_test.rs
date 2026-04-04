@@ -1,8 +1,8 @@
 use bookkeeper_client::bookie_connection::BookieConnection;
+use bookkeeper_config::server::ServerConfig;
 use bookkeeper_protocol::v2::response::V2Response;
 use bookkeeper_protocol::constants::V2_EOK;
 use bookkeeper_server::server::BookieServer;
-use bookkeeper_server::config::BookieConfig;
 use bytes::Bytes;
 use tempfile::TempDir;
 
@@ -19,16 +19,10 @@ fn make_entry(ledger_id: i64, entry_id: i64, lac: i64, payload: &[u8]) -> Bytes 
 #[tokio::test]
 async fn connect_and_add_entry() {
     let dir = TempDir::new().unwrap();
-    let config = BookieConfig {
-        port: 0,
-        ledger_dirs: vec![dir.path().to_string_lossy().to_string()],
-        journal_dir: dir.path().to_string_lossy().to_string(),
-        max_frame_size: 5 * 1024 * 1024,
-        zk_connect: None,
-        zk_ledger_root: "/ledgers".to_string(),
-        bookie_id: None,
-        http_port: None,
-    };
+    let mut config = ServerConfig::default();
+    config.bookie_port = 0;
+    config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
+    config.journal_directory = dir.path().to_string_lossy().to_string();
     let server = BookieServer::start(config).await.unwrap();
     let addr = server.local_addr();
 
@@ -52,16 +46,10 @@ async fn connect_and_add_entry() {
 #[tokio::test]
 async fn connect_and_read_entry() {
     let dir = TempDir::new().unwrap();
-    let config = BookieConfig {
-        port: 0,
-        ledger_dirs: vec![dir.path().to_string_lossy().to_string()],
-        journal_dir: dir.path().to_string_lossy().to_string(),
-        max_frame_size: 5 * 1024 * 1024,
-        zk_connect: None,
-        zk_ledger_root: "/ledgers".to_string(),
-        bookie_id: None,
-        http_port: None,
-    };
+    let mut config = ServerConfig::default();
+    config.bookie_port = 0;
+    config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
+    config.journal_directory = dir.path().to_string_lossy().to_string();
     let server = BookieServer::start(config).await.unwrap();
     let addr = server.local_addr();
 

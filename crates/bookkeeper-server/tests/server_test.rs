@@ -1,4 +1,4 @@
-use bookkeeper_server::config::BookieConfig;
+use bookkeeper_config::server::ServerConfig;
 use bookkeeper_server::server::BookieServer;
 use bookkeeper_protocol::framing::BookieCodec;
 use bookkeeper_protocol::v2::request::{encode_request, V2Request};
@@ -10,17 +10,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
 
-fn test_config(port: u16, ledger_dir: &str) -> BookieConfig {
-    BookieConfig {
-        port,
-        ledger_dirs: vec![ledger_dir.to_string()],
-        journal_dir: ledger_dir.to_string(),
-        max_frame_size: 5 * 1024 * 1024,
-        zk_connect: None,
-        zk_ledger_root: "/ledgers".to_string(),
-        bookie_id: None,
-        http_port: None,
-    }
+fn test_config(port: u16, ledger_dir: &str) -> ServerConfig {
+    let mut config = ServerConfig::default();
+    config.bookie_port = port;
+    config.ledger_directories = vec![ledger_dir.to_string()];
+    config.journal_directory = ledger_dir.to_string();
+    config
 }
 
 fn make_entry(ledger_id: i64, entry_id: i64, lac: i64, payload: &[u8]) -> Bytes {

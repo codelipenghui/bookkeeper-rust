@@ -351,6 +351,7 @@ name = "bookkeeper-client"
 version = "0.1.0"
 dependencies = [
  "bookkeeper-common",
+ "bookkeeper-config",
  "bookkeeper-metadata",
  "bookkeeper-proto",
  "bookkeeper-protocol",
@@ -428,6 +429,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bookkeeper-common",
+ "bookkeeper-config",
  "bookkeeper-metadata",
  "bookkeeper-proto",
  "bookkeeper-protocol",

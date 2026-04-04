@@ -15,7 +15,7 @@ use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
 
 use bookkeeper_metadata::traits::RegistrationManager;
 
-use crate::config::BookieConfig;
+use bookkeeper_config::server::ServerConfig;
 use crate::http_api;
 use crate::processor::RequestProcessor;
 use crate::state::{BookieState, BookieStateManager};
@@ -31,15 +31,15 @@ pub struct BookieServer {
 }
 
 impl BookieServer {
-    pub async fn start(config: BookieConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn start(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
         // Bind TCP listener
-        let addr = format!("0.0.0.0:{}", config.port);
+        let addr = format!("0.0.0.0:{}", config.bookie_port);
         let listener = TcpListener::bind(&addr).await?;
         let local_addr = listener.local_addr()?;
 
         // Open storage using first ledger dir
         let ledger_dir = config
-            .ledger_dirs
+            .ledger_directories
             .first()
             .ok_or("no ledger dirs configured")?;
         let storage = DbLedgerStorage::open(Path::new(ledger_dir))?;
@@ -60,12 +60,12 @@ impl BookieServer {
         let max_frame_size = config.max_frame_size;
 
         // Optionally register with ZooKeeper
-        let zk_reg = if let Some(ref zk_connect) = config.zk_connect {
-            let bookie_id = config.bookie_id.clone().unwrap_or_else(|| {
+        let zk_reg = if let Some(ref zk_servers) = config.zk_servers {
+            let bookie_id = config.advertised_address.clone().unwrap_or_else(|| {
                 format!("{}:{}", local_addr.ip(), local_addr.port())
             });
             let reg_mgr = bookkeeper_metadata::zk::registration::ZkRegistrationManager::new(
-                zk_connect,
+                zk_servers,
                 &config.zk_ledger_root,
             )
             .await
@@ -87,7 +87,8 @@ impl BookieServer {
 
 
         // Optionally start HTTP admin API server
-        let http_addr = if let Some(http_port) = config.http_port {
+        let http_addr = if config.http_server_enabled {
+            let http_port = config.http_server_port as u16;
             let http_state = http_api::HttpState { state_manager: state.clone() };
             let router = http_api::create_router(http_state);
             let http_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{http_port}")).await?;
@@ -159,11 +160,11 @@ impl BookieServer {
 async fn validate_cookie(
     zk_reg: &dyn bookkeeper_metadata::traits::RegistrationManager,
     bookie_id: &str,
-    config: &BookieConfig,
+    config: &ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bookkeeper_metadata::cookie::Cookie;
 
-    let journal_dir = std::path::Path::new(&config.journal_dir);
+    let journal_dir = std::path::Path::new(&config.journal_directory);
     let disk_cookie_path = journal_dir.join("COOKIE");
 
     // Read cookie from ZK
@@ -191,10 +192,10 @@ async fn validate_cookie(
         }
         (None, None) => {
             // First time — create cookie in both ZK and disk
-            let ledger_dirs: Vec<&str> = config.ledger_dirs.iter().map(|s| s.as_str()).collect();
+            let ledger_dirs: Vec<&str> = config.ledger_directories.iter().map(|s| s.as_str()).collect();
             let cookie = Cookie::new(
                 bookie_id,
-                &config.journal_dir,
+                &config.journal_directory,
                 &ledger_dirs,
                 zk_reg.get_cluster_instance_id().await
                     .map_err(|e| format!("get instance id: {e}"))?
