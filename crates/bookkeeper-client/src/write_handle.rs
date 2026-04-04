@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::future::join_all;
 
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::digest::DigestManager;
@@ -55,7 +56,7 @@ impl WriteHandle {
     /// bookies in parallel, waits for ack quorum, advances LAC. Returns the entry ID.
     pub async fn append(
         &mut self,
-        conns: &[Arc<tokio::sync::Mutex<BookieConnection>>],
+        conns: &[Arc<BookieConnection>],
         payload: &[u8],
     ) -> Result<i64, ClientError> {
         let entry_id = self.last_add_pushed + 1;
@@ -68,8 +69,7 @@ impl WriteHandle {
         // Determine write set
         let write_set = self.schedule.write_set(entry_id);
 
-        // Send to all bookies in parallel
-        let mut futures = Vec::new();
+        // Validate indices before building futures
         for &bookie_idx in &write_set {
             if bookie_idx >= conns.len() {
                 return Err(ClientError::Protocol(format!(
@@ -77,21 +77,24 @@ impl WriteHandle {
                     conns.len()
                 )));
             }
-            let conn = conns[bookie_idx].clone();
-            let entry = entry_bytes.clone();
-            let mk = self.master_key;
-            futures.push(tokio::spawn(async move {
-                let mut conn = conn.lock().await;
-                conn.send_add_entry(0, mk, entry).await
-            }));
         }
+
+        // Send to all bookies in parallel using join_all (no spawn needed — &self)
+        let mk = self.master_key;
+        let futures: Vec<_> = write_set.iter().map(|&bookie_idx| {
+            let conn = &*conns[bookie_idx];
+            let entry = entry_bytes.clone();
+            async move { conn.send_add_entry(0, mk, entry).await }
+        }).collect();
+
+        let results = join_all(futures).await;
 
         // Collect results
         let mut ack_set = self.schedule.new_ack_set();
-        for (i, future) in futures.into_iter().enumerate() {
+        for (i, result) in results.into_iter().enumerate() {
             let bookie_idx = write_set[i];
-            match future.await {
-                Ok(Ok(V2Response::Add { error_code, .. })) => {
+            match result {
+                Ok(V2Response::Add { error_code, .. }) => {
                     if error_code == V2_EOK {
                         if ack_set.complete_bookie(bookie_idx) {
                             self.last_add_confirmed = entry_id;
@@ -105,19 +108,14 @@ impl WriteHandle {
                         }
                     }
                 }
-                Ok(Ok(_)) => {
+                Ok(_) => {
                     if ack_set.fail_bookie(bookie_idx) {
                         return Err(ClientError::Protocol("unexpected response type".into()));
                     }
                 }
-                Ok(Err(e)) => {
-                    if ack_set.fail_bookie(bookie_idx) {
-                        return Err(e);
-                    }
-                }
                 Err(e) => {
                     if ack_set.fail_bookie(bookie_idx) {
-                        return Err(ClientError::Protocol(format!("task panic: {e}")));
+                        return Err(e);
                     }
                 }
             }

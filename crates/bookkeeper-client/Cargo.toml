@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 sha1 = { workspace = true }
 prost = { workspace = true }
 rand = "0.8"
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

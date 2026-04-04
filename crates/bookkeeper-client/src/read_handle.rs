@@ -34,7 +34,7 @@ impl ReadHandle {
     /// Read a single entry. Tries bookies in write set order, returns first success.
     pub async fn read_entry(
         &self,
-        conns: &[Arc<tokio::sync::Mutex<BookieConnection>>],
+        conns: &[Arc<BookieConnection>],
         entry_id: i64,
     ) -> Result<Vec<u8>, ClientError> {
         let write_set = self.schedule.write_set(entry_id);
@@ -44,8 +44,7 @@ impl ReadHandle {
             if bookie_idx >= conns.len() {
                 continue;
             }
-            let mut conn = conns[bookie_idx].lock().await;
-            match conn.send_read_entry(0, self.ledger_id, entry_id, Some(self.master_key)).await {
+            match conns[bookie_idx].send_read_entry(0, self.ledger_id, entry_id, Some(self.master_key)).await {
                 Ok(V2Response::Read { error_code, data, .. }) => {
                     if error_code == V2_EOK {
                         if let Some(entry_data) = data {
@@ -87,7 +86,7 @@ impl ReadHandle {
     /// Read a range of entries [first_entry..=last_entry].
     pub async fn read_entries(
         &self,
-        conns: &[Arc<tokio::sync::Mutex<BookieConnection>>],
+        conns: &[Arc<BookieConnection>],
         first_entry: i64,
         last_entry: i64,
     ) -> Result<Vec<Vec<u8>>, ClientError> {

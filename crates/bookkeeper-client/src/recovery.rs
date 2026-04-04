@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::Mutex;
+use futures::future::join_all;
 
 use bookkeeper_common::error::BKError;
 use bookkeeper_common::types::LAST_ADD_CONFIRMED;
@@ -65,39 +65,41 @@ impl RecoveryHandle {
     /// eliminating the need for an O(N) pre-loop in forward_read().
     pub async fn fence(
         &mut self,
-        conns: &[Arc<Mutex<BookieConnection>>],
+        conns: &[Arc<BookieConnection>],
         last_ensemble_entry_id: i64,
     ) -> Result<i64, ClientError> {
         let write_quorum = self.schedule.write_quorum_size();
-        let mut max_lac: i64 = -1;
-        let mut success_count = 0;
 
-        // Send fencing read to ALL bookies in ensemble (not just write set)
-        let mut futures = Vec::new();
-        for (idx, _bookie) in self.ensemble.iter().enumerate() {
-            if idx >= conns.len() {
-                continue;
-            }
-            let conn = conns[idx].clone();
-            let ledger_id = self.ledger_id;
-            let master_key = self.master_key;
-            futures.push(tokio::spawn(async move {
-                let mut conn = conn.lock().await;
+        let ledger_id = self.ledger_id;
+        let master_key = self.master_key;
+
+        // Send fencing read to ALL bookies in ensemble (not just write set) in parallel
+        let indices: Vec<usize> = (0..self.ensemble.len())
+            .filter(|&idx| idx < conns.len())
+            .collect();
+
+        let futures: Vec<_> = indices.iter().map(|&idx| {
+            let conn = &*conns[idx];
+            async move {
                 conn.send_read_entry(
                     FLAG_DO_FENCING,
                     ledger_id,
                     LAST_ADD_CONFIRMED,
                     Some(master_key),
                 ).await
-            }));
-        }
+            }
+        }).collect();
+
+        let responses = join_all(futures).await;
 
         let no_entry_code = BKError::NoEntry.to_v2_code();
 
-        // Collect responses
-        for future in futures {
-            match future.await {
-                Ok(Ok(V2Response::Read { error_code, entry_id, data, .. })) => {
+        let mut max_lac: i64 = -1;
+        let mut success_count = 0;
+
+        for result in responses {
+            match result {
+                Ok(V2Response::Read { error_code, entry_id, data, .. }) => {
                     if error_code == V2_EOK || error_code == no_entry_code {
                         success_count += 1;
                         // entry_id contains the LAC for LAST_ADD_CONFIRMED reads
@@ -138,7 +140,7 @@ impl RecoveryHandle {
     /// This method only scans forward from recovery_lac+1.
     pub async fn forward_read(
         &mut self,
-        conns: &[Arc<Mutex<BookieConnection>>],
+        conns: &[Arc<BookieConnection>],
         recovery_lac: i64,
     ) -> Result<i64, ClientError> {
         let mut last_entry = recovery_lac;
@@ -152,8 +154,7 @@ impl RecoveryHandle {
                 if bookie_idx >= conns.len() {
                     continue;
                 }
-                let mut conn = conns[bookie_idx].lock().await;
-                match conn.send_read_entry(0, self.ledger_id, entry_id, None).await {
+                match conns[bookie_idx].send_read_entry(0, self.ledger_id, entry_id, None).await {
                     Ok(V2Response::Read { error_code, data, .. }) => {
                         if error_code == V2_EOK {
                             if let Some(entry_data) = data {
@@ -185,8 +186,7 @@ impl RecoveryHandle {
                 if bookie_idx >= conns.len() {
                     continue;
                 }
-                let mut conn = conns[bookie_idx].lock().await;
-                match conn.send_read_entry(0, self.ledger_id, recovery_lac, None).await {
+                match conns[bookie_idx].send_read_entry(0, self.ledger_id, recovery_lac, None).await {
                     Ok(V2Response::Read { error_code, data, .. }) if error_code == V2_EOK => {
                         if let Some(entry_data) = data {
                             if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
@@ -210,7 +210,7 @@ impl RecoveryHandle {
     /// re-replicating existing entries where the cumulative length must be preserved.
     pub async fn recovery_add_entry(
         &self,
-        conns: &[Arc<Mutex<BookieConnection>>],
+        conns: &[Arc<BookieConnection>],
         entry_id: i64,
         payload: &[u8],
     ) -> Result<i64, ClientError> {
@@ -226,23 +226,24 @@ impl RecoveryHandle {
         let write_set = self.schedule.write_set(entry_id);
         let mut ack_set = self.schedule.new_ack_set();
 
-        let mut futures = Vec::new();
-        for &bookie_idx in &write_set {
-            if bookie_idx >= conns.len() {
-                continue;
-            }
-            let conn = conns[bookie_idx].clone();
-            let entry = entry_bytes.clone();
-            let mk = self.master_key;
-            futures.push((bookie_idx, tokio::spawn(async move {
-                let mut conn = conn.lock().await;
-                conn.send_add_entry(FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY, mk, entry).await
-            })));
-        }
+        let mk = self.master_key;
+        let valid_indices: Vec<usize> = write_set.iter()
+            .filter(|&&idx| idx < conns.len())
+            .copied()
+            .collect();
 
-        for (bookie_idx, future) in futures {
-            match future.await {
-                Ok(Ok(V2Response::Add { error_code, .. })) => {
+        let futures: Vec<_> = valid_indices.iter().map(|&bookie_idx| {
+            let conn = &*conns[bookie_idx];
+            let entry = entry_bytes.clone();
+            async move { conn.send_add_entry(FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY, mk, entry).await }
+        }).collect();
+
+        let results = join_all(futures).await;
+
+        for (i, result) in results.into_iter().enumerate() {
+            let bookie_idx = valid_indices[i];
+            match result {
+                Ok(V2Response::Add { error_code, .. }) => {
                     if error_code == V2_EOK {
                         if ack_set.complete_bookie(bookie_idx) {
                             return Ok(entry_id);
@@ -269,31 +270,31 @@ impl RecoveryHandle {
     /// preserving the cumulative `length` field already embedded in the entry.
     async fn recovery_add_raw(
         &self,
-        conns: &[Arc<Mutex<BookieConnection>>],
+        conns: &[Arc<BookieConnection>],
         entry_id: i64,
         entry_data: Bytes,
     ) -> Result<(), ClientError> {
         let write_set = self.schedule.write_set(entry_id);
         let mut ack_set = self.schedule.new_ack_set();
 
-        let mut futures = Vec::new();
-        for &bookie_idx in &write_set {
-            if bookie_idx >= conns.len() {
-                continue;
-            }
-            let conn = conns[bookie_idx].clone();
-            let entry = entry_data.clone();
-            let mk = self.master_key;
-            futures.push(tokio::spawn(async move {
-                let mut conn = conn.lock().await;
-                conn.send_add_entry(FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY, mk, entry).await
-            }));
-        }
+        let mk = self.master_key;
+        let valid_indices: Vec<usize> = write_set.iter()
+            .filter(|&&idx| idx < conns.len())
+            .copied()
+            .collect();
 
-        for (i, future) in futures.into_iter().enumerate() {
-            let bookie_idx = write_set[i];
-            match future.await {
-                Ok(Ok(V2Response::Add { error_code, .. })) => {
+        let futures: Vec<_> = valid_indices.iter().map(|&bookie_idx| {
+            let conn = &*conns[bookie_idx];
+            let entry = entry_data.clone();
+            async move { conn.send_add_entry(FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY, mk, entry).await }
+        }).collect();
+
+        let results = join_all(futures).await;
+
+        for (i, result) in results.into_iter().enumerate() {
+            let bookie_idx = valid_indices[i];
+            match result {
+                Ok(V2Response::Add { error_code, .. }) => {
                     if error_code == V2_EOK {
                         if ack_set.complete_bookie(bookie_idx) {
                             return Ok(());
@@ -327,7 +328,7 @@ impl RecoveryHandle {
     /// Returns (lastEntryId, totalLength) for metadata update.
     pub async fn recover(
         &mut self,
-        conns: &[Arc<Mutex<BookieConnection>>],
+        conns: &[Arc<BookieConnection>],
         last_ensemble_entry_id: i64,
     ) -> Result<(i64, i64), ClientError> {
         // Phase 1: Fence (also extracts total_length from fencing response data)
@@ -347,8 +348,7 @@ impl RecoveryHandle {
                 if bookie_idx >= conns.len() {
                     continue;
                 }
-                let mut conn = conns[bookie_idx].lock().await;
-                match conn.send_read_entry(0, self.ledger_id, eid, None).await {
+                match conns[bookie_idx].send_read_entry(0, self.ledger_id, eid, None).await {
                     Ok(V2Response::Read { error_code, data, .. }) if error_code == V2_EOK => {
                         if let Some(d) = data {
                             entry_data = Some(d);

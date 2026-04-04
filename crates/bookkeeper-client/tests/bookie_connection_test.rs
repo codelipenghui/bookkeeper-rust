@@ -32,7 +32,7 @@ async fn connect_and_add_entry() {
     let server = BookieServer::start(config).await.unwrap();
     let addr = server.local_addr();
 
-    let mut conn = BookieConnection::connect(addr).await.unwrap();
+    let conn = BookieConnection::connect(addr).await.unwrap();
 
     let entry_data = make_entry(1, 0, -1, b"hello from client");
     let resp = conn.send_add_entry(0, [0u8; 20], entry_data).await.unwrap();
@@ -65,7 +65,7 @@ async fn connect_and_read_entry() {
     let server = BookieServer::start(config).await.unwrap();
     let addr = server.local_addr();
 
-    let mut conn = BookieConnection::connect(addr).await.unwrap();
+    let conn = BookieConnection::connect(addr).await.unwrap();
 
     // Write
     let entry_data = make_entry(1, 0, -1, b"test data");

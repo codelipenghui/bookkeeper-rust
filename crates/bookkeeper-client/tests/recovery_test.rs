@@ -6,7 +6,6 @@ use bookkeeper_protocol::digest::{DigestManager, DigestType, generate_master_key
 use bookkeeper_server::server::BookieServer;
 use bookkeeper_server::config::BookieConfig;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tempfile::TempDir;
 
 fn test_config(dir: &TempDir) -> BookieConfig {
@@ -42,7 +41,7 @@ async fn fence_ledger_and_get_lac() {
     let dm = DigestManager::new(DigestType::Crc32c);
     let master_key = generate_master_key(b"");
 
-    let conn = Arc::new(Mutex::new(BookieConnection::connect(addr).await.unwrap()));
+    let conn = Arc::new(BookieConnection::connect(addr).await.unwrap());
     let conns = vec![conn];
 
     let mut recovery = RecoveryHandle::new(1, ensemble, schedule, dm, master_key);
@@ -68,7 +67,7 @@ async fn fence_blocks_normal_writes() {
     let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
     let dm = DigestManager::new(DigestType::Crc32c);
     let master_key = generate_master_key(b"");
-    let conn = Arc::new(Mutex::new(BookieConnection::connect(addr).await.unwrap()));
+    let conn = Arc::new(BookieConnection::connect(addr).await.unwrap());
     let mut recovery = RecoveryHandle::new(1, ensemble, schedule, dm, master_key);
     recovery.fence(&vec![conn], 0).await.unwrap();
 
@@ -97,7 +96,7 @@ async fn full_recovery_read_and_close() {
     let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
     let dm = DigestManager::new(DigestType::Crc32c);
     let master_key = generate_master_key(b"");
-    let conn = Arc::new(Mutex::new(BookieConnection::connect(addr).await.unwrap()));
+    let conn = Arc::new(BookieConnection::connect(addr).await.unwrap());
     let conns = vec![conn];
 
     let mut recovery = RecoveryHandle::new(1, ensemble, schedule, dm, master_key);
@@ -132,7 +131,7 @@ async fn recovery_add_bypasses_fence() {
     let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
     let dm = DigestManager::new(DigestType::Crc32c);
     let master_key = generate_master_key(b"");
-    let conn = Arc::new(Mutex::new(BookieConnection::connect(addr).await.unwrap()));
+    let conn = Arc::new(BookieConnection::connect(addr).await.unwrap());
     let conns = vec![conn];
     let mut recovery = RecoveryHandle::new(1, ensemble, schedule, dm, master_key);
     recovery.fence(&conns, 0).await.unwrap();
@@ -162,7 +161,7 @@ async fn combined_recover_protocol() {
     let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
     let dm = DigestManager::new(DigestType::Crc32c);
     let master_key = generate_master_key(b"");
-    let conn = Arc::new(Mutex::new(BookieConnection::connect(addr).await.unwrap()));
+    let conn = Arc::new(BookieConnection::connect(addr).await.unwrap());
     let conns = vec![conn];
 
     let mut recovery = RecoveryHandle::new(1, ensemble, schedule, dm, master_key);

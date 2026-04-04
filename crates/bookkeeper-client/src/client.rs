@@ -11,7 +11,7 @@ use crate::write_handle::WriteHandle;
 /// Uses a fixed set of bookie addresses (no ZK discovery in this phase).
 pub struct BookKeeperClient {
     bookie_addrs: Vec<String>,
-    connections: Vec<Arc<tokio::sync::Mutex<BookieConnection>>>,
+    connections: Vec<Arc<BookieConnection>>,
 }
 
 impl BookKeeperClient {
@@ -30,14 +30,14 @@ impl BookKeeperClient {
                 let addr: SocketAddr = addr_str.parse()
                     .map_err(|e| ClientError::Protocol(format!("bad address '{addr_str}': {e}")))?;
                 let conn = BookieConnection::connect(addr).await?;
-                conns.push(Arc::new(tokio::sync::Mutex::new(conn)));
+                conns.push(Arc::new(conn));
             }
             self.connections = conns;
         }
         Ok(())
     }
 
-    pub fn connections(&self) -> &[Arc<tokio::sync::Mutex<BookieConnection>>] {
+    pub fn connections(&self) -> &[Arc<BookieConnection>] {
         &self.connections
     }
 
