@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use bytes::Bytes;
 use futures::future::join_all;
@@ -11,6 +11,54 @@ use bookkeeper_protocol::digest::DigestManager;
 use bookkeeper_protocol::v2::response::V2Response;
 use crate::bookie_connection::{BookieConnection, ClientError};
 use crate::distribution::RoundRobinDistributionSchedule;
+
+// ---------------------------------------------------------------------------
+// EnsembleInfo — ensemble segments, changingEnsemble flag, delayed failures
+// ---------------------------------------------------------------------------
+
+/// Tracks ensemble segments (firstEntryId -> ensemble) and serializes
+/// concurrent ensemble changes via the `changing_ensemble` flag.
+/// Matches Java BookKeeper's ensemble change bookkeeping.
+pub struct EnsembleInfo {
+    /// Ensemble segments: maps firstEntryId to the ensemble active from that entry.
+    /// There is always at least one entry (key 0 = initial ensemble).
+    segments: std::sync::Mutex<BTreeMap<i64, Vec<String>>>,
+    /// Whether an ensemble change is currently in progress. Gates LAC
+    /// advancement and causes new failures to be queued in `delayed_failures`.
+    changing_ensemble: AtomicBool,
+    /// Failures accumulated while `changing_ensemble` is true.
+    /// Each entry is (bookie_index, failed_bookie_addr).
+    delayed_failures: std::sync::Mutex<Vec<(usize, String)>>,
+}
+
+impl EnsembleInfo {
+    fn new(initial_ensemble: Vec<String>) -> Self {
+        let mut segments = BTreeMap::new();
+        segments.insert(0, initial_ensemble);
+        Self {
+            segments: std::sync::Mutex::new(segments),
+            changing_ensemble: AtomicBool::new(false),
+            delayed_failures: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Return the current (latest) ensemble.
+    fn current_ensemble(&self) -> Vec<String> {
+        let segs = self.segments.lock().unwrap();
+        segs.values().next_back().cloned().unwrap_or_default()
+    }
+
+    /// Add a new ensemble segment starting at `first_entry_id`.
+    fn add_segment(&self, first_entry_id: i64, ensemble: Vec<String>) {
+        let mut segs = self.segments.lock().unwrap();
+        segs.insert(first_entry_id, ensemble);
+    }
+
+    /// Return a snapshot of all segments.
+    pub fn segments(&self) -> BTreeMap<i64, Vec<String>> {
+        self.segments.lock().unwrap().clone()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LacState — shared, ordered LAC advancement
@@ -27,9 +75,18 @@ impl LacState {
     }
 
     /// Mark `entry_id` as complete and advance LAC as far as possible in order.
-    fn advance_lac(&self, entry_id: i64, lac_value: &AtomicI64) {
+    /// If `changing_ensemble` is true, the entry is recorded as completed but
+    /// the atomic LAC value is NOT advanced — matching Java's gating of
+    /// `sendAddSuccessCallbacks()` with `!changingEnsemble`.
+    fn advance_lac(&self, entry_id: i64, lac_value: &AtomicI64, ensemble_info: &EnsembleInfo) {
         let mut completed = self.completed.lock().unwrap();
         completed.insert(entry_id);
+
+        if ensemble_info.changing_ensemble.load(Ordering::Acquire) {
+            // Gate: don't advance LAC during ensemble change
+            return;
+        }
+
         let mut current_lac = lac_value.load(Ordering::Acquire);
         while completed.contains(&(current_lac + 1)) {
             current_lac += 1;
@@ -60,9 +117,13 @@ impl PendingAdd {
 // WriteHandle
 // ---------------------------------------------------------------------------
 
+/// Callback invoked when an ensemble change occurs.
+/// Arguments: (first_entry_id_of_new_segment, new_ensemble).
+/// The caller can use this to perform a metadata CAS update (e.g. in ZooKeeper).
+pub type OnEnsembleChange = Box<dyn Fn(i64, &[String]) + Send + Sync>;
+
 pub struct WriteHandle {
     ledger_id: i64,
-    ensemble: Vec<String>,
     /// All bookies available in the pool, used to find replacements on failure.
     available_bookies: Vec<String>,
     schedule: RoundRobinDistributionSchedule,
@@ -74,6 +135,10 @@ pub struct WriteHandle {
     lac_value: Arc<AtomicI64>,
     /// Completion tracking for out-of-order acks.
     lac_state: Arc<LacState>,
+    /// Ensemble segments, changing flag, and delayed failures.
+    ensemble_info: Arc<EnsembleInfo>,
+    /// Optional callback for metadata CAS update on ensemble change.
+    on_ensemble_change: Option<OnEnsembleChange>,
 }
 
 impl WriteHandle {
@@ -98,7 +163,6 @@ impl WriteHandle {
     ) -> Self {
         Self {
             ledger_id,
-            ensemble,
             available_bookies,
             schedule,
             digest_manager,
@@ -107,7 +171,14 @@ impl WriteHandle {
             current_length: 0,
             lac_value: Arc::new(AtomicI64::new(-1)),
             lac_state: Arc::new(LacState::new()),
+            ensemble_info: Arc::new(EnsembleInfo::new(ensemble)),
+            on_ensemble_change: None,
         }
+    }
+
+    /// Set the callback invoked on ensemble change for metadata CAS integration.
+    pub fn set_on_ensemble_change(&mut self, cb: OnEnsembleChange) {
+        self.on_ensemble_change = Some(cb);
     }
 
     /// Return the current last-add-confirmed value.
@@ -119,8 +190,14 @@ impl WriteHandle {
         self.ledger_id
     }
 
-    pub fn ensemble(&self) -> &[String] {
-        &self.ensemble
+    /// Return the current (latest) ensemble.
+    pub fn ensemble(&self) -> Vec<String> {
+        self.ensemble_info.current_ensemble()
+    }
+
+    /// Return all ensemble segments (firstEntryId -> ensemble).
+    pub fn ensemble_segments(&self) -> BTreeMap<i64, Vec<String>> {
+        self.ensemble_info.segments()
     }
 
     /// Replace the bookie at `failed_bookie_idx` with one from the available pool
@@ -131,13 +208,14 @@ impl WriteHandle {
         conns: &mut Vec<Arc<BookieConnection>>,
         failed_bookie_idx: usize,
     ) -> Result<(), ClientError> {
-        let current_ensemble: std::collections::HashSet<&str> =
-            self.ensemble.iter().map(|s| s.as_str()).collect();
+        let current_ensemble = self.ensemble_info.current_ensemble();
+        let current_set: std::collections::HashSet<&str> =
+            current_ensemble.iter().map(|s| s.as_str()).collect();
 
         let replacement = self
             .available_bookies
             .iter()
-            .find(|b| !current_ensemble.contains(b.as_str()))
+            .find(|b| !current_set.contains(b.as_str()))
             .ok_or_else(|| ClientError::Protocol("no available replacement bookie".into()))?
             .clone();
 
@@ -146,10 +224,17 @@ impl WriteHandle {
             .map_err(|e| ClientError::Protocol(format!("bad replacement addr: {e}")))?;
         let new_conn = Arc::new(BookieConnection::connect(addr).await?);
 
-        // Update ensemble and connections.
-        if failed_bookie_idx < self.ensemble.len() {
-            self.ensemble[failed_bookie_idx] = replacement;
+        // Update ensemble in the current (latest) segment.
+        {
+            let mut segs = self.ensemble_info.segments.lock().unwrap();
+            if let Some((_key, ens)) = segs.iter_mut().next_back() {
+                if failed_bookie_idx < ens.len() {
+                    ens[failed_bookie_idx] = replacement;
+                }
+            }
         }
+
+        // Update connections.
         if failed_bookie_idx < conns.len() {
             conns[failed_bookie_idx] = new_conn;
         } else {
@@ -191,6 +276,7 @@ impl WriteHandle {
         let mk = self.master_key;
         let lac_value = Arc::clone(&self.lac_value);
         let lac_state = Arc::clone(&self.lac_state);
+        let ensemble_info = Arc::clone(&self.ensemble_info);
 
         // Clone Arc<BookieConnection> handles for the spawned task, keeping the
         // write-set position alongside each handle so we can report which indices failed.
@@ -252,7 +338,7 @@ impl WriteHandle {
             }
 
             let outcome = if ack_count >= ack_quorum {
-                lac_state.advance_lac(entry_id, &lac_value);
+                lac_state.advance_lac(entry_id, &lac_value, &ensemble_info);
                 Ok(entry_id)
             } else {
                 let message = last_err
@@ -284,9 +370,16 @@ impl WriteHandle {
     /// Append with automatic ensemble change on bookie failure.
     ///
     /// If the write quorum cannot be reached because one or more bookies fail,
-    /// this method replaces each failed bookie with a spare from `available_bookies`,
-    /// reconnects, and retries the write once. The `conns` slice is updated in-place
-    /// to reflect the new ensemble.
+    /// this method:
+    /// 1. Sets the `changing_ensemble` flag (gates LAC advancement)
+    /// 2. Replaces each failed bookie with a spare from `available_bookies`
+    /// 3. Adds a new ensemble segment at LAC + 1
+    /// 4. Invokes the `on_ensemble_change` callback (for metadata CAS)
+    /// 5. Clears `changing_ensemble` and flushes queued LAC entries
+    /// 6. Processes any delayed failures accumulated during the change
+    /// 7. Retries the failed write
+    ///
+    /// Matches Java BookKeeper's `handleBookieFailure`/`ensembleChangeLoop` behavior.
     pub async fn append_with_ensemble_change(
         &mut self,
         conns: &mut Vec<Arc<BookieConnection>>,
@@ -296,19 +389,73 @@ impl WriteHandle {
         let result = self.append_async(conns, payload)?.wait().await;
 
         match result {
-            Ok(entry_id) => return Ok(entry_id),
+            Ok(entry_id) => Ok(entry_id),
             Err(ClientError::WriteQuorumFailed { failed_indices, .. }) => {
-                // Replace every failed bookie, then retry.
-                for idx in failed_indices {
-                    self.handle_bookie_failure(conns, idx).await?;
+                // Step 1: Set changing_ensemble flag — gates LAC advancement
+                self.ensemble_info.changing_ensemble.store(true, Ordering::Release);
+
+                // Step 2: Replace every failed bookie
+                for idx in &failed_indices {
+                    self.handle_bookie_failure(conns, *idx).await?;
                 }
-                // Retry: roll back last_add_pushed so append_async assigns the same entry_id.
+
+                // Step 3: Add new ensemble segment at LAC + 1
+                let new_segment_start = self.last_add_confirmed() + 1;
+                let new_ensemble = self.ensemble_info.current_ensemble();
+                self.ensemble_info.add_segment(new_segment_start, new_ensemble.clone());
+
+                // Step 4: Invoke metadata callback if set
+                if let Some(ref cb) = self.on_ensemble_change {
+                    cb(new_segment_start, &new_ensemble);
+                }
+
+                // Step 5: Clear changing_ensemble and flush queued LAC entries
+                self.ensemble_info.changing_ensemble.store(false, Ordering::Release);
+                self.flush_lac();
+
+                // Step 6: Process any delayed failures accumulated during the change
+                let delayed = {
+                    let mut df = self.ensemble_info.delayed_failures.lock().unwrap();
+                    let d = df.clone();
+                    df.clear();
+                    d
+                };
+                if !delayed.is_empty() {
+                    // Recursive handling: set flag again and process
+                    self.ensemble_info.changing_ensemble.store(true, Ordering::Release);
+                    for (idx, _addr) in &delayed {
+                        self.handle_bookie_failure(conns, *idx).await?;
+                    }
+                    let seg_start = self.last_add_confirmed() + 1;
+                    let ens = self.ensemble_info.current_ensemble();
+                    self.ensemble_info.add_segment(seg_start, ens.clone());
+                    if let Some(ref cb) = self.on_ensemble_change {
+                        cb(seg_start, &ens);
+                    }
+                    self.ensemble_info.changing_ensemble.store(false, Ordering::Release);
+                    self.flush_lac();
+                }
+
+                // Step 7: Retry the failed write
                 self.last_add_pushed -= 1;
                 self.current_length -= payload.len() as i64;
                 self.append_async(conns, payload)?.wait().await
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Drain the completed set and advance the atomic LAC value.
+    /// Called after ensemble change completes to flush entries that were
+    /// gated during `changing_ensemble = true`.
+    fn flush_lac(&self) {
+        let mut completed = self.lac_state.completed.lock().unwrap();
+        let mut current_lac = self.lac_value.load(Ordering::Acquire);
+        while completed.contains(&(current_lac + 1)) {
+            current_lac += 1;
+            completed.remove(&current_lac);
+        }
+        self.lac_value.store(current_lac, Ordering::Release);
     }
 
     fn build_entry(&self, entry_id: i64, payload: &[u8]) -> Bytes {

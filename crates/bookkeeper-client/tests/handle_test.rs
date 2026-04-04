@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bookkeeper_client::bookie_connection::{BookieConnection, ClientError};
 use bookkeeper_client::distribution::RoundRobinDistributionSchedule;
@@ -260,4 +261,182 @@ async fn write_quorum_failed_error_carries_failed_indices() {
         }
         other => panic!("expected WriteQuorumFailed, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ensemble segments tests (Issue 5)
+// ---------------------------------------------------------------------------
+
+/// Verify that a fresh WriteHandle starts with a single segment at entry 0.
+#[tokio::test]
+async fn ensemble_segments_initial_single_segment() {
+    let dir = TempDir::new().unwrap();
+    let server = BookieServer::start(test_config(&dir)).await.unwrap();
+    let addr = server.local_addr();
+
+    let ensemble = vec![addr.to_string()];
+    let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = [0u8; 20];
+
+    let wh = WriteHandle::new(1, ensemble.clone(), schedule, dm, master_key);
+    let segments = wh.ensemble_segments();
+    assert_eq!(segments.len(), 1, "should have exactly one initial segment");
+    assert_eq!(segments[&0], ensemble, "initial segment should be at entry 0");
+
+    server.shutdown().await;
+}
+
+/// Verify that after an ensemble change, a new segment is added.
+#[tokio::test]
+async fn ensemble_change_creates_new_segment() {
+    let dir1 = TempDir::new().unwrap();
+    let dir2 = TempDir::new().unwrap();
+    let server1 = BookieServer::start(test_config(&dir1)).await.unwrap();
+    let server2 = BookieServer::start(test_config(&dir2)).await.unwrap();
+    let bookie1_addr = server1.local_addr();
+    let bookie2_addr = server2.local_addr();
+    let bookie1_str = bookie1_addr.to_string();
+    let bookie2_str = bookie2_addr.to_string();
+
+    let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = [0u8; 20];
+
+    let mut wh = WriteHandle::with_available_bookies(
+        44,
+        vec![bookie1_str.clone()],
+        vec![bookie1_str.clone(), bookie2_str.clone()],
+        schedule,
+        dm,
+        master_key,
+    );
+
+    let mut conns: Vec<Arc<BookieConnection>> = vec![
+        Arc::new(BookieConnection::connect(bookie1_addr).await.unwrap()),
+    ];
+
+    // Write entry 0 to bookie1 successfully.
+    wh.append_with_ensemble_change(&mut conns, b"seg0-entry").await.unwrap();
+
+    // Shut down bookie1 to force ensemble change.
+    server1.shutdown().await;
+
+    // This triggers ensemble change — should create a new segment.
+    wh.append_with_ensemble_change(&mut conns, b"seg1-entry").await.unwrap();
+
+    let segments = wh.ensemble_segments();
+    assert!(segments.len() >= 2, "expected at least 2 segments after ensemble change, got {}", segments.len());
+
+    // First segment should start at 0 with the original ensemble.
+    // A later segment should contain bookie2.
+    let last_segment = segments.values().next_back().unwrap();
+    assert_eq!(last_segment[0], bookie2_str, "latest segment should use replacement bookie");
+
+    server2.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// on_ensemble_change callback test (Issue 1)
+// ---------------------------------------------------------------------------
+
+/// Verify the on_ensemble_change callback is invoked during ensemble change.
+#[tokio::test]
+async fn on_ensemble_change_callback_invoked() {
+    let dir1 = TempDir::new().unwrap();
+    let dir2 = TempDir::new().unwrap();
+    let server1 = BookieServer::start(test_config(&dir1)).await.unwrap();
+    let server2 = BookieServer::start(test_config(&dir2)).await.unwrap();
+    let bookie1_addr = server1.local_addr();
+    let bookie2_addr = server2.local_addr();
+    let bookie1_str = bookie1_addr.to_string();
+    let bookie2_str = bookie2_addr.to_string();
+
+    let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = [0u8; 20];
+
+    let callback_invoked = Arc::new(AtomicBool::new(false));
+    let callback_flag = callback_invoked.clone();
+
+    let mut wh = WriteHandle::with_available_bookies(
+        45,
+        vec![bookie1_str.clone()],
+        vec![bookie1_str.clone(), bookie2_str.clone()],
+        schedule,
+        dm,
+        master_key,
+    );
+    wh.set_on_ensemble_change(Box::new(move |_first_entry, _ensemble| {
+        callback_flag.store(true, Ordering::Release);
+    }));
+
+    let mut conns: Vec<Arc<BookieConnection>> = vec![
+        Arc::new(BookieConnection::connect(bookie1_addr).await.unwrap()),
+    ];
+
+    // Successful write — callback should NOT fire.
+    wh.append_with_ensemble_change(&mut conns, b"ok").await.unwrap();
+    assert!(!callback_invoked.load(Ordering::Acquire), "callback should not fire on success");
+
+    // Shut down bookie1; next write triggers ensemble change.
+    server1.shutdown().await;
+    wh.append_with_ensemble_change(&mut conns, b"triggers-change").await.unwrap();
+
+    assert!(callback_invoked.load(Ordering::Acquire), "callback should fire on ensemble change");
+
+    server2.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// LAC gate test (Issue 4)
+// ---------------------------------------------------------------------------
+
+/// Verify that ensemble() returns the correct current ensemble.
+#[tokio::test]
+async fn ensemble_returns_current_after_change() {
+    let dir1 = TempDir::new().unwrap();
+    let dir2 = TempDir::new().unwrap();
+    let server1 = BookieServer::start(test_config(&dir1)).await.unwrap();
+    let server2 = BookieServer::start(test_config(&dir2)).await.unwrap();
+    let bookie1_addr = server1.local_addr();
+    let bookie2_addr = server2.local_addr();
+    let bookie1_str = bookie1_addr.to_string();
+    let bookie2_str = bookie2_addr.to_string();
+
+    let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = [0u8; 20];
+
+    let mut wh = WriteHandle::with_available_bookies(
+        46,
+        vec![bookie1_str.clone()],
+        vec![bookie1_str.clone(), bookie2_str.clone()],
+        schedule,
+        dm,
+        master_key,
+    );
+
+    // Before any change: ensemble should be [bookie1].
+    assert_eq!(wh.ensemble(), vec![bookie1_str.clone()]);
+
+    let mut conns: Vec<Arc<BookieConnection>> = vec![
+        Arc::new(BookieConnection::connect(bookie1_addr).await.unwrap()),
+    ];
+
+    wh.append_with_ensemble_change(&mut conns, b"pre").await.unwrap();
+
+    // After successful write, ensemble is still [bookie1].
+    assert_eq!(wh.ensemble(), vec![bookie1_str.clone()]);
+
+    server1.shutdown().await;
+    wh.append_with_ensemble_change(&mut conns, b"post").await.unwrap();
+
+    // After ensemble change, ensemble should be [bookie2].
+    assert_eq!(wh.ensemble(), vec![bookie2_str.clone()]);
+
+    // LAC should have advanced past the second entry.
+    assert_eq!(wh.last_add_confirmed(), 1);
+
+    server2.shutdown().await;
 }
