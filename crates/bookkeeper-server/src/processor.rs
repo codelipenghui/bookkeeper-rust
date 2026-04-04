@@ -109,14 +109,21 @@ impl RequestProcessor {
         }
 
         // Special case: LAST_ADD_CONFIRMED (-1)
+        // Java client expects the last entry body so it can verify digest and extract LAC+length
         if entry_id == LAST_ADD_CONFIRMED {
             match self.storage.get_last_add_confirmed(ledger_id) {
                 Ok(lac) => {
+                    // Try to return the actual last entry body for digest verification
+                    let data = if lac >= 0 {
+                        self.storage.get_entry(ledger_id, lac).ok()
+                    } else {
+                        None
+                    };
                     return V2Response::Read {
                         error_code: V2_EOK,
                         ledger_id,
                         entry_id: lac,
-                        data: None,
+                        data,
                     };
                 }
                 Err(_) => {
