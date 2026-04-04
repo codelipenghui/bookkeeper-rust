@@ -36,6 +36,21 @@ enum Commands {
         #[arg(short, long)]
         all: bool,
     },
+    /// Start a bookie server (long-running)
+    Serve {
+        /// Bookie port (0 = OS-assigned)
+        #[arg(long, default_value = "3181")]
+        port: u16,
+        /// Data directory
+        #[arg(long)]
+        data_dir: Option<String>,
+        /// ZooKeeper connection string
+        #[arg(long)]
+        zk: Option<String>,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+    },
     /// Run a sanity test: start bookie, write entries, read back, verify
     Bookiesanity {
         /// Number of entries to write
@@ -56,6 +71,9 @@ async fn main() {
         }
         Commands::Listbookies { zk, ledger_root, rw, ro, all } => {
             cmd_listbookies(&zk, &ledger_root, rw, ro, all).await
+        }
+        Commands::Serve { port, data_dir, zk, ledger_root } => {
+            cmd_serve(port, data_dir, zk, ledger_root).await
         }
         Commands::Bookiesanity { entries, data_dir } => {
             cmd_bookiesanity(entries, data_dir).await
@@ -194,5 +212,47 @@ async fn cmd_bookiesanity(
     println!("Sanity test PASSED.");
 
     server.shutdown().await;
+    Ok(())
+}
+
+async fn cmd_serve(
+    port: u16,
+    data_dir: Option<String>,
+    zk: Option<String>,
+    ledger_root: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use bookkeeper_server::server::BookieServer;
+    use bookkeeper_server::config::BookieConfig;
+
+    let _temp_dir;
+    let dir_path = match &data_dir {
+        Some(d) => d.clone(),
+        None => {
+            _temp_dir = tempfile::TempDir::new()?;
+            _temp_dir.path().to_string_lossy().to_string()
+        }
+    };
+
+    let config = BookieConfig {
+        port,
+        ledger_dirs: vec![dir_path.clone()],
+        journal_dir: dir_path.clone(),
+        max_frame_size: 5 * 1024 * 1024,
+        zk_connect: zk,
+        zk_ledger_root: ledger_root,
+        bookie_id: None,
+        http_port: None,
+    };
+
+    let server = BookieServer::start(config).await?;
+    let addr = server.local_addr();
+    println!("Bookie started at {addr}");
+    println!("Press Ctrl+C to stop.");
+
+    // Wait for Ctrl+C
+    tokio::signal::ctrl_c().await?;
+    println!("\nShutting down...");
+    server.shutdown().await;
+    println!("Bookie stopped.");
     Ok(())
 }

@@ -38,12 +38,11 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- Embedded ZooKeeper for testing -->
+        <!-- Embedded ZooKeeper for testing and EmbeddedZkServer main class -->
         <dependency>
             <groupId>org.apache.curator</groupId>
             <artifactId>curator-test</artifactId>
             <version>${curator.version}</version>
-            <scope>test</scope>
         </dependency>
     </dependencies>
 
