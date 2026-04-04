@@ -16,5 +16,10 @@ sha1 = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
 
+[[bench]]
+name = "protocol_bench"
+harness = false
+
 [dev-dependencies]
 tokio = { workspace = true }
+criterion = "0.5"

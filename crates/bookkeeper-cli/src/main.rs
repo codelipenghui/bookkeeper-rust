@@ -88,6 +88,48 @@ enum Commands {
         /// Digest type: crc32, crc32c, hmac, dummy
         #[arg(long, default_value = "crc32c")]
         digest: String,
+        /// Time-based sustained load duration in seconds (0 = count-based only)
+        #[arg(long, default_value = "0")]
+        duration: u64,
+        /// Mixed read/write: percentage of reads (0-100, 0 = write-only)
+        #[arg(long, default_value = "0")]
+        read_pct: u8,
+    },
+    /// End-to-end benchmark with ZK, quorum writes, multi-ledger
+    BenchE2e {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Entry payload size in bytes
+        #[arg(long, default_value = "1024")]
+        entry_size: usize,
+        /// Benchmark duration in seconds
+        #[arg(long, default_value = "60")]
+        duration: u64,
+        /// Ensemble size
+        #[arg(long, default_value = "3")]
+        ensemble: i32,
+        /// Write quorum
+        #[arg(long, default_value = "2")]
+        write_quorum: i32,
+        /// Ack quorum
+        #[arg(long, default_value = "2")]
+        ack_quorum: i32,
+        /// Number of concurrent ledgers
+        #[arg(long, default_value = "1")]
+        ledgers: usize,
+        /// Max concurrent in-flight requests
+        #[arg(long, default_value = "10000")]
+        max_outstanding: usize,
+        /// Warmup entries
+        #[arg(long, default_value = "10000")]
+        warmup: u64,
+        /// Digest type: crc32, crc32c, hmac, dummy
+        #[arg(long, default_value = "crc32c")]
+        digest: String,
     },
 }
 
@@ -107,8 +149,11 @@ async fn main() {
         Commands::Bookiesanity { entries, data_dir } => {
             cmd_bookiesanity(entries, data_dir).await
         }
-        Commands::BenchBookie { bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, digest } => {
-            bench::cmd_bench_bookie(&bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, &digest).await
+        Commands::BenchBookie { bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, digest, duration, read_pct } => {
+            bench::cmd_bench_bookie(&bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, &digest, duration, read_pct).await
+        }
+        Commands::BenchE2e { zk, ledger_root, entry_size, duration, ensemble, write_quorum, ack_quorum, ledgers, max_outstanding, warmup, digest } => {
+            bench::cmd_bench_e2e(&zk, &ledger_root, entry_size, duration, ensemble, write_quorum, ack_quorum, ledgers, max_outstanding, warmup, &digest).await
         }
     };
     if let Err(e) = result {
