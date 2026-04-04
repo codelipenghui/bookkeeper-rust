@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use bytes::Bytes;
 use futures::future::join_all;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::digest::DigestManager;
@@ -16,27 +17,25 @@ use crate::distribution::RoundRobinDistributionSchedule;
 // ---------------------------------------------------------------------------
 
 struct LacState {
-    last_add_confirmed: i64,
     /// Entries that have reached ack quorum but whose predecessors haven't yet.
-    completed: BTreeSet<i64>,
+    completed: std::sync::Mutex<BTreeSet<i64>>,
 }
 
 impl LacState {
     fn new() -> Self {
-        Self { last_add_confirmed: -1, completed: BTreeSet::new() }
+        Self { completed: std::sync::Mutex::new(BTreeSet::new()) }
     }
 
     /// Mark `entry_id` as complete and advance LAC as far as possible in order.
-    fn advance_lac(&mut self, entry_id: i64) {
-        self.completed.insert(entry_id);
-        while self.completed.contains(&(self.last_add_confirmed + 1)) {
-            self.last_add_confirmed += 1;
-            self.completed.remove(&self.last_add_confirmed);
+    fn advance_lac(&self, entry_id: i64, lac_value: &AtomicI64) {
+        let mut completed = self.completed.lock().unwrap();
+        completed.insert(entry_id);
+        let mut current_lac = lac_value.load(Ordering::Acquire);
+        while completed.contains(&(current_lac + 1)) {
+            current_lac += 1;
+            completed.remove(&current_lac);
         }
-    }
-
-    fn lac(&self) -> i64 {
-        self.last_add_confirmed
+        lac_value.store(current_lac, Ordering::Release);
     }
 }
 
@@ -69,8 +68,10 @@ pub struct WriteHandle {
     master_key: [u8; MASTER_KEY_LENGTH],
     last_add_pushed: i64,
     current_length: i64,
-    /// Shared LAC state — updated by spawned ack-collector tasks.
-    lac_state: Arc<Mutex<LacState>>,
+    /// Lock-free LAC value — updated by spawned ack-collector tasks.
+    lac_value: Arc<AtomicI64>,
+    /// Completion tracking for out-of-order acks.
+    lac_state: Arc<LacState>,
 }
 
 impl WriteHandle {
@@ -89,26 +90,14 @@ impl WriteHandle {
             master_key,
             last_add_pushed: -1,
             current_length: 0,
-            lac_state: Arc::new(Mutex::new(LacState::new())),
+            lac_value: Arc::new(AtomicI64::new(-1)),
+            lac_state: Arc::new(LacState::new()),
         }
     }
 
     /// Return the current last-add-confirmed value.
     pub fn last_add_confirmed(&self) -> i64 {
-        // We need a sync read. Use `blocking_lock` is not available in async
-        // contexts without care, but `try_lock` works fine here since we only
-        // read a single integer and contention is transient.
-        self.lac_state.try_lock()
-            .map(|g| g.lac())
-            .unwrap_or_else(|_| {
-                // Fall back to a blocking acquire on a new thread is overkill;
-                // instead spin briefly — the lock is held for nanoseconds.
-                loop {
-                    if let Ok(g) = self.lac_state.try_lock() {
-                        return g.lac();
-                    }
-                }
-            })
+        self.lac_value.load(Ordering::Acquire)
     }
 
     pub fn ledger_id(&self) -> i64 {
@@ -149,6 +138,7 @@ impl WriteHandle {
 
         let ack_quorum = self.schedule.ack_quorum_size();
         let mk = self.master_key;
+        let lac_value = Arc::clone(&self.lac_value);
         let lac_state = Arc::clone(&self.lac_state);
 
         // Clone Arc<BookieConnection> handles for the spawned task
@@ -210,7 +200,7 @@ impl WriteHandle {
             }
 
             let outcome = if ack_count >= ack_quorum {
-                lac_state.lock().await.advance_lac(entry_id);
+                lac_state.advance_lac(entry_id, &lac_value);
                 Ok(entry_id)
             } else {
                 Err(last_err.unwrap_or_else(|| {
@@ -237,7 +227,7 @@ impl WriteHandle {
     fn build_entry(&self, entry_id: i64, payload: &[u8]) -> Bytes {
         use bookkeeper_protocol::entry::EntryBuilder;
         // LAC embedded in the entry is the current confirmed value at build time.
-        let lac = self.lac_state.try_lock().map(|g| g.lac()).unwrap_or(-1);
+        let lac = self.lac_value.load(Ordering::Acquire);
         EntryBuilder::new(&self.digest_manager)
             .ledger_id(self.ledger_id)
             .entry_id(entry_id)

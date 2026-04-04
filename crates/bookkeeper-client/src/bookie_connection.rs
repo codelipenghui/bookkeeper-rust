@@ -121,18 +121,57 @@ async fn connection_task(
             // Accept new requests to send
             req = request_rx.recv() => {
                 match req {
-                    Some(req) => {
-                        if writer.write_all(&req.data).await.is_err() {
-                            let _ = req.response_tx.send(Err(ClientError::ConnectionClosed));
+                    Some(first_req) => {
+                        // Batch: gather first request + all immediately available
+                        let mut batch = BytesMut::from(first_req.data.as_ref());
+                        pending.push_back(first_req.response_tx);
+
+                        // Drain without blocking
+                        while let Ok(more) = request_rx.try_recv() {
+                            batch.extend_from_slice(&more.data);
+                            pending.push_back(more.response_tx);
+                        }
+
+                        if writer.write_all(&batch).await.is_err() {
+                            // Fail all pending including the ones we just queued
                             for tx in pending.drain(..) {
                                 let _ = tx.send(Err(ClientError::ConnectionClosed));
                             }
                             return;
                         }
-                        pending.push_back(req.response_tx);
                     }
                     None => {
-                        // Sender side dropped — no more requests will come
+                        // Channel closed — drain remaining pending responses
+                        while !pending.is_empty() {
+                            // Try to decode any already-buffered frames first
+                            loop {
+                                match codec.decode(&mut read_buf) {
+                                    Ok(Some(frame)) => {
+                                        if let Some(tx) = pending.pop_front() {
+                                            let resp = decode_response(frame.freeze())
+                                                .map_err(|e| ClientError::Protocol(format!("decode: {e}")));
+                                            let _ = tx.send(resp);
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            if pending.is_empty() { break; }
+                            // Read more data from socket
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                reader.read_buf(&mut read_buf)
+                            ).await {
+                                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
+                                    // EOF, error, or timeout — fail remaining
+                                    for tx in pending.drain(..) {
+                                        let _ = tx.send(Err(ClientError::ConnectionClosed));
+                                    }
+                                    break;
+                                }
+                                Ok(Ok(_)) => continue,
+                            }
+                        }
                         return;
                     }
                 }
