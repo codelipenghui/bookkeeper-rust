@@ -302,18 +302,17 @@ impl WriteHandle {
 
             let mut ack_count = 0usize;
             let mut failed_indices: Vec<usize> = Vec::new();
-            let write_quorum = results.len();
-            let max_failures = write_quorum.saturating_sub(ack_quorum);
 
             let mut last_err: Option<ClientError> = None;
 
+            // Process ALL results — don't break on quorum so we can detect
+            // post-quorum failures for proactive ensemble change.
+            // Matches Java's PendingAddOp.writeComplete() which reports
+            // failures via notifyWriteFailed even after quorum is reached.
             for (ensemble_idx, result) in results {
                 match result {
                     Ok(V2Response::Add { error_code, .. }) if error_code == V2_EOK => {
                         ack_count += 1;
-                        if ack_count >= ack_quorum {
-                            break;
-                        }
                     }
                     Ok(V2Response::Add { error_code, .. }) => {
                         last_err = Some(ClientError::Protocol(format!(
@@ -332,12 +331,21 @@ impl WriteHandle {
                         failed_indices.push(ensemble_idx);
                     }
                 }
-                if failed_indices.len() > max_failures {
-                    break;
-                }
             }
 
             let outcome = if ack_count >= ack_quorum {
+                // Quorum reached — but report post-quorum failures proactively.
+                // Matches Java's lh.notifyWriteFailed(bookieIndex, addr) which
+                // adds to delayedWriteFailedBookies even when the write succeeded.
+                if !failed_indices.is_empty() {
+                    let current_ens = ensemble_info.current_ensemble();
+                    let mut delayed = ensemble_info.delayed_failures.lock().unwrap();
+                    for &idx in &failed_indices {
+                        if idx < current_ens.len() {
+                            delayed.push((idx, current_ens[idx].clone()));
+                        }
+                    }
+                }
                 lac_state.advance_lac(entry_id, &lac_value, &ensemble_info);
                 Ok(entry_id)
             } else {
@@ -385,6 +393,11 @@ impl WriteHandle {
         conns: &mut Vec<Arc<BookieConnection>>,
         payload: &[u8],
     ) -> Result<i64, ClientError> {
+        // Proactive ensemble change: process any delayed failures from previous
+        // writes before attempting the next one.
+        // Matches Java's maybeHandleDelayedWriteBookieFailure().
+        self.maybe_handle_delayed_failures(conns).await?;
+
         // First attempt.
         let result = self.append_async(conns, payload)?.wait().await;
 
@@ -443,6 +456,47 @@ impl WriteHandle {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Process any delayed bookie failures accumulated by post-quorum failure
+    /// tracking. If there are failures, trigger a proactive ensemble change
+    /// BEFORE the next write attempt.
+    /// Matches Java's `maybeHandleDelayedWriteBookieFailure()`.
+    async fn maybe_handle_delayed_failures(
+        &mut self,
+        conns: &mut Vec<Arc<BookieConnection>>,
+    ) -> Result<(), ClientError> {
+        let delayed = {
+            let mut df = self.ensemble_info.delayed_failures.lock().unwrap();
+            if df.is_empty() {
+                return Ok(());
+            }
+            let d = df.clone();
+            df.clear();
+            d
+        };
+
+        // Set changing_ensemble flag — gates LAC advancement
+        self.ensemble_info.changing_ensemble.store(true, Ordering::Release);
+
+        for (idx, _addr) in &delayed {
+            self.handle_bookie_failure(conns, *idx).await?;
+        }
+
+        // Add new ensemble segment at LAC + 1
+        let new_start = self.last_add_confirmed() + 1;
+        let current_ens = self.ensemble_info.current_ensemble();
+        self.ensemble_info.add_segment(new_start, current_ens.clone());
+
+        if let Some(ref cb) = self.on_ensemble_change {
+            cb(new_start, &current_ens);
+        }
+
+        // Clear flag and flush queued LAC entries
+        self.ensemble_info.changing_ensemble.store(false, Ordering::Release);
+        self.flush_lac();
+
+        Ok(())
     }
 
     /// Drain the completed set and advance the atomic LAC value.
