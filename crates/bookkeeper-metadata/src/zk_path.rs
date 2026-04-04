@@ -63,7 +63,7 @@ impl ZkPaths {
             available_readonly: format!("{}/available/readonly", root),
             cookies: format!("{}/cookies", root),
             layout: format!("{}/LAYOUT", root),
-            instance_id: format!("{}/instanceid", root),
+            instance_id: format!("{}/INSTANCEID", root),
             idgen: format!("{}/idgen", root),
             idgen_long: format!("{}/idgen-long", root),
             underreplication: format!("{}/underreplication", root),

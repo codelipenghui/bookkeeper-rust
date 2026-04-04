@@ -54,6 +54,6 @@ fn base_paths() {
     assert_eq!(paths.available_readonly(), "/ledgers/available/readonly");
     assert_eq!(paths.cookies(), "/ledgers/cookies");
     assert_eq!(paths.layout(), "/ledgers/LAYOUT");
-    assert_eq!(paths.instance_id(), "/ledgers/instanceid");
+    assert_eq!(paths.instance_id(), "/ledgers/INSTANCEID");
     assert_eq!(paths.idgen_long(), "/ledgers/idgen-long");
 }
