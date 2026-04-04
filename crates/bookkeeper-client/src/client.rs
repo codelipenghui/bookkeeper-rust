@@ -61,12 +61,20 @@ impl BookKeeperClient {
             )));
         }
         let ensemble: Vec<String> = self.bookie_addrs[..ensemble_size].to_vec();
+        let available_bookies: Vec<String> = self.bookie_addrs.clone();
         let schedule = RoundRobinDistributionSchedule::new(ensemble_size, write_quorum, ack_quorum);
         let dm = DigestManager::new(digest_type).with_password(password);
 
         let master_key = generate_master_key(password);
 
-        Ok(WriteHandle::new(ledger_id, ensemble, schedule, dm, master_key))
+        Ok(WriteHandle::with_available_bookies(
+            ledger_id,
+            ensemble,
+            available_bookies,
+            schedule,
+            dm,
+            master_key,
+        ))
     }
 
     /// Open a ledger for reading. Returns a ReadHandle.

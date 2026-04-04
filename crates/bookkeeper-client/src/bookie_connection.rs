@@ -20,6 +20,15 @@ pub enum ClientError {
     Protocol(String),
     #[error("connection closed")]
     ConnectionClosed,
+    /// Write quorum could not be reached; carries which bookie indices in the
+    /// write set failed so the caller can trigger ensemble change.
+    #[error("write quorum failed for entry {entry_id}: {message}")]
+    WriteQuorumFailed {
+        message: String,
+        /// Indices into the ensemble (write-set positions) that failed.
+        failed_indices: Vec<usize>,
+        entry_id: i64,
+    },
 }
 
 struct PendingRequest {
