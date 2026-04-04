@@ -130,3 +130,34 @@ async fn write_multiple_entries_pipelined() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn read_entries_parallel() {
+    let dir = TempDir::new().unwrap();
+    let server = BookieServer::start(test_config(&dir)).await.unwrap();
+    let addr = server.local_addr();
+
+    let ensemble = vec![addr.to_string()];
+    let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = [0u8; 20];
+
+    // Write 50 entries
+    let conns = vec![Arc::new(BookieConnection::connect(addr).await.unwrap())];
+    let mut wh = WriteHandle::new(1, ensemble.clone(), schedule.clone(), dm.clone(), master_key);
+    for i in 0..50 {
+        wh.append(&conns, format!("parallel-read-{i}").as_bytes()).await.unwrap();
+    }
+
+    // Read all 50 entries with concurrency=10
+    let read_conns = vec![Arc::new(BookieConnection::connect(addr).await.unwrap())];
+    let rh = ReadHandle::new(1, ensemble, schedule, dm, master_key);
+    let entries = rh.read_entries_parallel(&read_conns, 0, 49, 10).await.unwrap();
+
+    assert_eq!(entries.len(), 50);
+    for (i, entry) in entries.iter().enumerate() {
+        assert_eq!(entry, format!("parallel-read-{i}").as_bytes());
+    }
+
+    server.shutdown().await;
+}

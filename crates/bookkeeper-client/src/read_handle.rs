@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use futures::stream::{self, StreamExt};
+
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::digest::DigestManager;
 use bookkeeper_protocol::entry::{parse_entry, EntryError};
@@ -83,17 +85,34 @@ impl ReadHandle {
         ))))
     }
 
-    /// Read a range of entries [first_entry..=last_entry].
+    /// Read a range of entries [first_entry..=last_entry] sequentially.
     pub async fn read_entries(
         &self,
         conns: &[Arc<BookieConnection>],
         first_entry: i64,
         last_entry: i64,
     ) -> Result<Vec<Vec<u8>>, ClientError> {
-        let mut results = Vec::new();
-        for eid in first_entry..=last_entry {
-            results.push(self.read_entry(conns, eid).await?);
-        }
-        Ok(results)
+        self.read_entries_parallel(conns, first_entry, last_entry, 1).await
+    }
+
+    /// Read a range of entries with bounded parallelism.
+    /// `concurrency` controls how many reads are in-flight simultaneously.
+    /// Entries destined for different bookies (round-robin striping) naturally
+    /// parallelize across pipelined connections.
+    pub async fn read_entries_parallel(
+        &self,
+        conns: &[Arc<BookieConnection>],
+        first_entry: i64,
+        last_entry: i64,
+        concurrency: usize,
+    ) -> Result<Vec<Vec<u8>>, ClientError> {
+        let concurrency = concurrency.max(1);
+        let results: Vec<Result<Vec<u8>, ClientError>> = stream::iter(first_entry..=last_entry)
+            .map(|eid| self.read_entry(conns, eid))
+            .buffered(concurrency)
+            .collect()
+            .await;
+
+        results.into_iter().collect()
     }
 }
