@@ -1,0 +1,328 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report-3.0.xsd" version="3.0" name="org.apache.bookkeeper.compat.RustBookieCompatTest" time="0.629" tests="7" errors="7" skipped="0" failures="0">
+  <properties>
+    <property name="jdk.tls.rejectClientInitiatedRenegotiation" value="true"/>
+    <property name="java.specification.version" value="21"/>
+    <property name="sun.jnu.encoding" value="UTF-8"/>
+    <property name="java.class.path" value="/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/test-classes:/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/classes:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-server/4.18.0-SNAPSHOT/bookkeeper-server-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-common/4.18.0-SNAPSHOT/bookkeeper-common-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/stats/bookkeeper-stats-api/4.18.0-SNAPSHOT/bookkeeper-stats-api-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/cpu-affinity/4.18.0-SNAPSHOT/cpu-affinity-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-configuration2/2.12.0/commons-configuration2-2.12.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-text/1.13.1/commons-text-1.13.1.jar:/Users/lipenghui/.m2/repository/commons-beanutils/commons-beanutils/1.11.0/commons-beanutils-1.11.0.jar:/Users/lipenghui/.m2/repository/io/netty/netty-common/4.1.130.Final/netty-common-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.17.1/jackson-core-2.17.1.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.17.1/jackson-databind-2.17.1.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.17.1/jackson-annotations-2.17.1.jar:/Users/lipenghui/.m2/repository/org/jctools/jctools-core/4.0.5/jctools-core-4.0.5.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-native-io_uring/0.0.26.Final/netty-incubator-transport-native-io_uring-0.0.26.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-classes-io_uring/0.0.26.Final/netty-incubator-transport-classes-io_uring-0.0.26.Final.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-native-io_uring/0.0.26.Final/netty-incubator-transport-native-io_uring-0.0.26.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-common-allocator/4.18.0-SNAPSHOT/bookkeeper-common-allocator-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/io/netty/netty-buffer/4.1.130.Final/netty-buffer-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-proto/4.18.0-SNAPSHOT/bookkeeper-proto-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/com/google/protobuf/protobuf-java/4.34.0/protobuf-java-4.34.0.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-slogger-slf4j/4.18.0-SNAPSHOT/bookkeeper-slogger-slf4j-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-slogger-api/4.18.0-SNAPSHOT/bookkeeper-slogger-api-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-tools-framework/4.18.0-SNAPSHOT/bookkeeper-tools-framework-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/native-io/4.18.0-SNAPSHOT/native-io-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/native-library-common/4.18.0-SNAPSHOT/native-library-common-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/rocksdb/rocksdbjni/9.9.3/rocksdbjni-9.9.3.jar:/Users/lipenghui/.m2/repository/org/apache/zookeeper/zookeeper/3.9.5/zookeeper-3.9.5.jar:/Users/lipenghui/.m2/repository/org/apache/zookeeper/zookeeper-jute/3.9.5/zookeeper-jute-3.9.5.jar:/Users/lipenghui/.m2/repository/org/apache/yetus/audience-annotations/0.12.0/audience-annotations-0.12.0.jar:/Users/lipenghui/.m2/repository/io/netty/netty-handler/4.1.130.Final/netty-handler-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-resolver/4.1.130.Final/netty-resolver-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport/4.1.130.Final/netty-transport-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-unix-common/4.1.130.Final/netty-transport-native-unix-common-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-codec/4.1.130.Final/netty-codec-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-epoll/4.1.130.Final/netty-transport-native-epoll-4.1.130.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-classes-epoll/4.1.130.Final/netty-transport-classes-epoll-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-epoll/4.1.130.Final/netty-transport-native-epoll-4.1.130.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-classes/2.0.74.Final/netty-tcnative-classes-2.0.74.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-osx-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-osx-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-windows-x86_64.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/http/http-server/4.18.0-SNAPSHOT/http-server-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/circe-checksum/4.18.0-SNAPSHOT/circe-checksum-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/commons-cli/commons-cli/1.9.0/commons-cli-1.9.0.jar:/Users/lipenghui/.m2/repository/commons-codec/commons-codec/1.18.0/commons-codec-1.18.0.jar:/Users/lipenghui/.m2/repository/commons-io/commons-io/2.19.0/commons-io-2.19.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-lang3/3.20.0/commons-lang3-3.20.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-collections4/4.1/commons-collections4-4.1.jar:/Users/lipenghui/.m2/repository/org/bouncycastle/bc-fips/1.0.2.5/bc-fips-1.0.2.5.jar:/Users/lipenghui/.m2/repository/com/beust/jcommander/1.82/jcommander-1.82.jar:/Users/lipenghui/.m2/repository/org/apache/httpcomponents/httpclient/4.5.13/httpclient-4.5.13.jar:/Users/lipenghui/.m2/repository/org/apache/httpcomponents/httpcore/4.4.13/httpcore-4.4.13.jar:/Users/lipenghui/.m2/repository/commons-logging/commons-logging/1.2/commons-logging-1.2.jar:/Users/lipenghui/.m2/repository/io/reactivex/rxjava3/rxjava/3.0.1/rxjava-3.0.1.jar:/Users/lipenghui/.m2/repository/org/reactivestreams/reactive-streams/1.0.3/reactive-streams-1.0.3.jar:/Users/lipenghui/.m2/repository/com/carrotsearch/hppc/0.9.1/hppc-0.9.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-core/2.23.1/log4j-core-2.23.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-api/2.23.1/log4j-api-2.23.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-slf4j2-impl/2.23.1/log4j-slf4j2-impl-2.23.1.jar:/Users/lipenghui/.m2/repository/com/lmax/disruptor/4.0.0/disruptor-4.0.0.jar:/Users/lipenghui/.m2/repository/org/slf4j/slf4j-api/2.0.12/slf4j-api-2.0.12.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter/5.10.2/junit-jupiter-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.10.2/junit-jupiter-api-5.10.2.jar:/Users/lipenghui/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar:/Users/lipenghui/.m2/repository/org/junit/platform/junit-platform-commons/1.10.2/junit-platform-commons-1.10.2.jar:/Users/lipenghui/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.10.2/junit-jupiter-params-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.10.2/junit-jupiter-engine-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/platform/junit-platform-engine/1.10.2/junit-platform-engine-1.10.2.jar:/Users/lipenghui/.m2/repository/org/apache/curator/curator-test/5.5.0/curator-test-5.5.0.jar:/Users/lipenghui/.m2/repository/io/dropwizard/metrics/metrics-core/3.2.5/metrics-core-3.2.5.jar:/Users/lipenghui/.m2/repository/org/xerial/snappy/snappy-java/1.1.7/snappy-java-1.1.7.jar:/Users/lipenghui/.m2/repository/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar:/Users/lipenghui/.m2/repository/com/google/guava/failureaccess/1.0.1/failureaccess-1.0.1.jar:/Users/lipenghui/.m2/repository/com/google/guava/listenablefuture/9999.0-empty-to-avoid-conflict-with-guava/listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar:/Users/lipenghui/.m2/repository/com/google/code/findbugs/jsr305/3.0.2/jsr305-3.0.2.jar:/Users/lipenghui/.m2/repository/org/checkerframework/checker-qual/3.12.0/checker-qual-3.12.0.jar:/Users/lipenghui/.m2/repository/com/google/errorprone/error_prone_annotations/2.11.0/error_prone_annotations-2.11.0.jar:/Users/lipenghui/.m2/repository/com/google/j2objc/j2objc-annotations/1.3/j2objc-annotations-1.3.jar:"/>
+    <property name="java.vm.vendor" value="Amazon.com Inc."/>
+    <property name="sun.arch.data.model" value="64"/>
+    <property name="java.vendor.url" value="https://aws.amazon.com/corretto/"/>
+    <property name="user.timezone" value="America/Los_Angeles"/>
+    <property name="os.name" value="Mac OS X"/>
+    <property name="java.vm.specification.version" value="21"/>
+    <property name="sun.java.launcher" value="SUN_STANDARD"/>
+    <property name="user.country" value="US"/>
+    <property name="sun.boot.library.path" value="/Users/lipenghui/Library/Java/JavaVirtualMachines/corretto-21.0.6/Contents/Home/lib"/>
+    <property name="sun.java.command" value="/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/surefire/surefirebooter-20260403185240971_3.jar /Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/surefire 2026-04-03T18-52-40_430-jvmRun1 surefire-20260403185240971_1tmp surefire_0-20260403185240971_2tmp"/>
+    <property name="jdk.debug" value="release"/>
+    <property name="surefire.test.class.path" value="/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/test-classes:/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/classes:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-server/4.18.0-SNAPSHOT/bookkeeper-server-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-common/4.18.0-SNAPSHOT/bookkeeper-common-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/stats/bookkeeper-stats-api/4.18.0-SNAPSHOT/bookkeeper-stats-api-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/cpu-affinity/4.18.0-SNAPSHOT/cpu-affinity-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-configuration2/2.12.0/commons-configuration2-2.12.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-text/1.13.1/commons-text-1.13.1.jar:/Users/lipenghui/.m2/repository/commons-beanutils/commons-beanutils/1.11.0/commons-beanutils-1.11.0.jar:/Users/lipenghui/.m2/repository/io/netty/netty-common/4.1.130.Final/netty-common-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.17.1/jackson-core-2.17.1.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.17.1/jackson-databind-2.17.1.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.17.1/jackson-annotations-2.17.1.jar:/Users/lipenghui/.m2/repository/org/jctools/jctools-core/4.0.5/jctools-core-4.0.5.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-native-io_uring/0.0.26.Final/netty-incubator-transport-native-io_uring-0.0.26.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-classes-io_uring/0.0.26.Final/netty-incubator-transport-classes-io_uring-0.0.26.Final.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-native-io_uring/0.0.26.Final/netty-incubator-transport-native-io_uring-0.0.26.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-common-allocator/4.18.0-SNAPSHOT/bookkeeper-common-allocator-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/io/netty/netty-buffer/4.1.130.Final/netty-buffer-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-proto/4.18.0-SNAPSHOT/bookkeeper-proto-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/com/google/protobuf/protobuf-java/4.34.0/protobuf-java-4.34.0.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-slogger-slf4j/4.18.0-SNAPSHOT/bookkeeper-slogger-slf4j-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-slogger-api/4.18.0-SNAPSHOT/bookkeeper-slogger-api-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-tools-framework/4.18.0-SNAPSHOT/bookkeeper-tools-framework-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/native-io/4.18.0-SNAPSHOT/native-io-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/native-library-common/4.18.0-SNAPSHOT/native-library-common-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/rocksdb/rocksdbjni/9.9.3/rocksdbjni-9.9.3.jar:/Users/lipenghui/.m2/repository/org/apache/zookeeper/zookeeper/3.9.5/zookeeper-3.9.5.jar:/Users/lipenghui/.m2/repository/org/apache/zookeeper/zookeeper-jute/3.9.5/zookeeper-jute-3.9.5.jar:/Users/lipenghui/.m2/repository/org/apache/yetus/audience-annotations/0.12.0/audience-annotations-0.12.0.jar:/Users/lipenghui/.m2/repository/io/netty/netty-handler/4.1.130.Final/netty-handler-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-resolver/4.1.130.Final/netty-resolver-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport/4.1.130.Final/netty-transport-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-unix-common/4.1.130.Final/netty-transport-native-unix-common-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-codec/4.1.130.Final/netty-codec-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-epoll/4.1.130.Final/netty-transport-native-epoll-4.1.130.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-classes-epoll/4.1.130.Final/netty-transport-classes-epoll-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-epoll/4.1.130.Final/netty-transport-native-epoll-4.1.130.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-classes/2.0.74.Final/netty-tcnative-classes-2.0.74.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-osx-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-osx-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-windows-x86_64.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/http/http-server/4.18.0-SNAPSHOT/http-server-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/circe-checksum/4.18.0-SNAPSHOT/circe-checksum-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/commons-cli/commons-cli/1.9.0/commons-cli-1.9.0.jar:/Users/lipenghui/.m2/repository/commons-codec/commons-codec/1.18.0/commons-codec-1.18.0.jar:/Users/lipenghui/.m2/repository/commons-io/commons-io/2.19.0/commons-io-2.19.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-lang3/3.20.0/commons-lang3-3.20.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-collections4/4.1/commons-collections4-4.1.jar:/Users/lipenghui/.m2/repository/org/bouncycastle/bc-fips/1.0.2.5/bc-fips-1.0.2.5.jar:/Users/lipenghui/.m2/repository/com/beust/jcommander/1.82/jcommander-1.82.jar:/Users/lipenghui/.m2/repository/org/apache/httpcomponents/httpclient/4.5.13/httpclient-4.5.13.jar:/Users/lipenghui/.m2/repository/org/apache/httpcomponents/httpcore/4.4.13/httpcore-4.4.13.jar:/Users/lipenghui/.m2/repository/commons-logging/commons-logging/1.2/commons-logging-1.2.jar:/Users/lipenghui/.m2/repository/io/reactivex/rxjava3/rxjava/3.0.1/rxjava-3.0.1.jar:/Users/lipenghui/.m2/repository/org/reactivestreams/reactive-streams/1.0.3/reactive-streams-1.0.3.jar:/Users/lipenghui/.m2/repository/com/carrotsearch/hppc/0.9.1/hppc-0.9.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-core/2.23.1/log4j-core-2.23.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-api/2.23.1/log4j-api-2.23.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-slf4j2-impl/2.23.1/log4j-slf4j2-impl-2.23.1.jar:/Users/lipenghui/.m2/repository/com/lmax/disruptor/4.0.0/disruptor-4.0.0.jar:/Users/lipenghui/.m2/repository/org/slf4j/slf4j-api/2.0.12/slf4j-api-2.0.12.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter/5.10.2/junit-jupiter-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.10.2/junit-jupiter-api-5.10.2.jar:/Users/lipenghui/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar:/Users/lipenghui/.m2/repository/org/junit/platform/junit-platform-commons/1.10.2/junit-platform-commons-1.10.2.jar:/Users/lipenghui/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.10.2/junit-jupiter-params-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.10.2/junit-jupiter-engine-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/platform/junit-platform-engine/1.10.2/junit-platform-engine-1.10.2.jar:/Users/lipenghui/.m2/repository/org/apache/curator/curator-test/5.5.0/curator-test-5.5.0.jar:/Users/lipenghui/.m2/repository/io/dropwizard/metrics/metrics-core/3.2.5/metrics-core-3.2.5.jar:/Users/lipenghui/.m2/repository/org/xerial/snappy/snappy-java/1.1.7/snappy-java-1.1.7.jar:/Users/lipenghui/.m2/repository/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar:/Users/lipenghui/.m2/repository/com/google/guava/failureaccess/1.0.1/failureaccess-1.0.1.jar:/Users/lipenghui/.m2/repository/com/google/guava/listenablefuture/9999.0-empty-to-avoid-conflict-with-guava/listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar:/Users/lipenghui/.m2/repository/com/google/code/findbugs/jsr305/3.0.2/jsr305-3.0.2.jar:/Users/lipenghui/.m2/repository/org/checkerframework/checker-qual/3.12.0/checker-qual-3.12.0.jar:/Users/lipenghui/.m2/repository/com/google/errorprone/error_prone_annotations/2.11.0/error_prone_annotations-2.11.0.jar:/Users/lipenghui/.m2/repository/com/google/j2objc/j2objc-annotations/1.3/j2objc-annotations-1.3.jar:"/>
+    <property name="sun.cpu.endian" value="little"/>
+    <property name="user.home" value="/Users/lipenghui"/>
+    <property name="user.language" value="en"/>
+    <property name="java.specification.vendor" value="Oracle Corporation"/>
+    <property name="java.version.date" value="2025-01-21"/>
+    <property name="java.home" value="/Users/lipenghui/Library/Java/JavaVirtualMachines/corretto-21.0.6/Contents/Home"/>
+    <property name="file.separator" value="/"/>
+    <property name="basedir" value="/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat"/>
+    <property name="java.vm.compressedOopsMode" value="Zero based"/>
+    <property name="line.separator" value="&#10;"/>
+    <property name="java.vm.specification.vendor" value="Oracle Corporation"/>
+    <property name="java.specification.name" value="Java Platform API Specification"/>
+    <property name="apple.awt.application.name" value="ForkedBooter"/>
+    <property name="surefire.real.class.path" value="/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/surefire/surefirebooter-20260403185240971_3.jar"/>
+    <property name="sun.management.compiler" value="HotSpot 64-Bit Tiered Compilers"/>
+    <property name="java.runtime.version" value="21.0.6+7-LTS"/>
+    <property name="user.name" value="lipenghui"/>
+    <property name="stdout.encoding" value="UTF-8"/>
+    <property name="path.separator" value=":"/>
+    <property name="os.version" value="15.7.3"/>
+    <property name="java.runtime.name" value="OpenJDK Runtime Environment"/>
+    <property name="file.encoding" value="UTF-8"/>
+    <property name="java.vm.name" value="OpenJDK 64-Bit Server VM"/>
+    <property name="java.vendor.version" value="Corretto-21.0.6.7.1"/>
+    <property name="localRepository" value="/Users/lipenghui/.m2/repository"/>
+    <property name="java.vendor.url.bug" value="https://github.com/corretto/corretto-21/issues/"/>
+    <property name="java.io.tmpdir" value="/var/folders/cw/557zcqw50yg8qx6d3qgl2f9c0000gn/T/"/>
+    <property name="java.version" value="21.0.6"/>
+    <property name="user.dir" value="/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat"/>
+    <property name="os.arch" value="aarch64"/>
+    <property name="zk.connect" value="localhost:61590"/>
+    <property name="java.vm.specification.name" value="Java Virtual Machine Specification"/>
+    <property name="native.encoding" value="UTF-8"/>
+    <property name="java.library.path" value="/Users/lipenghui/Library/Java/Extensions:/Library/Java/Extensions:/Network/Library/Java/Extensions:/System/Library/Java/Extensions:/usr/lib/java:."/>
+    <property name="java.vm.info" value="mixed mode, sharing"/>
+    <property name="stderr.encoding" value="UTF-8"/>
+    <property name="java.vendor" value="Amazon.com Inc."/>
+    <property name="java.vm.version" value="21.0.6+7-LTS"/>
+    <property name="sun.io.unicode.encoding" value="UnicodeBig"/>
+    <property name="java.class.version" value="65.0"/>
+  </properties>
+  <testcase name="testMultipleDigestTypes" classname="org.apache.bookkeeper.compat.RustBookieCompatTest" time="0.541">
+    <error message="Failed to initialize ledger manager factory" type="java.io.IOException"><![CDATA[java.io.IOException: Failed to initialize ledger manager factory
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:540)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:344)
+	at org.apache.bookkeeper.compat.RustBookieCompatTest.createClient(RustBookieCompatTest.java:54)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+Caused by: org.apache.bookkeeper.meta.exceptions.MetadataException: Failed to initialized ledger manager factory
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:286)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:538)
+	... 5 more
+Caused by: java.io.IOException: Incompatible layout version found : 2
+	at org.apache.bookkeeper.meta.LegacyHierarchicalLedgerManagerFactory.initialize(LegacyHierarchicalLedgerManagerFactory.java:57)
+	at org.apache.bookkeeper.meta.AbstractZkLedgerManagerFactory.newLedgerManagerFactory(AbstractZkLedgerManagerFactory.java:236)
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:282)
+	... 6 more
+]]></error>
+    <system-out><![CDATA[[RustBookieCompatTest] Using ZooKeeper at: localhost:61590
+2026-04-03T18:52:41,506 - INFO  - [main:MetadataDrivers@106] - BookKeeper metadata driver manager initialized
+2026-04-03T18:52:41,515 - INFO  - [main:ZKMetadataDriverBase@212] - Initialize zookeeper metadata driver at metadata service uri zk+hierarchical://localhost:61590/ledgers : zkServers = localhost:61590, ledgersRootPath = /ledgers.
+2026-04-03T18:52:41,518 - INFO  - [main:Environment@98] - Client environment:zookeeper.version=3.9.5-293c895a8d966a3ecb92872be4a1daf87d725da2, built on 2026-02-11 20:18 UTC
+2026-04-03T18:52:41,518 - INFO  - [main:Environment@98] - Client environment:host.name=localhost
+2026-04-03T18:52:41,518 - INFO  - [main:Environment@98] - Client environment:java.version=21.0.6
+2026-04-03T18:52:41,518 - INFO  - [main:Environment@98] - Client environment:java.vendor=Amazon.com Inc.
+2026-04-03T18:52:41,518 - INFO  - [main:Environment@98] - Client environment:java.home=/Users/lipenghui/Library/Java/JavaVirtualMachines/corretto-21.0.6/Contents/Home
+2026-04-03T18:52:41,518 - INFO  - [main:Environment@98] - Client environment:java.class.path=/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/test-classes:/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat/target/classes:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-server/4.18.0-SNAPSHOT/bookkeeper-server-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-common/4.18.0-SNAPSHOT/bookkeeper-common-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/stats/bookkeeper-stats-api/4.18.0-SNAPSHOT/bookkeeper-stats-api-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/cpu-affinity/4.18.0-SNAPSHOT/cpu-affinity-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-configuration2/2.12.0/commons-configuration2-2.12.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-text/1.13.1/commons-text-1.13.1.jar:/Users/lipenghui/.m2/repository/commons-beanutils/commons-beanutils/1.11.0/commons-beanutils-1.11.0.jar:/Users/lipenghui/.m2/repository/io/netty/netty-common/4.1.130.Final/netty-common-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.17.1/jackson-core-2.17.1.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.17.1/jackson-databind-2.17.1.jar:/Users/lipenghui/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.17.1/jackson-annotations-2.17.1.jar:/Users/lipenghui/.m2/repository/org/jctools/jctools-core/4.0.5/jctools-core-4.0.5.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-native-io_uring/0.0.26.Final/netty-incubator-transport-native-io_uring-0.0.26.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-classes-io_uring/0.0.26.Final/netty-incubator-transport-classes-io_uring-0.0.26.Final.jar:/Users/lipenghui/.m2/repository/io/netty/incubator/netty-incubator-transport-native-io_uring/0.0.26.Final/netty-incubator-transport-native-io_uring-0.0.26.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-common-allocator/4.18.0-SNAPSHOT/bookkeeper-common-allocator-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/io/netty/netty-buffer/4.1.130.Final/netty-buffer-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-proto/4.18.0-SNAPSHOT/bookkeeper-proto-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/com/google/protobuf/protobuf-java/4.34.0/protobuf-java-4.34.0.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-slogger-slf4j/4.18.0-SNAPSHOT/bookkeeper-slogger-slf4j-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-slogger-api/4.18.0-SNAPSHOT/bookkeeper-slogger-api-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/bookkeeper-tools-framework/4.18.0-SNAPSHOT/bookkeeper-tools-framework-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/native-io/4.18.0-SNAPSHOT/native-io-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/native-library-common/4.18.0-SNAPSHOT/native-library-common-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/rocksdb/rocksdbjni/9.9.3/rocksdbjni-9.9.3.jar:/Users/lipenghui/.m2/repository/org/apache/zookeeper/zookeeper/3.9.5/zookeeper-3.9.5.jar:/Users/lipenghui/.m2/repository/org/apache/zookeeper/zookeeper-jute/3.9.5/zookeeper-jute-3.9.5.jar:/Users/lipenghui/.m2/repository/org/apache/yetus/audience-annotations/0.12.0/audience-annotations-0.12.0.jar:/Users/lipenghui/.m2/repository/io/netty/netty-handler/4.1.130.Final/netty-handler-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-resolver/4.1.130.Final/netty-resolver-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport/4.1.130.Final/netty-transport-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-unix-common/4.1.130.Final/netty-transport-native-unix-common-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-codec/4.1.130.Final/netty-codec-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-epoll/4.1.130.Final/netty-transport-native-epoll-4.1.130.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-classes-epoll/4.1.130.Final/netty-transport-classes-epoll-4.1.130.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-transport-native-epoll/4.1.130.Final/netty-transport-native-epoll-4.1.130.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-classes/2.0.74.Final/netty-tcnative-classes-2.0.74.Final.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-linux-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-linux-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-osx-x86_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-osx-aarch_64.jar:/Users/lipenghui/.m2/repository/io/netty/netty-tcnative-boringssl-static/2.0.74.Final/netty-tcnative-boringssl-static-2.0.74.Final-windows-x86_64.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/http/http-server/4.18.0-SNAPSHOT/http-server-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/org/apache/bookkeeper/circe-checksum/4.18.0-SNAPSHOT/circe-checksum-4.18.0-SNAPSHOT.jar:/Users/lipenghui/.m2/repository/commons-cli/commons-cli/1.9.0/commons-cli-1.9.0.jar:/Users/lipenghui/.m2/repository/commons-codec/commons-codec/1.18.0/commons-codec-1.18.0.jar:/Users/lipenghui/.m2/repository/commons-io/commons-io/2.19.0/commons-io-2.19.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-lang3/3.20.0/commons-lang3-3.20.0.jar:/Users/lipenghui/.m2/repository/org/apache/commons/commons-collections4/4.1/commons-collections4-4.1.jar:/Users/lipenghui/.m2/repository/org/bouncycastle/bc-fips/1.0.2.5/bc-fips-1.0.2.5.jar:/Users/lipenghui/.m2/repository/com/beust/jcommander/1.82/jcommander-1.82.jar:/Users/lipenghui/.m2/repository/org/apache/httpcomponents/httpclient/4.5.13/httpclient-4.5.13.jar:/Users/lipenghui/.m2/repository/org/apache/httpcomponents/httpcore/4.4.13/httpcore-4.4.13.jar:/Users/lipenghui/.m2/repository/commons-logging/commons-logging/1.2/commons-logging-1.2.jar:/Users/lipenghui/.m2/repository/io/reactivex/rxjava3/rxjava/3.0.1/rxjava-3.0.1.jar:/Users/lipenghui/.m2/repository/org/reactivestreams/reactive-streams/1.0.3/reactive-streams-1.0.3.jar:/Users/lipenghui/.m2/repository/com/carrotsearch/hppc/0.9.1/hppc-0.9.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-core/2.23.1/log4j-core-2.23.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-api/2.23.1/log4j-api-2.23.1.jar:/Users/lipenghui/.m2/repository/org/apache/logging/log4j/log4j-slf4j2-impl/2.23.1/log4j-slf4j2-impl-2.23.1.jar:/Users/lipenghui/.m2/repository/com/lmax/disruptor/4.0.0/disruptor-4.0.0.jar:/Users/lipenghui/.m2/repository/org/slf4j/slf4j-api/2.0.12/slf4j-api-2.0.12.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter/5.10.2/junit-jupiter-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-api/5.10.2/junit-jupiter-api-5.10.2.jar:/Users/lipenghui/.m2/repository/org/opentest4j/opentest4j/1.3.0/opentest4j-1.3.0.jar:/Users/lipenghui/.m2/repository/org/junit/platform/junit-platform-commons/1.10.2/junit-platform-commons-1.10.2.jar:/Users/lipenghui/.m2/repository/org/apiguardian/apiguardian-api/1.1.2/apiguardian-api-1.1.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-params/5.10.2/junit-jupiter-params-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/jupiter/junit-jupiter-engine/5.10.2/junit-jupiter-engine-5.10.2.jar:/Users/lipenghui/.m2/repository/org/junit/platform/junit-platform-engine/1.10.2/junit-platform-engine-1.10.2.jar:/Users/lipenghui/.m2/repository/org/apache/curator/curator-test/5.5.0/curator-test-5.5.0.jar:/Users/lipenghui/.m2/repository/io/dropwizard/metrics/metrics-core/3.2.5/metrics-core-3.2.5.jar:/Users/lipenghui/.m2/repository/org/xerial/snappy/snappy-java/1.1.7/snappy-java-1.1.7.jar:/Users/lipenghui/.m2/repository/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar:/Users/lipenghui/.m2/repository/com/google/guava/failureaccess/1.0.1/failureaccess-1.0.1.jar:/Users/lipenghui/.m2/repository/com/google/guava/listenablefuture/9999.0-empty-to-avoid-conflict-with-guava/listenablefuture-9999.0-empty-to-avoid-conflict-with-guava.jar:/Users/lipenghui/.m2/repository/com/google/code/findbugs/jsr305/3.0.2/jsr305-3.0.2.jar:/Users/lipenghui/.m2/repository/org/checkerframework/checker-qual/3.12.0/checker-qual-3.12.0.jar:/Users/lipenghui/.m2/repository/com/google/errorprone/error_prone_annotations/2.11.0/error_prone_annotations-2.11.0.jar:/Users/lipenghui/.m2/repository/com/google/j2objc/j2objc-annotations/1.3/j2objc-annotations-1.3.jar:
+2026-04-03T18:52:41,519 - INFO  - [main:Environment@98] - Client environment:java.library.path=/Users/lipenghui/Library/Java/Extensions:/Library/Java/Extensions:/Network/Library/Java/Extensions:/System/Library/Java/Extensions:/usr/lib/java:.
+2026-04-03T18:52:41,519 - INFO  - [main:Environment@98] - Client environment:java.io.tmpdir=/var/folders/cw/557zcqw50yg8qx6d3qgl2f9c0000gn/T/
+2026-04-03T18:52:41,519 - INFO  - [main:Environment@98] - Client environment:java.compiler=<NA>
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:os.name=Mac OS X
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:os.arch=aarch64
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:os.version=15.7.3
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:user.name=lipenghui
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:user.home=/Users/lipenghui
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:user.dir=/Users/lipenghui/Github/sn/bookkeeper-rust/tests/java-compat
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:os.memory.free=488MB
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:os.memory.max=8192MB
+2026-04-03T18:52:41,520 - INFO  - [main:Environment@98] - Client environment:os.memory.total=516MB
+2026-04-03T18:52:41,522 - INFO  - [main:ZooKeeper@635] - Initiating client connection, connectString=localhost:61590 sessionTimeout=10000 watcher=org.apache.bookkeeper.zookeeper.ZooKeeperWatcherBase@6f70f32f
+2026-04-03T18:52:41,526 - INFO  - [main:X509Util@93] - Setting -D jdk.tls.rejectClientInitiatedRenegotiation=true to disable client-initiated TLS renegotiation
+2026-04-03T18:52:41,603 - INFO  - [main:X509Util@115] - Default TLS protocol is TLSv1.3, supported TLS protocols are [TLSv1.3, TLSv1.2, TLSv1.1, TLSv1, SSLv3, SSLv2Hello]
+2026-04-03T18:52:41,609 - INFO  - [main:ClientCnxnSocket@235] - jute.maxbuffer value is 1048575 Bytes
+2026-04-03T18:52:41,612 - INFO  - [main:ClientCnxn@1734] - zookeeper.request.timeout value is 0. feature enabled=false
+2026-04-03T18:52:41,633 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1170] - Opening socket connection to server localhost/127.0.0.1:61590.
+2026-04-03T18:52:41,633 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1172] - SASL config status: Will not attempt to authenticate using SASL (unknown error)
+2026-04-03T18:52:41,641 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1006] - Socket connection established, initiating session, client: /127.0.0.1:61598, server: localhost/127.0.0.1:61590
+2026-04-03T18:52:41,647 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1438] - Session establishment complete on server localhost/127.0.0.1:61590, session id = 0x10099b90f230002, negotiated timeout = 10000
+2026-04-03T18:52:41,648 - INFO  - [main-EventThread:ZooKeeperWatcherBase@133] - ZooKeeper client is connected now.
+2026-04-03T18:52:41,694 - WARN  - [main:RackawareEnsemblePlacementPolicyImpl@314] - Failed to initialize DNS Resolver org.apache.bookkeeper.net.ScriptBasedMapping, used default subnet resolver because No network topology script is found when using script based DNS resolver.
+2026-04-03T18:52:41,705 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@257] - Initialize rackaware ensemble placement policy @ <Bookie:127.0.0.1:0> @ /default-rack : org.apache.bookkeeper.client.TopologyAwareEnsemblePlacementPolicy$DefaultResolver.
+2026-04-03T18:52:41,705 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@267] - Not weighted
+2026-04-03T18:52:41,710 - INFO  - [main:BookKeeper@529] - Weighted ledger placement is not enabled
+2026-04-03T18:52:41,772 - INFO  - [main-EventThread:ZKRegistrationClient@271] - Update BookieInfoCache (writable bookie) 0.0.0.0:61592 -> BookieServiceInfo{properties={}, endpoints=[EndpointInfo{id=0.0.0.0:61592, port=61592, host=0.0.0.0, protocol=bookie-rpc, auth=[], extensions=[]}]}
+2026-04-03T18:52:41,775 - INFO  - [BookKeeperHighPriorityThread-OrderedScheduler-0-0:NetworkTopologyImpl@428] - Adding a new node: /default-rack/0.0.0.0:61592
+]]></system-out>
+  </testcase>
+  <testcase name="testManyEntries" classname="org.apache.bookkeeper.compat.RustBookieCompatTest" time="0.014">
+    <error message="Failed to initialize ledger manager factory" type="java.io.IOException"><![CDATA[java.io.IOException: Failed to initialize ledger manager factory
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:540)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:344)
+	at org.apache.bookkeeper.compat.RustBookieCompatTest.createClient(RustBookieCompatTest.java:54)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+Caused by: org.apache.bookkeeper.meta.exceptions.MetadataException: Failed to initialized ledger manager factory
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:286)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:538)
+	... 5 more
+Caused by: java.io.IOException: Incompatible layout version found : 2
+	at org.apache.bookkeeper.meta.LegacyHierarchicalLedgerManagerFactory.initialize(LegacyHierarchicalLedgerManagerFactory.java:57)
+	at org.apache.bookkeeper.meta.AbstractZkLedgerManagerFactory.newLedgerManagerFactory(AbstractZkLedgerManagerFactory.java:236)
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:282)
+	... 6 more
+]]></error>
+    <system-out><![CDATA[2026-04-03T18:52:41,788 - INFO  - [main:ZKMetadataDriverBase@212] - Initialize zookeeper metadata driver at metadata service uri zk+hierarchical://localhost:61590/ledgers : zkServers = localhost:61590, ledgersRootPath = /ledgers.
+2026-04-03T18:52:41,788 - INFO  - [main:ZooKeeper@635] - Initiating client connection, connectString=localhost:61590 sessionTimeout=10000 watcher=org.apache.bookkeeper.zookeeper.ZooKeeperWatcherBase@25a73de1
+2026-04-03T18:52:41,788 - INFO  - [main:ClientCnxnSocket@235] - jute.maxbuffer value is 1048575 Bytes
+2026-04-03T18:52:41,789 - INFO  - [main:ClientCnxn@1734] - zookeeper.request.timeout value is 0. feature enabled=false
+2026-04-03T18:52:41,789 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1170] - Opening socket connection to server localhost/127.0.0.1:61590.
+2026-04-03T18:52:41,789 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1172] - SASL config status: Will not attempt to authenticate using SASL (unknown error)
+2026-04-03T18:52:41,789 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1006] - Socket connection established, initiating session, client: /127.0.0.1:61599, server: localhost/127.0.0.1:61590
+2026-04-03T18:52:41,794 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1438] - Session establishment complete on server localhost/127.0.0.1:61590, session id = 0x10099b90f230003, negotiated timeout = 10000
+2026-04-03T18:52:41,794 - INFO  - [main-EventThread:ZooKeeperWatcherBase@133] - ZooKeeper client is connected now.
+2026-04-03T18:52:41,795 - WARN  - [main:RackawareEnsemblePlacementPolicyImpl@314] - Failed to initialize DNS Resolver org.apache.bookkeeper.net.ScriptBasedMapping, used default subnet resolver because No network topology script is found when using script based DNS resolver.
+2026-04-03T18:52:41,796 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@257] - Initialize rackaware ensemble placement policy @ <Bookie:127.0.0.1:0> @ /default-rack : org.apache.bookkeeper.client.TopologyAwareEnsemblePlacementPolicy$DefaultResolver.
+2026-04-03T18:52:41,796 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@267] - Not weighted
+2026-04-03T18:52:41,796 - INFO  - [main:BookKeeper@529] - Weighted ledger placement is not enabled
+2026-04-03T18:52:41,798 - INFO  - [main-EventThread:ZKRegistrationClient@271] - Update BookieInfoCache (writable bookie) 0.0.0.0:61592 -> BookieServiceInfo{properties={}, endpoints=[EndpointInfo{id=0.0.0.0:61592, port=61592, host=0.0.0.0, protocol=bookie-rpc, auth=[], extensions=[]}]}
+2026-04-03T18:52:41,798 - INFO  - [BookKeeperHighPriorityThread-OrderedScheduler-0-0:NetworkTopologyImpl@428] - Adding a new node: /default-rack/0.0.0.0:61592
+]]></system-out>
+  </testcase>
+  <testcase name="testV3CreateWriteReadClose" classname="org.apache.bookkeeper.compat.RustBookieCompatTest" time="0.012">
+    <error message="Failed to initialize ledger manager factory" type="java.io.IOException"><![CDATA[java.io.IOException: Failed to initialize ledger manager factory
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:540)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:344)
+	at org.apache.bookkeeper.compat.RustBookieCompatTest.createClient(RustBookieCompatTest.java:54)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+Caused by: org.apache.bookkeeper.meta.exceptions.MetadataException: Failed to initialized ledger manager factory
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:286)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:538)
+	... 5 more
+Caused by: java.io.IOException: Incompatible layout version found : 2
+	at org.apache.bookkeeper.meta.LegacyHierarchicalLedgerManagerFactory.initialize(LegacyHierarchicalLedgerManagerFactory.java:57)
+	at org.apache.bookkeeper.meta.AbstractZkLedgerManagerFactory.newLedgerManagerFactory(AbstractZkLedgerManagerFactory.java:236)
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:282)
+	... 6 more
+]]></error>
+    <system-out><![CDATA[2026-04-03T18:52:41,802 - INFO  - [main:ZKMetadataDriverBase@212] - Initialize zookeeper metadata driver at metadata service uri zk+hierarchical://localhost:61590/ledgers : zkServers = localhost:61590, ledgersRootPath = /ledgers.
+2026-04-03T18:52:41,802 - INFO  - [main:ZooKeeper@635] - Initiating client connection, connectString=localhost:61590 sessionTimeout=10000 watcher=org.apache.bookkeeper.zookeeper.ZooKeeperWatcherBase@5bdd5689
+2026-04-03T18:52:41,803 - INFO  - [main:ClientCnxnSocket@235] - jute.maxbuffer value is 1048575 Bytes
+2026-04-03T18:52:41,803 - INFO  - [main:ClientCnxn@1734] - zookeeper.request.timeout value is 0. feature enabled=false
+2026-04-03T18:52:41,803 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1170] - Opening socket connection to server localhost/127.0.0.1:61590.
+2026-04-03T18:52:41,803 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1172] - SASL config status: Will not attempt to authenticate using SASL (unknown error)
+2026-04-03T18:52:41,803 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1006] - Socket connection established, initiating session, client: /127.0.0.1:61600, server: localhost/127.0.0.1:61590
+2026-04-03T18:52:41,807 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1438] - Session establishment complete on server localhost/127.0.0.1:61590, session id = 0x10099b90f230004, negotiated timeout = 10000
+2026-04-03T18:52:41,807 - INFO  - [main-EventThread:ZooKeeperWatcherBase@133] - ZooKeeper client is connected now.
+2026-04-03T18:52:41,808 - WARN  - [main:RackawareEnsemblePlacementPolicyImpl@314] - Failed to initialize DNS Resolver org.apache.bookkeeper.net.ScriptBasedMapping, used default subnet resolver because No network topology script is found when using script based DNS resolver.
+2026-04-03T18:52:41,808 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@257] - Initialize rackaware ensemble placement policy @ <Bookie:127.0.0.1:0> @ /default-rack : org.apache.bookkeeper.client.TopologyAwareEnsemblePlacementPolicy$DefaultResolver.
+2026-04-03T18:52:41,808 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@267] - Not weighted
+2026-04-03T18:52:41,809 - INFO  - [main:BookKeeper@529] - Weighted ledger placement is not enabled
+2026-04-03T18:52:41,810 - INFO  - [main-EventThread:ZKRegistrationClient@271] - Update BookieInfoCache (writable bookie) 0.0.0.0:61592 -> BookieServiceInfo{properties={}, endpoints=[EndpointInfo{id=0.0.0.0:61592, port=61592, host=0.0.0.0, protocol=bookie-rpc, auth=[], extensions=[]}]}
+2026-04-03T18:52:41,810 - INFO  - [BookKeeperHighPriorityThread-OrderedScheduler-0-0:NetworkTopologyImpl@428] - Adding a new node: /default-rack/0.0.0.0:61592
+]]></system-out>
+  </testcase>
+  <testcase name="testFencing" classname="org.apache.bookkeeper.compat.RustBookieCompatTest" time="0.012">
+    <error message="Failed to initialize ledger manager factory" type="java.io.IOException"><![CDATA[java.io.IOException: Failed to initialize ledger manager factory
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:540)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:344)
+	at org.apache.bookkeeper.compat.RustBookieCompatTest.createClient(RustBookieCompatTest.java:54)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+Caused by: org.apache.bookkeeper.meta.exceptions.MetadataException: Failed to initialized ledger manager factory
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:286)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:538)
+	... 5 more
+Caused by: java.io.IOException: Incompatible layout version found : 2
+	at org.apache.bookkeeper.meta.LegacyHierarchicalLedgerManagerFactory.initialize(LegacyHierarchicalLedgerManagerFactory.java:57)
+	at org.apache.bookkeeper.meta.AbstractZkLedgerManagerFactory.newLedgerManagerFactory(AbstractZkLedgerManagerFactory.java:236)
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:282)
+	... 6 more
+]]></error>
+    <system-out><![CDATA[2026-04-03T18:52:41,814 - INFO  - [main:ZKMetadataDriverBase@212] - Initialize zookeeper metadata driver at metadata service uri zk+hierarchical://localhost:61590/ledgers : zkServers = localhost:61590, ledgersRootPath = /ledgers.
+2026-04-03T18:52:41,814 - INFO  - [main:ZooKeeper@635] - Initiating client connection, connectString=localhost:61590 sessionTimeout=10000 watcher=org.apache.bookkeeper.zookeeper.ZooKeeperWatcherBase@15fb7a32
+2026-04-03T18:52:41,814 - INFO  - [main:ClientCnxnSocket@235] - jute.maxbuffer value is 1048575 Bytes
+2026-04-03T18:52:41,814 - INFO  - [main:ClientCnxn@1734] - zookeeper.request.timeout value is 0. feature enabled=false
+2026-04-03T18:52:41,815 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1170] - Opening socket connection to server localhost/[0:0:0:0:0:0:0:1]:61590.
+2026-04-03T18:52:41,816 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1172] - SASL config status: Will not attempt to authenticate using SASL (unknown error)
+2026-04-03T18:52:41,816 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1006] - Socket connection established, initiating session, client: /[0:0:0:0:0:0:0:1]:61601, server: localhost/[0:0:0:0:0:0:0:1]:61590
+2026-04-03T18:52:41,820 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1438] - Session establishment complete on server localhost/[0:0:0:0:0:0:0:1]:61590, session id = 0x10099b90f230005, negotiated timeout = 10000
+2026-04-03T18:52:41,820 - INFO  - [main-EventThread:ZooKeeperWatcherBase@133] - ZooKeeper client is connected now.
+2026-04-03T18:52:41,821 - WARN  - [main:RackawareEnsemblePlacementPolicyImpl@314] - Failed to initialize DNS Resolver org.apache.bookkeeper.net.ScriptBasedMapping, used default subnet resolver because No network topology script is found when using script based DNS resolver.
+2026-04-03T18:52:41,821 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@257] - Initialize rackaware ensemble placement policy @ <Bookie:127.0.0.1:0> @ /default-rack : org.apache.bookkeeper.client.TopologyAwareEnsemblePlacementPolicy$DefaultResolver.
+2026-04-03T18:52:41,821 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@267] - Not weighted
+2026-04-03T18:52:41,822 - INFO  - [main:BookKeeper@529] - Weighted ledger placement is not enabled
+2026-04-03T18:52:41,823 - INFO  - [main-EventThread:ZKRegistrationClient@271] - Update BookieInfoCache (writable bookie) 0.0.0.0:61592 -> BookieServiceInfo{properties={}, endpoints=[EndpointInfo{id=0.0.0.0:61592, port=61592, host=0.0.0.0, protocol=bookie-rpc, auth=[], extensions=[]}]}
+2026-04-03T18:52:41,823 - INFO  - [BookKeeperHighPriorityThread-OrderedScheduler-0-0:NetworkTopologyImpl@428] - Adding a new node: /default-rack/0.0.0.0:61592
+]]></system-out>
+  </testcase>
+  <testcase name="testEmptyPassword" classname="org.apache.bookkeeper.compat.RustBookieCompatTest" time="0.011">
+    <error message="Failed to initialize ledger manager factory" type="java.io.IOException"><![CDATA[java.io.IOException: Failed to initialize ledger manager factory
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:540)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:344)
+	at org.apache.bookkeeper.compat.RustBookieCompatTest.createClient(RustBookieCompatTest.java:54)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+Caused by: org.apache.bookkeeper.meta.exceptions.MetadataException: Failed to initialized ledger manager factory
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:286)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:538)
+	... 5 more
+Caused by: java.io.IOException: Incompatible layout version found : 2
+	at org.apache.bookkeeper.meta.LegacyHierarchicalLedgerManagerFactory.initialize(LegacyHierarchicalLedgerManagerFactory.java:57)
+	at org.apache.bookkeeper.meta.AbstractZkLedgerManagerFactory.newLedgerManagerFactory(AbstractZkLedgerManagerFactory.java:236)
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:282)
+	... 6 more
+]]></error>
+    <system-out><![CDATA[2026-04-03T18:52:41,826 - INFO  - [main:ZKMetadataDriverBase@212] - Initialize zookeeper metadata driver at metadata service uri zk+hierarchical://localhost:61590/ledgers : zkServers = localhost:61590, ledgersRootPath = /ledgers.
+2026-04-03T18:52:41,826 - INFO  - [main:ZooKeeper@635] - Initiating client connection, connectString=localhost:61590 sessionTimeout=10000 watcher=org.apache.bookkeeper.zookeeper.ZooKeeperWatcherBase@3b0ee03a
+2026-04-03T18:52:41,826 - INFO  - [main:ClientCnxnSocket@235] - jute.maxbuffer value is 1048575 Bytes
+2026-04-03T18:52:41,827 - INFO  - [main:ClientCnxn@1734] - zookeeper.request.timeout value is 0. feature enabled=false
+2026-04-03T18:52:41,827 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1170] - Opening socket connection to server localhost/127.0.0.1:61590.
+2026-04-03T18:52:41,827 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1172] - SASL config status: Will not attempt to authenticate using SASL (unknown error)
+2026-04-03T18:52:41,827 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1006] - Socket connection established, initiating session, client: /127.0.0.1:61602, server: localhost/127.0.0.1:61590
+2026-04-03T18:52:41,831 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1438] - Session establishment complete on server localhost/127.0.0.1:61590, session id = 0x10099b90f230006, negotiated timeout = 10000
+2026-04-03T18:52:41,831 - INFO  - [main-EventThread:ZooKeeperWatcherBase@133] - ZooKeeper client is connected now.
+2026-04-03T18:52:41,832 - WARN  - [main:RackawareEnsemblePlacementPolicyImpl@314] - Failed to initialize DNS Resolver org.apache.bookkeeper.net.ScriptBasedMapping, used default subnet resolver because No network topology script is found when using script based DNS resolver.
+2026-04-03T18:52:41,833 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@257] - Initialize rackaware ensemble placement policy @ <Bookie:127.0.0.1:0> @ /default-rack : org.apache.bookkeeper.client.TopologyAwareEnsemblePlacementPolicy$DefaultResolver.
+2026-04-03T18:52:41,833 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@267] - Not weighted
+2026-04-03T18:52:41,833 - INFO  - [main:BookKeeper@529] - Weighted ledger placement is not enabled
+2026-04-03T18:52:41,834 - INFO  - [main-EventThread:ZKRegistrationClient@271] - Update BookieInfoCache (writable bookie) 0.0.0.0:61592 -> BookieServiceInfo{properties={}, endpoints=[EndpointInfo{id=0.0.0.0:61592, port=61592, host=0.0.0.0, protocol=bookie-rpc, auth=[], extensions=[]}]}
+2026-04-03T18:52:41,834 - INFO  - [BookKeeperHighPriorityThread-OrderedScheduler-0-0:NetworkTopologyImpl@428] - Adding a new node: /default-rack/0.0.0.0:61592
+]]></system-out>
+  </testcase>
+  <testcase name="testV2WireProtocol" classname="org.apache.bookkeeper.compat.RustBookieCompatTest" time="0.014">
+    <error message="Failed to initialize ledger manager factory" type="java.io.IOException"><![CDATA[java.io.IOException: Failed to initialize ledger manager factory
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:540)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:344)
+	at org.apache.bookkeeper.compat.RustBookieCompatTest.createClient(RustBookieCompatTest.java:54)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+Caused by: org.apache.bookkeeper.meta.exceptions.MetadataException: Failed to initialized ledger manager factory
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:286)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:538)
+	... 5 more
+Caused by: java.io.IOException: Incompatible layout version found : 2
+	at org.apache.bookkeeper.meta.LegacyHierarchicalLedgerManagerFactory.initialize(LegacyHierarchicalLedgerManagerFactory.java:57)
+	at org.apache.bookkeeper.meta.AbstractZkLedgerManagerFactory.newLedgerManagerFactory(AbstractZkLedgerManagerFactory.java:236)
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:282)
+	... 6 more
+]]></error>
+    <system-out><![CDATA[2026-04-03T18:52:41,837 - INFO  - [main:ZKMetadataDriverBase@212] - Initialize zookeeper metadata driver at metadata service uri zk+hierarchical://localhost:61590/ledgers : zkServers = localhost:61590, ledgersRootPath = /ledgers.
+2026-04-03T18:52:41,838 - INFO  - [main:ZooKeeper@635] - Initiating client connection, connectString=localhost:61590 sessionTimeout=10000 watcher=org.apache.bookkeeper.zookeeper.ZooKeeperWatcherBase@630d1b2f
+2026-04-03T18:52:41,838 - INFO  - [main:ClientCnxnSocket@235] - jute.maxbuffer value is 1048575 Bytes
+2026-04-03T18:52:41,838 - INFO  - [main:ClientCnxn@1734] - zookeeper.request.timeout value is 0. feature enabled=false
+2026-04-03T18:52:41,841 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1170] - Opening socket connection to server localhost/127.0.0.1:61590.
+2026-04-03T18:52:41,841 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1172] - SASL config status: Will not attempt to authenticate using SASL (unknown error)
+2026-04-03T18:52:41,841 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1006] - Socket connection established, initiating session, client: /127.0.0.1:61603, server: localhost/127.0.0.1:61590
+2026-04-03T18:52:41,845 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1438] - Session establishment complete on server localhost/127.0.0.1:61590, session id = 0x10099b90f230007, negotiated timeout = 10000
+2026-04-03T18:52:41,845 - INFO  - [main-EventThread:ZooKeeperWatcherBase@133] - ZooKeeper client is connected now.
+2026-04-03T18:52:41,846 - WARN  - [main:RackawareEnsemblePlacementPolicyImpl@314] - Failed to initialize DNS Resolver org.apache.bookkeeper.net.ScriptBasedMapping, used default subnet resolver because No network topology script is found when using script based DNS resolver.
+2026-04-03T18:52:41,846 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@257] - Initialize rackaware ensemble placement policy @ <Bookie:127.0.0.1:0> @ /default-rack : org.apache.bookkeeper.client.TopologyAwareEnsemblePlacementPolicy$DefaultResolver.
+2026-04-03T18:52:41,847 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@267] - Not weighted
+2026-04-03T18:52:41,847 - INFO  - [main:BookKeeper@529] - Weighted ledger placement is not enabled
+2026-04-03T18:52:41,848 - INFO  - [main-EventThread:ZKRegistrationClient@271] - Update BookieInfoCache (writable bookie) 0.0.0.0:61592 -> BookieServiceInfo{properties={}, endpoints=[EndpointInfo{id=0.0.0.0:61592, port=61592, host=0.0.0.0, protocol=bookie-rpc, auth=[], extensions=[]}]}
+2026-04-03T18:52:41,848 - INFO  - [BookKeeperHighPriorityThread-OrderedScheduler-0-0:NetworkTopologyImpl@428] - Adding a new node: /default-rack/0.0.0.0:61592
+]]></system-out>
+  </testcase>
+  <testcase name="testLargeEntries" classname="org.apache.bookkeeper.compat.RustBookieCompatTest" time="0.01">
+    <error message="Failed to initialize ledger manager factory" type="java.io.IOException"><![CDATA[java.io.IOException: Failed to initialize ledger manager factory
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:540)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:344)
+	at org.apache.bookkeeper.compat.RustBookieCompatTest.createClient(RustBookieCompatTest.java:54)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:580)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+	at java.base/java.util.ArrayList.forEach(ArrayList.java:1596)
+Caused by: org.apache.bookkeeper.meta.exceptions.MetadataException: Failed to initialized ledger manager factory
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:286)
+	at org.apache.bookkeeper.client.BookKeeper.<init>(BookKeeper.java:538)
+	... 5 more
+Caused by: java.io.IOException: Incompatible layout version found : 2
+	at org.apache.bookkeeper.meta.LegacyHierarchicalLedgerManagerFactory.initialize(LegacyHierarchicalLedgerManagerFactory.java:57)
+	at org.apache.bookkeeper.meta.AbstractZkLedgerManagerFactory.newLedgerManagerFactory(AbstractZkLedgerManagerFactory.java:236)
+	at org.apache.bookkeeper.meta.zk.ZKMetadataDriverBase.getLedgerManagerFactory(ZKMetadataDriverBase.java:282)
+	... 6 more
+]]></error>
+    <system-out><![CDATA[2026-04-03T18:52:41,851 - INFO  - [main:ZKMetadataDriverBase@212] - Initialize zookeeper metadata driver at metadata service uri zk+hierarchical://localhost:61590/ledgers : zkServers = localhost:61590, ledgersRootPath = /ledgers.
+2026-04-03T18:52:41,851 - INFO  - [main:ZooKeeper@635] - Initiating client connection, connectString=localhost:61590 sessionTimeout=10000 watcher=org.apache.bookkeeper.zookeeper.ZooKeeperWatcherBase@7159139f
+2026-04-03T18:52:41,851 - INFO  - [main:ClientCnxnSocket@235] - jute.maxbuffer value is 1048575 Bytes
+2026-04-03T18:52:41,852 - INFO  - [main:ClientCnxn@1734] - zookeeper.request.timeout value is 0. feature enabled=false
+2026-04-03T18:52:41,852 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1170] - Opening socket connection to server localhost/127.0.0.1:61590.
+2026-04-03T18:52:41,852 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1172] - SASL config status: Will not attempt to authenticate using SASL (unknown error)
+2026-04-03T18:52:41,852 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1006] - Socket connection established, initiating session, client: /127.0.0.1:61604, server: localhost/127.0.0.1:61590
+2026-04-03T18:52:41,856 - INFO  - [main-SendThread(localhost:61590):ClientCnxn$SendThread@1438] - Session establishment complete on server localhost/127.0.0.1:61590, session id = 0x10099b90f230008, negotiated timeout = 10000
+2026-04-03T18:52:41,856 - INFO  - [main-EventThread:ZooKeeperWatcherBase@133] - ZooKeeper client is connected now.
+2026-04-03T18:52:41,857 - WARN  - [main:RackawareEnsemblePlacementPolicyImpl@314] - Failed to initialize DNS Resolver org.apache.bookkeeper.net.ScriptBasedMapping, used default subnet resolver because No network topology script is found when using script based DNS resolver.
+2026-04-03T18:52:41,857 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@257] - Initialize rackaware ensemble placement policy @ <Bookie:127.0.0.1:0> @ /default-rack : org.apache.bookkeeper.client.TopologyAwareEnsemblePlacementPolicy$DefaultResolver.
+2026-04-03T18:52:41,857 - INFO  - [main:RackawareEnsemblePlacementPolicyImpl@267] - Not weighted
+2026-04-03T18:52:41,857 - INFO  - [main:BookKeeper@529] - Weighted ledger placement is not enabled
+2026-04-03T18:52:41,858 - INFO  - [main-EventThread:ZKRegistrationClient@271] - Update BookieInfoCache (writable bookie) 0.0.0.0:61592 -> BookieServiceInfo{properties={}, endpoints=[EndpointInfo{id=0.0.0.0:61592, port=61592, host=0.0.0.0, protocol=bookie-rpc, auth=[], extensions=[]}]}
+2026-04-03T18:52:41,858 - INFO  - [BookKeeperHighPriorityThread-OrderedScheduler-0-0:NetworkTopologyImpl@428] - Adding a new node: /default-rack/0.0.0.0:61592
+]]></system-out>
+  </testcase>
+</testsuite>

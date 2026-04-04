@@ -94,7 +94,7 @@ async fn cmd_initnewcluster(zk: &str, ledger_root: &str) -> Result<(), Box<dyn s
     let layout = LedgerLayout {
         manager_factory_class: "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"
             .to_string(),
-        manager_version: 2,
+        manager_version: 1,
     };
     let instance_id = uuid::Uuid::new_v4().to_string();
     mgr.init_new_cluster(&layout, &instance_id).await?;
