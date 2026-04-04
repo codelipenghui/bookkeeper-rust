@@ -33,6 +33,10 @@ pub trait LedgerManager: Send + Sync {
         ledger_id: i64,
         version: i32,
     ) -> Result<(), MetadataError>;
+
+    /// Iterate over all ledger IDs in the metadata store.
+    /// Used by the Auditor to build bookie-to-ledger indexes.
+    async fn get_ledger_ranges(&self) -> Result<Vec<i64>, MetadataError>;
 }
 
 /// Generates unique ledger IDs.

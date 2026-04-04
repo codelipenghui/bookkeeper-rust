@@ -255,6 +255,53 @@ impl LedgerStorage for DbLedgerStorage {
         self.ledger_index.update_lac(ledger_id, lac)
     }
 
+    fn get_active_ledgers(&self) -> Result<Vec<i64>, StorageError> {
+        self.ledger_index.list_all_ledgers()
+    }
+
+    fn entry_log_dir(&self) -> Option<&Path> {
+        Some(&self.entry_log_dir)
+    }
+
+    fn current_log_id(&self) -> Option<u32> {
+        Some(self.log_state.lock().unwrap().log_id)
+    }
+
+    fn compact_entry_locations(&self) -> Result<(), StorageError> {
+        self.entry_location_index.compact()
+    }
+
+    fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError> {
+        use std::io::BufWriter;
+        let mut log_state = self.log_state.lock().unwrap();
+        self.ensure_entry_log_exists(log_state.log_id)?;
+
+        let encoded_size = (4 + entry.len()) as u64;
+        if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
+            log_state.log_id += 1;
+            log_state.offset = LOGFILE_HEADER_SIZE as u64;
+            self.ensure_entry_log_exists(log_state.log_id)?;
+        }
+
+        let path = self.entry_log_path(log_state.log_id);
+        let mut writer = BufWriter::new(
+            fs::OpenOptions::new().create(true).append(true).open(&path)?
+        );
+        writer.write_all(&(entry.len() as i32).to_be_bytes())?;
+        writer.write_all(entry)?;
+        writer.flush()?;
+
+        let position = log_state.offset + 4;
+        let location = EntryLocation::new(log_state.log_id, position as u32).to_u64();
+        log_state.offset += encoded_size;
+        Ok(location)
+    }
+
+    fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError> {
+        self.entry_location_index.put_batch(batch)?;
+        self.entry_location_index.flush()
+    }
+
     fn delete_ledger(&self, ledger_id: i64) -> Result<(), StorageError> {
         self.ledger_index.delete(ledger_id)?;
         self.entry_location_index.delete_ledger(ledger_id)?;

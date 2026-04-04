@@ -44,7 +44,7 @@ fn underreplication_path() {
 #[test]
 fn underreplication_path_zero() {
     let path = underreplication_ledger_path("/ledgers/underreplication/ledgers", 0);
-    assert_eq!(path, "/ledgers/underreplication/ledgers/0000/0000/0000/0000/urL0");
+    assert_eq!(path, "/ledgers/underreplication/ledgers/0000/0000/0000/0000/urL0000000000");
 }
 
 #[test]

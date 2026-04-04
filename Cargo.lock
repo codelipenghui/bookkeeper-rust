@@ -350,6 +350,7 @@ dependencies = [
 name = "bookkeeper-client"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bookkeeper-common",
  "bookkeeper-config",
  "bookkeeper-metadata",
@@ -366,6 +367,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "uuid",
+ "zookeeper-client",
 ]
 
 [[package]]
@@ -444,11 +447,13 @@ name = "bookkeeper-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bookkeeper-client",
  "bookkeeper-common",
  "bookkeeper-config",
  "bookkeeper-metadata",
  "bookkeeper-proto",
  "bookkeeper-protocol",
+ "bookkeeper-replication",
  "bookkeeper-storage",
  "bytes",
  "libc",
@@ -461,6 +466,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "zookeeper-client",
 ]
 
 [[package]]

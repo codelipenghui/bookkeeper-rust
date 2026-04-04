@@ -21,10 +21,11 @@ fn long_hierarchical_path(root: &str, ledger_id: i64) -> String {
 
 /// Compute the ZK path for an underreplicated ledger marker.
 /// Uses 4-level hex hierarchy from 64-bit ledger ID.
+/// Ledger ID in the znode name is zero-padded to 10 digits (%010d), matching Java.
 pub fn underreplication_ledger_path(base: &str, ledger_id: i64) -> String {
     let id = ledger_id as u64;
     format!(
-        "{}/{:04x}/{:04x}/{:04x}/{:04x}/urL{}",
+        "{}/{:04x}/{:04x}/{:04x}/{:04x}/urL{:010}",
         base,
         (id >> 48) & 0xFFFF,
         (id >> 32) & 0xFFFF,
@@ -32,6 +33,12 @@ pub fn underreplication_ledger_path(base: &str, ledger_id: i64) -> String {
         id & 0xFFFF,
         ledger_id,
     )
+}
+
+/// Compute the ZK lock path for an underreplicated ledger.
+/// Lock path uses flat structure: {base}/urL{%010d}.
+pub fn underreplication_lock_path(base: &str, ledger_id: i64) -> String {
+    format!("{}/urL{:010}", base, ledger_id)
 }
 
 /// Well-known ZK paths relative to the ledger root.

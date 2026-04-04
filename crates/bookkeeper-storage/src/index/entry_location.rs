@@ -74,6 +74,13 @@ impl EntryLocationIndex {
         opts.set_wait(true);
         self.db.flush_opt(&opts).map_err(|e| StorageError::RocksDb(e.to_string()))
     }
+
+    /// Trigger RocksDB compaction to reclaim space after ledger deletions.
+    /// Matches Java's DbLedgerStorage.entryLocationCompact().
+    pub fn compact(&self) -> Result<(), StorageError> {
+        self.db.compact_range::<&[u8], &[u8]>(None, None);
+        Ok(())
+    }
 }
 
 fn encode_location_key(ledger_id: i64, entry_id: i64) -> [u8; 16] {

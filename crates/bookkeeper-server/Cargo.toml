@@ -11,6 +11,8 @@ bookkeeper-protocol = { workspace = true }
 bookkeeper-storage = { workspace = true }
 bookkeeper-metadata = { workspace = true }
 bookkeeper-config = { workspace = true }
+bookkeeper-replication = { workspace = true }
+bookkeeper-client = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -20,6 +22,7 @@ prost = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+zookeeper-client = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

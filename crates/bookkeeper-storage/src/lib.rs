@@ -8,3 +8,4 @@ pub mod cache;
 pub mod checkpoint;
 pub mod ledger_storage;
 pub mod db_ledger_storage;
+pub mod gc;

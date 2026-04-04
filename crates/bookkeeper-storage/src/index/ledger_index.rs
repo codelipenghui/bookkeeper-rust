@@ -81,6 +81,26 @@ impl LedgerMetadataIndex {
         }
     }
 
+    /// Enumerate all ledger IDs in the index.
+    /// Used by GC to compare local ledgers against metadata store.
+    pub fn list_all_ledgers(&self) -> Result<Vec<i64>, StorageError> {
+        let mut ledgers = Vec::new();
+        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            if key.len() == 8 {
+                let ledger_id = i64::from_be_bytes(key[..8].try_into().unwrap());
+                // Only include ledgers that actually exist
+                if let Ok(proto) = bookkeeper_proto::LedgerData::decode(&value[..]) {
+                    if proto.exists {
+                        ledgers.push(ledger_id);
+                    }
+                }
+            }
+        }
+        Ok(ledgers)
+    }
+
     pub fn delete(&self, ledger_id: i64) -> Result<(), StorageError> {
         let key = ledger_id.to_be_bytes();
         self.db.delete(&key).map_err(|e| StorageError::RocksDb(e.to_string()))

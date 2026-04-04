@@ -16,6 +16,8 @@ import java.util.Enumeration;
 
 import org.apache.bookkeeper.client.LedgerEntry;
 
+import org.apache.bookkeeper.client.BKException;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -329,6 +331,263 @@ public class RustBookieCompatTest {
         }
         assertEquals(numEntries, count, "Should have read all " + numEntries + " entries");
 
+        readLh.close();
+    }
+
+    // -----------------------------------------------------------------------
+    // New compatibility tests
+    // -----------------------------------------------------------------------
+
+    /**
+     * Test 8: Ledger recovery — write entries without closing, then open with recovery.
+     *
+     * <p>Simulates a writer crash by not calling close(). The recovery open should
+     * fence the ledger, discover all written entries, and seal the ledger.
+     */
+    @Test
+    void testLedgerRecovery() throws Exception {
+        final int numEntries = 20;
+
+        // Create and write without closing (simulate crash)
+        LedgerHandle writer = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+        long ledgerId = writer.getId();
+
+        for (int i = 0; i < numEntries; i++) {
+            writer.addEntry(("recovery-" + i).getBytes(StandardCharsets.UTF_8));
+        }
+        long writerLac = writer.getLastAddConfirmed();
+        assertEquals(numEntries - 1, writerLac, "Writer LAC should be " + (numEntries - 1));
+        // Do NOT call writer.close() — simulating crash
+
+        // New client opens with recovery
+        ClientConfiguration conf2 = new ClientConfiguration();
+        conf2.setMetadataServiceUri("zk+hierarchical://" + zkConnect + "/ledgers");
+        try (BookKeeper bk2 = new BookKeeper(conf2)) {
+            LedgerHandle recovered = bk2.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+            long recoveredLac = recovered.getLastAddConfirmed();
+            assertTrue(recoveredLac >= numEntries - 1,
+                    "Recovered LAC should be >= " + (numEntries - 1) + ", got " + recoveredLac);
+
+            // Read all entries
+            Enumeration<LedgerEntry> entries = recovered.readEntries(0, recoveredLac);
+            int count = 0;
+            while (entries.hasMoreElements()) {
+                LedgerEntry entry = entries.nextElement();
+                String expected = "recovery-" + count;
+                assertEquals(expected, new String(entry.getEntry(), StandardCharsets.UTF_8),
+                        "Recovery entry " + count + " mismatch");
+                count++;
+            }
+            assertTrue(count >= numEntries,
+                    "Should recover at least " + numEntries + " entries, got " + count);
+            recovered.close();
+        }
+
+        try { writer.close(); } catch (Exception ignored) {}
+    }
+
+    /**
+     * Test 9: Ledger deletion — create, write, close, delete, verify it's gone.
+     *
+     * <p>After deletion, attempting to open the ledger should fail with
+     * NoSuchLedgerExistsOnMetadataServerException.
+     */
+    @Test
+    void testLedgerDeletion() throws Exception {
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+        long ledgerId = lh.getId();
+
+        lh.addEntry("delete-me".getBytes(StandardCharsets.UTF_8));
+        lh.close();
+
+        // Verify ledger exists
+        LedgerHandle readLh = bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        assertEquals(0, readLh.getLastAddConfirmed());
+        readLh.close();
+
+        // Delete
+        bk.deleteLedger(ledgerId);
+
+        // Verify ledger is gone
+        assertThrows(BKException.BKNoSuchLedgerExistsOnMetadataServerException.class, () -> {
+            bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        }, "Opening a deleted ledger should throw");
+    }
+
+    /**
+     * Test 10: readLastConfirmed — verify LAC is correctly reported by the bookie.
+     *
+     * <p>Creates a ledger, writes entries one at a time, and after each write
+     * verifies the LAC reflects the last confirmed entry.
+     */
+    @Test
+    void testReadLastConfirmed() throws Exception {
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+        long ledgerId = lh.getId();
+
+        // LAC starts at -1 (no entries written)
+        assertEquals(-1, lh.getLastAddConfirmed(), "Initial LAC should be -1");
+
+        // Write entries and check LAC progresses
+        for (int i = 0; i < 5; i++) {
+            lh.addEntry(("lac-" + i).getBytes(StandardCharsets.UTF_8));
+            assertEquals(i, lh.getLastAddConfirmed(),
+                    "LAC should be " + i + " after writing entry " + i);
+        }
+
+        lh.close();
+
+        // Re-open and verify LAC matches
+        LedgerHandle readLh = bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        assertEquals(4, readLh.getLastAddConfirmed(), "LAC should be 4 after re-open");
+        readLh.close();
+    }
+
+    /**
+     * Test 11: Wrong password rejection — opening with the wrong password should fail.
+     *
+     * <p>Verifies the bookie correctly validates the master key derived from the password.
+     */
+    @Test
+    void testWrongPasswordRejected() throws Exception {
+        byte[] correctPassword = "correct-horse-battery-staple".getBytes(StandardCharsets.UTF_8);
+        byte[] wrongPassword = "wrong-password".getBytes(StandardCharsets.UTF_8);
+
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, correctPassword);
+        long ledgerId = lh.getId();
+        lh.addEntry("secret-data".getBytes(StandardCharsets.UTF_8));
+        lh.close();
+
+        // Opening with wrong password should fail
+        assertThrows(BKException.class, () -> {
+            bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, wrongPassword);
+        }, "Opening with wrong password should throw BKException");
+    }
+
+    /**
+     * Test 12: Multiple concurrent ledgers — create several ledgers and write to them
+     * in interleaved fashion, then read each one back.
+     *
+     * <p>Verifies there is no cross-contamination between ledgers on the same bookie.
+     */
+    @Test
+    void testMultipleConcurrentLedgers() throws Exception {
+        final int numLedgers = 5;
+        final int entriesPerLedger = 10;
+        long[] ledgerIds = new long[numLedgers];
+        LedgerHandle[] handles = new LedgerHandle[numLedgers];
+
+        // Create all ledgers
+        for (int l = 0; l < numLedgers; l++) {
+            handles[l] = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+            ledgerIds[l] = handles[l].getId();
+        }
+
+        // Write entries in round-robin across ledgers
+        for (int i = 0; i < entriesPerLedger; i++) {
+            for (int l = 0; l < numLedgers; l++) {
+                byte[] data = ("L" + l + "-E" + i).getBytes(StandardCharsets.UTF_8);
+                handles[l].addEntry(data);
+            }
+        }
+
+        // Close all
+        for (int l = 0; l < numLedgers; l++) {
+            handles[l].close();
+        }
+
+        // Read each ledger back and verify isolation
+        for (int l = 0; l < numLedgers; l++) {
+            LedgerHandle readLh = bk.openLedger(ledgerIds[l], BookKeeper.DigestType.CRC32C, PASSWORD);
+            assertEquals(entriesPerLedger - 1, readLh.getLastAddConfirmed(),
+                    "Ledger " + l + " LAC mismatch");
+
+            Enumeration<LedgerEntry> entries = readLh.readEntries(0, entriesPerLedger - 1);
+            int count = 0;
+            while (entries.hasMoreElements()) {
+                LedgerEntry entry = entries.nextElement();
+                String expected = "L" + l + "-E" + count;
+                assertEquals(expected, new String(entry.getEntry(), StandardCharsets.UTF_8),
+                        "Ledger " + l + " entry " + count + " mismatch");
+                count++;
+            }
+            assertEquals(entriesPerLedger, count);
+            readLh.close();
+        }
+    }
+
+    /**
+     * Test 13: V2 write → V3 read cross-protocol — write using V2, read using V3 (default).
+     *
+     * <p>Verifies data written via V2 binary protocol is correctly readable via V3 protobuf.
+     * This tests the bookie's storage layer consistency across protocol versions.
+     */
+    @Test
+    void testV2WriteV3Read() throws Exception {
+        final int numEntries = 5;
+
+        // Write using V2 protocol
+        ClientConfiguration v2Conf = new ClientConfiguration();
+        v2Conf.setMetadataServiceUri("zk+hierarchical://" + zkConnect + "/ledgers");
+        v2Conf.setUseV2WireProtocol(true);
+
+        long ledgerId;
+        try (BookKeeper v2Bk = new BookKeeper(v2Conf)) {
+            LedgerHandle lh = v2Bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+            ledgerId = lh.getId();
+
+            for (int i = 0; i < numEntries; i++) {
+                lh.addEntry(("cross-" + i).getBytes(StandardCharsets.UTF_8));
+            }
+            lh.close();
+        }
+
+        // Read using V3 protocol (default)
+        LedgerHandle readLh = bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        assertEquals(numEntries - 1, readLh.getLastAddConfirmed());
+
+        Enumeration<LedgerEntry> entries = readLh.readEntries(0, numEntries - 1);
+        int count = 0;
+        while (entries.hasMoreElements()) {
+            LedgerEntry entry = entries.nextElement();
+            String expected = "cross-" + count;
+            assertEquals(expected, new String(entry.getEntry(), StandardCharsets.UTF_8),
+                    "Cross-protocol entry " + count + " mismatch");
+            count++;
+        }
+        assertEquals(numEntries, count);
+        readLh.close();
+    }
+
+    /**
+     * Test 14: DUMMY digest — verifies ledger creation and I/O with no checksum.
+     *
+     * <p>DUMMY digest skips checksum computation, useful for performance benchmarks.
+     * Tests that the Rust bookie handles this correctly.
+     */
+    @Test
+    void testDummyDigest() throws Exception {
+        final int numEntries = 5;
+
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.DUMMY, PASSWORD);
+        long ledgerId = lh.getId();
+
+        for (int i = 0; i < numEntries; i++) {
+            lh.addEntry(("dummy-" + i).getBytes(StandardCharsets.UTF_8));
+        }
+        lh.close();
+
+        LedgerHandle readLh = bk.openLedger(ledgerId, BookKeeper.DigestType.DUMMY, PASSWORD);
+        assertEquals(numEntries - 1, readLh.getLastAddConfirmed());
+
+        Enumeration<LedgerEntry> entries = readLh.readEntries(0, numEntries - 1);
+        int count = 0;
+        while (entries.hasMoreElements()) {
+            LedgerEntry entry = entries.nextElement();
+            assertEquals("dummy-" + count, new String(entry.getEntry(), StandardCharsets.UTF_8));
+            count++;
+        }
+        assertEquals(numEntries, count);
         readLh.close();
     }
 }

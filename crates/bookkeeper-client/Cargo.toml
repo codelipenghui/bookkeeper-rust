@@ -17,9 +17,12 @@ sha1 = { workspace = true }
 prost = { workspace = true }
 rand = "0.8"
 futures = { workspace = true }
+zookeeper-client = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
 bookkeeper-storage = { workspace = true }
 bookkeeper-server = { workspace = true }
 bookkeeper-config = { workspace = true }
+uuid = { workspace = true }

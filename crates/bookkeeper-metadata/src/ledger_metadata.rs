@@ -190,8 +190,14 @@ pub enum MetadataError {
     UnknownVersion(i32),
     #[error("ledger not found: {0}")]
     NotFound(i64),
+    #[error("ledger already exists: {0}")]
+    LedgerExists(i64),
     #[error("version conflict: expected {expected}, got {actual}")]
     VersionConflict { expected: i32, actual: i32 },
     #[error("metadata store connection error: {0}")]
     ConnectionError(String),
+    #[error("ZooKeeper error: {0}")]
+    ZkError(String),
+    #[error("ledger id overflow")]
+    LedgerIdOverflow,
 }

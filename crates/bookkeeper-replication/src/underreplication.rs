@@ -1,19 +1,87 @@
-use prost::Message;
+use std::collections::HashSet;
 use zookeeper_client as zk;
-use bookkeeper_metadata::zk_path::{ZkPaths, underreplication_ledger_path};
+use bookkeeper_metadata::zk_path::{ZkPaths, underreplication_ledger_path, underreplication_lock_path};
+use bookkeeper_proto::{UnderreplicatedLedgerFormat, LockDataFormat, LedgerRereplicationLayoutFormat};
+use crate::text_format;
+
+/// Layout type for the underreplication subsystem, matching Java's constant.
+const LAYOUT_TYPE: &str = "BASIC";
+const LAYOUT_VERSION: i32 = 1;
+
+/// Maximum CAS retry attempts before giving up.
+const MAX_CAS_RETRIES: usize = 20;
 
 /// Manages underreplicated ledger tracking in ZooKeeper.
+/// Compatible with Java BookKeeper's ZkLedgerUnderreplicationManager.
 pub struct ZkUnderreplicationManager {
     client: zk::Client,
     paths: ZkPaths,
+    bookie_id: String,
+    /// Pre-computed lock data (protobuf text format with bookieId).
+    lock_data: Vec<u8>,
 }
 
 impl ZkUnderreplicationManager {
-    pub fn new(client: zk::Client, paths: ZkPaths) -> Self {
-        Self { client, paths }
+    pub async fn new(
+        client: zk::Client,
+        paths: ZkPaths,
+        bookie_id: String,
+    ) -> Result<Self, ReplicationError> {
+        let lock_data = text_format::serialize_lock_data(&LockDataFormat {
+            bookie_id: Some(bookie_id.clone()),
+        });
+
+        let mgr = Self { client, paths, bookie_id, lock_data };
+
+        // Initialize the underreplication tree and LAYOUT znode (matches Java).
+        mgr.init_layout().await?;
+
+        Ok(mgr)
+    }
+
+    /// Initialize the underreplication LAYOUT znode.
+    /// Java creates: {underreplication}/LAYOUT with LedgerRereplicationLayoutFormat text.
+    async fn init_layout(&self) -> Result<(), ReplicationError> {
+        let ur_base = self.paths.underreplication();
+
+        // Ensure base paths exist
+        self.ensure_path(ur_base).await?;
+        let ledgers_path = format!("{}/ledgers", ur_base);
+        self.ensure_path(&ledgers_path).await?;
+        let locks_path = format!("{}/locks", ur_base);
+        self.ensure_path(&locks_path).await?;
+
+        let layout_path = format!("{}/LAYOUT", ur_base);
+        let layout_msg = LedgerRereplicationLayoutFormat {
+            r#type: LAYOUT_TYPE.to_string(),
+            version: LAYOUT_VERSION,
+        };
+        let layout_data = text_format::serialize_layout(&layout_msg);
+
+        let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
+        match self.client.create(&layout_path, &layout_data, &options).await {
+            Ok(_) => {}
+            Err(zk::Error::NodeExists) => {
+                // Verify existing layout is compatible
+                let (data, _) = self.client.get_data(&layout_path).await
+                    .map_err(|e| ReplicationError::Zk(format!("read layout: {e}")))?;
+                let existing = text_format::parse_layout(&data)
+                    .map_err(|e| ReplicationError::Zk(format!("parse layout: {e}")))?;
+                if existing.r#type != LAYOUT_TYPE || existing.version != LAYOUT_VERSION {
+                    return Err(ReplicationError::Zk(format!(
+                        "incompatible underreplication layout: type={}, version={}",
+                        existing.r#type, existing.version
+                    )));
+                }
+            }
+            Err(e) => return Err(ReplicationError::Zk(format!("create layout: {e}"))),
+        }
+
+        Ok(())
     }
 
     /// Mark a ledger as underreplicated with the list of missing bookie addresses.
+    /// Uses CAS retry logic matching Java's handleLedgerUnderreplicatedAlreadyMarked.
     pub async fn mark_ledger_underreplicated(
         &self,
         ledger_id: i64,
@@ -24,8 +92,7 @@ impl ZkUnderreplicationManager {
             ledger_id,
         );
 
-        // Build protobuf content
-        let proto = bookkeeper_proto::UnderreplicatedLedgerFormat {
+        let proto = UnderreplicatedLedgerFormat {
             replica: missing_replicas.to_vec(),
             ctime: Some(
                 std::time::SystemTime::now()
@@ -34,25 +101,87 @@ impl ZkUnderreplicationManager {
                     .as_millis() as i64,
             ),
         };
-        let data = proto.encode_to_vec();
+        let data = text_format::serialize_underreplicated_ledger(&proto);
 
         // Create parent paths if needed
         self.ensure_parents(&ur_path).await?;
 
-        // Create or update the znode
         let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
         match self.client.create(&ur_path, &data, &options).await {
             Ok(_) => Ok(()),
             Err(zk::Error::NodeExists) => {
-                // Merge: read existing, add new replicas
-                self.client
-                    .set_data(&ur_path, &data, None)
-                    .await
-                    .map_err(|e| ReplicationError::Zk(format!("update underrep: {e}")))?;
-                Ok(())
+                // Node already exists — merge replicas with CAS retry
+                self.merge_underreplicated(&ur_path, missing_replicas).await
             }
             Err(e) => Err(ReplicationError::Zk(format!("mark underrep: {e}"))),
         }
+    }
+
+    /// Merge new missing replicas into an existing underreplicated marker.
+    /// Uses version-checked (CAS) updates with retry on BadVersion, matching Java.
+    async fn merge_underreplicated(
+        &self,
+        znode_path: &str,
+        new_replicas: &[String],
+    ) -> Result<(), ReplicationError> {
+        for _ in 0..MAX_CAS_RETRIES {
+            // Read current data with version
+            let (existing_data, stat) = match self.client.get_data(znode_path).await {
+                Ok(result) => result,
+                Err(zk::Error::NoNode) => {
+                    // Node was deleted between our check and read — retry creation
+                    let proto = UnderreplicatedLedgerFormat {
+                        replica: new_replicas.to_vec(),
+                        ctime: Some(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as i64,
+                        ),
+                    };
+                    let data = text_format::serialize_underreplicated_ledger(&proto);
+                    let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
+                    match self.client.create(znode_path, &data, &options).await {
+                        Ok(_) => return Ok(()),
+                        Err(zk::Error::NodeExists) => continue, // retry merge
+                        Err(e) => return Err(ReplicationError::Zk(format!("recreate: {e}"))),
+                    }
+                }
+                Err(e) => return Err(ReplicationError::Zk(format!("read underrep: {e}"))),
+            };
+
+            // Parse existing and merge replicas
+            let mut existing = text_format::parse_underreplicated_ledger(&existing_data)
+                .map_err(|e| ReplicationError::Zk(format!("parse underrep: {e}")))?;
+
+            let existing_set: HashSet<String> = existing.replica.iter().cloned().collect();
+            for r in new_replicas {
+                if !existing_set.contains(r) {
+                    existing.replica.push(r.clone());
+                }
+            }
+            // Update ctime
+            existing.ctime = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+            );
+
+            let merged_data = text_format::serialize_underreplicated_ledger(&existing);
+
+            // CAS update with version
+            match self.client.set_data(znode_path, &merged_data, Some(stat.version)).await {
+                Ok(_) => return Ok(()),
+                Err(zk::Error::BadVersion) => continue, // retry
+                Err(zk::Error::NoNode) => continue, // node deleted, retry
+                Err(e) => return Err(ReplicationError::Zk(format!("update underrep: {e}"))),
+            }
+        }
+
+        Err(ReplicationError::Zk(format!(
+            "failed to mark underreplicated after {} retries", MAX_CAS_RETRIES
+        )))
     }
 
     /// Try to claim a ledger for replication. Returns Some(ledger_id) if lock acquired.
@@ -60,7 +189,6 @@ impl ZkUnderreplicationManager {
         let ur_ledgers_path = format!("{}/ledgers", self.paths.underreplication());
 
         // Scan for underreplicated ledgers by listing children recursively.
-        // For simplicity, scan the top-level hex directories.
         let children = match self.client.get_children(&ur_ledgers_path).await {
             Ok((c, _)) => c,
             Err(zk::Error::NoNode) => return Ok(None),
@@ -73,13 +201,14 @@ impl ZkUnderreplicationManager {
                 .find_underreplicated_in_tree(&format!("{}/{}", ur_ledgers_path, dir1))
                 .await
             {
-                // Try to acquire lock
-                let lock_path =
-                    format!("{}/locks/urL{}", self.paths.underreplication(), lid);
+                // Try to acquire ephemeral lock
+                let lock_path = underreplication_lock_path(
+                    &format!("{}/locks", self.paths.underreplication()),
+                    lid,
+                );
                 self.ensure_parents(&lock_path).await?;
-                let lock_data = b"{}";
                 let options = zk::CreateMode::Ephemeral.with_acls(zk::Acls::anyone_all());
-                match self.client.create(&lock_path, lock_data, &options).await {
+                match self.client.create(&lock_path, &self.lock_data, &options).await {
                     Ok(_) => return Ok(Some(lid)),
                     Err(zk::Error::NodeExists) => continue, // already locked
                     Err(e) => {
@@ -97,14 +226,18 @@ impl ZkUnderreplicationManager {
             &format!("{}/ledgers", self.paths.underreplication()),
             ledger_id,
         );
-        let lock_path = format!(
-            "{}/locks/urL{}",
-            self.paths.underreplication(),
-            ledger_id
+        let lock_path = underreplication_lock_path(
+            &format!("{}/locks", self.paths.underreplication()),
+            ledger_id,
         );
 
-        // Delete marker
-        let _ = self.client.delete(&ur_path, None).await;
+        // Delete marker — ignore BadVersion (another worker may have updated it)
+        match self.client.delete(&ur_path, None).await {
+            Ok(()) => {}
+            Err(zk::Error::NoNode) => {} // already deleted
+            Err(zk::Error::BadVersion) => {} // leave it, someone re-marked
+            Err(e) => return Err(ReplicationError::Zk(format!("delete marker: {e}"))),
+        }
         // Release lock
         let _ = self.client.delete(&lock_path, None).await;
         Ok(())
@@ -112,10 +245,9 @@ impl ZkUnderreplicationManager {
 
     /// Release lock without deleting marker (for retry).
     pub async fn release_lock(&self, ledger_id: i64) -> Result<(), ReplicationError> {
-        let lock_path = format!(
-            "{}/locks/urL{}",
-            self.paths.underreplication(),
-            ledger_id
+        let lock_path = underreplication_lock_path(
+            &format!("{}/locks", self.paths.underreplication()),
+            ledger_id,
         );
         let _ = self.client.delete(&lock_path, None).await;
         Ok(())
@@ -131,6 +263,21 @@ impl ZkUnderreplicationManager {
         }
     }
 
+    /// Get the bookie ID of this manager instance.
+    pub fn bookie_id(&self) -> &str {
+        &self.bookie_id
+    }
+
+    /// Get the ZK client (for advanced use like bookie discovery).
+    pub fn client(&self) -> &zk::Client {
+        &self.client
+    }
+
+    /// Get the ZK paths.
+    pub fn paths(&self) -> &ZkPaths {
+        &self.paths
+    }
+
     fn find_underreplicated_in_tree<'a>(
         &'a self,
         path: &'a str,
@@ -143,7 +290,7 @@ impl ZkUnderreplicationManager {
             };
             for child in &children {
                 if let Some(suffix) = child.strip_prefix("urL") {
-                    // Extract ledger ID
+                    // Extract ledger ID (may be zero-padded)
                     if let Ok(lid) = suffix.parse::<i64>() {
                         return Ok(Some(lid));
                     }
@@ -162,7 +309,6 @@ impl ZkUnderreplicationManager {
     }
 
     async fn ensure_parents(&self, path: &str) -> Result<(), ReplicationError> {
-        // Create parent directories one by one
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         let mut current = String::new();
         let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
@@ -170,7 +316,6 @@ impl ZkUnderreplicationManager {
             current.push('/');
             current.push_str(part);
             if i < parts.len() - 1 {
-                // don't create the leaf node
                 match self.client.create(&current, &[], &options).await {
                     Ok(_) | Err(zk::Error::NodeExists) => {}
                     Err(e) => {
@@ -178,6 +323,23 @@ impl ZkUnderreplicationManager {
                             "ensure {current}: {e}"
                         )))
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_path(&self, path: &str) -> Result<(), ReplicationError> {
+        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        let mut current = String::new();
+        let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
+        for part in &parts {
+            current.push('/');
+            current.push_str(part);
+            match self.client.create(&current, &[], &options).await {
+                Ok(_) | Err(zk::Error::NodeExists) => {}
+                Err(e) => {
+                    return Err(ReplicationError::Zk(format!("ensure {current}: {e}")))
                 }
             }
         }

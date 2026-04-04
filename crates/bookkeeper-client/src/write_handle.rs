@@ -190,6 +190,14 @@ impl WriteHandle {
         self.ledger_id
     }
 
+    pub fn current_length(&self) -> i64 {
+        self.current_length
+    }
+
+    pub fn last_add_pushed(&self) -> i64 {
+        self.last_add_pushed
+    }
+
     /// Return the current (latest) ensemble.
     pub fn ensemble(&self) -> Vec<String> {
         self.ensemble_info.current_ensemble()

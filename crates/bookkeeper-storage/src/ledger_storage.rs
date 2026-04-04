@@ -1,3 +1,4 @@
+use std::path::Path;
 use bytes::Bytes;
 use crate::StorageError;
 
@@ -33,6 +34,28 @@ pub trait LedgerStorage: Send + Sync {
 
     /// Delete a ledger and all its entries.
     fn delete_ledger(&self, ledger_id: i64) -> Result<(), StorageError>;
+
+    /// List all ledger IDs in local storage.
+    fn get_active_ledgers(&self) -> Result<Vec<i64>, StorageError>;
+
+    /// Get the path to the entry log directory (for GC to scan/delete files).
+    fn entry_log_dir(&self) -> Option<&Path>;
+
+    /// Get the current active entry log ID (the one being written to).
+    /// GC must NOT delete this file.
+    fn current_log_id(&self) -> Option<u32>;
+
+    /// Trigger RocksDB compaction on the entry location index.
+    /// Matches Java's DbLedgerStorage.entryLocationCompact().
+    fn compact_entry_locations(&self) -> Result<(), StorageError>;
+
+    /// Write an entry directly to the entry log (bypassing write cache) and update
+    /// the location index. Used by compaction to move entries between log files.
+    /// Returns the new location.
+    fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError>;
+
+    /// Update a batch of entry locations in the index.
+    fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError>;
 
     /// Flush all pending data to persistent storage.
     fn flush(&self) -> Result<(), StorageError>;

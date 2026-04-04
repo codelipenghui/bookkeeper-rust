@@ -24,6 +24,11 @@ impl ZkRegistrationManager {
         &self.paths
     }
 
+    /// Get the underlying ZK client for sharing with other components.
+    pub fn zk_client(&self) -> &zk::Client {
+        &self.client
+    }
+
     async fn ensure_path_exists(&self, path: &str) -> Result<(), MetadataError> {
         let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
         match self.client.create(path, &[], &options).await {
