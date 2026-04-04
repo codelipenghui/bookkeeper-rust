@@ -424,6 +424,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bookkeeper-replication"
+version = "0.1.0"
+dependencies = [
+ "bookkeeper-client",
+ "bookkeeper-common",
+ "bookkeeper-metadata",
+ "bookkeeper-proto",
+ "bookkeeper-protocol",
+ "bytes",
+ "prost",
+ "thiserror 2.0.18",
+ "tokio",
+ "zookeeper-client",
+]
+
+[[package]]
 name = "bookkeeper-server"
 version = "0.1.0"
 dependencies = [

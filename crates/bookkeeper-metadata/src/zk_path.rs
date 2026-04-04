@@ -36,6 +36,7 @@ pub fn underreplication_ledger_path(base: &str, ledger_id: i64) -> String {
 
 /// Well-known ZK paths relative to the ledger root.
 /// All fixed paths are pre-computed at construction time.
+#[derive(Clone)]
 pub struct ZkPaths {
     root: String,
     available: String,
