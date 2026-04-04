@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+mod bench;
+
 #[derive(Parser)]
 #[command(name = "bk", about = "BookKeeper CLI tool")]
 struct Cli {
@@ -63,6 +65,30 @@ enum Commands {
         #[arg(long)]
         data_dir: Option<String>,
     },
+    /// Benchmark a single bookie (direct protocol, no ZK)
+    BenchBookie {
+        /// Bookie address (ip:port)
+        #[arg(long, default_value = "127.0.0.1:3181")]
+        bookie: String,
+        /// Entry payload size in bytes
+        #[arg(long, default_value = "1024")]
+        entry_size: usize,
+        /// Warmup entries (not measured)
+        #[arg(long, default_value = "1000")]
+        warmup: u64,
+        /// Sequential entries for latency measurement
+        #[arg(long, default_value = "5000")]
+        latency_count: u64,
+        /// Async entries for throughput measurement
+        #[arg(long, default_value = "50000")]
+        throughput_count: u64,
+        /// Max concurrent in-flight requests
+        #[arg(long, default_value = "1000")]
+        max_outstanding: usize,
+        /// Digest type: crc32, crc32c, hmac, dummy
+        #[arg(long, default_value = "crc32c")]
+        digest: String,
+    },
 }
 
 #[tokio::main]
@@ -80,6 +106,9 @@ async fn main() {
         }
         Commands::Bookiesanity { entries, data_dir } => {
             cmd_bookiesanity(entries, data_dir).await
+        }
+        Commands::BenchBookie { bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, digest } => {
+            bench::cmd_bench_bookie(&bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, &digest).await
         }
     };
     if let Err(e) = result {
