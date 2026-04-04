@@ -357,6 +357,7 @@ dependencies = [
  "bookkeeper-server",
  "bookkeeper-storage",
  "bytes",
+ "futures",
  "prost",
  "rand",
  "sha1",

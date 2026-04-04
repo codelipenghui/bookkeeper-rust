@@ -94,3 +94,39 @@ async fn read_verifies_digest() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn write_multiple_entries_pipelined() {
+    let dir = TempDir::new().unwrap();
+    let server = BookieServer::start(test_config(&dir)).await.unwrap();
+    let addr = server.local_addr();
+
+    let ensemble = vec![addr.to_string()];
+    let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = [0u8; 20];
+
+    let conns = vec![Arc::new(BookieConnection::connect(addr).await.unwrap())];
+    let mut wh = WriteHandle::new(1, ensemble.clone(), schedule.clone(), dm.clone(), master_key);
+
+    // Submit all entries without awaiting any — true pipelining.
+    let mut pending = Vec::new();
+    for i in 0..20 {
+        let data = format!("pipelined-{i}");
+        let p = wh.append_async(&conns, data.as_bytes()).unwrap();
+        pending.push(p);
+    }
+
+    // All 20 entries were submitted without waiting for any acks.
+    // Now resolve them in order.
+    for (i, p) in pending.into_iter().enumerate() {
+        let entry_id = p.wait().await.unwrap();
+        assert_eq!(entry_id, i as i64, "unexpected entry_id for slot {i}");
+    }
+
+    // Allow the LAC-update tasks a moment to complete (they run concurrently).
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    assert_eq!(wh.last_add_confirmed(), 19);
+
+    server.shutdown().await;
+}
