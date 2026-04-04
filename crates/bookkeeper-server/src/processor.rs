@@ -22,32 +22,47 @@ impl RequestProcessor {
     pub fn process_request(&self, req: V2Request) -> V2Response {
         match req {
             V2Request::AddEntry { flags, master_key, entry_data } => {
+                let entry_size = entry_data.len();
+                let is_recovery = flags & FLAG_RECOVERY_ADD != 0;
+                crate::metrics::ADD_ENTRY_IN_PROGRESS.inc();
                 let timer = std::time::Instant::now();
                 let resp = self.handle_add_entry(flags, &master_key, entry_data);
                 let elapsed = timer.elapsed().as_secs_f64();
+                crate::metrics::ADD_ENTRY_IN_PROGRESS.dec();
                 let success = matches!(resp, V2Response::Add { error_code, .. } if error_code == V2_EOK);
                 let label = if success { "true" } else { "false" };
                 crate::metrics::ADD_ENTRY_REQUEST.with_label_values(&[label]).observe(elapsed);
                 crate::metrics::BOOKIE_ADD_ENTRY.with_label_values(&[label]).observe(elapsed);
+                if is_recovery {
+                    crate::metrics::BOOKIE_RECOVERY_ADD_ENTRY.with_label_values(&[label]).observe(elapsed);
+                }
                 if success {
-                    // entry_data is consumed by handle_add_entry, estimate from response
-                    crate::metrics::WRITE_BYTES.inc_by(64); // approximate
-                } else if matches!(resp, V2Response::Add { error_code, .. } if error_code != V2_EOK) {
+                    crate::metrics::WRITE_BYTES.inc_by(entry_size as u64);
+                    crate::metrics::BOOKIE_ADD_ENTRY_BYTES.with_label_values(&["true"]).observe(entry_size as f64);
+                } else {
                     crate::metrics::ADD_ENTRY_REJECTED.inc();
                 }
                 resp
             }
             V2Request::ReadEntry { flags, ledger_id, entry_id, master_key } => {
+                let is_fence = flags & FLAG_DO_FENCING != 0;
+                crate::metrics::READ_ENTRY_IN_PROGRESS.inc();
                 let timer = std::time::Instant::now();
                 let resp = self.handle_read_entry(flags, ledger_id, entry_id, master_key);
                 let elapsed = timer.elapsed().as_secs_f64();
+                crate::metrics::READ_ENTRY_IN_PROGRESS.dec();
                 let success = matches!(resp, V2Response::Read { error_code, .. } if error_code == V2_EOK);
                 let label = if success { "true" } else { "false" };
                 crate::metrics::READ_ENTRY_REQUEST.with_label_values(&[label]).observe(elapsed);
                 crate::metrics::BOOKIE_READ_ENTRY.with_label_values(&[label]).observe(elapsed);
+                if is_fence {
+                    crate::metrics::READ_ENTRY_FENCE_REQUEST.with_label_values(&[label]).observe(elapsed);
+                }
                 if success {
                     if let V2Response::Read { data: Some(ref d), .. } = resp {
-                        crate::metrics::READ_BYTES.inc_by(d.len() as u64);
+                        let sz = d.len() as u64;
+                        crate::metrics::READ_BYTES.inc_by(sz);
+                        crate::metrics::BOOKIE_READ_ENTRY_BYTES.with_label_values(&["true"]).observe(sz as f64);
                     }
                 }
                 resp
