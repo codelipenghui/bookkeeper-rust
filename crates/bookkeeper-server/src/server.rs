@@ -207,14 +207,28 @@ impl BookieServer {
         let tls_acceptor = if let (Some(ref cert), Some(ref key)) =
             (&config.tls_certificate_path, &config.tls_key_path)
         {
-            let acceptor = crate::tls::build_tls_acceptor(
-                cert,
-                key,
-                config.tls_trust_store_path.as_deref(),
-                config.tls_client_authentication,
-            )?;
-            println!("TLS enabled (cert: {cert}, key: {key})");
-            Some(acceptor)
+            let tls_cfg = crate::tls::TlsConfig {
+                cert_path: cert.clone(),
+                key_path: key.clone(),
+                trust_store_path: config.tls_trust_store_path.clone(),
+                client_auth: config.tls_client_authentication,
+                keystore_type: config.tls_keystore_type.clone(),
+                enabled_protocols: config.tls_enabled_protocols.clone(),
+                cert_refresh_seconds: config.tls_cert_refresh_seconds,
+            };
+
+            let reloadable = Arc::new(crate::tls::ReloadableTlsAcceptor::new(tls_cfg)?);
+            if config.tls_cert_refresh_seconds > 0 {
+                reloadable.start_refresh_task(
+                    config.tls_cert_refresh_seconds as u64,
+                    shutdown_rx.clone(),
+                );
+                println!("TLS enabled with cert refresh every {}s (cert: {cert}, key: {key})",
+                    config.tls_cert_refresh_seconds);
+            } else {
+                println!("TLS enabled (cert: {cert}, key: {key})");
+            }
+            Some(reloadable)
         } else {
             None
         };
@@ -723,7 +737,7 @@ async fn accept_loop(
     state: Arc<BookieStateManager>,
     mut shutdown_rx: watch::Receiver<bool>,
     max_frame_size: usize,
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    tls_acceptor: Option<Arc<crate::tls::ReloadableTlsAcceptor>>,
 ) {
     loop {
         tokio::select! {
@@ -732,10 +746,11 @@ async fn accept_loop(
                     Ok((stream, _peer_addr)) => {
                         let proc = processor.clone();
                         if let Some(ref tls) = tls_acceptor {
-                            // TLS enabled: accept plaintext first, upgrade via StartTLS protocol.
-                            // Matches Java's BookieNettyServer StartTLS flow.
                             let tls = tls.clone();
-                            tokio::spawn(handle_starttls_connection(stream, proc, max_frame_size, tls));
+                            tokio::spawn(async move {
+                                let acceptor = tls.acceptor().await;
+                                handle_starttls_connection(stream, proc, max_frame_size, acceptor).await;
+                            });
                         } else {
                             // Plain TCP connection (no TLS configured)
                             tokio::spawn(handle_connection(stream, proc, max_frame_size));

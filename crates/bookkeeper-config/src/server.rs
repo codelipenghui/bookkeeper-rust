@@ -55,6 +55,10 @@ pub struct ServerConfig {
     pub tls_key_path: Option<String>,
     pub tls_trust_store_path: Option<String>,
     pub tls_client_authentication: bool,
+    pub tls_keystore_type: String,
+    pub tls_enabled_cipher_suites: Option<String>,
+    pub tls_enabled_protocols: Option<String>,
+    pub tls_cert_refresh_seconds: i64,
 
     // Disk Management
     pub disk_usage_threshold: f64,
@@ -123,6 +127,10 @@ impl Default for ServerConfig {
             tls_key_path: None,
             tls_trust_store_path: None,
             tls_client_authentication: false,
+            tls_keystore_type: "PEM".to_string(),
+            tls_enabled_cipher_suites: None,
+            tls_enabled_protocols: None,
+            tls_cert_refresh_seconds: 0,
             disk_usage_threshold: 0.95,
             disk_usage_warn_threshold: 0.90,
             disk_usage_lwm_threshold: 0.95,
@@ -185,6 +193,10 @@ impl ServerConfig {
         if let Some(v) = props.get("tlsKeyFilePath") { config.tls_key_path = Some(v.clone()); }
         if let Some(v) = props.get("tlsTrustStore") { config.tls_trust_store_path = Some(v.clone()); }
         if let Some(v) = props.get("tlsClientAuthentication") { config.tls_client_authentication = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("tlsKeyStoreType") { config.tls_keystore_type = v.clone(); }
+        if let Some(v) = props.get("tlsEnabledCipherSuites") { config.tls_enabled_cipher_suites = Some(v.clone()); }
+        if let Some(v) = props.get("tlsEnabledProtocols") { config.tls_enabled_protocols = Some(v.clone()); }
+        if let Some(v) = props.get("tlsCertFilesRefreshDurationSeconds") { if let Ok(n) = v.parse() { config.tls_cert_refresh_seconds = n; } }
         if let Some(v) = props.get("diskUsageThreshold") { if let Ok(n) = v.parse() { config.disk_usage_threshold = n; } }
         if let Some(v) = props.get("diskUsageWarnThreshold") { if let Ok(n) = v.parse() { config.disk_usage_warn_threshold = n; } }
         if let Some(v) = props.get("diskUsageLwmThreshold") { if let Ok(n) = v.parse() { config.disk_usage_lwm_threshold = n; } }
