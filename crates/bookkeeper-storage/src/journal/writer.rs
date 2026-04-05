@@ -175,12 +175,24 @@ fn flush_and_ack(
     pending_bytes: &mut usize,
     pending_count: &mut usize,
 ) {
-    if let Err(e) = state.flush(config.sync_data) {
+    // Step 1: Flush to OS page cache
+    if let Err(e) = state.flush(false) {
         eprintln!("Journal flush error: {e}");
     }
+
+    // Step 2: ACK clients immediately after page cache write (matching Java's ackBeforeSync=true).
+    // This is the default behavior — clients get fast ACKs, fsync happens async below.
     for ack in pending_acks.drain(..) {
         let _ = ack.send(());
     }
+
+    // Step 3: fsync to disk if configured (async relative to client ACK)
+    if config.sync_data {
+        if let Err(e) = state.fsync() {
+            eprintln!("Journal fsync error: {e}");
+        }
+    }
+
     *pending_bytes = 0;
     *pending_count = 0;
 }
@@ -232,8 +244,10 @@ impl WriterState {
             .open(&path)?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
         let header = JournalHeader::new(config.format_version);
-        writer.write_all(&header.to_bytes())?;
-        self.position = SECTOR_SIZE as u64;
+        let header_bytes = header.to_bytes();
+        let header_size = header_bytes.len();
+        writer.write_all(&header_bytes)?;
+        self.position = header_size as u64;
         self.writer = Some(writer);
         Ok(())
     }
@@ -258,6 +272,13 @@ impl WriterState {
             if sync_data {
                 writer.get_ref().sync_data()?;
             }
+        }
+        Ok(())
+    }
+
+    fn fsync(&mut self) -> Result<(), StorageError> {
+        if let Some(ref mut writer) = self.writer {
+            writer.get_ref().sync_data()?;
         }
         Ok(())
     }
@@ -300,11 +321,15 @@ pub fn replay_journal(
     let mut total = 0;
     for (_, path) in &journal_files {
         let data = fs::read(path)?;
-        if data.len() < SECTOR_SIZE {
+        if data.len() < 8 {
+            continue; // too small for even a minimal header
+        }
+        let header = JournalHeader::from_bytes(&data)?;
+        let hdr_size = header.header_size();
+        if data.len() < hdr_size {
             continue;
         }
-        let header = JournalHeader::from_bytes(&data[..SECTOR_SIZE])?;
-        let entries = format::scan_journal_entries(&data[SECTOR_SIZE..], header.version());
+        let entries = format::scan_journal_entries(&data[hdr_size..], header.version());
         for entry_data in entries {
             callback(entry_data);
             total += 1;

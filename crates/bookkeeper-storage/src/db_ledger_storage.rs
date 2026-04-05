@@ -38,6 +38,8 @@ pub struct DbLedgerStorage {
     flush_mutex: Mutex<()>,
     /// Journal for write-ahead logging. None if not initialized (standalone mode).
     journal: Option<crate::journal::writer::Journal>,
+    /// Journal directory path (for cleanup after checkpoint).
+    journal_dir: Option<PathBuf>,
 }
 
 impl DbLedgerStorage {
@@ -67,6 +69,7 @@ impl DbLedgerStorage {
             }),
             flush_mutex: Mutex::new(()),
             journal: None,
+            journal_dir: None,
         })
     }
 
@@ -99,9 +102,26 @@ impl DbLedgerStorage {
         }
 
         // Start journal writer
+        self.journal_dir = Some(journal_dir.to_path_buf());
         self.journal = Some(crate::journal::writer::Journal::start(config));
 
         Ok(replayed)
+    }
+
+    /// Remove old journal files after successful flush/checkpoint.
+    /// All entries have been flushed to entry logs + RocksDB, so journals are no longer needed.
+    /// Matches Java's SyncThread journal cleanup after lastMark rollover.
+    fn cleanup_journals(&self) {
+        if let Some(ref journal_dir) = self.journal_dir {
+            if let Ok(entries) = fs::read_dir(journal_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().ends_with(".txn") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
     }
 
     fn extract_ledger_id(entry: &[u8]) -> i64 {
@@ -441,7 +461,11 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn checkpoint(&self) -> Result<(), StorageError> {
-        self.flush()
+        self.flush()?;
+        // After flush, all write cache entries are in entry logs + RocksDB index.
+        // Old journal files are no longer needed — clean them up.
+        self.cleanup_journals();
+        Ok(())
     }
 
     fn validate_for_write(&self, ledger_id: i64, master_key: &[u8]) -> Result<bool, StorageError> {

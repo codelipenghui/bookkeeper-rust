@@ -21,11 +21,19 @@ impl JournalHeader {
         self.version
     }
 
+    /// Serialize header. V1-V4: 8 bytes. V5+: 512 bytes (sector-aligned).
+    /// Matches Java's JournalChannel header format.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; SECTOR_SIZE];
+        let size = if self.version >= 5 { SECTOR_SIZE } else { 8 };
+        let mut buf = vec![0u8; size];
         buf[0..4].copy_from_slice(JOURNAL_MAGIC);
         buf[4..8].copy_from_slice(&self.version.to_be_bytes());
         buf
+    }
+
+    /// Header size on disk for this version.
+    pub fn header_size(&self) -> usize {
+        if self.version >= 5 { SECTOR_SIZE } else { 8 }
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, StorageError> {
