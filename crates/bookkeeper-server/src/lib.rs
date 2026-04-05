@@ -5,3 +5,4 @@ pub mod http_api;
 pub mod v3_processor;
 pub mod metrics;
 pub mod tls;
+pub mod auth;

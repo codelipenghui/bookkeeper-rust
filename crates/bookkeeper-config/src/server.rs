@@ -60,6 +60,9 @@ pub struct ServerConfig {
     pub tls_enabled_protocols: Option<String>,
     pub tls_cert_refresh_seconds: i64,
 
+    // Authentication
+    pub bookie_auth_provider_factory_class: Option<String>,
+
     // Disk Management
     pub disk_usage_threshold: f64,
     pub disk_usage_warn_threshold: f64,
@@ -131,6 +134,7 @@ impl Default for ServerConfig {
             tls_enabled_cipher_suites: None,
             tls_enabled_protocols: None,
             tls_cert_refresh_seconds: 0,
+            bookie_auth_provider_factory_class: None,
             disk_usage_threshold: 0.95,
             disk_usage_warn_threshold: 0.90,
             disk_usage_lwm_threshold: 0.95,
@@ -197,6 +201,7 @@ impl ServerConfig {
         if let Some(v) = props.get("tlsEnabledCipherSuites") { config.tls_enabled_cipher_suites = Some(v.clone()); }
         if let Some(v) = props.get("tlsEnabledProtocols") { config.tls_enabled_protocols = Some(v.clone()); }
         if let Some(v) = props.get("tlsCertFilesRefreshDurationSeconds") { if let Ok(n) = v.parse() { config.tls_cert_refresh_seconds = n; } }
+        if let Some(v) = props.get("bookieAuthProviderFactoryClass") { config.bookie_auth_provider_factory_class = Some(v.clone()); }
         if let Some(v) = props.get("diskUsageThreshold") { if let Ok(n) = v.parse() { config.disk_usage_threshold = n; } }
         if let Some(v) = props.get("diskUsageWarnThreshold") { if let Ok(n) = v.parse() { config.disk_usage_warn_threshold = n; } }
         if let Some(v) = props.get("diskUsageLwmThreshold") { if let Ok(n) = v.parse() { config.disk_usage_lwm_threshold = n; } }
