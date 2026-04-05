@@ -123,13 +123,16 @@ impl RequestProcessor {
             Err(e) => return self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id),
         }
 
-        // Matches Java's BookieImpl.addEntryInternal: storage first, then journal.
+        // Matches Java's BookieImpl.addEntryInternal:
+        // 1. Storage write (in-memory write cache — fast)
+        // 2. Master key journaling (first write per ledger)
+        // 3. Data entry journaling (durability)
         match self.storage.add_entry(&entry_data) {
             Ok(()) => {
                 if let Some(journal) = self.storage.journal() {
-                    // Journal master key on first write to this ledger (matching Java)
+                    // Journal master key BEFORE data entry (matching Java's ordering)
                     let _ = journal.maybe_journal_master_key(ledger_id, master_key);
-                    // Journal the entry for durability
+                    // Journal the data entry — blocks until durable
                     if let Err(_e) = journal.log_add_entry(&entry_data) {
                         return self.add_error_response(BKError::Io, ledger_id, entry_id);
                     }

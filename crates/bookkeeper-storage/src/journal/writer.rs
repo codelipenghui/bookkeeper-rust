@@ -101,17 +101,22 @@ impl Journal {
     /// Journal a master key entry for a ledger if not already journaled.
     /// Matches Java's BookieImpl.addEntryInternal which journals
     /// METAENTRY_ID_LEDGER_KEY on first write to each ledger.
+    /// Journal a master key entry for a ledger if not already journaled.
+    /// Atomic: cache insert happens under lock BEFORE journal send,
+    /// matching Java's putIfAbsent + journal pattern.
     pub fn maybe_journal_master_key(
         &self,
         ledger_id: i64,
         master_key: &[u8],
     ) -> Result<(), StorageError> {
-        {
-            let cache = self.master_key_cache.lock().unwrap();
-            if cache.contains(&ledger_id) {
-                return Ok(()); // already journaled
-            }
+        let mut cache = self.master_key_cache.lock().unwrap();
+        if cache.contains(&ledger_id) {
+            return Ok(()); // already journaled
         }
+        // Insert into cache first (under lock) to prevent duplicate journaling.
+        // Matches Java's putIfAbsent semantics.
+        cache.insert(ledger_id);
+        drop(cache); // release lock before blocking on channel send
 
         // Build master key entry: [ledgerId(8)][METAENTRY_ID(8)][keyLen(4)][key]
         let entry_len = 8 + 8 + 4 + master_key.len();
@@ -127,8 +132,6 @@ impl Journal {
             ack_tx: None,
         });
 
-        let mut cache = self.master_key_cache.lock().unwrap();
-        cache.insert(ledger_id);
         Ok(())
     }
 }
@@ -260,8 +263,10 @@ fn journal_writer_loop(
 ///
 /// Matches Java's ForceWriteThread:
 /// 1. Collects all pending FsyncRequests
-/// 2. Fsyncs once (covers all prior writes)
+/// 2. Fsyncs ALL unique files (handles journal rotation across batch)
 /// 3. ACKs all clients whose entries are now durable
+/// 4. On fsync failure: logs error, does NOT ACK (clients will timeout)
+///    Matching Java which crashes the bookie on fsync failure.
 fn fsync_loop(_config: JournalConfig, rx: mpsc::Receiver<FsyncRequest>) {
     loop {
         let first = match rx.recv() {
@@ -269,23 +274,49 @@ fn fsync_loop(_config: JournalConfig, rx: mpsc::Receiver<FsyncRequest>) {
             Err(_) => break,
         };
 
-        // Collect all queued requests
         let mut all_requests = vec![first];
         while let Ok(req) = rx.try_recv() {
             all_requests.push(req);
         }
 
-        // fsync the last file (covers all prior writes to same file)
-        let last_path = &all_requests.last().unwrap().journal_path;
-        if let Ok(file) = fs::OpenOptions::new().read(true).open(last_path) {
-            let _ = file.sync_data();
+        // Collect ALL unique file paths (handles rotation across requests)
+        let mut unique_paths: Vec<PathBuf> = Vec::new();
+        for req in &all_requests {
+            if !unique_paths.contains(&req.journal_path) {
+                unique_paths.push(req.journal_path.clone());
+            }
         }
 
-        // ACK all clients whose entries are now durable on disk
-        for req in all_requests {
-            for ack in req.pending_acks {
-                let _ = ack.send(());
+        // fsync ALL files (each file may have entries from different batches)
+        let mut fsync_ok = true;
+        for path in &unique_paths {
+            match fs::OpenOptions::new().read(true).open(path) {
+                Ok(file) => {
+                    if let Err(e) = file.sync_data() {
+                        eprintln!("FATAL: journal fsync failed for {:?}: {e}", path);
+                        fsync_ok = false;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("FATAL: cannot open journal for fsync {:?}: {e}", path);
+                    fsync_ok = false;
+                }
             }
+        }
+
+        if fsync_ok {
+            // ACK all clients — entries are durable on disk
+            for req in all_requests {
+                for ack in req.pending_acks {
+                    let _ = ack.send(());
+                }
+            }
+        } else {
+            // fsync failed — do NOT ACK clients. They will timeout.
+            // Matching Java's behavior: ForceWriteThread crashes, pending ACKs abandoned.
+            eprintln!("FATAL: journal fsync failed, abandoning {} pending ACKs",
+                all_requests.iter().map(|r| r.pending_acks.len()).sum::<usize>());
+            // Drop pending_acks without sending — clients will get timeout errors
         }
     }
 }
