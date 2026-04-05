@@ -130,7 +130,7 @@ pub fn create_auth_factory(
             Box::new(DisabledAuthProviderFactory)
         }
         Some(class) => {
-            eprintln!("Auth: unknown factory class '{class}', using disabled auth");
+            tracing::warn!("Auth: unknown factory class '{class}', using disabled auth");
             Box::new(DisabledAuthProviderFactory)
         }
     }

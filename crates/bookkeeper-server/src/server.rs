@@ -65,7 +65,7 @@ impl BookieServer {
             journal_config,
         )?;
         if replayed > 0 {
-            println!("Journal recovery: replayed {replayed} entries");
+            tracing::info!("Journal recovery: replayed {replayed} entries");
         }
 
         let storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage> =
@@ -223,10 +223,10 @@ impl BookieServer {
                     config.tls_cert_refresh_seconds as u64,
                     shutdown_rx.clone(),
                 );
-                println!("TLS enabled with cert refresh every {}s (cert: {cert}, key: {key})",
+                tracing::info!("TLS enabled with cert refresh every {}s (cert: {cert}, key: {key})",
                     config.tls_cert_refresh_seconds);
             } else {
-                println!("TLS enabled (cert: {cert}, key: {key})");
+                tracing::info!("TLS enabled (cert: {cert}, key: {key})");
             }
             Some(reloadable)
         } else {
@@ -287,13 +287,13 @@ impl BookieServer {
     /// Java order: lock → forceToReadOnly → SyncThread.shutdown → Journal.shutdown
     ///             → LedgerStorage.shutdown → DiskMonitor.shutdown → StateManager.close (ZK)
     pub async fn shutdown(self) {
-        println!("Graceful shutdown starting...");
+        tracing::info!("Graceful shutdown starting...");
 
         // Step 1: Transition to READ_ONLY to reject new writes immediately.
         // Matches Java's stateManager.forceToReadOnly() (BookieImpl.java:897).
         // This ensures no new writes are accepted while we flush.
         self.state.transition_to(BookieState::ReadOnly);
-        println!("  Transitioned to read-only.");
+        tracing::info!("Transitioned to read-only.");
 
         // Step 2: Signal shutdown — stops accept loop and background tasks
         let _ = self.shutdown_tx.send(true);
@@ -316,30 +316,30 @@ impl BookieServer {
         if let Some(h) = self.sync_handle {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
-        println!("  Background tasks stopped.");
+        tracing::info!("Background tasks stopped.");
 
         // Step 4: Wait for accept loop to finish (drains in-flight connections)
         let _ = self.accept_handle.await;
-        println!("  Accept loop stopped.");
+        tracing::info!("Accept loop stopped.");
 
         // Step 5: Flush storage — persist write cache to entry logs + checkpoint.
         // Matches Java's SyncThread.shutdown() which waits up to 5 minutes.
         // Journal cleanup happens inside checkpoint().
-        println!("  Flushing storage...");
+        tracing::info!("Flushing storage...");
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(300),
             tokio::task::spawn_blocking({
                 let storage = self.storage.clone();
                 move || {
                     if let Err(e) = storage.checkpoint() {
-                        eprintln!("  WARNING: checkpoint failed during shutdown: {e}");
+                        tracing::warn!("WARNING: checkpoint failed during shutdown: {e}");
                     }
                 }
             })
         ).await {
-            Ok(Ok(())) => println!("  Storage flushed."),
-            Ok(Err(e)) => eprintln!("  WARNING: storage flush task panicked: {e}"),
-            Err(_) => eprintln!("  WARNING: storage flush timed out after 5 minutes"),
+            Ok(Ok(())) => tracing::info!("Storage flushed."),
+            Ok(Err(e)) => tracing::warn!("WARNING: storage flush task panicked: {e}"),
+            Err(_) => tracing::warn!("WARNING: storage flush timed out after 5 minutes"),
         }
 
         // Step 6: Transition to ShuttingDown
@@ -349,10 +349,10 @@ impl BookieServer {
         // Matches Java's StateManager.close() as the final step.
         if let Some((reg_mgr, bookie_id)) = self.zk_reg {
             let _ = reg_mgr.unregister_bookie(&bookie_id, false).await;
-            println!("  Unregistered from ZooKeeper.");
+            tracing::info!("Unregistered from ZooKeeper.");
         }
 
-        println!("Graceful shutdown complete.");
+        tracing::info!("Graceful shutdown complete.");
     }
 }
 
@@ -462,7 +462,7 @@ async fn run_disk_monitor(
                             dir_count += 1;
                         }
                         Err(e) => {
-                            eprintln!("Disk monitor: error checking {dir}: {e}");
+                            tracing::warn!("Disk monitor: error checking {dir}: {e}");
                         }
                     }
                 }
@@ -478,14 +478,14 @@ async fn run_disk_monitor(
                 if any_full && current == BookieState::Running {
                     if state.transition_to(BookieState::ReadOnly) {
                         crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
-                        println!("Disk monitor: disk usage exceeds {:.0}% threshold, transitioning to READ-ONLY", threshold * 100.0);
+                        tracing::info!("Disk monitor: disk usage exceeds {:.0}% threshold, transitioning to READ-ONLY", threshold * 100.0);
                         update_zk_registration(&zk_info, true).await;
                     }
                 } else if total_usage < lwm_threshold && current == BookieState::ReadOnly && dir_count > 0 {
                     // Recover: total usage across all dirs is below LWM (matching Java)
                     if state.transition_to(BookieState::Running) {
                         crate::metrics::BOOKIE_STATE.set(1); // 1 = writable
-                        println!("Disk monitor: total disk usage ({:.1}%) below {:.0}% LWM, transitioning back to WRITABLE",
+                        tracing::info!("Disk monitor: total disk usage ({:.1}%) below {:.0}% LWM, transitioning back to WRITABLE",
                             total_usage * 100.0, lwm_threshold * 100.0);
                         update_zk_registration(&zk_info, false).await;
                     }
@@ -529,7 +529,7 @@ async fn update_zk_registration(
         };
         let _ = zk_client.delete(&old_path, None).await;
 
-        println!(
+        tracing::info!(
             "Disk monitor: ZK registration updated (read_only={})",
             read_only
         );
@@ -586,16 +586,16 @@ async fn run_sync_thread(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let interval = tokio::time::Duration::from_millis(flush_interval_ms);
-    println!("SyncThread started (interval: {}ms)", flush_interval_ms);
+    tracing::info!("SyncThread started (interval: {}ms)", flush_interval_ms);
 
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    println!("SyncThread shutting down");
+                    tracing::info!("SyncThread shutting down");
                     // Final flush before exit
                     if let Err(e) = storage.checkpoint() {
-                        eprintln!("SyncThread: final checkpoint error: {e}");
+                        tracing::warn!("SyncThread: final checkpoint error: {e}");
                     }
                     break;
                 }
@@ -603,7 +603,7 @@ async fn run_sync_thread(
             _ = tokio::time::sleep(interval) => {
                 // Periodic checkpoint: flush write cache → entry logs → clean journals
                 if let Err(e) = storage.checkpoint() {
-                    eprintln!("SyncThread: checkpoint error: {e}");
+                    tracing::warn!("SyncThread: checkpoint error: {e}");
                 }
             }
         }
@@ -629,13 +629,13 @@ async fn run_gc_loop(
     let gc = GarbageCollector::new(storage);
     let interval = tokio::time::Duration::from_millis(gc_wait_ms);
 
-    println!("GC thread started (interval: {}ms)", gc_wait_ms);
+    tracing::info!("GC thread started (interval: {}ms)", gc_wait_ms);
 
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    println!("GC thread shutting down");
+                    tracing::info!("GC thread shutting down");
                     break;
                 }
             }
@@ -645,11 +645,11 @@ async fn run_gc_loop(
                     Ok(metadata_ledgers) => {
                         let active: HashSet<i64> = metadata_ledgers.into_iter().collect();
                         if let Err(e) = gc.gc(&active) {
-                            eprintln!("GC cycle error: {e}");
+                            tracing::warn!("GC cycle error: {e}");
                         }
                     }
                     Err(e) => {
-                        eprintln!("GC: failed to get metadata ledgers: {e}");
+                        tracing::warn!("GC: failed to get metadata ledgers: {e}");
                     }
                 }
             }
@@ -706,7 +706,7 @@ async fn start_auto_recovery(
             )
             .await
         {
-            eprintln!("AuditorElector exited with error: {e}");
+            tracing::warn!("AuditorElector exited with error: {e}");
         }
     });
 
@@ -723,11 +723,11 @@ async fn start_auto_recovery(
             shutdown_rx,
         );
         if let Err(e) = worker.run().await {
-            eprintln!("ReplicationWorker exited with error: {e}");
+            tracing::warn!("ReplicationWorker exited with error: {e}");
         }
     });
 
-    println!("Auto-recovery daemon started (auditor elector + replication worker)");
+    tracing::info!("Auto-recovery daemon started (auditor elector + replication worker)");
     Ok((auditor_handle, worker_handle))
 }
 
@@ -829,14 +829,14 @@ async fn handle_starttls_connection(
                                 handle_connection_io(tls_reader, tls_writer, processor, max_frame_size).await;
                             }
                             Err(e) => {
-                                eprintln!("TLS handshake failed after StartTLS: {e}");
+                                tracing::warn!("TLS handshake failed after StartTLS: {e}");
                             }
                         }
                         return;
                     } else {
                         // Not a StartTLS request — this is a plaintext V3 request.
                         // Process it and continue as plaintext (shouldn't happen if TLS required).
-                        eprintln!("Expected StartTLSRequest but got op={op}, processing as plaintext");
+                        tracing::warn!("Expected StartTLSRequest but got op={op}, processing as plaintext");
                         let tcp_stream = reader.reunite(writer).unwrap();
                         handle_connection(tcp_stream, processor, max_frame_size).await;
                         return;

@@ -77,7 +77,7 @@ impl GarbageCollector {
         for &ledger_id in &local_ledgers {
             if !active_ledgers_in_metadata.contains(&ledger_id) {
                 if let Err(e) = self.storage.delete_ledger(ledger_id) {
-                    eprintln!("GC: failed to delete ledger {ledger_id}: {e}");
+                    tracing::warn!("GC: failed to delete ledger {ledger_id}: {e}");
                 } else {
                     deleted_count += 1;
                 }
@@ -85,10 +85,10 @@ impl GarbageCollector {
         }
 
         if deleted_count > 0 {
-            println!("GC: deleted {deleted_count} ledger(s) from local storage");
+            tracing::info!("GC: deleted {deleted_count} ledger(s) from local storage");
 
             if let Err(e) = self.storage.compact_entry_locations() {
-                eprintln!("GC: RocksDB compaction error: {e}");
+                tracing::warn!("GC: RocksDB compaction error: {e}");
             }
         }
 
@@ -102,7 +102,7 @@ impl GarbageCollector {
                 .collect();
 
             if let Err(e) = self.gc_and_compact_entry_logs(entry_log_dir, current_log_id, &active_local) {
-                eprintln!("GC: entry log cleanup error: {e}");
+                tracing::warn!("GC: entry log cleanup error: {e}");
             }
         }
 
@@ -148,7 +148,7 @@ impl GarbageCollector {
             let meta = match self.extract_entry_log_meta(&path, log_id) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("GC: error reading entry log {}: {e}", name);
+                    tracing::warn!("GC: error reading entry log {}: {e}", name);
                     continue;
                 }
             };
@@ -156,7 +156,7 @@ impl GarbageCollector {
             if !meta.has_active_ledgers(active_ledgers) {
                 // No active ledgers — delete the file entirely
                 if let Err(e) = fs::remove_file(&path) {
-                    eprintln!("GC: failed to delete entry log {}: {e}", name);
+                    tracing::warn!("GC: failed to delete entry log {}: {e}", name);
                 } else {
                     deleted_files += 1;
                 }
@@ -172,7 +172,7 @@ impl GarbageCollector {
                             }
                         }
                         Err(e) => {
-                            eprintln!("GC: compaction error for {}: {e}", name);
+                            tracing::warn!("GC: compaction error for {}: {e}", name);
                         }
                     }
                 }
@@ -180,10 +180,10 @@ impl GarbageCollector {
         }
 
         if deleted_files > 0 {
-            println!("GC: deleted {deleted_files} empty entry log file(s)");
+            tracing::info!("GC: deleted {deleted_files} empty entry log file(s)");
         }
         if compacted_files > 0 {
-            println!("GC: compacted {compacted_files} entry log file(s)");
+            tracing::info!("GC: compacted {compacted_files} entry log file(s)");
         }
 
         Ok(())

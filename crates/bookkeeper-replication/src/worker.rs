@@ -49,11 +49,11 @@ impl ReplicationWorker {
 
     /// Run the replication worker main loop.
     pub async fn run(&mut self) -> Result<(), ReplicationError> {
-        println!("ReplicationWorker started (bookie: {})", self.bookie_id);
+        tracing::info!("ReplicationWorker started (bookie: {})", self.bookie_id);
 
         loop {
             if *self.shutdown_rx.borrow() {
-                println!("ReplicationWorker shutting down");
+                tracing::info!("ReplicationWorker shutting down");
                 break;
             }
 
@@ -65,7 +65,7 @@ impl ReplicationWorker {
                     tokio::select! {
                         _ = self.shutdown_rx.changed() => {
                             if *self.shutdown_rx.borrow() {
-                                println!("ReplicationWorker shutting down");
+                                tracing::info!("ReplicationWorker shutting down");
                                 break;
                             }
                         }
@@ -73,11 +73,11 @@ impl ReplicationWorker {
                     }
                 }
                 Err(e) => {
-                    eprintln!("ReplicationWorker error: {e}");
+                    tracing::warn!("ReplicationWorker error: {e}");
                     tokio::select! {
                         _ = self.shutdown_rx.changed() => {
                             if *self.shutdown_rx.borrow() {
-                                println!("ReplicationWorker shutting down");
+                                tracing::info!("ReplicationWorker shutting down");
                                 break;
                             }
                         }
@@ -99,16 +99,16 @@ impl ReplicationWorker {
             None => return Ok(false),
         };
 
-        println!("ReplicationWorker: claimed ledger {ledger_id} for replication");
+        tracing::info!("ReplicationWorker: claimed ledger {ledger_id} for replication");
 
         match self.rereplicate(ledger_id).await {
             Ok(()) => {
                 self.ur_manager.mark_ledger_replicated(ledger_id).await?;
-                println!("ReplicationWorker: ledger {ledger_id} replicated successfully");
+                tracing::info!("ReplicationWorker: ledger {ledger_id} replicated successfully");
                 Ok(true)
             }
             Err(e) => {
-                eprintln!("ReplicationWorker: failed to replicate ledger {ledger_id}: {e}");
+                tracing::warn!("ReplicationWorker: failed to replicate ledger {ledger_id}: {e}");
                 self.ur_manager.release_lock(ledger_id).await?;
                 Ok(false)
             }
@@ -208,7 +208,7 @@ impl ReplicationWorker {
                 continue; // this segment is fine
             }
 
-            println!(
+            tracing::info!(
                 "ReplicationWorker: ledger {ledger_id} segment [{seg_start}..{seg_end}] has bad bookies at indices {:?}",
                 bad_indices
             );
@@ -299,7 +299,7 @@ impl ReplicationWorker {
             self.update_ensemble_metadata(ledger_id, *seg_start, ensemble, &replacements)
                 .await?;
 
-            println!(
+            tracing::info!(
                 "ReplicationWorker: ledger {ledger_id} segment [{seg_start}..{seg_end}] replicated, replacements: {:?}",
                 replacements
             );

@@ -164,7 +164,7 @@ fn journal_writer_loop(
         match rx.recv_timeout(timeout) {
             Ok(entry) => {
                 if let Err(e) = state.write_entry(&config, &entry.data) {
-                    eprintln!("Journal write error: {e}");
+                    tracing::warn!("Journal write error: {e}");
                 }
                 pending_bytes += 4 + entry.data.len();
                 pending_count += 1;
@@ -175,7 +175,7 @@ fn journal_writer_loop(
                 // Drain more entries without blocking (batch)
                 while let Ok(entry) = rx.try_recv() {
                     if let Err(e) = state.write_entry(&config, &entry.data) {
-                        eprintln!("Journal write error: {e}");
+                        tracing::warn!("Journal write error: {e}");
                     }
                     pending_bytes += 4 + entry.data.len();
                     pending_count += 1;
@@ -199,13 +199,13 @@ fn journal_writer_loop(
                     // V5+ padding before flush
                     if config.format_version >= 5 && config.alignment_size > 0 {
                         if let Err(e) = state.write_padding(config.alignment_size) {
-                            eprintln!("Journal padding error: {e}");
+                            tracing::warn!("Journal padding error: {e}");
                         }
                     }
 
                     // Flush to OS page cache
                     if let Err(e) = state.flush(false) {
-                        eprintln!("Journal flush error: {e}");
+                        tracing::warn!("Journal flush error: {e}");
                     }
 
                     if config.sync_data {
@@ -298,12 +298,12 @@ fn fsync_loop(_config: JournalConfig, rx: mpsc::Receiver<FsyncRequest>) {
             match fs::OpenOptions::new().read(true).open(path) {
                 Ok(file) => {
                     if let Err(e) = file.sync_data() {
-                        eprintln!("FATAL: journal fsync failed for {:?}: {e}", path);
+                        tracing::error!("FATAL: journal fsync failed for {:?}: {e}", path);
                         fsync_ok = false;
                     }
                 }
                 Err(e) => {
-                    eprintln!("FATAL: cannot open journal for fsync {:?}: {e}", path);
+                    tracing::error!("FATAL: cannot open journal for fsync {:?}: {e}", path);
                     fsync_ok = false;
                 }
             }
@@ -319,7 +319,7 @@ fn fsync_loop(_config: JournalConfig, rx: mpsc::Receiver<FsyncRequest>) {
         } else {
             // fsync failed — do NOT ACK clients. They will timeout.
             // Matching Java's behavior: ForceWriteThread crashes, pending ACKs abandoned.
-            eprintln!("FATAL: journal fsync failed, abandoning {} pending ACKs",
+            tracing::error!("FATAL: journal fsync failed, abandoning {} pending ACKs",
                 all_requests.iter().map(|r| r.pending_acks.len()).sum::<usize>());
             // Drop pending_acks without sending — clients will get timeout errors
         }

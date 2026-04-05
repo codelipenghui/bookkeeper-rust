@@ -41,7 +41,7 @@ pub fn build_tls_acceptor(cfg: &TlsConfig) -> Result<TlsAcceptor, Box<dyn std::e
                 match p.trim() {
                     "TLSv1.3" | "TLS1.3" => versions.push(&rustls::version::TLS13),
                     "TLSv1.2" | "TLS1.2" => versions.push(&rustls::version::TLS12),
-                    other => eprintln!("TLS: unsupported protocol version {other}, ignoring"),
+                    other => tracing::warn!("TLS: unsupported protocol version {other}, ignoring"),
                 }
             }
             if versions.is_empty() { None } else { Some(versions) }
@@ -122,7 +122,7 @@ impl ReloadableTlsAcceptor {
         let new_acceptor = match build_tls_acceptor(&self.config) {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("TLS: certificate reload failed: {e}");
+                tracing::warn!("TLS: certificate reload failed: {e}");
                 return false;
             }
         };
@@ -130,7 +130,7 @@ impl ReloadableTlsAcceptor {
         // Update acceptor and timestamp
         *self.acceptor.write().await = new_acceptor;
         *self.last_modified.lock() = current_mtime;
-        println!("TLS: certificates reloaded");
+        tracing::info!("TLS: certificates reloaded");
         true
     }
 

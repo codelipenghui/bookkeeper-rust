@@ -59,7 +59,7 @@ impl Auditor {
     /// watchBookieChanges() which watches BOTH writable and readonly bookies.
     /// Periodic 60s fallback as safety net.
     pub async fn run(&mut self) -> Result<(), ReplicationError> {
-        println!("Auditor started");
+        tracing::info!("Auditor started");
 
         // Initial bookie list with watchers for both paths
         let writable_watcher = self.refresh_writable_with_watch().await?;
@@ -70,7 +70,7 @@ impl Auditor {
 
         // Run initial audit immediately after election (matching Java's scheduleBookieCheckTask)
         if let Err(e) = self.check_bookies().await {
-            eprintln!("Auditor initial check error: {e}");
+            tracing::warn!("Auditor initial check error: {e}");
         }
 
         loop {
@@ -91,7 +91,7 @@ impl Auditor {
             tokio::select! {
                 _ = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {
-                        println!("Auditor shutting down");
+                        tracing::info!("Auditor shutting down");
                         break;
                     }
                 }
@@ -110,7 +110,7 @@ impl Auditor {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
                     // Periodic fallback safety net
                     if let Err(e) = self.check_bookies().await {
-                        eprintln!("Auditor periodic check error: {e}");
+                        tracing::warn!("Auditor periodic check error: {e}");
                     }
                     // Re-set watchers if lost
                     if cur_writable_watcher.is_none() {
@@ -131,15 +131,15 @@ impl Auditor {
             match ev.event_type {
                 zk::EventType::NodeChildrenChanged => {
                     if let Err(e) = self.check_bookies().await {
-                        eprintln!("Auditor bookie check error: {e}");
+                        tracing::warn!("Auditor bookie check error: {e}");
                     }
                 }
                 zk::EventType::Session => {
                     // ZK session reconnected — re-audit in case bookies changed
                     // while disconnected (matching Java's implicit re-audit on reconnect)
-                    println!("Auditor: ZK session event, triggering re-audit");
+                    tracing::info!("Auditor: ZK session event, triggering re-audit");
                     if let Err(e) = self.check_bookies().await {
-                        eprintln!("Auditor session re-audit error: {e}");
+                        tracing::warn!("Auditor session re-audit error: {e}");
                     }
                 }
                 _ => {}
@@ -197,7 +197,7 @@ impl Auditor {
         match self.client.list_and_watch_children(self.paths.available()).await {
             Ok((_children, watcher)) => Some(watcher),
             Err(e) => {
-                eprintln!("Auditor: failed to set writable watcher: {e}");
+                tracing::warn!("Auditor: failed to set writable watcher: {e}");
                 None
             }
         }
@@ -255,15 +255,15 @@ impl Auditor {
             .collect();
 
         if !new_bookies.is_empty() {
-            println!("Auditor: new bookies detected: {:?}", new_bookies);
+            tracing::info!("Auditor: new bookies detected: {:?}", new_bookies);
         }
 
         if !failed.is_empty() {
             // Check if another audit is already running (deduplication)
             if self.auditing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-                println!("Auditor: audit already in progress, skipping");
+                tracing::info!("Auditor: audit already in progress, skipping");
             } else {
-                println!("Auditor: bookie failures detected: {:?}", failed);
+                tracing::info!("Auditor: bookie failures detected: {:?}", failed);
 
                 if failed.len() > 1 || self.lost_bookie_recovery_delay_secs == 0 {
                     // Multiple failures or no delay: immediate audit
@@ -271,12 +271,12 @@ impl Auditor {
                     self.auditing.store(false, Ordering::SeqCst);
                     if let Err(e) = result {
                         // Don't update known bookies on audit error — retry on next check
-                        eprintln!("Auditor: audit failed: {e}");
+                        tracing::warn!("Auditor: audit failed: {e}");
                         return Ok(());
                     }
                 } else {
                     // Single failure: delayed audit (matching Java's lostBookieRecoveryDelay)
-                    println!(
+                    tracing::info!(
                         "Auditor: scheduling delayed check in {}s",
                         self.lost_bookie_recovery_delay_secs
                     );
@@ -312,7 +312,7 @@ impl Auditor {
                             .collect();
 
                         if !still_failed.is_empty() {
-                            println!(
+                            tracing::info!(
                                 "Auditor: bookies still missing after delay: {:?}",
                                 still_failed
                             );
@@ -323,7 +323,7 @@ impl Auditor {
                             )
                             .await
                             {
-                                eprintln!("Auditor: delayed audit error: {e}");
+                                tracing::warn!("Auditor: delayed audit error: {e}");
                             }
                         }
                         auditing.store(false, Ordering::SeqCst);
@@ -358,7 +358,7 @@ async fn handle_lost_bookies(
         .await
         .map_err(|e| ReplicationError::Failed(format!("get ledger ranges: {e}")))?;
 
-    println!(
+    tracing::info!(
         "Auditor: scanning {} ledgers for failed bookies {:?}",
         ledger_ids.len(),
         failed_bookies
@@ -383,7 +383,7 @@ async fn handle_lost_bookies(
                 continue;
             }
             Err(e) => {
-                eprintln!("Auditor: failed to read metadata for ledger {lid}: {e}");
+                tracing::warn!("Auditor: failed to read metadata for ledger {lid}: {e}");
                 continue;
             }
         }
@@ -397,7 +397,7 @@ async fn handle_lost_bookies(
                     .mark_ledger_underreplicated(*lid, &[bookie.clone()])
                     .await
                 {
-                    eprintln!("Auditor: failed to mark ledger {lid}: {e}");
+                    tracing::warn!("Auditor: failed to mark ledger {lid}: {e}");
                 } else {
                     marked_count += 1;
                 }
@@ -405,7 +405,7 @@ async fn handle_lost_bookies(
         }
     }
 
-    println!(
+    tracing::info!(
         "Auditor: marked {} ledgers as underreplicated for {} failed bookies",
         marked_count,
         failed_bookies.len()

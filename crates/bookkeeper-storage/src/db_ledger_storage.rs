@@ -102,7 +102,7 @@ impl DbLedgerStorage {
         })?;
 
         if replayed > 0 {
-            println!("Journal: replayed {} entries from crash recovery", replayed);
+            tracing::info!("Journal: replayed {} entries from crash recovery", replayed);
             // Flush replayed entries to entry logs
             let _ = self.flush();
         }

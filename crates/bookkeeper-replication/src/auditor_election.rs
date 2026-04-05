@@ -61,7 +61,7 @@ impl AuditorElector {
             // Try to become auditor
             match self.try_become_auditor().await? {
                 ElectionResult::Elected => {
-                    println!("Auditor elected: {}", self.bookie_id);
+                    tracing::info!("Auditor elected: {}", self.bookie_id);
 
                     // Update election znode data with our bookie ID (for debugging)
                     let vote_data = crate::text_format::serialize_auditor_vote(&AuditorVoteFormat {
@@ -83,7 +83,7 @@ impl AuditorElector {
                         auditor_shutdown,
                     );
                     if let Err(e) = auditor.run().await {
-                        eprintln!("Auditor exited: {e}");
+                        tracing::warn!("Auditor exited: {e}");
                     }
                     // If auditor exits (shutdown or error), break
                     break;
