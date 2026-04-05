@@ -50,6 +50,12 @@ pub struct ServerConfig {
     pub num_add_worker_threads: i32,
     pub num_read_worker_threads: i32,
 
+    // TLS
+    pub tls_certificate_path: Option<String>,
+    pub tls_key_path: Option<String>,
+    pub tls_trust_store_path: Option<String>,
+    pub tls_client_authentication: bool,
+
     // Disk Management
     pub disk_usage_threshold: f64,
     pub disk_usage_warn_threshold: f64,
@@ -113,6 +119,10 @@ impl Default for ServerConfig {
             max_frame_size: 5 * 1024 * 1024,
             num_add_worker_threads: 1,
             num_read_worker_threads: 8,
+            tls_certificate_path: None,
+            tls_key_path: None,
+            tls_trust_store_path: None,
+            tls_client_authentication: false,
             disk_usage_threshold: 0.95,
             disk_usage_warn_threshold: 0.90,
             disk_usage_lwm_threshold: 0.95,
@@ -170,6 +180,11 @@ impl ServerConfig {
         if let Some(v) = props.get("nettyMaxFrameSizeBytes") { if let Ok(n) = v.parse() { config.max_frame_size = n; } }
         if let Some(v) = props.get("numAddWorkerThreads") { if let Ok(n) = v.parse() { config.num_add_worker_threads = n; } }
         if let Some(v) = props.get("numReadWorkerThreads") { if let Ok(n) = v.parse() { config.num_read_worker_threads = n; } }
+        if let Some(v) = props.get("tlsCertificatePath") { config.tls_certificate_path = Some(v.clone()); }
+        if let Some(v) = props.get("tlsKeyStore") { config.tls_key_path = Some(v.clone()); }
+        if let Some(v) = props.get("tlsKeyFilePath") { config.tls_key_path = Some(v.clone()); }
+        if let Some(v) = props.get("tlsTrustStore") { config.tls_trust_store_path = Some(v.clone()); }
+        if let Some(v) = props.get("tlsClientAuthentication") { config.tls_client_authentication = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("diskUsageThreshold") { if let Ok(n) = v.parse() { config.disk_usage_threshold = n; } }
         if let Some(v) = props.get("diskUsageWarnThreshold") { if let Ok(n) = v.parse() { config.disk_usage_warn_threshold = n; } }
         if let Some(v) = props.get("diskUsageLwmThreshold") { if let Ok(n) = v.parse() { config.disk_usage_lwm_threshold = n; } }

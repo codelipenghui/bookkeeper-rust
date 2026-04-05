@@ -203,6 +203,22 @@ impl BookieServer {
             run_sync_thread(sync_storage, flush_interval_ms, sync_shutdown).await;
         }));
 
+        // Build TLS acceptor if configured
+        let tls_acceptor = if let (Some(ref cert), Some(ref key)) =
+            (&config.tls_certificate_path, &config.tls_key_path)
+        {
+            let acceptor = crate::tls::build_tls_acceptor(
+                cert,
+                key,
+                config.tls_trust_store_path.as_deref(),
+                config.tls_client_authentication,
+            )?;
+            println!("TLS enabled (cert: {cert}, key: {key})");
+            Some(acceptor)
+        } else {
+            None
+        };
+
         // Spawn accept loop
         let accept_handle = tokio::spawn(accept_loop(
             listener,
@@ -210,6 +226,7 @@ impl BookieServer {
             state.clone(),
             shutdown_rx,
             max_frame_size,
+            tls_acceptor,
         ));
 
         Ok(BookieServer {
@@ -706,6 +723,7 @@ async fn accept_loop(
     state: Arc<BookieStateManager>,
     mut shutdown_rx: watch::Receiver<bool>,
     max_frame_size: usize,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
     loop {
         tokio::select! {
@@ -713,10 +731,26 @@ async fn accept_loop(
                 match accept_result {
                     Ok((stream, _peer_addr)) => {
                         let proc = processor.clone();
-                        tokio::spawn(handle_connection(stream, proc, max_frame_size));
+                        if let Some(ref tls) = tls_acceptor {
+                            // TLS connection
+                            let tls = tls.clone();
+                            tokio::spawn(async move {
+                                match tls.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        let (reader, writer) = tokio::io::split(tls_stream);
+                                        handle_connection_io(reader, writer, proc, max_frame_size).await;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("TLS handshake failed: {e}");
+                                    }
+                                }
+                            });
+                        } else {
+                            // Plain TCP connection
+                            tokio::spawn(handle_connection(stream, proc, max_frame_size));
+                        }
                     }
                     Err(_) => {
-                        // Listener error — stop the loop
                         break;
                     }
                 }
@@ -736,7 +770,20 @@ async fn handle_connection(
     processor: Arc<RequestProcessor>,
     max_frame_size: usize,
 ) {
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    handle_connection_io(reader, writer, processor, max_frame_size).await;
+}
+
+async fn handle_connection_io<R, W>(
+    mut reader: R,
+    mut writer: W,
+    processor: Arc<RequestProcessor>,
+    max_frame_size: usize,
+)
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
     let mut codec = BookieCodec::new(max_frame_size);
     let mut buf = BytesMut::with_capacity(4096);
     let mut out = BytesMut::with_capacity(256);

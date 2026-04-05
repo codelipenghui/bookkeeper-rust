@@ -25,6 +25,9 @@ serde_json = { workspace = true }
 zookeeper-client = { workspace = true }
 prometheus = { workspace = true }
 lazy_static = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
