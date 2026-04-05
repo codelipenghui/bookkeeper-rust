@@ -98,6 +98,37 @@ impl LedgerMetadataBuilder {
         }
     }
 
+    /// Create a builder pre-populated from existing metadata.
+    /// Copies all fields (ensemble_size, quorum, digest, password, ctime, ensembles, etc.).
+    /// Useful for CAS metadata updates where most fields are preserved.
+    pub fn from_existing(md: &LedgerMetadata) -> Self {
+        let mut builder = Self::new()
+            .ledger_id(md.ledger_id)
+            .metadata_format_version(md.metadata_format_version)
+            .ensemble_size(md.ensemble_size)
+            .write_quorum_size(md.write_quorum_size)
+            .ack_quorum_size(md.ack_quorum_size);
+        if let Some(dt) = md.digest_type {
+            builder = builder.with_digest_type(dt);
+        }
+        if let Some(ref pw) = md.password {
+            builder = builder.with_password(pw.clone());
+        }
+        if md.store_ctime {
+            builder = builder.with_ctime(md.ctime);
+        }
+        for (first_entry, ens) in &md.ensembles {
+            builder = builder.new_ensemble_entry(*first_entry, ens.clone());
+        }
+        if !md.custom_metadata.is_empty() {
+            builder = builder.with_custom_metadata(md.custom_metadata.clone());
+        }
+        if md.c_token != 0 {
+            builder = builder.with_c_token(md.c_token);
+        }
+        builder
+    }
+
     pub fn ledger_id(mut self, v: i64) -> Self { self.ledger_id = v; self }
     pub fn metadata_format_version(mut self, v: i32) -> Self { self.metadata_format_version = v; self }
     pub fn ensemble_size(mut self, v: i32) -> Self { self.ensemble_size = v; self }
@@ -112,6 +143,11 @@ impl LedgerMetadataBuilder {
     pub fn new_ensemble_entry(mut self, first_entry_id: i64, ensemble: Vec<String>) -> Self {
         self.ensembles.insert(first_entry_id, ensemble);
         self
+    }
+
+    /// Clear all ensemble entries (used before replacing with overrides).
+    pub fn clear_ensembles(&mut self) {
+        self.ensembles.clear();
     }
 
     pub fn with_in_recovery_state(mut self) -> Self {

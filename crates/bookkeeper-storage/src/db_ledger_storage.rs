@@ -21,6 +21,8 @@ const MAX_ENTRY_SIZE: usize = 100 * 1024 * 1024; // 100MB sanity limit
 struct EntryLogState {
     log_id: u32,
     offset: u64,
+    /// Persistent file handle for the current entry log. Avoids open/close per write.
+    writer: Option<std::io::BufWriter<fs::File>>,
 }
 
 pub struct DbLedgerStorage {
@@ -59,6 +61,7 @@ impl DbLedgerStorage {
             log_state: Mutex::new(EntryLogState {
                 log_id: 0,
                 offset: LOGFILE_HEADER_SIZE as u64,
+                writer: None,
             }),
             flush_mutex: Mutex::new(()),
         })
@@ -274,22 +277,30 @@ impl LedgerStorage for DbLedgerStorage {
     fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError> {
         use std::io::BufWriter;
         let mut log_state = self.log_state.lock().unwrap();
-        self.ensure_entry_log_exists(log_state.log_id)?;
 
         let encoded_size = (4 + entry.len()) as u64;
         if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
+            // Flush and close current writer before rotating
+            if let Some(ref mut w) = log_state.writer {
+                w.flush()?;
+            }
+            log_state.writer = None;
             log_state.log_id += 1;
             log_state.offset = LOGFILE_HEADER_SIZE as u64;
-            self.ensure_entry_log_exists(log_state.log_id)?;
         }
 
-        let path = self.entry_log_path(log_state.log_id);
-        let mut writer = BufWriter::new(
-            fs::OpenOptions::new().create(true).append(true).open(&path)?
-        );
+        // Open writer if not already open
+        if log_state.writer.is_none() {
+            self.ensure_entry_log_exists(log_state.log_id)?;
+            let path = self.entry_log_path(log_state.log_id);
+            let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            log_state.writer = Some(BufWriter::new(file));
+        }
+
+        let writer = log_state.writer.as_mut().unwrap();
         writer.write_all(&(entry.len() as i32).to_be_bytes())?;
         writer.write_all(entry)?;
-        writer.flush()?;
+        // Don't flush per entry — caller flushes after batch via update_entry_locations
 
         let position = log_state.offset + 4;
         let location = EntryLocation::new(log_state.log_id, position as u32).to_u64();
@@ -298,6 +309,13 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError> {
+        // Flush entry log to disk before updating index (matching Java's flush ordering)
+        {
+            let mut log_state = self.log_state.lock().unwrap();
+            if let Some(ref mut w) = log_state.writer {
+                w.flush()?;
+            }
+        }
         self.entry_location_index.put_batch(batch)?;
         self.entry_location_index.flush()
     }
@@ -309,7 +327,6 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn flush(&self) -> Result<(), StorageError> {
-        use std::io::BufWriter;
         let _lock = self.flush_mutex.lock().unwrap();
 
         // Swap: active → being_flushed, being_flushed (cleared) → active
@@ -332,36 +349,44 @@ impl LedgerStorage for DbLedgerStorage {
 
         {
             let mut log_state = self.log_state.lock().unwrap();
-            self.ensure_entry_log_exists(log_state.log_id)?;
-            let path = self.entry_log_path(log_state.log_id);
-            let mut writer = BufWriter::new(
-                fs::OpenOptions::new().create(true).append(true).open(&path)?
-            );
+
+            // Open writer if not already open
+            if log_state.writer.is_none() {
+                self.ensure_entry_log_exists(log_state.log_id)?;
+                let path = self.entry_log_path(log_state.log_id);
+                let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                log_state.writer = Some(BufWriter::new(file));
+            }
 
             for &(ledger_id, entry_id, offset, size) in &entries {
                 let entry_data = &flushing_data[offset..offset + size];
                 let encoded_size = (4 + entry_data.len()) as u64;
 
                 if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
-                    writer.flush()?;
-                    drop(writer);
+                    // Rotate: flush + close current, open new
+                    if let Some(ref mut w) = log_state.writer {
+                        w.flush()?;
+                    }
+                    log_state.writer = None;
                     log_state.log_id += 1;
                     log_state.offset = LOGFILE_HEADER_SIZE as u64;
                     self.ensure_entry_log_exists(log_state.log_id)?;
                     let new_path = self.entry_log_path(log_state.log_id);
-                    writer = BufWriter::new(
-                        fs::OpenOptions::new().create(true).append(true).open(&new_path)?
-                    );
+                    let file = fs::OpenOptions::new().create(true).append(true).open(&new_path)?;
+                    log_state.writer = Some(BufWriter::new(file));
                 }
 
-                writer.write_all(&(entry_data.len() as i32).to_be_bytes())?;
-                writer.write_all(entry_data)?;
+                let w = log_state.writer.as_mut().unwrap();
+                w.write_all(&(entry_data.len() as i32).to_be_bytes())?;
+                w.write_all(entry_data)?;
                 let position = log_state.offset + 4;
                 let location = EntryLocation::new(log_state.log_id, position as u32).to_u64();
                 batch.push((ledger_id, entry_id, location));
                 log_state.offset += encoded_size;
             }
-            writer.flush()?;
+            if let Some(ref mut w) = log_state.writer {
+                w.flush()?;
+            }
         }
 
         if !batch.is_empty() {

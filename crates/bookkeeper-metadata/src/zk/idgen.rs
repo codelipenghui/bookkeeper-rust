@@ -282,22 +282,7 @@ impl LedgerIdGenerator for ZkLedgerIdGenerator {
 }
 
 async fn ensure_path(client: &zk::Client, path: &str) -> Result<(), MetadataError> {
-    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    let mut current = String::new();
-    let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
-    for part in &parts {
-        current.push('/');
-        current.push_str(part);
-        match client.create(&current, &[], &options).await {
-            Ok(_) | Err(zk::Error::NodeExists) => {}
-            Err(e) => {
-                return Err(MetadataError::ZkError(format!(
-                    "ensure {current}: {e}"
-                )));
-            }
-        }
-    }
-    Ok(())
+    crate::zk_path::ensure_zk_path(client, path).await
 }
 
 #[cfg(test)]

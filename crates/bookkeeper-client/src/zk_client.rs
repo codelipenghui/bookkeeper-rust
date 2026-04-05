@@ -447,30 +447,12 @@ fn build_closed_metadata(
     length: i64,
     segments_override: Option<&std::collections::BTreeMap<i64, Vec<String>>>,
 ) -> Result<bookkeeper_metadata::ledger_metadata::LedgerMetadata, ClientError> {
-    let mut builder = LedgerMetadataBuilder::new()
-        .ledger_id(ledger_id)
-        .metadata_format_version(3)
-        .ensemble_size(md.ensemble_size())
-        .write_quorum_size(md.write_quorum_size())
-        .ack_quorum_size(md.ack_quorum_size());
+    let mut builder = LedgerMetadataBuilder::from_existing(md);
 
-    if let Some(dt) = md.digest_type() {
-        builder = builder.with_digest_type(dt);
-    }
-    if let Some(pw) = md.password() {
-        builder = builder.with_password(pw.to_vec());
-    }
-    if md.store_ctime() {
-        builder = builder.with_ctime(md.ctime());
-    }
-
-    // Copy ensemble segments
+    // Override ensemble segments if provided (e.g., from WriteHandle)
     if let Some(segments) = segments_override {
+        builder.clear_ensembles();
         for (first_entry, ensemble) in segments {
-            builder = builder.new_ensemble_entry(*first_entry, ensemble.clone());
-        }
-    } else {
-        for (first_entry, ensemble) in md.all_ensembles() {
             builder = builder.new_ensemble_entry(*first_entry, ensemble.clone());
         }
     }

@@ -27,6 +27,19 @@ pub enum DigestType {
     Dummy,
 }
 
+impl std::str::FromStr for DigestType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "crc32" => Ok(DigestType::Crc32),
+            "crc32c" => Ok(DigestType::Crc32c),
+            "hmac" | "hmac_sha1" | "hmacsha1" | "mac" => Ok(DigestType::HmacSha1),
+            "dummy" => Ok(DigestType::Dummy),
+            other => Err(format!("unknown digest type: {other}")),
+        }
+    }
+}
+
 impl DigestType {
     pub fn digest_length(&self) -> usize {
         match self {

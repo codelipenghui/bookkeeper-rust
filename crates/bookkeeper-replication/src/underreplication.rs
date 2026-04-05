@@ -309,41 +309,15 @@ impl ZkUnderreplicationManager {
     }
 
     async fn ensure_parents(&self, path: &str) -> Result<(), ReplicationError> {
-        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        let mut current = String::new();
-        let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
-        for (i, part) in parts.iter().enumerate() {
-            current.push('/');
-            current.push_str(part);
-            if i < parts.len() - 1 {
-                match self.client.create(&current, &[], &options).await {
-                    Ok(_) | Err(zk::Error::NodeExists) => {}
-                    Err(e) => {
-                        return Err(ReplicationError::Zk(format!(
-                            "ensure {current}: {e}"
-                        )))
-                    }
-                }
-            }
-        }
-        Ok(())
+        bookkeeper_metadata::zk_path::ensure_zk_parents(&self.client, path)
+            .await
+            .map_err(|e| ReplicationError::Zk(format!("{e}")))
     }
 
     async fn ensure_path(&self, path: &str) -> Result<(), ReplicationError> {
-        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        let mut current = String::new();
-        let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
-        for part in &parts {
-            current.push('/');
-            current.push_str(part);
-            match self.client.create(&current, &[], &options).await {
-                Ok(_) | Err(zk::Error::NodeExists) => {}
-                Err(e) => {
-                    return Err(ReplicationError::Zk(format!("ensure {current}: {e}")))
-                }
-            }
-        }
-        Ok(())
+        bookkeeper_metadata::zk_path::ensure_zk_path(&self.client, path)
+            .await
+            .map_err(|e| ReplicationError::Zk(format!("{e}")))
     }
 }
 

@@ -11,13 +11,7 @@ use bookkeeper_protocol::digest::{DigestManager, DigestType, generate_master_key
 use bookkeeper_protocol::entry::EntryBuilder;
 
 fn parse_digest(s: &str) -> Result<DigestType, Box<dyn std::error::Error>> {
-    match s {
-        "crc32" => Ok(DigestType::Crc32),
-        "crc32c" => Ok(DigestType::Crc32c),
-        "hmac" => Ok(DigestType::HmacSha1),
-        "dummy" => Ok(DigestType::Dummy),
-        other => Err(format!("unknown digest: {other}").into()),
-    }
+    s.parse::<DigestType>().map_err(|e| e.into())
 }
 
 fn random_payload(size: usize) -> Vec<u8> {

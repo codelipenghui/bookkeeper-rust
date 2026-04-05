@@ -355,28 +355,8 @@ impl ReplicationWorker {
                 break;
             }
 
-            let mut builder = LedgerMetadataBuilder::new()
-                .ledger_id(ledger_id)
-                .metadata_format_version(3)
-                .ensemble_size(current.ensemble_size())
-                .write_quorum_size(current.write_quorum_size())
-                .ack_quorum_size(current.ack_quorum_size());
-
-            if let Some(dt) = current.digest_type() {
-                builder = builder.with_digest_type(dt);
-            }
-            if let Some(pw) = current.password() {
-                builder = builder.with_password(pw.to_vec());
-            }
-            if current.store_ctime() {
-                builder = builder.with_ctime(current.ctime());
-            }
-            for (first_entry, ens) in current.all_ensembles() {
-                builder = builder.new_ensemble_entry(*first_entry, ens.clone());
-            }
-            builder = builder.with_closed_state(last_entry, total_length);
-
-            let closed_md = builder
+            let closed_md = LedgerMetadataBuilder::from_existing(current)
+                .with_closed_state(last_entry, total_length)
                 .build()
                 .map_err(|e| ReplicationError::Failed(format!("build closed md: {e}")))?;
 
@@ -562,23 +542,9 @@ impl ReplicationWorker {
                 return Ok(()); // already updated by someone else
             }
 
-            let mut builder = LedgerMetadataBuilder::new()
-                .ledger_id(ledger_id)
-                .metadata_format_version(3)
-                .ensemble_size(md.ensemble_size())
-                .write_quorum_size(md.write_quorum_size())
-                .ack_quorum_size(md.ack_quorum_size());
-
-            if let Some(dt) = md.digest_type() {
-                builder = builder.with_digest_type(dt);
-            }
-            if let Some(pw) = md.password() {
-                builder = builder.with_password(pw.to_vec());
-            }
-            if md.store_ctime() {
-                builder = builder.with_ctime(md.ctime());
-            }
-            // Copy all segments, replacing the target segment's ensemble
+            let mut builder = LedgerMetadataBuilder::from_existing(md);
+            // Replace the target segment's ensemble
+            builder.clear_ensembles();
             for (first_entry, ens) in md.all_ensembles() {
                 if *first_entry == segment_start {
                     builder = builder.new_ensemble_entry(*first_entry, new_ensemble.clone());

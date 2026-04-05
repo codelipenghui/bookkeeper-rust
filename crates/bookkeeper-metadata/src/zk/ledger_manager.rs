@@ -29,25 +29,8 @@ impl ZkLedgerManager {
         ledger_path(self.paths.root(), ledger_id)
     }
 
-    /// Create all parent znodes for a path (recursive mkdir -p).
     async fn ensure_parents(&self, path: &str) -> Result<(), MetadataError> {
-        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        let mut current = String::new();
-        let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
-        // Create all parents (skip the leaf)
-        for part in &parts[..parts.len().saturating_sub(1)] {
-            current.push('/');
-            current.push_str(part);
-            match self.client.create(&current, &[], &options).await {
-                Ok(_) | Err(zk::Error::NodeExists) => {}
-                Err(e) => {
-                    return Err(MetadataError::ZkError(format!(
-                        "ensure parent {current}: {e}"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        crate::zk_path::ensure_zk_parents(&self.client, path).await
     }
 
     /// Delete a znode and clean up empty parent directories.
