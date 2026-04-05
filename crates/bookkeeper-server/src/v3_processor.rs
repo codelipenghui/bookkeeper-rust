@@ -157,11 +157,15 @@ pub fn process_v3_request(
             }
         }
         op if op == bookkeeper_proto::OperationType::Auth as i32 => {
-            // Return success with empty auth
+            // Auth disabled: return AUTHENTICATION_DISABLED with empty payload.
+            // Matches Java's BookieRequestProcessor when no auth provider is configured.
             let resp = bookkeeper_proto::Response {
                 header: make_v3_header(txn_id, operation),
                 status: bookkeeper_proto::StatusCode::Eok as i32,
-                auth_response: req.auth_request,
+                auth_response: Some(bookkeeper_proto::AuthMessage {
+                    auth_plugin_name: "AUTHENTICATION_DISABLED".to_string(),
+                    payload: Vec::new(),
+                }),
                 ..Default::default()
             };
             return resp.encode_to_vec();

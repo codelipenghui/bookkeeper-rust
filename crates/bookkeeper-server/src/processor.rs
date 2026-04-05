@@ -88,8 +88,10 @@ impl RequestProcessor {
             V2Request::GetBookieInfo { flags: _, requested } => {
                 self.handle_get_bookie_info(requested)
             }
-            V2Request::Auth { payload } => {
-                V2Response::Auth { error_code: V2_EOK, payload }
+            V2Request::Auth { payload: _ } => {
+                // Auth disabled: return success with empty payload.
+                // Matches Java's AuthenticationDisabledAuthProviderFactory behavior.
+                V2Response::Auth { error_code: V2_EOK, payload: bytes::Bytes::new() }
             }
             V2Request::BatchReadEntry { flags, ledger_id, start_entry_id, request_id, max_count, max_size } => {
                 self.handle_batch_read(flags, ledger_id, start_entry_id, request_id, max_count, max_size)
