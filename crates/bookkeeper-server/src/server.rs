@@ -32,6 +32,7 @@ pub struct BookieServer {
     worker_handle: Option<tokio::task::JoinHandle<()>>,
     gc_handle: Option<tokio::task::JoinHandle<()>>,
     disk_monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    sync_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BookieServer {
@@ -193,6 +194,15 @@ impl BookieServer {
             None
         };
 
+        // Start SyncThread — periodic flush of write cache to entry logs.
+        // Matches Java's SyncThread which runs every flushInterval ms (default 10s).
+        let sync_storage = storage.clone();
+        let sync_shutdown = shutdown_rx.clone();
+        let flush_interval_ms = config.flush_interval as u64;
+        let sync_handle = Some(tokio::spawn(async move {
+            run_sync_thread(sync_storage, flush_interval_ms, sync_shutdown).await;
+        }));
+
         // Spawn accept loop
         let accept_handle = tokio::spawn(accept_loop(
             listener,
@@ -214,6 +224,7 @@ impl BookieServer {
             worker_handle,
             gc_handle,
             disk_monitor_handle,
+            sync_handle,
         })
     }
 
@@ -270,6 +281,9 @@ impl BookieServer {
         }
         if let Some(h) = self.disk_monitor_handle {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), h).await;
+        }
+        if let Some(h) = self.sync_handle {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
         println!("  Background tasks stopped.");
 
@@ -529,6 +543,42 @@ fn get_disk_usage_details(path: &str) -> Result<(f64, f64, f64), String> {
 ///
 /// Matches Java's GarbageCollectorThread + ScanAndCompareGarbageCollector:
 /// 1. Get all ledger IDs from metadata store (ZK)
+/// Periodic sync thread — flushes write cache to entry logs and checkpoints.
+///
+/// Matches Java's SyncThread (BookieImpl.java:480):
+/// - Runs every `flushInterval` ms (default 10 seconds)
+/// - Calls storage.checkpoint() which flushes write cache → entry logs,
+///   updates RocksDB index, and cleans up old journal files
+async fn run_sync_thread(
+    storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
+    flush_interval_ms: u64,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let interval = tokio::time::Duration::from_millis(flush_interval_ms);
+    println!("SyncThread started (interval: {}ms)", flush_interval_ms);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    println!("SyncThread shutting down");
+                    // Final flush before exit
+                    if let Err(e) = storage.checkpoint() {
+                        eprintln!("SyncThread: final checkpoint error: {e}");
+                    }
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(interval) => {
+                // Periodic checkpoint: flush write cache → entry logs → clean journals
+                if let Err(e) = storage.checkpoint() {
+                    eprintln!("SyncThread: checkpoint error: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// 2. Compare against local storage
 /// 3. Delete local data for ledgers no longer in metadata
 /// 4. Delete empty entry log files

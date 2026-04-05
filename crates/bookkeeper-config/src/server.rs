@@ -29,6 +29,9 @@ pub struct ServerConfig {
     pub journal_alignment_size: i32,
     pub journal_format_version_to_write: i32,
 
+    // Sync / Checkpoint
+    pub flush_interval: i32,
+
     // Entry Logs
     pub log_size_limit: i64,
     pub entry_log_per_ledger_enabled: bool,
@@ -97,6 +100,7 @@ impl Default for ServerConfig {
             journal_buffered_entries_threshold: 0,
             journal_alignment_size: 4096,
             journal_format_version_to_write: 6,
+            flush_interval: 10000,
             log_size_limit: 1073741823,
             entry_log_per_ledger_enabled: false,
             db_storage_write_cache_max_size_mb: 64,
@@ -153,6 +157,7 @@ impl ServerConfig {
         if let Some(v) = props.get("journalBufferedEntriesThreshold") { if let Ok(n) = v.parse() { config.journal_buffered_entries_threshold = n; } }
         if let Some(v) = props.get("journalAlignmentSize") { if let Ok(n) = v.parse() { config.journal_alignment_size = n; } }
         if let Some(v) = props.get("journalFormatVersionToWrite") { if let Ok(n) = v.parse() { config.journal_format_version_to_write = n; } }
+        if let Some(v) = props.get("flushInterval") { if let Ok(n) = v.parse() { config.flush_interval = n; } }
         if let Some(v) = props.get("logSizeLimit") { if let Ok(n) = v.parse() { config.log_size_limit = n; } }
         if let Some(v) = props.get("entryLogPerLedgerEnabled") { config.entry_log_per_ledger_enabled = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("dbStorage_writeCacheMaxSizeMb") { if let Ok(n) = v.parse() { config.db_storage_write_cache_max_size_mb = n; } }
