@@ -4,11 +4,23 @@
 //! with optional rack-awareness for fault domain isolation.
 
 use std::collections::{HashMap, HashSet};
+use rand::seq::SliceRandom;
+
+/// Placement policy adherence level matching Java's PlacementPolicyAdherence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyAdherence {
+    /// Placement failed to meet policy requirements.
+    Fail,
+    /// Placement meets soft requirements (e.g., degraded rack availability).
+    MeetsSoft,
+    /// Placement fully meets all policy requirements.
+    MeetsStrict,
+}
 
 /// Result of a placement operation.
 pub struct PlacementResult {
     pub bookies: Vec<String>,
-    pub adheres_to_policy: bool,
+    pub adherence: PolicyAdherence,
 }
 
 /// Trait for ensemble placement policies.
@@ -82,7 +94,7 @@ impl EnsemblePlacementPolicy for DefaultPlacementPolicy {
         }
         Ok(PlacementResult {
             bookies: available[..ensemble_size].iter().map(|s| s.to_string()).collect(),
-            adheres_to_policy: true,
+            adherence: PolicyAdherence::MeetsStrict,
         })
     }
 
@@ -243,29 +255,37 @@ impl EnsemblePlacementPolicy for RackAwarePlacementPolicy {
             });
         }
 
-        // Round-robin across racks to spread bookies.
-        // Matches Java's RRTopologyAwareCoverageEnsemble approach.
+        // Round-robin across racks with random selection within each rack.
+        // Matches Java's topology-aware selection with randomization.
         let mut ensemble: Vec<String> = Vec::with_capacity(ensemble_size);
         let mut rack_names: Vec<String> = by_rack.keys().cloned().collect();
-        rack_names.sort(); // deterministic order
+        let mut rng = rand::thread_rng();
+        rack_names.shuffle(&mut rng);
+
+        // Shuffle bookies within each rack (matching Java's selectRandomFromRack)
+        let mut shuffled_by_rack: HashMap<String, Vec<String>> = HashMap::new();
+        for (rack, mut bookies) in by_rack {
+            bookies.shuffle(&mut rng);
+            shuffled_by_rack.insert(rack, bookies);
+        }
+
         let mut rack_idx = 0;
         let mut rack_offsets: HashMap<String, usize> = HashMap::new();
 
         while ensemble.len() < ensemble_size {
             let rack = &rack_names[rack_idx % rack_names.len()];
             let offset = rack_offsets.entry(rack.clone()).or_insert(0);
-            let bookies_in_rack = &by_rack[rack];
-
-            if *offset < bookies_in_rack.len() {
-                let bookie = &bookies_in_rack[*offset];
-                if !ensemble.contains(bookie) {
-                    ensemble.push(bookie.clone());
+            if let Some(bookies_in_rack) = shuffled_by_rack.get(rack) {
+                if *offset < bookies_in_rack.len() {
+                    let bookie = &bookies_in_rack[*offset];
+                    if !ensemble.contains(bookie) {
+                        ensemble.push(bookie.clone());
+                    }
+                    *offset += 1;
                 }
-                *offset += 1;
             }
             rack_idx += 1;
 
-            // Safety: prevent infinite loop if we can't find enough
             if rack_idx > ensemble_size * rack_names.len() * 2 {
                 break;
             }
@@ -278,10 +298,17 @@ impl EnsemblePlacementPolicy for RackAwarePlacementPolicy {
             });
         }
 
-        let adheres = self.check_write_quorum_coverage(&ensemble, write_quorum_size);
+        let adherence = if self.check_write_quorum_coverage(&ensemble, write_quorum_size) {
+            PolicyAdherence::MeetsStrict
+        } else if num_racks < self.min_racks_per_write_quorum {
+            PolicyAdherence::MeetsSoft
+        } else {
+            PolicyAdherence::Fail
+        };
+
         Ok(PlacementResult {
             bookies: ensemble,
-            adheres_to_policy: adheres,
+            adherence,
         })
     }
 

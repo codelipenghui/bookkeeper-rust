@@ -133,8 +133,8 @@ impl ZkBookKeeper {
             .placement
             .new_ensemble(ensemble_size, write_quorum, ack_quorum, &exclude_set)
             .map_err(|e| ClientError::Protocol(format!("{e}")))?;
-        if !result.adheres_to_policy {
-            tracing::warn!("Ensemble placement does not fully adhere to policy");
+        if result.adherence != crate::placement::PolicyAdherence::MeetsStrict {
+            tracing::warn!("Ensemble placement adherence: {:?}", result.adherence);
         }
         Ok(result.bookies)
     }
