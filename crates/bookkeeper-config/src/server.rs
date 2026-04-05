@@ -92,7 +92,7 @@ impl Default for ServerConfig {
             journal_max_backups: 5,
             journal_sync_data: false,
             journal_adaptive_group_writes: true,
-            journal_max_group_wait_ms: 1,
+            journal_max_group_wait_ms: 2,
             journal_buffered_writes_threshold: 524288,
             journal_buffered_entries_threshold: 0,
             journal_alignment_size: 4096,

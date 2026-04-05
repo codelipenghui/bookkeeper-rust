@@ -184,11 +184,16 @@ fn journal_writer_loop(
                     }
                 }
 
-                let should_flush = (config.buffered_entries_threshold > 0
-                    && pending_count >= config.buffered_entries_threshold)
-                    || (config.buffered_writes_threshold > 0
-                        && pending_bytes >= config.buffered_writes_threshold)
-                    || pending_count > 0;
+                // Group commit decision matching Java's Journal.java:1052-1086:
+                // 1. Threshold exceeded (entries or bytes)
+                // 2. Queue drained (all available entries consumed — flush what we have)
+                //
+                // Java uses flushWhenQueueEmpty which flushes when no more entries are
+                // immediately available. The try_recv() loop above already drained
+                // everything available, so we always flush here. The group_wait timeout
+                // applies when the FIRST entry arrives and we wait for more before
+                // the initial recv_timeout. Once we have entries, we drain and flush.
+                let should_flush = pending_count > 0;
 
                 if should_flush {
                     // V5+ padding before flush
