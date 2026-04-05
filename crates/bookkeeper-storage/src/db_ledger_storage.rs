@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use bytes::Bytes;
@@ -36,6 +36,8 @@ pub struct DbLedgerStorage {
     entry_log_dir: PathBuf,
     log_state: Mutex<EntryLogState>,
     flush_mutex: Mutex<()>,
+    /// Journal for write-ahead logging. None if not initialized (standalone mode).
+    journal: Option<crate::journal::writer::Journal>,
 }
 
 impl DbLedgerStorage {
@@ -64,7 +66,42 @@ impl DbLedgerStorage {
                 writer: None,
             }),
             flush_mutex: Mutex::new(()),
+            journal: None,
         })
+    }
+
+    /// Initialize the journal for write-ahead logging.
+    /// Should be called after open() and before serving writes.
+    /// Replays any existing journal entries for crash recovery.
+    pub fn init_journal(&mut self, journal_dir: &Path, config: crate::journal::writer::JournalConfig) -> Result<usize, StorageError> {
+        // Replay existing journal entries (crash recovery)
+        let replayed = crate::journal::writer::replay_journal(journal_dir, |entry_data| {
+            if entry_data.len() >= 32 {
+                // Replay into write cache (same as add_entry, but without re-journaling)
+                let ledger_id = Self::extract_ledger_id(entry_data);
+                let entry_id = Self::extract_entry_id(entry_data);
+                let lac = Self::extract_lac(entry_data);
+
+                if self.ledger_index.get(ledger_id).ok().flatten().is_none() {
+                    let _ = self.ledger_index.set(ledger_id, false, None, None);
+                }
+                if lac >= 0 {
+                    let _ = self.ledger_index.update_lac(ledger_id, lac);
+                }
+                let _ = self.write_cache.read().put(ledger_id, entry_id, entry_data);
+            }
+        })?;
+
+        if replayed > 0 {
+            println!("Journal: replayed {} entries from crash recovery", replayed);
+            // Flush replayed entries to entry logs
+            let _ = self.flush();
+        }
+
+        // Start journal writer
+        self.journal = Some(crate::journal::writer::Journal::start(config));
+
+        Ok(replayed)
     }
 
     fn extract_ledger_id(entry: &[u8]) -> i64 {
@@ -256,6 +293,10 @@ impl LedgerStorage for DbLedgerStorage {
 
     fn set_explicit_lac(&self, ledger_id: i64, lac: i64) -> Result<(), StorageError> {
         self.ledger_index.update_lac(ledger_id, lac)
+    }
+
+    fn journal(&self) -> Option<&crate::journal::writer::Journal> {
+        self.journal.as_ref()
     }
 
     fn get_active_ledgers(&self) -> Result<Vec<i64>, StorageError> {

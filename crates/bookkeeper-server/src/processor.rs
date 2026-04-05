@@ -123,6 +123,16 @@ impl RequestProcessor {
             Err(e) => return self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id),
         }
 
+        // Journal entry for durability (write-ahead log) before adding to write cache.
+        // Matches Java's BookieImpl.addEntryInternal: journal first, then storage.
+        if let Some(journal) = self.storage.journal() {
+            if let Err(_e) = journal.log_add_entry(&entry_data) {
+                return self.add_error_response(
+                    BKError::Io, ledger_id, entry_id,
+                );
+            }
+        }
+
         match self.storage.add_entry(&entry_data) {
             Ok(()) => V2Response::Add { error_code: V2_EOK, ledger_id, entry_id },
             Err(e) => self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id),

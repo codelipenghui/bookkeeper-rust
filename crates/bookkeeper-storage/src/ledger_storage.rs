@@ -5,7 +5,12 @@ use crate::StorageError;
 /// The LedgerStorage trait defines the interface for bookie storage backends.
 pub trait LedgerStorage: Send + Sync {
     /// Add an entry to storage. Returns after the entry is in the write cache.
+    /// If a journal is configured, the entry is journaled first for durability.
     fn add_entry(&self, entry: &[u8]) -> Result<(), StorageError>;
+
+    /// Get journal handle for async journaling (used by the request processor
+    /// to journal before acknowledging writes).
+    fn journal(&self) -> Option<&crate::journal::writer::Journal>;
 
     /// Get an entry by ledger ID and entry ID.
     fn get_entry(&self, ledger_id: i64, entry_id: i64) -> Result<Bytes, StorageError>;

@@ -47,7 +47,27 @@ impl BookieServer {
             .ledger_directories
             .first()
             .ok_or("no ledger dirs configured")?;
-        let storage = DbLedgerStorage::open(Path::new(ledger_dir))?;
+        let mut storage = DbLedgerStorage::open(Path::new(ledger_dir))?;
+
+        // Initialize journal for write-ahead logging (crash recovery)
+        let journal_config = bookkeeper_storage::journal::writer::JournalConfig {
+            journal_dir: std::path::PathBuf::from(&config.journal_directory),
+            max_file_size: (config.journal_max_size_mb as u64) * 1024 * 1024,
+            sync_data: config.journal_sync_data,
+            max_group_wait_ms: config.journal_max_group_wait_ms as u64,
+            buffered_writes_threshold: config.journal_buffered_writes_threshold as usize,
+            buffered_entries_threshold: config.journal_buffered_entries_threshold as usize,
+            alignment_size: config.journal_alignment_size as usize,
+            format_version: config.journal_format_version_to_write,
+        };
+        let replayed = storage.init_journal(
+            Path::new(&config.journal_directory),
+            journal_config,
+        )?;
+        if replayed > 0 {
+            println!("Journal recovery: replayed {replayed} entries");
+        }
+
         let storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage> =
             Arc::new(storage);
 
