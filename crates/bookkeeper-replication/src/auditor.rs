@@ -269,7 +269,11 @@ impl Auditor {
                     // Multiple failures or no delay: immediate audit
                     let result = self.audit_failed_bookies(&failed).await;
                     self.auditing.store(false, Ordering::SeqCst);
-                    result?;
+                    if let Err(e) = result {
+                        // Don't update known bookies on audit error — retry on next check
+                        eprintln!("Auditor: audit failed: {e}");
+                        return Ok(());
+                    }
                 } else {
                     // Single failure: delayed audit (matching Java's lostBookieRecoveryDelay)
                     println!(

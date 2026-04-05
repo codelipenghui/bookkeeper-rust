@@ -341,7 +341,7 @@ impl ReplicationWorker {
             recovery.recover(&conns, *last_segment_entry).await?;
 
         // Update metadata to CLOSED with CAS retry
-        for _ in 0..10 {
+        for _ in 0..bookkeeper_common::MAX_CAS_RETRIES {
             let versioned = self
                 .ledger_manager
                 .read_ledger_metadata(ledger_id)
@@ -529,7 +529,7 @@ impl ReplicationWorker {
         old_ensemble: &[String],
         replacements: &HashMap<usize, String>,
     ) -> Result<(), ReplicationError> {
-        for _ in 0..10 {
+        for _ in 0..bookkeeper_common::MAX_CAS_RETRIES {
             let versioned = self
                 .ledger_manager
                 .read_ledger_metadata(ledger_id)

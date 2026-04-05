@@ -250,7 +250,7 @@ impl ZkBookKeeper {
         let segments = wh.ensemble_segments();
 
         // CAS retry loop matching Java's MetadataUpdateLoop
-        for _ in 0..10 {
+        for _ in 0..bookkeeper_common::MAX_CAS_RETRIES {
             let versioned = self
                 .ledger_manager
                 .read_ledger_metadata(ledger_id)
@@ -386,7 +386,7 @@ impl ZkBookKeeper {
             recovery.recover(&conns, *last_segment_entry).await?;
 
         // Update metadata to CLOSED with CAS retry
-        for _ in 0..10 {
+        for _ in 0..bookkeeper_common::MAX_CAS_RETRIES {
             let versioned = self
                 .ledger_manager
                 .read_ledger_metadata(ledger_id)
@@ -496,7 +496,7 @@ async fn update_ensemble_metadata(
     password: &[u8],
 ) -> Result<(), MetadataError> {
     // CAS retry loop
-    for _ in 0..10 {
+    for _ in 0..bookkeeper_common::MAX_CAS_RETRIES {
         let versioned = lm.read_ledger_metadata(ledger_id).await?;
         let md = versioned.value();
         let version = versioned.version();

@@ -305,10 +305,7 @@ mod tests {
 
     #[test]
     fn test_reconstruct_long_id_large() {
-        // Long: /ledgers/002/1474/8364/8000/L0001 → ID = 2147483648000 + 1
-        // Actually: "002" + "1474" + "8364" + "8000" + "0001" = "0021474836480001"
-        // Hmm let me recalculate properly:
-        // ID 2147483648 (i32::MAX + 1) → format!("{:019}", 2147483648) = "0000000002147483648"
+        // ID 2147483648 (i32::MAX + 1): format!("{:019}", 2147483648) = "0000000002147483648"
         // Split 3-4-4-4-4: "000/0000/0021/4748/L3648"
         let id = reconstruct_ledger_id("/ledgers/000/0000/0021/4748", "/ledgers", 3648);
         assert_eq!(id, 2147483648);
