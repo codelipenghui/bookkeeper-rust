@@ -41,8 +41,9 @@ pub struct DbLedgerStorage {
     /// Journal directory path (for cleanup after checkpoint).
     journal_dir: Option<PathBuf>,
     /// In-memory cache of explicit LAC bodies (matching Java's TransientLedgerInfo).
-    /// Key: ledger_id, Value: raw LAC body bytes from WriteLac request.
     explicit_lac_cache: dashmap::DashMap<i64, Vec<u8>>,
+    /// LAC watcher registry for long poll reads.
+    lac_watchers: crate::lac_watcher::LacWatcherRegistry,
 }
 
 impl DbLedgerStorage {
@@ -74,6 +75,7 @@ impl DbLedgerStorage {
             journal: None,
             journal_dir: None,
             explicit_lac_cache: dashmap::DashMap::new(),
+            lac_watchers: crate::lac_watcher::LacWatcherRegistry::new(),
         })
     }
 
@@ -202,6 +204,10 @@ impl LedgerStorage for DbLedgerStorage {
                 }
             }
         }
+
+        // Notify long poll watchers that LAC has advanced.
+        // Matches Java's TransientLedgerInfo.setLastAddConfirmed → notifyWatchers.
+        self.lac_watchers.notify_lac_advance(ledger_id, entry_id);
 
         // Try write cache
         {
@@ -334,6 +340,10 @@ impl LedgerStorage for DbLedgerStorage {
         }
         // Fall back to RocksDB (cold path, after restart)
         self.ledger_index.get_explicit_lac_body(ledger_id)
+    }
+
+    fn lac_watchers(&self) -> Option<&crate::lac_watcher::LacWatcherRegistry> {
+        Some(&self.lac_watchers)
     }
 
     fn journal(&self) -> Option<&crate::journal::writer::Journal> {

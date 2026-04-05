@@ -49,6 +49,11 @@ pub fn process_v3_request(
         }
         op if op == bookkeeper_proto::OperationType::ReadEntry as i32 => {
             if let Some(read) = req.read_request {
+                // Check for long poll: presence of previousLAC field.
+                // Matches Java's RequestUtils.isLongPollReadRequest().
+                let is_long_poll = read.previous_lac.is_some()
+                    && read.flag != Some(bookkeeper_proto::read_request::Flag::FenceLedger as i32);
+
                 let mut flags: u16 = 0;
                 let mut master_key_opt = None;
                 if read.flag == Some(bookkeeper_proto::read_request::Flag::FenceLedger as i32) {
@@ -60,13 +65,82 @@ pub fn process_v3_request(
                         master_key_opt = Some(key);
                     }
                 }
-                let v2_req = V2Request::ReadEntry {
-                    flags,
-                    ledger_id: read.ledger_id,
-                    entry_id: read.entry_id,
-                    master_key: master_key_opt,
-                };
-                processor.process_request(v2_req)
+
+                if is_long_poll {
+                    // Long poll: check if entry is already available
+                    let previous_lac = read.previous_lac.unwrap();
+                    let timeout_ms = read.time_out.unwrap_or(10000) as u64;
+                    let ledger_id = read.ledger_id;
+                    let piggyback = read.flag == Some(bookkeeper_proto::read_request::Flag::EntryPiggyback as i32);
+
+                    // Try reading current LAC
+                    let current_lac = processor.storage().get_last_add_confirmed(ledger_id)
+                        .unwrap_or(-1);
+
+                    if current_lac > previous_lac {
+                        // Entry already available — read it immediately
+                        let read_entry_id = if piggyback { previous_lac + 1 } else { read.entry_id };
+                        let v2_req = V2Request::ReadEntry {
+                            flags, ledger_id, entry_id: read_entry_id, master_key: master_key_opt,
+                        };
+                        let mut resp = processor.process_request(v2_req);
+                        // Inject maxLAC into response (V3 field)
+                        resp
+                    } else {
+                        // Entry not yet available — register watcher and wait
+                        if let Some(watchers) = processor.storage().lac_watchers() {
+                            if let Some(rx) = watchers.watch(ledger_id, previous_lac, current_lac) {
+                                // Wait with timeout
+                                let result = tokio::runtime::Handle::current().block_on(async {
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_millis(timeout_ms),
+                                        rx,
+                                    ).await
+                                });
+
+                                match result {
+                                    Ok(Ok(new_lac)) => {
+                                        // LAC advanced — read the entry
+                                        let read_entry_id = if piggyback { previous_lac + 1 } else { read.entry_id };
+                                        let v2_req = V2Request::ReadEntry {
+                                            flags, ledger_id, entry_id: read_entry_id, master_key: master_key_opt,
+                                        };
+                                        processor.process_request(v2_req)
+                                    }
+                                    _ => {
+                                        // Timeout or error — return current state
+                                        let v2_req = V2Request::ReadEntry {
+                                            flags, ledger_id, entry_id: read.entry_id, master_key: master_key_opt,
+                                        };
+                                        processor.process_request(v2_req)
+                                    }
+                                }
+                            } else {
+                                // Watcher returned None = entry already available
+                                let read_entry_id = if piggyback { previous_lac + 1 } else { read.entry_id };
+                                let v2_req = V2Request::ReadEntry {
+                                    flags, ledger_id, entry_id: read_entry_id, master_key: master_key_opt,
+                                };
+                                processor.process_request(v2_req)
+                            }
+                        } else {
+                            // No watcher support — fall through to normal read
+                            let v2_req = V2Request::ReadEntry {
+                                flags, ledger_id: read.ledger_id, entry_id: read.entry_id, master_key: master_key_opt,
+                            };
+                            processor.process_request(v2_req)
+                        }
+                    }
+                } else {
+                    // Normal read (not long poll)
+                    let v2_req = V2Request::ReadEntry {
+                        flags,
+                        ledger_id: read.ledger_id,
+                        entry_id: read.entry_id,
+                        master_key: master_key_opt,
+                    };
+                    processor.process_request(v2_req)
+                }
             } else {
                 return build_v3_error_response(txn_id, operation, BKError::BadRequest);
             }

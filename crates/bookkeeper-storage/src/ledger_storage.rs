@@ -69,6 +69,9 @@ pub trait LedgerStorage: Send + Sync {
     /// Update a batch of entry locations in the index.
     fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError>;
 
+    /// Get the LAC watcher registry for long poll reads.
+    fn lac_watchers(&self) -> Option<&crate::lac_watcher::LacWatcherRegistry>;
+
     /// Flush all pending data to persistent storage.
     fn flush(&self) -> Result<(), StorageError>;
 

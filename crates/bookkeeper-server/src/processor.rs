@@ -19,6 +19,10 @@ impl RequestProcessor {
         Self { storage, state }
     }
 
+    pub fn storage(&self) -> &dyn LedgerStorage {
+        &*self.storage
+    }
+
     pub fn process_request(&self, req: V2Request) -> V2Response {
         match req {
             V2Request::AddEntry { flags, master_key, entry_data } => {
