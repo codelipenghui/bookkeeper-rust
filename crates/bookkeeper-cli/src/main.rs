@@ -328,9 +328,26 @@ async fn cmd_serve(
     }
     println!("Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c().await?;
-    println!("\nShutting down...");
+    // Handle both SIGINT (Ctrl+C) and SIGTERM (kill/systemd)
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nReceived SIGINT, shutting down...");
+            }
+            _ = sigterm.recv() => {
+                println!("\nReceived SIGTERM, shutting down...");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        println!("\nShutting down...");
+    }
+
     server.shutdown().await;
-    println!("Bookie stopped.");
     Ok(())
 }

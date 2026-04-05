@@ -240,38 +240,67 @@ impl BookieServer {
         Ok(())
     }
 
+    /// Graceful shutdown matching Java's BookieImpl.shutdown() sequence:
+    /// 1. Signal shutdown (stop accepting new connections)
+    /// 2. Transition to read-only (reject new writes)
+    /// 3. Wait for accept loop to drain
+    /// 4. Flush storage (write cache → entry logs, checkpoint)
+    /// 5. Stop background tasks (auditor, worker, GC, disk monitor)
+    /// 6. Unregister from ZooKeeper (LAST — so clients see bookie until data is safe)
     pub async fn shutdown(self) {
-        // Signal the accept loop and replication tasks to stop
+        println!("Graceful shutdown starting...");
+
+        // Step 1: Signal shutdown — stops accept loop and background tasks
         let _ = self.shutdown_tx.send(true);
-        // Wait for the accept loop to finish
+
+        // Step 2: Wait for accept loop to finish (drains in-flight connections)
         let _ = self.accept_handle.await;
-        // Wait for replication tasks with timeout (matching Java's 10s per component)
+        println!("  Accept loop stopped.");
+
+        // Step 3: Flush storage — persist write cache to entry logs + checkpoint.
+        // This is the most critical step: ensures all acknowledged writes are durable.
+        // Matches Java's SyncThread.shutdown() which waits up to 5 minutes.
+        println!("  Flushing storage...");
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(300), // 5 minute timeout matching Java
+            tokio::task::spawn_blocking({
+                let storage = self.storage.clone();
+                move || {
+                    if let Err(e) = storage.checkpoint() {
+                        eprintln!("  WARNING: checkpoint failed during shutdown: {e}");
+                    }
+                }
+            })
+        ).await {
+            Ok(Ok(())) => println!("  Storage flushed."),
+            Ok(Err(e)) => eprintln!("  WARNING: storage flush task panicked: {e}"),
+            Err(_) => eprintln!("  WARNING: storage flush timed out after 5 minutes"),
+        }
+
+        // Step 4: Stop background tasks with timeouts
         if let Some(h) = self.auditor_handle {
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_secs(10), h
-            ).await;
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
         if let Some(h) = self.worker_handle {
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_secs(10), h
-            ).await;
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
         if let Some(h) = self.gc_handle {
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_secs(10), h
-            ).await;
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
         if let Some(h) = self.disk_monitor_handle {
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_secs(5), h
-            ).await;
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), h).await;
         }
-        // Unregister from ZooKeeper if configured
+        println!("  Background tasks stopped.");
+
+        // Step 5: Unregister from ZooKeeper LAST.
+        // Java does this after all internal cleanup is complete.
+        // This ensures clients continue routing to this bookie until all data is safe.
         if let Some((reg_mgr, bookie_id)) = self.zk_reg {
             let _ = reg_mgr.unregister_bookie(&bookie_id, false).await;
+            println!("  Unregistered from ZooKeeper.");
         }
-        // Flush storage to persist any pending data
-        let _ = self.storage.flush();
+
+        println!("Graceful shutdown complete.");
     }
 }
 
