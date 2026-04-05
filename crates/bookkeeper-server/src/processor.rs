@@ -124,12 +124,12 @@ impl RequestProcessor {
         }
 
         // Matches Java's BookieImpl.addEntryInternal: storage first, then journal.
-        // Storage write is to the in-memory write cache (fast).
-        // Journal write provides durability — entry is on disk before ACK.
         match self.storage.add_entry(&entry_data) {
             Ok(()) => {
-                // Journal for durability (if configured)
                 if let Some(journal) = self.storage.journal() {
+                    // Journal master key on first write to this ledger (matching Java)
+                    let _ = journal.maybe_journal_master_key(ledger_id, master_key);
+                    // Journal the entry for durability
                     if let Err(_e) = journal.log_add_entry(&entry_data) {
                         return self.add_error_response(BKError::Io, ledger_id, entry_id);
                     }
