@@ -135,9 +135,10 @@ impl Journal {
 
 /// Request from writer thread to fsync thread.
 struct FsyncRequest {
-    /// File to fsync (shared handle via raw fd).
-    /// We pass a path and log_id so fsync thread can identify the file.
     journal_path: PathBuf,
+    /// Pending client ACKs that must wait for fsync (syncData=true).
+    /// These are ACKed AFTER fsync, matching Java's ackBeforeSync=false.
+    pending_acks: Vec<mpsc::Sender<()>>,
 }
 
 /// Background journal writer loop (runs on dedicated OS thread).
@@ -199,17 +200,19 @@ fn journal_writer_loop(
                         eprintln!("Journal flush error: {e}");
                     }
 
-                    // ACK clients immediately (ackBeforeSync=true default)
-                    for ack in pending_acks.drain(..) {
-                        let _ = ack.send(());
-                    }
-
-                    // Request fsync from dedicated thread (matching Java's ForceWriteThread)
                     if config.sync_data {
+                        // syncData=true: ACK AFTER fsync (matching Java's ackBeforeSync=false).
+                        // Send pending ACKs to ForceWrite thread; it will ACK after fsync.
                         if let Some(ref path) = state.current_path(&config) {
                             let _ = fsync_tx.send(FsyncRequest {
                                 journal_path: path.clone(),
+                                pending_acks: pending_acks.drain(..).collect(),
                             });
+                        }
+                    } else {
+                        // syncData=false: ACK immediately after page cache write.
+                        for ack in pending_acks.drain(..) {
+                            let _ = ack.send(());
                         }
                     }
 
@@ -223,14 +226,17 @@ fn journal_writer_loop(
                         let _ = state.write_padding(config.alignment_size);
                     }
                     let _ = state.flush(false);
-                    for ack in pending_acks.drain(..) {
-                        let _ = ack.send(());
-                    }
+
                     if config.sync_data {
                         if let Some(ref path) = state.current_path(&config) {
                             let _ = fsync_tx.send(FsyncRequest {
                                 journal_path: path.clone(),
+                                pending_acks: pending_acks.drain(..).collect(),
                             });
+                        }
+                    } else {
+                        for ack in pending_acks.drain(..) {
+                            let _ = ack.send(());
                         }
                     }
                     pending_bytes = 0;
@@ -250,26 +256,36 @@ fn journal_writer_loop(
     }
 }
 
-/// Dedicated fsync thread — batches fsync operations.
-/// Matches Java's ForceWriteThread: takes the LAST request and fsyncs once
-/// for the entire batch, since fsync covers all prior writes.
+/// Dedicated fsync thread — batches fsync operations, then ACKs clients.
+///
+/// Matches Java's ForceWriteThread:
+/// 1. Collects all pending FsyncRequests
+/// 2. Fsyncs once (covers all prior writes)
+/// 3. ACKs all clients whose entries are now durable
 fn fsync_loop(_config: JournalConfig, rx: mpsc::Receiver<FsyncRequest>) {
     loop {
-        // Wait for first request
         let first = match rx.recv() {
             Ok(req) => req,
-            Err(_) => break, // channel closed
+            Err(_) => break,
         };
 
-        // Drain all queued requests — we only need to fsync the last one
-        let mut last = first;
+        // Collect all queued requests
+        let mut all_requests = vec![first];
         while let Ok(req) = rx.try_recv() {
-            last = req;
+            all_requests.push(req);
         }
 
-        // fsync the file
-        if let Ok(file) = fs::OpenOptions::new().read(true).open(&last.journal_path) {
+        // fsync the last file (covers all prior writes to same file)
+        let last_path = &all_requests.last().unwrap().journal_path;
+        if let Ok(file) = fs::OpenOptions::new().read(true).open(last_path) {
             let _ = file.sync_data();
+        }
+
+        // ACK all clients whose entries are now durable on disk
+        for req in all_requests {
+            for ack in req.pending_acks {
+                let _ = ack.send(());
+            }
         }
     }
 }
