@@ -732,21 +732,12 @@ async fn accept_loop(
                     Ok((stream, _peer_addr)) => {
                         let proc = processor.clone();
                         if let Some(ref tls) = tls_acceptor {
-                            // TLS connection
+                            // TLS enabled: accept plaintext first, upgrade via StartTLS protocol.
+                            // Matches Java's BookieNettyServer StartTLS flow.
                             let tls = tls.clone();
-                            tokio::spawn(async move {
-                                match tls.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        let (reader, writer) = tokio::io::split(tls_stream);
-                                        handle_connection_io(reader, writer, proc, max_frame_size).await;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("TLS handshake failed: {e}");
-                                    }
-                                }
-                            });
+                            tokio::spawn(handle_starttls_connection(stream, proc, max_frame_size, tls));
                         } else {
-                            // Plain TCP connection
+                            // Plain TCP connection (no TLS configured)
                             tokio::spawn(handle_connection(stream, proc, max_frame_size));
                         }
                     }
@@ -761,6 +752,95 @@ async fn accept_loop(
                     break;
                 }
             }
+        }
+    }
+}
+
+/// Handle a connection with StartTLS upgrade support.
+/// Matches Java's BookieNettyServer + BookieRequestProcessor StartTLS flow:
+/// 1. Accept plaintext connection
+/// 2. Read first frame — expect V3 StartTLSRequest
+/// 3. Send StartTLSResponse
+/// 4. Upgrade connection to TLS
+/// 5. Continue handling encrypted frames
+async fn handle_starttls_connection(
+    stream: TcpStream,
+    processor: Arc<RequestProcessor>,
+    max_frame_size: usize,
+    tls_acceptor: tokio_rustls::TlsAcceptor,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::codec::{Decoder, Encoder};
+
+    let (mut reader, mut writer) = stream.into_split();
+    let mut codec = BookieCodec::new(max_frame_size);
+    let mut buf = BytesMut::with_capacity(4096);
+    let mut out = BytesMut::with_capacity(256);
+
+    // Read first frame (plaintext — should be StartTLSRequest)
+    loop {
+        match codec.decode(&mut buf) {
+            Ok(Some(frame)) => {
+                let frame_bytes = frame.freeze();
+                // Try to decode as V3 protobuf
+                if let Some(v3_req) = crate::v3_processor::try_decode_v3(&frame_bytes) {
+                    let op = v3_req.header.operation;
+                    if op == bookkeeper_proto::OperationType::StartTls as i32 {
+                        // StartTLS request — send response and upgrade
+                        let txn_id = v3_req.header.txn_id;
+                        let resp = bookkeeper_proto::Response {
+                            header: bookkeeper_proto::BkPacketHeader {
+                                version: bookkeeper_proto::ProtocolVersion::VersionThree as i32,
+                                operation: bookkeeper_proto::OperationType::StartTls as i32,
+                                txn_id,
+                                priority: None,
+                            },
+                            status: bookkeeper_proto::StatusCode::Eok as i32,
+                            ..Default::default()
+                        };
+                        let resp_bytes = Bytes::from(prost::Message::encode_to_vec(&resp));
+                        out.clear();
+                        if codec.encode(resp_bytes, &mut out).is_ok() {
+                            if writer.write_all(&out).await.is_err() {
+                                return;
+                            }
+                        }
+
+                        // Upgrade to TLS
+                        let tcp_stream = reader.reunite(writer).unwrap();
+                        match tls_acceptor.accept(tcp_stream).await {
+                            Ok(tls_stream) => {
+                                let (tls_reader, tls_writer) = tokio::io::split(tls_stream);
+                                handle_connection_io(tls_reader, tls_writer, processor, max_frame_size).await;
+                            }
+                            Err(e) => {
+                                eprintln!("TLS handshake failed after StartTLS: {e}");
+                            }
+                        }
+                        return;
+                    } else {
+                        // Not a StartTLS request — this is a plaintext V3 request.
+                        // Process it and continue as plaintext (shouldn't happen if TLS required).
+                        eprintln!("Expected StartTLSRequest but got op={op}, processing as plaintext");
+                        let tcp_stream = reader.reunite(writer).unwrap();
+                        handle_connection(tcp_stream, processor, max_frame_size).await;
+                        return;
+                    }
+                } else {
+                    // V2 binary request — process as plaintext
+                    let tcp_stream = reader.reunite(writer).unwrap();
+                    handle_connection(tcp_stream, processor, max_frame_size).await;
+                    return;
+                }
+            }
+            Ok(None) => {
+                match reader.read_buf(&mut buf).await {
+                    Ok(0) => return, // EOF
+                    Ok(_) => continue,
+                    Err(_) => return,
+                }
+            }
+            Err(_) => return,
         }
     }
 }

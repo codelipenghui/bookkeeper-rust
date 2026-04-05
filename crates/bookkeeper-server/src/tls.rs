@@ -57,8 +57,8 @@ pub fn build_tls_acceptor(
             .with_single_cert(certs, key)?
     };
 
-    // Enable ALPN for HTTP/1.1 (for the HTTP metrics endpoint if shared)
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // No ALPN — BookKeeper protocol is not HTTP.
+    // Java BookKeeper doesn't negotiate ALPN for bookie connections.
 
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
