@@ -40,6 +40,9 @@ pub struct DbLedgerStorage {
     journal: Option<crate::journal::writer::Journal>,
     /// Journal directory path (for cleanup after checkpoint).
     journal_dir: Option<PathBuf>,
+    /// In-memory cache of explicit LAC bodies (matching Java's TransientLedgerInfo).
+    /// Key: ledger_id, Value: raw LAC body bytes from WriteLac request.
+    explicit_lac_cache: dashmap::DashMap<i64, Vec<u8>>,
 }
 
 impl DbLedgerStorage {
@@ -70,6 +73,7 @@ impl DbLedgerStorage {
             flush_mutex: Mutex::new(()),
             journal: None,
             journal_dir: None,
+            explicit_lac_cache: dashmap::DashMap::new(),
         })
     }
 
@@ -313,6 +317,15 @@ impl LedgerStorage for DbLedgerStorage {
 
     fn set_explicit_lac(&self, ledger_id: i64, lac: i64) -> Result<(), StorageError> {
         self.ledger_index.update_lac(ledger_id, lac)
+    }
+
+    fn set_explicit_lac_body(&self, ledger_id: i64, body: &[u8]) -> Result<(), StorageError> {
+        self.explicit_lac_cache.insert(ledger_id, body.to_vec());
+        Ok(())
+    }
+
+    fn get_explicit_lac_body(&self, ledger_id: i64) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.explicit_lac_cache.get(&ledger_id).map(|v| v.clone()))
     }
 
     fn journal(&self) -> Option<&crate::journal::writer::Journal> {

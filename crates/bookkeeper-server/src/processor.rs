@@ -67,7 +67,7 @@ impl RequestProcessor {
                 }
                 resp
             }
-            V2Request::WriteLac { ledger_id, lac, master_key, body: _ } => {
+            V2Request::WriteLac { ledger_id, lac, master_key, body } => {
                 // Validate master key before writing LAC
                 if let Err(e) = self.storage.check_master_key(ledger_id, &master_key) {
                     return V2Response::WriteLac {
@@ -76,7 +76,7 @@ impl RequestProcessor {
                         entry_id: 0,
                     };
                 }
-                self.handle_write_lac(ledger_id, lac)
+                self.handle_write_lac(ledger_id, lac, body)
             }
             V2Request::ReadLac { ledger_id } => {
                 self.handle_read_lac(ledger_id)
@@ -198,37 +198,66 @@ impl RequestProcessor {
         }
     }
 
-    fn handle_write_lac(&self, ledger_id: i64, lac: i64) -> V2Response {
-        match self.storage.set_explicit_lac(ledger_id, lac) {
-            Ok(()) => V2Response::WriteLac {
-                error_code: V2_EOK,
-                ledger_id,
-                entry_id: 0,
-            },
-            Err(e) => V2Response::WriteLac {
+    fn handle_write_lac(&self, ledger_id: i64, lac: i64, body: Bytes) -> V2Response {
+        // Store LAC value
+        if let Err(e) = self.storage.set_explicit_lac(ledger_id, lac) {
+            return V2Response::WriteLac {
                 error_code: self.storage_error_to_bk(&e).to_v2_code(),
                 ledger_id,
                 entry_id: 0,
-            },
+            };
+        }
+        // Store raw LAC body (with digest) for ReadLac to return.
+        // Matches Java's TransientLedgerInfo.setExplicitLac(ByteBuf).
+        if !body.is_empty() {
+            let _ = self.storage.set_explicit_lac_body(ledger_id, &body);
+        }
+        V2Response::WriteLac {
+            error_code: V2_EOK,
+            ledger_id,
+            entry_id: 0,
         }
     }
 
+    /// ReadLac returns two pieces of data matching Java's ReadLacResponse:
+    /// 1. lac_body: The explicit LAC from the most recent WriteLac request (with digest)
+    /// 2. last_entry_body: The actual last entry on disk (piggybacked LAC)
+    /// The client compares both to determine the true LAC.
     fn handle_read_lac(&self, ledger_id: i64) -> V2Response {
-        match self.storage.get_last_add_confirmed(ledger_id) {
-            Ok(lac) => V2Response::ReadLac {
-                error_code: V2_EOK,
-                ledger_id,
-                entry_id: lac,
-                lac_body: None,
-                last_entry_body: None,
-            },
-            Err(e) => V2Response::ReadLac {
-                error_code: self.storage_error_to_bk(&e).to_v2_code(),
-                ledger_id,
-                entry_id: 0,
-                lac_body: None,
-                last_entry_body: None,
-            },
+        let lac = match self.storage.get_last_add_confirmed(ledger_id) {
+            Ok(l) => l,
+            Err(e) => {
+                return V2Response::ReadLac {
+                    error_code: self.storage_error_to_bk(&e).to_v2_code(),
+                    ledger_id,
+                    entry_id: 0,
+                    lac_body: None,
+                    last_entry_body: None,
+                };
+            }
+        };
+
+        // Get explicit LAC body from WriteLac cache
+        let lac_body = self
+            .storage
+            .get_explicit_lac_body(ledger_id)
+            .ok()
+            .flatten()
+            .map(Bytes::from);
+
+        // Get last entry body from disk (piggybacked LAC)
+        let last_entry_body = if lac >= 0 {
+            self.storage.get_entry(ledger_id, lac).ok().map(|b| b)
+        } else {
+            None
+        };
+
+        V2Response::ReadLac {
+            error_code: V2_EOK,
+            ledger_id,
+            entry_id: lac,
+            lac_body,
+            last_entry_body,
         }
     }
 

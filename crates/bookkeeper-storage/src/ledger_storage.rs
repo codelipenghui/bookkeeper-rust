@@ -34,8 +34,15 @@ pub trait LedgerStorage: Send + Sync {
     /// Get the last add confirmed for a ledger.
     fn get_last_add_confirmed(&self, ledger_id: i64) -> Result<i64, StorageError>;
 
-    /// Set the explicit LAC for a ledger.
+    /// Set the explicit LAC for a ledger (value only).
     fn set_explicit_lac(&self, ledger_id: i64, lac: i64) -> Result<(), StorageError>;
+
+    /// Store the explicit LAC body (raw bytes with digest, from WriteLac request).
+    /// Returned by ReadLac so clients can verify the digest.
+    fn set_explicit_lac_body(&self, ledger_id: i64, body: &[u8]) -> Result<(), StorageError>;
+
+    /// Get the explicit LAC body previously stored by WriteLac.
+    fn get_explicit_lac_body(&self, ledger_id: i64) -> Result<Option<Vec<u8>>, StorageError>;
 
     /// Delete a ledger and all its entries.
     fn delete_ledger(&self, ledger_id: i64) -> Result<(), StorageError>;
