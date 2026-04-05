@@ -206,8 +206,11 @@ impl LedgerStorage for DbLedgerStorage {
         }
 
         // Notify long poll watchers that LAC has advanced.
-        // Matches Java's TransientLedgerInfo.setLastAddConfirmed → notifyWatchers.
-        self.lac_watchers.notify_lac_advance(ledger_id, entry_id);
+        // Use the LAC value from the entry header (not entry_id).
+        // Matches Java's TransientLedgerInfo.setLastAddConfirmed(lac) → notifyWatchers(lac).
+        if lac >= 0 {
+            self.lac_watchers.notify_lac_advance(ledger_id, lac);
+        }
 
         // Try write cache
         {

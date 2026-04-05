@@ -67,70 +67,44 @@ pub fn process_v3_request(
                 }
 
                 if is_long_poll {
-                    // Long poll: check if entry is already available
+                    // Long poll read matching Java's LongPollReadEntryProcessorV3.
+                    // Uses std::sync::mpsc (not tokio) to avoid block_on deadlock.
                     let previous_lac = read.previous_lac.unwrap();
                     let timeout_ms = read.time_out.unwrap_or(10000) as u64;
                     let ledger_id = read.ledger_id;
                     let piggyback = read.flag == Some(bookkeeper_proto::read_request::Flag::EntryPiggyback as i32);
 
-                    // Try reading current LAC
                     let current_lac = processor.storage().get_last_add_confirmed(ledger_id)
                         .unwrap_or(-1);
 
-                    if current_lac > previous_lac {
-                        // Entry already available — read it immediately
-                        let read_entry_id = if piggyback { previous_lac + 1 } else { read.entry_id };
-                        let v2_req = V2Request::ReadEntry {
-                            flags, ledger_id, entry_id: read_entry_id, master_key: master_key_opt,
-                        };
-                        let mut resp = processor.process_request(v2_req);
-                        // Inject maxLAC into response (V3 field)
-                        resp
-                    } else {
-                        // Entry not yet available — register watcher and wait
-                        if let Some(watchers) = processor.storage().lac_watchers() {
-                            if let Some(rx) = watchers.watch(ledger_id, previous_lac, current_lac) {
-                                // Wait with timeout
-                                let result = tokio::runtime::Handle::current().block_on(async {
-                                    tokio::time::timeout(
-                                        std::time::Duration::from_millis(timeout_ms),
-                                        rx,
-                                    ).await
-                                });
-
-                                match result {
-                                    Ok(Ok(new_lac)) => {
-                                        // LAC advanced — read the entry
-                                        let read_entry_id = if piggyback { previous_lac + 1 } else { read.entry_id };
-                                        let v2_req = V2Request::ReadEntry {
-                                            flags, ledger_id, entry_id: read_entry_id, master_key: master_key_opt,
-                                        };
-                                        processor.process_request(v2_req)
-                                    }
-                                    _ => {
-                                        // Timeout or error — return current state
-                                        let v2_req = V2Request::ReadEntry {
-                                            flags, ledger_id, entry_id: read.entry_id, master_key: master_key_opt,
-                                        };
-                                        processor.process_request(v2_req)
-                                    }
-                                }
-                            } else {
-                                // Watcher returned None = entry already available
-                                let read_entry_id = if piggyback { previous_lac + 1 } else { read.entry_id };
-                                let v2_req = V2Request::ReadEntry {
-                                    flags, ledger_id, entry_id: read_entry_id, master_key: master_key_opt,
-                                };
-                                processor.process_request(v2_req)
+                    // Determine the effective LAC (may wait for update)
+                    let effective_lac = if current_lac > previous_lac {
+                        current_lac // already advanced
+                    } else if let Some(watchers) = processor.storage().lac_watchers() {
+                        if let Some(rx) = watchers.watch(ledger_id, previous_lac, current_lac) {
+                            // Wait using sync recv_timeout (safe in spawn_blocking context)
+                            match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
+                                Ok(new_lac) => new_lac,
+                                Err(_) => current_lac, // timeout
                             }
                         } else {
-                            // No watcher support — fall through to normal read
-                            let v2_req = V2Request::ReadEntry {
-                                flags, ledger_id: read.ledger_id, entry_id: read.entry_id, master_key: master_key_opt,
-                            };
-                            processor.process_request(v2_req)
+                            // Entry became available between check and watch
+                            processor.storage().get_last_add_confirmed(ledger_id).unwrap_or(-1)
                         }
-                    }
+                    } else {
+                        current_lac
+                    };
+
+                    // Read the entry
+                    let read_entry_id = if piggyback && effective_lac > previous_lac {
+                        previous_lac + 1
+                    } else {
+                        read.entry_id
+                    };
+                    let v2_req = V2Request::ReadEntry {
+                        flags, ledger_id, entry_id: read_entry_id, master_key: master_key_opt,
+                    };
+                    processor.process_request(v2_req)
                 } else {
                     // Normal read (not long poll)
                     let v2_req = V2Request::ReadEntry {
@@ -216,6 +190,9 @@ fn v2_response_to_v3(txn_id: u64, operation: i32, v2_resp: V2Response) -> Vec<u8
             }
         }
         V2Response::Read { error_code, ledger_id, entry_id, data } => {
+            // For long poll reads, include maxLAC matching Java's ReadResponse.
+            // entry_id for LAST_ADD_CONFIRMED reads contains the actual LAC value.
+            let max_lac = if entry_id >= 0 { Some(entry_id) } else { None };
             bookkeeper_proto::Response {
                 header: make_v3_header(txn_id, operation),
                 status: v2_to_v3_status(error_code),
@@ -224,7 +201,7 @@ fn v2_response_to_v3(txn_id: u64, operation: i32, v2_resp: V2Response) -> Vec<u8
                     ledger_id,
                     entry_id,
                     body: data.map(|d| d.to_vec()),
-                    max_lac: None,
+                    max_lac,
                     lac_update_timestamp: None,
                 }),
                 ..Default::default()
