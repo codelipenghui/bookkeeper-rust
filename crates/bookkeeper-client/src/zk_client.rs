@@ -34,6 +34,8 @@ pub struct ZkBookKeeper {
     bookie_addrs: Vec<String>,
     /// Active connections keyed by bookie address.
     connections: std::collections::HashMap<String, Arc<BookieConnection>>,
+    /// Ensemble placement policy (default or rack-aware).
+    placement: Box<dyn crate::placement::EnsemblePlacementPolicy>,
 }
 
 impl ZkBookKeeper {
@@ -62,6 +64,7 @@ impl ZkBookKeeper {
             id_generator,
             bookie_addrs: Vec::new(),
             connections: std::collections::HashMap::new(),
+            placement: Box::new(crate::placement::DefaultPlacementPolicy::new()),
         };
 
         // Initial bookie discovery
@@ -83,6 +86,9 @@ impl ZkBookKeeper {
             .into_iter()
             .filter(|c| c != "readonly")
             .collect();
+
+        // Update placement policy with new bookie list
+        self.placement.on_cluster_changed(&self.bookie_addrs, &[]);
 
         Ok(())
     }
@@ -112,32 +118,32 @@ impl ZkBookKeeper {
         Ok(conns)
     }
 
-    /// Select bookies for a new ensemble.
-    /// Simple round-robin selection matching Java's DefaultEnsemblePlacementPolicy
-    /// for single-rack deployments.
+    /// Select bookies for a new ensemble using the configured placement policy.
+    /// Default: round-robin (DefaultPlacementPolicy).
+    /// With rack awareness: spreads bookies across racks (RackAwarePlacementPolicy).
     fn select_ensemble(
         &self,
         ensemble_size: usize,
+        write_quorum: usize,
+        ack_quorum: usize,
         exclude: &[String],
     ) -> Result<Vec<String>, ClientError> {
-        let mut ensemble = Vec::with_capacity(ensemble_size);
-        for addr in &self.bookie_addrs {
-            if !exclude.contains(addr) {
-                ensemble.push(addr.clone());
-                if ensemble.len() == ensemble_size {
-                    break;
-                }
-            }
+        let exclude_set: std::collections::HashSet<String> = exclude.iter().cloned().collect();
+        let result = self
+            .placement
+            .new_ensemble(ensemble_size, write_quorum, ack_quorum, &exclude_set)
+            .map_err(|e| ClientError::Protocol(format!("{e}")))?;
+        if !result.adheres_to_policy {
+            tracing::warn!("Ensemble placement does not fully adhere to policy");
         }
-        if ensemble.len() < ensemble_size {
-            return Err(ClientError::Protocol(format!(
-                "not enough bookies: need {}, available {} (excluding {})",
-                ensemble_size,
-                self.bookie_addrs.len(),
-                exclude.len()
-            )));
-        }
-        Ok(ensemble)
+        Ok(result.bookies)
+    }
+
+    /// Set a custom placement policy (e.g., rack-aware).
+    pub fn set_placement_policy(&mut self, policy: Box<dyn crate::placement::EnsemblePlacementPolicy>) {
+        self.placement = policy;
+        // Update with current bookie list
+        self.placement.on_cluster_changed(&self.bookie_addrs, &[]);
     }
 
     /// Create a new ledger. Allocates ID from ZK, selects ensemble, stores metadata.
@@ -166,7 +172,12 @@ impl ZkBookKeeper {
             .map_err(|e| ClientError::Protocol(format!("allocate id: {e}")))?;
 
         // Step 2: Select ensemble
-        let ensemble = self.select_ensemble(ensemble_size as usize, &[])?;
+        let ensemble = self.select_ensemble(
+            ensemble_size as usize,
+            write_quorum as usize,
+            ack_quorum as usize,
+            &[],
+        )?;
 
         // Step 3: Build and store metadata
         let meta_digest = to_meta_digest(digest_type);
