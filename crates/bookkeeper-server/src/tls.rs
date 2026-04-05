@@ -33,43 +33,48 @@ pub fn build_tls_acceptor(cfg: &TlsConfig) -> Result<TlsAcceptor, Box<dyn std::e
         return Err("no certificates found".into());
     }
 
-    // Build rustls ServerConfig
-    let mut config = if cfg.client_auth {
+    // Parse protocol versions (if configured)
+    let protocol_versions: Option<Vec<&'static rustls::SupportedProtocolVersion>> =
+        cfg.enabled_protocols.as_ref().and_then(|protocols| {
+            let mut versions = Vec::new();
+            for p in protocols.split(',') {
+                match p.trim() {
+                    "TLSv1.3" | "TLS1.3" => versions.push(&rustls::version::TLS13),
+                    "TLSv1.2" | "TLS1.2" => versions.push(&rustls::version::TLS12),
+                    other => eprintln!("TLS: unsupported protocol version {other}, ignoring"),
+                }
+            }
+            if versions.is_empty() { None } else { Some(versions) }
+        });
+
+    // Build ServerConfig with optional protocol versions and client auth.
+    // Single build path avoids redundant cert loading.
+    let config = if cfg.client_auth {
         let trust_path = cfg.trust_store_path.as_deref()
             .ok_or("tlsTrustStore required when tlsClientAuthentication=true")?;
         let root_store = load_trust_store(trust_path)?;
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
             .build()?;
-        rustls::ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)?
+        if let Some(ref versions) = protocol_versions {
+            rustls::ServerConfig::builder_with_protocol_versions(versions)
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)?
+        } else {
+            rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)?
+        }
     } else {
-        rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?
-    };
-
-    // Configure TLS protocol versions if specified.
-    // Java supports: tlsEnabledProtocols=TLSv1.2,TLSv1.3
-    // rustls supports TLS 1.2 and 1.3 by default (no legacy protocols).
-    if let Some(ref protocols) = cfg.enabled_protocols {
-        let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::new();
-        for p in protocols.split(',') {
-            match p.trim() {
-                "TLSv1.3" | "TLS1.3" => versions.push(&rustls::version::TLS13),
-                "TLSv1.2" | "TLS1.2" => versions.push(&rustls::version::TLS12),
-                other => eprintln!("TLS: unsupported protocol version {other}, ignoring"),
-            }
-        }
-        if !versions.is_empty() {
-            config = rustls::ServerConfig::builder_with_protocol_versions(&versions)
+        if let Some(ref versions) = protocol_versions {
+            rustls::ServerConfig::builder_with_protocol_versions(versions)
                 .with_no_client_auth()
-                .with_single_cert(
-                    load_pem(&cfg.cert_path, &cfg.key_path)?.0,
-                    load_pem(&cfg.cert_path, &cfg.key_path)?.1,
-                )?;
+                .with_single_cert(certs, key)?
+        } else {
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?
         }
-    }
+    };
 
     // Note: rustls does not support arbitrary cipher suite selection.
     // It uses a curated, secure default set. The tlsEnabledCipherSuites config
@@ -170,12 +175,7 @@ fn load_pem(cert_path: &str, key_path: &str) -> Result<(Vec<CertificateDer<'stat
 }
 
 fn load_pkcs12(path: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
-    // PKCS12 files need a password. Try empty password first (common for dev certs).
-    // For production, the password should be in tlsKeyStorePasswordPath.
-    let data = fs::read(path)?;
-
-    // rustls doesn't natively parse PKCS12. Convert via the p12 format.
-    // For now, return an error suggesting PEM conversion.
+    // rustls doesn't natively parse PKCS12. Suggest PEM conversion.
     Err(format!(
         "PKCS12 keystore at {path}: please convert to PEM format using:\n  \
          openssl pkcs12 -in {path} -out cert.pem -clcerts -nokeys\n  \
