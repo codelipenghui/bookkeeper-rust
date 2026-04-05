@@ -101,6 +101,26 @@ impl LedgerMetadataIndex {
         Ok(ledgers)
     }
 
+    /// Store the raw explicit LAC body (from WriteLac) to RocksDB.
+    /// Uses a separate key prefix "lac:" to avoid conflicting with ledger metadata.
+    pub fn set_explicit_lac_body(&self, ledger_id: i64, body: &[u8]) -> Result<(), StorageError> {
+        let mut key = Vec::with_capacity(12);
+        key.extend_from_slice(b"lac:");
+        key.extend_from_slice(&ledger_id.to_be_bytes());
+        self.db.put(&key, body).map_err(|e| StorageError::RocksDb(e.to_string()))
+    }
+
+    /// Get the raw explicit LAC body from RocksDB.
+    pub fn get_explicit_lac_body(&self, ledger_id: i64) -> Result<Option<Vec<u8>>, StorageError> {
+        let mut key = Vec::with_capacity(12);
+        key.extend_from_slice(b"lac:");
+        key.extend_from_slice(&ledger_id.to_be_bytes());
+        match self.db.get(&key).map_err(|e| StorageError::RocksDb(e.to_string()))? {
+            Some(v) => Ok(Some(v)),
+            None => Ok(None),
+        }
+    }
+
     pub fn delete(&self, ledger_id: i64) -> Result<(), StorageError> {
         let key = ledger_id.to_be_bytes();
         self.db.delete(&key).map_err(|e| StorageError::RocksDb(e.to_string()))

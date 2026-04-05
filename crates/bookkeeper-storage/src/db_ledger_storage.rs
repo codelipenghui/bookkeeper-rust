@@ -320,12 +320,20 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn set_explicit_lac_body(&self, ledger_id: i64, body: &[u8]) -> Result<(), StorageError> {
+        // In-memory cache for fast reads (matching Java's TransientLedgerInfo)
         self.explicit_lac_cache.insert(ledger_id, body.to_vec());
+        // Persist to RocksDB so body survives restart (matching Java's ledgerIndex.setExplicitLac)
+        self.ledger_index.set_explicit_lac_body(ledger_id, body)?;
         Ok(())
     }
 
     fn get_explicit_lac_body(&self, ledger_id: i64) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(self.explicit_lac_cache.get(&ledger_id).map(|v| v.clone()))
+        // Check in-memory cache first (fast path)
+        if let Some(body) = self.explicit_lac_cache.get(&ledger_id) {
+            return Ok(Some(body.clone()));
+        }
+        // Fall back to RocksDB (cold path, after restart)
+        self.ledger_index.get_explicit_lac_body(ledger_id)
     }
 
     fn journal(&self) -> Option<&crate::journal::writer::Journal> {

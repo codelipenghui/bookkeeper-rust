@@ -43,10 +43,15 @@ pub fn encode_response(resp: &V2Response) -> BytesMut {
             encode_response_header(OP_WRITE_LAC, *error_code, *ledger_id, *entry_id, 0)
         }
         V2Response::ReadLac { error_code, ledger_id, entry_id, lac_body, last_entry_body } => {
+            // Encode with 4-byte length prefix for each body, so the client can
+            // distinguish where lac_body ends and last_entry_body begins.
             let lac_len = lac_body.as_ref().map_or(0, |b| b.len());
             let entry_len = last_entry_body.as_ref().map_or(0, |b| b.len());
-            let mut buf = encode_response_header(OP_READ_LAC, *error_code, *ledger_id, *entry_id, lac_len + entry_len);
+            let data_size = 4 + lac_len + 4 + entry_len;
+            let mut buf = encode_response_header(OP_READ_LAC, *error_code, *ledger_id, *entry_id, data_size);
+            buf.put_i32(lac_len as i32);
             if let Some(b) = lac_body { buf.put_slice(b); }
+            buf.put_i32(entry_len as i32);
             if let Some(b) = last_entry_body { buf.put_slice(b); }
             buf
         }
@@ -86,12 +91,27 @@ pub fn decode_response(data: Bytes) -> Result<V2Response, ResponseDecodeError> {
         OP_AUTH => Ok(V2Response::Auth { error_code, payload: data.slice(V2_RESPONSE_HEADER_SIZE..) }),
         OP_WRITE_LAC => Ok(V2Response::WriteLac { error_code, ledger_id, entry_id }),
         OP_READ_LAC => {
-            let lac_body = if data.len() > V2_RESPONSE_HEADER_SIZE {
-                Some(data.slice(V2_RESPONSE_HEADER_SIZE..))
-            } else {
-                None
-            };
-            Ok(V2Response::ReadLac { error_code, ledger_id, entry_id, lac_body, last_entry_body: None })
+            let mut lac_body = None;
+            let mut last_entry_body = None;
+            let mut pos = V2_RESPONSE_HEADER_SIZE;
+            // Decode length-prefixed lac_body
+            if pos + 4 <= data.len() {
+                let lac_len = i32::from_be_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                pos += 4;
+                if lac_len > 0 && pos + lac_len <= data.len() {
+                    lac_body = Some(data.slice(pos..pos + lac_len));
+                    pos += lac_len;
+                }
+            }
+            // Decode length-prefixed last_entry_body
+            if pos + 4 <= data.len() {
+                let entry_len = i32::from_be_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                pos += 4;
+                if entry_len > 0 && pos + entry_len <= data.len() {
+                    last_entry_body = Some(data.slice(pos..pos + entry_len));
+                }
+            }
+            Ok(V2Response::ReadLac { error_code, ledger_id, entry_id, lac_body, last_entry_body })
         }
         OP_GET_BOOKIE_INFO => {
             if buf.remaining() < 16 { return Err(ResponseDecodeError::TooShort); }
