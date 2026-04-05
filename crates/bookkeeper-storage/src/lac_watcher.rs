@@ -35,21 +35,28 @@ impl LacWatcherRegistry {
     }
 
     /// Notify all watchers for a ledger that LAC has advanced.
+    /// Releases the lock before sending to avoid serializing under concurrent load.
     pub fn notify_lac_advance(&self, ledger_id: i64, new_lac: i64) {
-        let mut watchers = self.watchers.lock().unwrap();
-        if let Some(list) = watchers.get_mut(&ledger_id) {
-            let remaining: Vec<_> = list
-                .drain(..)
-                .filter_map(|(prev, tx)| {
+        let to_notify: Vec<std::sync::mpsc::Sender<i64>> = {
+            let mut watchers = self.watchers.lock().unwrap();
+            if let Some(list) = watchers.get_mut(&ledger_id) {
+                let mut remaining = Vec::new();
+                let mut notify = Vec::new();
+                for (prev, tx) in list.drain(..) {
                     if new_lac > prev {
-                        let _ = tx.send(new_lac);
-                        None
+                        notify.push(tx);
                     } else {
-                        Some((prev, tx))
+                        remaining.push((prev, tx));
                     }
-                })
-                .collect();
-            *list = remaining;
+                }
+                *list = remaining;
+                notify
+            } else {
+                Vec::new()
+            }
+        }; // lock released
+        for tx in to_notify {
+            let _ = tx.send(new_lac);
         }
     }
 

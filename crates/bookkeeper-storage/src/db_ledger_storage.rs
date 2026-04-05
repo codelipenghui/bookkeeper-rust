@@ -416,6 +416,8 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn delete_ledger(&self, ledger_id: i64) -> Result<(), StorageError> {
+        // Notify long poll watchers that this ledger is gone
+        self.lac_watchers.notify_ledger_closed(ledger_id);
         self.ledger_index.delete(ledger_id)?;
         self.entry_location_index.delete_ledger(ledger_id)?;
         Ok(())
