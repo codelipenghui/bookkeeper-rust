@@ -10,9 +10,22 @@ pub struct ClientConfig {
     pub add_entry_timeout: i32,
     pub add_entry_quorum_timeout: i32,
     pub speculative_read_timeout: i32,
+    pub first_speculative_read_timeout: i32,
+    pub max_speculative_read_timeout: i32,
+    pub speculative_read_timeout_backoff_multiplier: f64,
     pub num_channels_per_bookie: i32,
     pub enable_digest_type_autodetection: bool,
     pub explicit_lac_interval_ms: i32,
+    // TLS — matches Java's ClientConfiguration TLS fields.
+    // TLS is enabled if `tls_provider_factory_class` is set (matches Java).
+    pub tls_provider_factory_class: Option<String>,
+    pub tls_keystore_type: String,
+    pub tls_certificate_path: Option<String>,
+    pub tls_key_path: Option<String>,
+    pub tls_trust_store_path: Option<String>,
+    pub tls_client_authentication: bool,
+    pub tls_enabled_protocols: Option<String>,
+    pub tls_hostname_verification_enabled: bool,
 }
 
 impl Default for ClientConfig {
@@ -24,10 +37,21 @@ impl Default for ClientConfig {
             read_timeout: 5,
             add_entry_timeout: 5,
             add_entry_quorum_timeout: 5,
-            speculative_read_timeout: -1,
+            speculative_read_timeout: 2000,
+            first_speculative_read_timeout: 0, // 0 = use speculativeReadTimeout; -1 = disabled
+            max_speculative_read_timeout: 0,   // 0 = use speculativeReadTimeout
+            speculative_read_timeout_backoff_multiplier: 2.0,
             num_channels_per_bookie: 1,
             enable_digest_type_autodetection: true,
             explicit_lac_interval_ms: 0,
+            tls_provider_factory_class: None,
+            tls_keystore_type: "PEM".to_string(),
+            tls_certificate_path: None,
+            tls_key_path: None,
+            tls_trust_store_path: None,
+            tls_client_authentication: false,
+            tls_enabled_protocols: None,
+            tls_hostname_verification_enabled: false,
         }
     }
 }
@@ -42,9 +66,21 @@ impl ClientConfig {
         if let Some(v) = props.get("addEntryTimeout") { if let Ok(n) = v.parse() { config.add_entry_timeout = n; } }
         if let Some(v) = props.get("addEntryQuorumTimeout") { if let Ok(n) = v.parse() { config.add_entry_quorum_timeout = n; } }
         if let Some(v) = props.get("speculativeReadTimeout") { if let Ok(n) = v.parse() { config.speculative_read_timeout = n; } }
+        if let Some(v) = props.get("firstSpeculativeReadTimeout") { if let Ok(n) = v.parse() { config.first_speculative_read_timeout = n; } }
+        if let Some(v) = props.get("maxSpeculativeReadTimeout") { if let Ok(n) = v.parse() { config.max_speculative_read_timeout = n; } }
+        if let Some(v) = props.get("speculativeReadTimeoutBackoffMultiplier") { if let Ok(n) = v.parse() { config.speculative_read_timeout_backoff_multiplier = n; } }
         if let Some(v) = props.get("numChannelsPerBookie") { if let Ok(n) = v.parse() { config.num_channels_per_bookie = n; } }
         if let Some(v) = props.get("enableDigestTypeAutodetection") { config.enable_digest_type_autodetection = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("explicitLacIntervalMs") { if let Ok(n) = v.parse() { config.explicit_lac_interval_ms = n; } }
+        // TLS fields
+        if let Some(v) = props.get("tlsProviderFactoryClass") { config.tls_provider_factory_class = Some(v.clone()); }
+        if let Some(v) = props.get("tlsKeyStoreType") { config.tls_keystore_type = v.clone(); }
+        if let Some(v) = props.get("tlsCertificatePath") { config.tls_certificate_path = Some(v.clone()); }
+        if let Some(v) = props.get("tlsKeyStore") { config.tls_key_path = Some(v.clone()); }
+        if let Some(v) = props.get("tlsTrustStore") { config.tls_trust_store_path = Some(v.clone()); }
+        if let Some(v) = props.get("tlsClientAuthentication") { config.tls_client_authentication = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("tlsEnabledProtocols") { config.tls_enabled_protocols = Some(v.clone()); }
+        if let Some(v) = props.get("tlsHostnameVerificationEnabled") { config.tls_hostname_verification_enabled = v.eq_ignore_ascii_case("true"); }
         config
     }
 

@@ -17,3 +17,4 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+testcontainers = "0.23"

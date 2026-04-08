@@ -85,6 +85,23 @@ pub fn parse_lock_data(data: &[u8]) -> Result<LockDataFormat, String> {
     Ok(LockDataFormat { bookie_id })
 }
 
+pub fn parse_auditor_vote(data: &[u8]) -> Result<AuditorVoteFormat, String> {
+    let text = std::str::from_utf8(data).map_err(|e| format!("invalid utf8: {e}"))?;
+    let mut bookie_id = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(value) = strip_field(line, "bookieId") {
+            bookie_id = Some(unquote_string(value)?);
+        }
+    }
+
+    Ok(AuditorVoteFormat { bookie_id })
+}
+
 pub fn parse_layout(data: &[u8]) -> Result<LedgerRereplicationLayoutFormat, String> {
     let text = std::str::from_utf8(data).map_err(|e| format!("invalid utf8: {e}"))?;
     let mut layout_type = None;

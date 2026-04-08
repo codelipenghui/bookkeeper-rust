@@ -75,6 +75,28 @@ impl EntryLocationIndex {
         self.db.flush_opt(&opts).map_err(|e| StorageError::RocksDb(e.to_string()))
     }
 
+    /// Iterate all entries for a given ledger, returning (entry_id, location) pairs.
+    pub fn iter_ledger_entries(&self, ledger_id: i64) -> Result<Vec<(i64, u64)>, StorageError> {
+        let mut start = [0u8; 16];
+        start[0..8].copy_from_slice(&ledger_id.to_be_bytes());
+
+        let mut end = [0u8; 16];
+        end[0..8].copy_from_slice(&(ledger_id + 1).to_be_bytes());
+
+        let mut results = Vec::new();
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward));
+        for item in iter {
+            let (key, value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            if key.len() != 16 || &key[..] >= &end[..] {
+                break;
+            }
+            let entry_id = i64::from_be_bytes(key[8..16].try_into().unwrap());
+            let location = u64::from_be_bytes(value[..8].try_into().unwrap());
+            results.push((entry_id, location));
+        }
+        Ok(results)
+    }
+
     /// Trigger RocksDB compaction to reclaim space after ledger deletions.
     /// Matches Java's DbLedgerStorage.entryLocationCompact().
     pub fn compact(&self) -> Result<(), StorageError> {

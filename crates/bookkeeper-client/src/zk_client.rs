@@ -36,6 +36,12 @@ pub struct ZkBookKeeper {
     connections: std::collections::HashMap<String, Arc<BookieConnection>>,
     /// Ensemble placement policy (default or rack-aware).
     placement: Box<dyn crate::placement::EnsemblePlacementPolicy>,
+    /// Number of TCP channels per bookie (matching Java's numChannelsPerBookie).
+    num_channels_per_bookie: usize,
+    /// Speculative read policy (None = disabled).
+    speculative_policy: Option<crate::read_handle::SpeculativeReadPolicy>,
+    /// Optional TLS connector — if set, all bookie connections use StartTLS.
+    tls_connector: Option<Arc<tokio_rustls::TlsConnector>>,
 }
 
 impl ZkBookKeeper {
@@ -65,6 +71,9 @@ impl ZkBookKeeper {
             bookie_addrs: Vec::new(),
             connections: std::collections::HashMap::new(),
             placement: Box::new(crate::placement::DefaultPlacementPolicy::new()),
+            num_channels_per_bookie: 1,
+            speculative_policy: None,
+            tls_connector: None,
         };
 
         // Initial bookie discovery
@@ -93,15 +102,44 @@ impl ZkBookKeeper {
         Ok(())
     }
 
-    /// Get or create a connection to a bookie.
+    /// Get or create a pooled connection to a bookie.
+    /// Uses `num_channels_per_bookie` and optional TLS from config.
+    /// The bookie ID is parsed as "host:port" — `host` is preserved as the SNI
+    /// hostname for TLS handshakes. `host` is then resolved to a SocketAddr for TCP.
     async fn get_connection(&mut self, addr: &str) -> Result<Arc<BookieConnection>, ClientError> {
         if let Some(conn) = self.connections.get(addr) {
             return Ok(conn.clone());
         }
-        let socket_addr: SocketAddr = addr
-            .parse()
-            .map_err(|e| ClientError::Protocol(format!("bad address '{addr}': {e}")))?;
-        let conn = Arc::new(BookieConnection::connect(socket_addr).await?);
+
+        // Split host:port to preserve the textual host (SNI input).
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((h, p)) => (h.trim_matches(|c| c == '[' || c == ']'), p),
+            None => return Err(ClientError::Protocol(format!("bad address '{addr}': missing port"))),
+        };
+        let port: u16 = port.parse()
+            .map_err(|e| ClientError::Protocol(format!("bad port in '{addr}': {e}")))?;
+
+        // Resolve host to a SocketAddr (handles both hostnames and IP literals).
+        let socket_addr: SocketAddr = tokio::net::lookup_host((host, port)).await
+            .map_err(|e| ClientError::Protocol(format!("resolve '{addr}': {e}")))?
+            .next()
+            .ok_or_else(|| ClientError::Protocol(format!("no addresses for '{addr}'")))?;
+
+        // Use the original host as SNI hostname only if it's not an IP literal.
+        let server_hostname = if host.parse::<std::net::IpAddr>().is_ok() {
+            None
+        } else {
+            Some(host.to_string())
+        };
+
+        let conn = Arc::new(
+            BookieConnection::connect_pooled_with_tls_named(
+                socket_addr,
+                server_hostname,
+                self.num_channels_per_bookie,
+                self.tls_connector.clone(),
+            ).await?
+        );
         self.connections.insert(addr.to_string(), conn.clone());
         Ok(conn)
     }
@@ -328,13 +366,16 @@ impl ZkBookKeeper {
         let dm = DigestManager::new(digest_type).with_password(password);
         let master_key = generate_master_key(password);
 
-        let rh = ReadHandle::new(
+        let mut rh = ReadHandle::new(
             ledger_id,
             ensemble.clone(),
             schedule,
             dm,
             master_key,
         );
+        if let Some(ref policy) = self.speculative_policy {
+            rh = rh.with_speculative_policy(policy.clone());
+        }
 
         let conns = self.ensemble_connections(ensemble).await?;
 
@@ -411,7 +452,10 @@ impl ZkBookKeeper {
 
             match self.ledger_manager.write_ledger_metadata(ledger_id, &closed_md, version).await {
                 Ok(_) => {
-                    let rh = ReadHandle::new(ledger_id, ensemble.clone(), schedule, dm, master_key);
+                    let mut rh = ReadHandle::new(ledger_id, ensemble.clone(), schedule, dm, master_key);
+                    if let Some(ref policy) = self.speculative_policy {
+                        rh = rh.with_speculative_policy(policy.clone());
+                    }
                     return Ok((rh, conns));
                 }
                 Err(MetadataError::VersionConflict { .. }) => continue,
@@ -439,6 +483,26 @@ impl ZkBookKeeper {
     }
 
     /// Get the underlying LedgerManager (for advanced use).
+    /// Set the number of TCP channels per bookie (default: 1).
+    /// Matches Java's `numChannelsPerBookie`. Higher values increase throughput
+    /// by spreading requests across multiple pipelined connections.
+    /// Must be called before any connections are established.
+    pub fn set_num_channels_per_bookie(&mut self, n: usize) {
+        self.num_channels_per_bookie = n.max(1);
+    }
+
+    /// Set speculative read policy. See `SpeculativeReadPolicy::from_config`.
+    pub fn set_speculative_read_policy(&mut self, policy: crate::read_handle::SpeculativeReadPolicy) {
+        self.speculative_policy = Some(policy);
+    }
+
+    /// Enable TLS for all bookie connections via StartTLS upgrade.
+    /// Build the connector with `crate::tls::build_tls_connector(&cfg)`.
+    /// Must be called before any connections are established.
+    pub fn set_tls_connector(&mut self, connector: Arc<tokio_rustls::TlsConnector>) {
+        self.tls_connector = Some(connector);
+    }
+
     pub fn ledger_manager(&self) -> &Arc<ZkLedgerManager> {
         &self.ledger_manager
     }

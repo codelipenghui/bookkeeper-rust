@@ -20,6 +20,9 @@ use crate::http_api;
 use crate::processor::RequestProcessor;
 use crate::state::{BookieState, BookieStateManager};
 
+/// Filename for unclean shutdown detection, matching Java's UncleanShutdownDetectionImpl.
+const DIRTY_FILENAME: &str = "DIRTY";
+
 pub struct BookieServer {
     local_addr: SocketAddr,
     http_addr: Option<SocketAddr>,
@@ -33,12 +36,20 @@ pub struct BookieServer {
     gc_handle: Option<tokio::task::JoinHandle<()>>,
     disk_monitor_handle: Option<tokio::task::JoinHandle<()>>,
     sync_handle: Option<tokio::task::JoinHandle<()>>,
+    session_watcher_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Ledger directories — used to create/remove DIRTY files.
+    ledger_directories: Vec<String>,
 }
 
 impl BookieServer {
     pub async fn start(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        // Bind TCP listener
-        let addr = format!("0.0.0.0:{}", config.bookie_port);
+        // Bind TCP listener. Honor `listeningInterface` if set so the bookie
+        // can register a routable address with ZK; default to 0.0.0.0.
+        let bind_ip = config
+            .listening_interface
+            .clone()
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let addr = format!("{bind_ip}:{}", config.bookie_port);
         let listener = TcpListener::bind(&addr).await?;
         let local_addr = listener.local_addr()?;
 
@@ -68,8 +79,34 @@ impl BookieServer {
             tracing::info!("Journal recovery: replayed {replayed} entries");
         }
 
+        // Check for unclean shutdown (DIRTY file in any ledger directory).
+        // Java defaults to unclean=true on any I/O error (fail-safe).
+        let was_unclean = config.ledger_directories.iter().any(|dir| {
+            let dirty_path = Path::new(dir).join(DIRTY_FILENAME);
+            match dirty_path.try_exists() {
+                Ok(exists) => exists,
+                Err(e) => {
+                    tracing::error!("Failed to check DIRTY file in {dir}: {e} — assuming unclean");
+                    true // fail-safe: assume unclean
+                }
+            }
+        });
+        if was_unclean {
+            tracing::info!("Unclean shutdown detected (DIRTY file present). Journal replay completed.");
+        }
+
         let storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage> =
             Arc::new(storage);
+
+        // Create DIRTY file in each ledger directory — signals unclean shutdown
+        // if the process crashes before clean shutdown removes it.
+        // Matches Java: written AFTER bookie.start() succeeds, BEFORE accepting connections.
+        // Java aborts startup if DIRTY creation fails (re-throws IOException).
+        for dir in &config.ledger_directories {
+            let dirty_path = Path::new(dir).join(DIRTY_FILENAME);
+            std::fs::File::create(&dirty_path)
+                .map_err(|e| format!("Failed to create DIRTY file in {dir}: {e}"))?;
+        }
 
         // Create state manager and transition to Running
         let state = Arc::new(BookieStateManager::new());
@@ -91,6 +128,7 @@ impl BookieServer {
         // Optionally register with ZooKeeper
         let mut auditor_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut worker_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut session_watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         let zk_reg = if let Some(ref zk_servers) = config.zk_servers {
             let bookie_id = config.advertised_address.clone().unwrap_or_else(|| {
@@ -113,6 +151,30 @@ impl BookieServer {
                 .await
                 .map_err(|e| format!("ZK register: {e}"))?;
 
+            // Start ZK session watcher — monitors for session expiry.
+            // On expiry, exits the process for supervisor restart (matching Java behavior).
+            {
+                let watcher_zk_servers = zk_servers.clone();
+                let watcher_ledger_root = config.zk_ledger_root.clone();
+                let watcher_bookie_id = bookie_id.clone();
+                let watcher_shutdown = shutdown_rx.clone();
+                let watcher_state = state.clone();
+                let mut session_watcher = reg_mgr.zk_client().state_watcher();
+                let watcher_local_addr = local_addr;
+
+                session_watcher_handle = Some(tokio::spawn(async move {
+                    run_session_watcher(
+                        &mut session_watcher,
+                        &watcher_zk_servers,
+                        &watcher_ledger_root,
+                        &watcher_bookie_id,
+                        watcher_local_addr,
+                        watcher_state,
+                        watcher_shutdown,
+                    ).await;
+                }));
+            }
+
             // Start auto-recovery daemon if enabled
             if config.auto_recovery_daemon_enabled {
                 let (ah, wh) = start_auto_recovery(
@@ -132,6 +194,12 @@ impl BookieServer {
             None
         };
 
+        // Shared GC control flags — used by both the GC loop and HTTP API.
+        let gc_suspend_major = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gc_suspend_minor = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gc_force_major = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gc_force_minor = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Start GC thread if ZK is available
         let gc_handle = if zk_reg.is_some() {
             let gc_storage = storage.clone();
@@ -139,9 +207,17 @@ impl BookieServer {
             let gc_paths = zk_reg.as_ref().unwrap().0.paths().clone();
             let gc_wait_ms = config.gc_wait_time as u64;
             let gc_shutdown = shutdown_rx.clone();
+            let gc_suspend_major_c = gc_suspend_major.clone();
+            let gc_suspend_minor_c = gc_suspend_minor.clone();
+            let gc_force_major_c = gc_force_major.clone();
+            let gc_force_minor_c = gc_force_minor.clone();
 
             Some(tokio::spawn(async move {
-                run_gc_loop(gc_storage, gc_zk, gc_paths, gc_wait_ms, gc_shutdown).await;
+                run_gc_loop(
+                    gc_storage, gc_zk, gc_paths, gc_wait_ms, gc_shutdown,
+                    gc_suspend_major_c, gc_suspend_minor_c,
+                    gc_force_major_c, gc_force_minor_c,
+                ).await;
             }))
         } else {
             None
@@ -182,7 +258,27 @@ impl BookieServer {
         // Optionally start HTTP admin API server
         let http_addr = if config.http_server_enabled {
             let http_port = config.http_server_port as u16;
-            let http_state = http_api::HttpState { state_manager: state.clone() };
+            let (zk_client, zk_paths, http_bookie_id) = match &zk_reg {
+                Some((reg, bid)) => (
+                    Some(reg.zk_client().clone()),
+                    Some(reg.paths().clone()),
+                    Some(bid.clone()),
+                ),
+                None => (None, None, None),
+            };
+            let http_state = http_api::HttpState {
+                state_manager: state.clone(),
+                storage: Some(storage.clone()),
+                ledger_dirs: config.ledger_directories.clone(),
+                journal_dir: config.journal_directory.clone(),
+                zk_client,
+                zk_paths,
+                bookie_id: http_bookie_id,
+                gc_suspend_major: gc_suspend_major.clone(),
+                gc_suspend_minor: gc_suspend_minor.clone(),
+                gc_force_major: gc_force_major.clone(),
+                gc_force_minor: gc_force_minor.clone(),
+            };
             let router = http_api::create_router(http_state);
             let http_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{http_port}")).await?;
             let http_local_addr = http_listener.local_addr()?;
@@ -256,6 +352,8 @@ impl BookieServer {
             gc_handle,
             disk_monitor_handle,
             sync_handle,
+            session_watcher_handle,
+            ledger_directories: config.ledger_directories.clone(),
         })
     }
 
@@ -316,6 +414,9 @@ impl BookieServer {
         if let Some(h) = self.sync_handle {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
+        if let Some(h) = self.session_watcher_handle {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), h).await;
+        }
         tracing::info!("Background tasks stopped.");
 
         // Step 4: Wait for accept loop to finish (drains in-flight connections)
@@ -342,10 +443,21 @@ impl BookieServer {
             Err(_) => tracing::warn!("WARNING: storage flush timed out after 5 minutes"),
         }
 
-        // Step 6: Transition to ShuttingDown
+        // Step 6: Remove DIRTY files — clean shutdown confirmed.
+        // Matches Java: deleted AFTER bookie.shutdown() completes (all flushed).
+        for dir in &self.ledger_directories {
+            let dirty_path = Path::new(dir).join(DIRTY_FILENAME);
+            if dirty_path.exists() {
+                if let Err(e) = std::fs::remove_file(&dirty_path) {
+                    tracing::warn!("Failed to remove DIRTY file in {dir}: {e}");
+                }
+            }
+        }
+
+        // Step 7: Transition to ShuttingDown
         self.state.transition_to(BookieState::ShuttingDown);
 
-        // Step 7: Unregister from ZooKeeper LAST.
+        // Step 8: Unregister from ZooKeeper LAST.
         // Matches Java's StateManager.close() as the final step.
         if let Some((reg_mgr, bookie_id)) = self.zk_reg {
             let _ = reg_mgr.unregister_bookie(&bookie_id, false).await;
@@ -421,6 +533,111 @@ async fn validate_cookie(
     Ok(())
 }
 
+/// Monitors ZK session state for fatal events.
+///
+/// Matches Java's actual behavior on session expiry:
+/// - Disconnected: log warning, wait for auto-reconnect (ephemeral nodes survive within session)
+/// - Expired: session is dead, ephemeral registration gone, all ZK-dependent components broken.
+///   Java's BookieStateManager attempts re-registration but fails (stale ZK handle), then calls
+///   shutdownHandler.shutdown(ZK_REG_FAIL). We match this by exiting the process so the external
+///   supervisor (systemd, k8s) can restart it with a fresh ZK session.
+/// - AuthFailed: fatal, exit process.
+async fn run_session_watcher(
+    watcher: &mut zookeeper_client::StateWatcher,
+    _zk_servers: &str,
+    _ledger_root: &str,
+    bookie_id: &str,
+    _local_addr: SocketAddr,
+    _state: Arc<BookieStateManager>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    use zookeeper_client::SessionState;
+
+    loop {
+        tokio::select! {
+            session_state = watcher.changed() => {
+                match session_state {
+                    SessionState::Disconnected => {
+                        tracing::warn!("ZK session disconnected — waiting for reconnect \
+                            (ephemeral nodes survive within same session)");
+                    }
+                    SessionState::SyncConnected => {
+                        tracing::info!("ZK session reconnected (same session)");
+                    }
+                    SessionState::Expired => {
+                        // Session expired = ephemeral registration gone, all ZK components stale.
+                        // Java: ZooKeeperClient calls Runtime.exit(-1) on reconnect failure;
+                        // BookieStateManager calls shutdownHandler.shutdown(ZK_REG_FAIL).
+                        // Match this by exiting the process for supervisor restart.
+                        tracing::error!(
+                            "ZK session expired for bookie {bookie_id}. \
+                             Ephemeral registration lost. All ZK-dependent components are stale. \
+                             Exiting process for supervisor restart (matching Java ZK_REG_FAIL)."
+                        );
+                        std::process::exit(1);
+                    }
+                    SessionState::AuthFailed => {
+                        tracing::error!(
+                            "ZK authentication failed for bookie {bookie_id}. \
+                             Exiting process."
+                        );
+                        std::process::exit(1);
+                    }
+                    SessionState::Closed => {
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Decision returned by [`decide_disk_monitor_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskMonitorAction {
+    /// No state change required.
+    Stay,
+    /// Transition Running → ReadOnly because at least one ledger directory
+    /// is over the high-water threshold.
+    GoReadOnly,
+    /// Transition ReadOnly → Running because total disk usage dropped below
+    /// the low-water mark.
+    GoRunning,
+}
+
+/// Pure policy decision for the disk monitor: given the current bookie
+/// state and the observed disk usage, decide whether to transition.
+///
+/// Extracted from [`run_disk_monitor`] so it can be unit-tested without a
+/// real filesystem or tokio runtime. Mirrors Java's LedgerDirsMonitor:
+/// - any directory over `threshold` triggers a Running → ReadOnly transition
+/// - aggregate usage below `lwm_threshold` recovers ReadOnly → Running
+///   (only when at least one directory was successfully measured)
+pub fn decide_disk_monitor_action(
+    current: BookieState,
+    any_full: bool,
+    total_usage: f64,
+    lwm_threshold: f64,
+    dir_count: usize,
+) -> DiskMonitorAction {
+    if any_full && current == BookieState::Running {
+        return DiskMonitorAction::GoReadOnly;
+    }
+    if current == BookieState::ReadOnly
+        && dir_count > 0
+        && total_usage < lwm_threshold
+    {
+        return DiskMonitorAction::GoRunning;
+    }
+    DiskMonitorAction::Stay
+}
+
 /// Periodic disk usage monitor for read-only mode transitions.
 ///
 /// Matches Java's LedgerDirsMonitor:
@@ -475,20 +692,25 @@ async fn run_disk_monitor(
                 };
 
                 let current = state.state();
-                if any_full && current == BookieState::Running {
-                    if state.transition_to(BookieState::ReadOnly) {
-                        crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
-                        tracing::info!("Disk monitor: disk usage exceeds {:.0}% threshold, transitioning to READ-ONLY", threshold * 100.0);
-                        update_zk_registration(&zk_info, true).await;
+                match decide_disk_monitor_action(
+                    current, any_full, total_usage, lwm_threshold, dir_count,
+                ) {
+                    DiskMonitorAction::GoReadOnly => {
+                        if state.transition_to(BookieState::ReadOnly) {
+                            crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
+                            tracing::info!("Disk monitor: disk usage exceeds {:.0}% threshold, transitioning to READ-ONLY", threshold * 100.0);
+                            update_zk_registration(&zk_info, true).await;
+                        }
                     }
-                } else if total_usage < lwm_threshold && current == BookieState::ReadOnly && dir_count > 0 {
-                    // Recover: total usage across all dirs is below LWM (matching Java)
-                    if state.transition_to(BookieState::Running) {
-                        crate::metrics::BOOKIE_STATE.set(1); // 1 = writable
-                        tracing::info!("Disk monitor: total disk usage ({:.1}%) below {:.0}% LWM, transitioning back to WRITABLE",
-                            total_usage * 100.0, lwm_threshold * 100.0);
-                        update_zk_registration(&zk_info, false).await;
+                    DiskMonitorAction::GoRunning => {
+                        if state.transition_to(BookieState::Running) {
+                            crate::metrics::BOOKIE_STATE.set(1); // 1 = writable
+                            tracing::info!("Disk monitor: total disk usage ({:.1}%) below {:.0}% LWM, transitioning back to WRITABLE",
+                                total_usage * 100.0, lwm_threshold * 100.0);
+                            update_zk_registration(&zk_info, false).await;
+                        }
                     }
+                    DiskMonitorAction::Stay => {}
                 }
             }
         }
@@ -619,18 +841,26 @@ async fn run_gc_loop(
     paths: bookkeeper_metadata::zk_path::ZkPaths,
     gc_wait_ms: u64,
     mut shutdown_rx: watch::Receiver<bool>,
+    suspend_major: Arc<std::sync::atomic::AtomicBool>,
+    suspend_minor: Arc<std::sync::atomic::AtomicBool>,
+    force_major: Arc<std::sync::atomic::AtomicBool>,
+    force_minor: Arc<std::sync::atomic::AtomicBool>,
 ) {
     use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
     use bookkeeper_metadata::traits::LedgerManager;
     use bookkeeper_storage::gc::GarbageCollector;
     use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
 
     let ledger_manager = ZkLedgerManager::new(zk_client, paths);
     let gc = GarbageCollector::new(storage);
     let interval = tokio::time::Duration::from_millis(gc_wait_ms);
+    // Force-trigger checks at a faster cadence (1s) so HTTP-triggered GC is responsive.
+    let force_check_interval = tokio::time::Duration::from_secs(1);
 
     tracing::info!("GC thread started (interval: {}ms)", gc_wait_ms);
 
+    let mut last_run = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -639,8 +869,27 @@ async fn run_gc_loop(
                     break;
                 }
             }
-            _ = tokio::time::sleep(interval) => {
-                // Get all ledger IDs from metadata store
+            _ = tokio::time::sleep(force_check_interval) => {
+                // Check force flags first (HTTP-triggered immediate GC)
+                let forced = force_major.swap(false, Ordering::Relaxed)
+                    || force_minor.swap(false, Ordering::Relaxed);
+                let should_run = forced || last_run.elapsed() >= interval;
+                if !should_run {
+                    continue;
+                }
+
+                // Honor suspension flags. If both major and minor are suspended,
+                // skip the GC cycle entirely. (This is a coarse-grained match to
+                // Java's per-compaction suspension; the underlying GC implementation
+                // does not yet distinguish major vs minor compaction tiers.)
+                let major_suspended = suspend_major.load(Ordering::Relaxed);
+                let minor_suspended = suspend_minor.load(Ordering::Relaxed);
+                if major_suspended && minor_suspended && !forced {
+                    last_run = tokio::time::Instant::now();
+                    continue;
+                }
+
+                last_run = tokio::time::Instant::now();
                 match ledger_manager.get_ledger_ranges().await {
                     Ok(metadata_ledgers) => {
                         let active: HashSet<i64> = metadata_ledgers.into_iter().collect();

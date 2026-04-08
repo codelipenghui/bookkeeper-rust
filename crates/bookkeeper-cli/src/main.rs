@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod admin;
 mod bench;
 
 #[derive(Parser)]
@@ -95,6 +96,300 @@ enum Commands {
         #[arg(long, default_value = "0")]
         read_pct: u8,
     },
+    /// List all ledgers in the cluster
+    Listledgers {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Show metadata for each ledger
+        #[arg(long)]
+        meta: bool,
+        /// Filter by bookie ID (show only ledgers on this bookie)
+        #[arg(long)]
+        bookieid: Option<String>,
+    },
+    /// Show metadata for a specific ledger
+    Ledgerinfo {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Ledger ID to inspect
+        #[arg(long)]
+        ledger_id: i64,
+    },
+    /// List under-replicated ledgers
+    Listunderreplicated {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Filter: only show ledgers missing this replica
+        #[arg(long)]
+        missingreplica: Option<String>,
+        /// Filter: exclude ledgers missing this replica
+        #[arg(long)]
+        excludingmissingreplica: Option<String>,
+        /// Print missing replicas for each ledger
+        #[arg(long)]
+        printmissingreplica: bool,
+        /// Only display the count
+        #[arg(long)]
+        onlydisplayledgercount: bool,
+    },
+    /// Show the current auditor
+    Whoisauditor {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+    },
+    /// Enable auto-recovery
+    Autorecovery {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Enable auto-recovery
+        #[arg(long)]
+        enable: bool,
+        /// Disable auto-recovery
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Show cluster info: bookies, auditor, replication status
+    Clusterinfo {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+    },
+    /// Delete a ledger's metadata
+    Deleteledger {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Ledger ID to delete
+        #[arg(long)]
+        ledger_id: i64,
+        /// Confirm deletion
+        #[arg(long)]
+        force: bool,
+    },
+    /// Read entries from a ledger
+    Readledger {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Ledger ID to read
+        #[arg(long)]
+        ledger_id: i64,
+        /// First entry ID to read
+        #[arg(long, default_value = "0")]
+        first_entry: i64,
+        /// Last entry ID to read (defaults to last entry in ledger)
+        #[arg(long)]
+        last_entry: Option<i64>,
+        /// Read from a specific bookie (ip:port)
+        #[arg(long)]
+        bookie: Option<String>,
+    },
+    /// Get a bookie's cookie from ZooKeeper
+    CookieGet {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Bookie ID (host:port)
+        #[arg(long)]
+        bookie_id: String,
+    },
+    /// Delete a bookie's cookie from ZooKeeper
+    CookieDelete {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Bookie ID (host:port)
+        #[arg(long)]
+        bookie_id: String,
+        /// Confirm deletion
+        #[arg(long)]
+        force: bool,
+    },
+    /// Recover ledgers from a failed bookie or a specific ledger
+    Recover {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Recover a specific ledger
+        #[arg(long)]
+        ledger_id: Option<i64>,
+        /// Source bookie to recover data from (for full-bookie recovery)
+        #[arg(long)]
+        bookie_src: Option<String>,
+        /// Dry run: show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Decommission a bookie (replicate data away, delete cookie)
+    Decommissionbookie {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Bookie ID to decommission (host:port)
+        #[arg(long)]
+        bookie_id: String,
+    },
+    /// Check local bookie storage consistency
+    Localconsistencycheck {
+        /// Bookie data directory
+        #[arg(long)]
+        data_dir: String,
+    },
+    /// Get or set lostBookieRecoveryDelay (seconds)
+    Lostbookierecoverydelay {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Set the delay in seconds (omit to read current value)
+        #[arg(long)]
+        set: Option<i32>,
+    },
+    /// Trigger an immediate audit cycle
+    Triggeraudit {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+    },
+    /// Wipe all BookKeeper metadata from ZooKeeper
+    Metaformat {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Confirm destructive operation
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the last journal checkpoint mark
+    Lastmark {
+        /// Data directory (searches for lastMark)
+        #[arg(long)]
+        data_dir: String,
+    },
+    /// Scan and dump entries from a journal file
+    Readjournal {
+        /// Path to journal file (.txn)
+        #[arg(long)]
+        file: String,
+    },
+    /// Scan and dump entries from an entry log file
+    Readlog {
+        /// Path to entry log file (.log)
+        #[arg(long)]
+        file: String,
+    },
+    /// List journal, entry log, and index files on disk
+    Listfilesondisc {
+        /// Bookie data directory
+        #[arg(long)]
+        data_dir: String,
+        /// Journal directory (defaults to data_dir)
+        #[arg(long)]
+        journal_dir: Option<String>,
+    },
+    /// Replace a bookie address in all ledger metadata (re-IP)
+    Updatebookieinledger {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Old bookie address to replace
+        #[arg(long)]
+        old_bookie: String,
+        /// New bookie address
+        #[arg(long)]
+        new_bookie: String,
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print the cluster instance ID
+    Whatisinstanceid {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+    },
+    /// Format (wipe) local bookie data directories
+    Bookieformat {
+        /// Bookie data directory
+        #[arg(long)]
+        data_dir: String,
+        /// Journal directory (defaults to data_dir)
+        #[arg(long)]
+        journal_dir: Option<String>,
+        /// Confirm destructive operation
+        #[arg(long)]
+        force: bool,
+    },
+    /// Delete all cluster metadata and state (nuclear option)
+    Nukeexistingcluster {
+        /// ZooKeeper connection string
+        #[arg(long, default_value = "localhost:2181")]
+        zk: String,
+        /// ZooKeeper ledger root path
+        #[arg(long, default_value = "/ledgers")]
+        ledger_root: String,
+        /// Confirm destructive operation
+        #[arg(long)]
+        force: bool,
+        /// Validate instance ID before nuking (alternative to --force)
+        #[arg(long)]
+        instanceid: Option<String>,
+    },
     /// End-to-end benchmark with ZK, quorum writes, multi-ledger
     BenchE2e {
         /// ZooKeeper connection string
@@ -157,6 +452,82 @@ async fn main() {
         }
         Commands::Bookiesanity { entries, data_dir } => {
             cmd_bookiesanity(entries, data_dir).await
+        }
+        Commands::Listledgers { zk, ledger_root, meta, bookieid } => {
+            admin::cmd_listledgers(&zk, &ledger_root, meta, bookieid.as_deref()).await
+        }
+        Commands::Ledgerinfo { zk, ledger_root, ledger_id } => {
+            admin::cmd_ledgerinfo(&zk, &ledger_root, ledger_id).await
+        }
+        Commands::Listunderreplicated { zk, ledger_root, missingreplica, excludingmissingreplica, printmissingreplica, onlydisplayledgercount } => {
+            admin::cmd_listunderreplicated(&zk, &ledger_root, missingreplica.as_deref(), excludingmissingreplica.as_deref(), printmissingreplica, onlydisplayledgercount).await
+        }
+        Commands::Whoisauditor { zk, ledger_root } => {
+            admin::cmd_whoisauditor(&zk, &ledger_root).await
+        }
+        Commands::Autorecovery { zk, ledger_root, enable, disable } => {
+            if enable == disable {
+                Err("specify exactly one of --enable or --disable".into())
+            } else {
+                admin::cmd_toggle_recovery(&zk, &ledger_root, enable).await
+            }
+        }
+        Commands::Clusterinfo { zk, ledger_root } => {
+            admin::cmd_clusterinfo(&zk, &ledger_root).await
+        }
+        Commands::Deleteledger { zk, ledger_root, ledger_id, force } => {
+            admin::cmd_deleteledger(&zk, &ledger_root, ledger_id, force).await
+        }
+        Commands::Readledger { zk, ledger_root, ledger_id, first_entry, last_entry, bookie } => {
+            admin::cmd_readledger(&zk, &ledger_root, ledger_id, first_entry, last_entry, bookie.as_deref()).await
+        }
+        Commands::CookieGet { zk, ledger_root, bookie_id } => {
+            admin::cmd_cookie_get(&zk, &ledger_root, &bookie_id).await
+        }
+        Commands::CookieDelete { zk, ledger_root, bookie_id, force } => {
+            admin::cmd_cookie_delete(&zk, &ledger_root, &bookie_id, force).await
+        }
+        Commands::Recover { zk, ledger_root, ledger_id, bookie_src, dry_run } => {
+            admin::cmd_recover(&zk, &ledger_root, ledger_id, bookie_src.as_deref(), dry_run).await
+        }
+        Commands::Decommissionbookie { zk, ledger_root, bookie_id } => {
+            admin::cmd_decommissionbookie(&zk, &ledger_root, &bookie_id).await
+        }
+        Commands::Localconsistencycheck { data_dir } => {
+            admin::cmd_localconsistencycheck(&data_dir).await
+        }
+        Commands::Lostbookierecoverydelay { zk, ledger_root, set } => {
+            admin::cmd_lostbookierecoverydelay(&zk, &ledger_root, set).await
+        }
+        Commands::Triggeraudit { zk, ledger_root } => {
+            admin::cmd_triggeraudit(&zk, &ledger_root).await
+        }
+        Commands::Metaformat { zk, ledger_root, force } => {
+            admin::cmd_metaformat(&zk, &ledger_root, force).await
+        }
+        Commands::Lastmark { data_dir } => {
+            admin::cmd_lastmark(&data_dir).await
+        }
+        Commands::Readjournal { file } => {
+            admin::cmd_readjournal(&file).await
+        }
+        Commands::Readlog { file } => {
+            admin::cmd_readlog(&file).await
+        }
+        Commands::Listfilesondisc { data_dir, journal_dir } => {
+            admin::cmd_listfilesondisc(&data_dir, journal_dir.as_deref()).await
+        }
+        Commands::Updatebookieinledger { zk, ledger_root, old_bookie, new_bookie, dry_run } => {
+            admin::cmd_updatebookieinledger(&zk, &ledger_root, &old_bookie, &new_bookie, dry_run).await
+        }
+        Commands::Whatisinstanceid { zk, ledger_root } => {
+            admin::cmd_whatisinstanceid(&zk, &ledger_root).await
+        }
+        Commands::Bookieformat { data_dir, journal_dir, force } => {
+            admin::cmd_bookieformat(&data_dir, journal_dir.as_deref(), force).await
+        }
+        Commands::Nukeexistingcluster { zk, ledger_root, force, instanceid } => {
+            admin::cmd_nukeexistingcluster(&zk, &ledger_root, force, instanceid.as_deref()).await
         }
         Commands::BenchBookie { bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, digest, duration, read_pct } => {
             bench::cmd_bench_bookie(&bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, &digest, duration, read_pct).await

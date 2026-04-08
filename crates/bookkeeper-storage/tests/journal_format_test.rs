@@ -40,13 +40,15 @@ fn test_encode_journal_entry() {
 #[test]
 fn padding_calculation() {
     // At position 520 with alignment 4096:
-    // Next aligned = 4096, padding needed = 4096 - 520 = 3576
+    // Next aligned = 4096, total padding block = 4096 - 520 = 3576 bytes.
+    // The block layout is [PADDING_MASK(4)][zero_fill_len(4)][zeros(zero_fill_len)],
+    // matching Java's Journal.writePaddingBytes format. So zero_fill_len = 3576 - 8 = 3568.
     let padding = calculate_padding(520, 4096);
     assert_eq!(padding.len(), 3576);
     // First 4 bytes: PADDING_MASK
     assert_eq!(i32::from_be_bytes(padding[0..4].try_into().unwrap()), PADDING_MASK);
-    // Next 4 bytes: padding length
-    assert_eq!(i32::from_be_bytes(padding[4..8].try_into().unwrap()), 3576);
+    // Next 4 bytes: zero_fill length (NOT including the 8-byte header)
+    assert_eq!(i32::from_be_bytes(padding[4..8].try_into().unwrap()), 3568);
     // Rest: zeros
     assert!(padding[8..].iter().all(|&b| b == 0));
 }

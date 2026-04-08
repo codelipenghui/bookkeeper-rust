@@ -57,16 +57,19 @@ pub fn encode_journal_entry(payload: &[u8]) -> Vec<u8> {
 }
 
 /// Calculate padding bytes to align current position to alignment boundary.
-/// Returns the complete padding block: [PADDING_MASK(4)][length(4)][zeros].
+/// Returns the complete padding block: [PADDING_MASK(4)][zero_fill_len(4)][zeros].
+/// The length field stores the zero-fill byte count (NOT including the 8-byte header),
+/// matching Java's Journal.writePaddingBytes format.
 pub fn calculate_padding(current_pos: u64, alignment: u64) -> Vec<u8> {
     let next_aligned = ((current_pos + alignment - 1) / alignment) * alignment;
-    let mut pad_len = (next_aligned - current_pos) as usize;
-    if pad_len < 8 {
-        pad_len += alignment as usize;
+    let mut total_len = (next_aligned - current_pos) as usize;
+    if total_len < 8 {
+        total_len += alignment as usize;
     }
-    let mut buf = vec![0u8; pad_len];
+    let zero_fill_len = total_len - 8; // exclude PADDING_MASK(4) + length(4)
+    let mut buf = vec![0u8; total_len];
     buf[0..4].copy_from_slice(&PADDING_MASK.to_be_bytes());
-    buf[4..8].copy_from_slice(&(pad_len as i32).to_be_bytes());
+    buf[4..8].copy_from_slice(&(zero_fill_len as i32).to_be_bytes());
     buf
 }
 
@@ -84,9 +87,13 @@ pub fn scan_journal_entries(data: &[u8], version: i32) -> Vec<&[u8]> {
             if pos + 8 > data.len() {
                 break;
             }
-            let pad_len = i32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
-            pos += pad_len;
+            // pad_len is the zero-fill byte count (Java format); total block = 8 + pad_len
+            let zero_fill_len = i32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 8 + zero_fill_len;
             continue;
+        }
+        if size < 0 {
+            break; // corrupt entry — negative length
         }
         let entry_size = size as usize;
         let entry_start = pos + 4;

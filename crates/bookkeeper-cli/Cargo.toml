@@ -24,3 +24,11 @@ hdrhistogram = { workspace = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 rand = "0.8"
+zookeeper-client = { workspace = true }
+bookkeeper-replication = { workspace = true }
+bookkeeper-storage = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+testcontainers = "0.23"

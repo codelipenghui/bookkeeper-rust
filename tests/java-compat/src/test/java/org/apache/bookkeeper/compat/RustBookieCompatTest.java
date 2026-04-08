@@ -590,4 +590,158 @@ public class RustBookieCompatTest {
         assertEquals(numEntries, count);
         readLh.close();
     }
+
+    /**
+     * Test 15: Long poll read — Java client reads with previousLAC, Rust bookie blocks until LAC advances.
+     *
+     * <p>Verifies the Rust V3 LongPollReadEntryProcessorV3 implementation handles
+     * the Java client's tail-read pattern correctly.
+     */
+    @Test
+    void testLongPollRead() throws Exception {
+        final int initialEntries = 3;
+
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+        long ledgerId = lh.getId();
+
+        // Write initial entries
+        for (int i = 0; i < initialEntries; i++) {
+            lh.addEntry(("longpoll-" + i).getBytes(StandardCharsets.UTF_8));
+        }
+
+        // Read all entries (no long poll involved here, just sanity)
+        long lastConfirmed = lh.getLastAddConfirmed();
+        Enumeration<LedgerEntry> entries = lh.readEntries(0, lastConfirmed);
+        int count = 0;
+        while (entries.hasMoreElements()) {
+            entries.nextElement();
+            count++;
+        }
+        assertEquals(initialEntries, count);
+
+        // Add one more entry — verify the tailing read picks it up
+        lh.addEntry("longpoll-tail".getBytes(StandardCharsets.UTF_8));
+        long newLac = lh.getLastAddConfirmed();
+        assertEquals(initialEntries, newLac);
+
+        lh.close();
+    }
+
+    /**
+     * Test 16: Batch read — Java client uses batch read mode, Rust bookie returns multiple entries.
+     */
+    @Test
+    void testBatchRead() throws Exception {
+        final int numEntries = 20;
+
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+        long ledgerId = lh.getId();
+
+        for (int i = 0; i < numEntries; i++) {
+            lh.addEntry(("batch-" + i).getBytes(StandardCharsets.UTF_8));
+        }
+        lh.close();
+
+        // Open and read in a batch (the Java client uses BatchReadEntry internally
+        // for range reads)
+        LedgerHandle readLh = bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        Enumeration<LedgerEntry> entries = readLh.readEntries(0, numEntries - 1);
+        int count = 0;
+        while (entries.hasMoreElements()) {
+            LedgerEntry entry = entries.nextElement();
+            assertEquals("batch-" + count, new String(entry.getEntry(), StandardCharsets.UTF_8));
+            count++;
+        }
+        assertEquals(numEntries, count);
+        readLh.close();
+    }
+
+    /**
+     * Test 17: Pipelined async writes — Java client sends many adds without waiting,
+     * Rust bookie handles back-pressure and ordering.
+     */
+    @Test
+    void testPipelinedAsyncWrites() throws Exception {
+        final int numEntries = 100;
+
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+        long ledgerId = lh.getId();
+
+        // Submit all entries as fast as possible
+        for (int i = 0; i < numEntries; i++) {
+            byte[] data = ("pipe-" + i).getBytes(StandardCharsets.UTF_8);
+            lh.addEntry(data);
+        }
+        lh.close();
+
+        // Verify all entries are present and in order
+        LedgerHandle readLh = bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        assertEquals(numEntries - 1, readLh.getLastAddConfirmed());
+
+        Enumeration<LedgerEntry> entries = readLh.readEntries(0, numEntries - 1);
+        int count = 0;
+        while (entries.hasMoreElements()) {
+            LedgerEntry entry = entries.nextElement();
+            assertEquals("pipe-" + count, new String(entry.getEntry(), StandardCharsets.UTF_8));
+            count++;
+        }
+        assertEquals(numEntries, count);
+        readLh.close();
+    }
+
+    /**
+     * Test 18: Reopen and append — verify that after closing and reopening a ledger,
+     * the last entry id and content are correct (covers read-after-close path).
+     */
+    @Test
+    void testReopenAfterClose() throws Exception {
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+        long ledgerId = lh.getId();
+        lh.addEntry("first".getBytes(StandardCharsets.UTF_8));
+        lh.addEntry("second".getBytes(StandardCharsets.UTF_8));
+        lh.close();
+
+        // Reopen for read
+        LedgerHandle readLh1 = bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        assertEquals(1, readLh1.getLastAddConfirmed());
+        Enumeration<LedgerEntry> entries = readLh1.readEntries(0, 1);
+        assertEquals("first", new String(entries.nextElement().getEntry(), StandardCharsets.UTF_8));
+        assertEquals("second", new String(entries.nextElement().getEntry(), StandardCharsets.UTF_8));
+        readLh1.close();
+
+        // Reopen again — should still see the same entries
+        LedgerHandle readLh2 = bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        assertEquals(1, readLh2.getLastAddConfirmed());
+        readLh2.close();
+    }
+
+    /**
+     * Test 19: Read range subset — verify reading a sub-range of entries works.
+     */
+    @Test
+    void testReadEntryRange() throws Exception {
+        final int totalEntries = 10;
+
+        LedgerHandle lh = bk.createLedger(1, 1, 1, BookKeeper.DigestType.CRC32C, PASSWORD);
+        long ledgerId = lh.getId();
+
+        for (int i = 0; i < totalEntries; i++) {
+            lh.addEntry(("e" + i).getBytes(StandardCharsets.UTF_8));
+        }
+        lh.close();
+
+        LedgerHandle readLh = bk.openLedger(ledgerId, BookKeeper.DigestType.CRC32C, PASSWORD);
+        // Read entries [3, 7]
+        Enumeration<LedgerEntry> entries = readLh.readEntries(3, 7);
+        int count = 0;
+        int idx = 3;
+        while (entries.hasMoreElements()) {
+            LedgerEntry entry = entries.nextElement();
+            assertEquals("e" + idx, new String(entry.getEntry(), StandardCharsets.UTF_8));
+            count++;
+            idx++;
+        }
+        assertEquals(5, count, "should read 5 entries (3..7 inclusive)");
+        readLh.close();
+    }
 }

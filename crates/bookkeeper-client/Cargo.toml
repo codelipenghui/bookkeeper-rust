@@ -20,6 +20,9 @@ rand = "0.8"
 futures = { workspace = true }
 zookeeper-client = { workspace = true }
 async-trait = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -27,3 +30,4 @@ bookkeeper-storage = { workspace = true }
 bookkeeper-server = { workspace = true }
 bookkeeper-config = { workspace = true }
 uuid = { workspace = true }
+testcontainers = "0.23"

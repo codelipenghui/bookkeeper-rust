@@ -136,6 +136,7 @@ pub trait RackResolver: Send + Sync {
 }
 
 /// Static rack mapping from config.
+#[derive(Clone)]
 pub struct StaticRackResolver {
     mapping: HashMap<String, String>,
     default_rack: String,

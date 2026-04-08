@@ -17,12 +17,26 @@ pub struct TlsConfig {
     pub cert_refresh_seconds: i64,
 }
 
+/// Ensure rustls has a default CryptoProvider installed. When the workspace
+/// has multiple crypto provider features enabled, rustls refuses to auto-select
+/// one and panics. Explicitly install aws-lc-rs (rustls's default provider)
+/// which is always available. Safe to call multiple times.
+fn ensure_crypto_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 /// Build a TLS acceptor from certificate and key files.
 ///
 /// Supports PEM and PKCS12 keystore types matching Java's TLSContextFactory:
 /// - PEM: separate cert and key files (tlsCertificatePath + tlsKeyFilePath)
 /// - PKCS12: single .p12/.pfx file containing cert + key (tlsKeyStore)
 pub fn build_tls_acceptor(cfg: &TlsConfig) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+    ensure_crypto_provider();
+
     let (certs, key) = match cfg.keystore_type.to_uppercase().as_str() {
         "PEM" => load_pem(&cfg.cert_path, &cfg.key_path)?,
         "PKCS12" | "P12" | "PFX" => load_pkcs12(&cfg.key_path)?,

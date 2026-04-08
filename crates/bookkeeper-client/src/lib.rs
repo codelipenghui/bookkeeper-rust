@@ -6,3 +6,4 @@ pub mod client;
 pub mod recovery;
 pub mod zk_client;
 pub mod placement;
+pub mod tls;
