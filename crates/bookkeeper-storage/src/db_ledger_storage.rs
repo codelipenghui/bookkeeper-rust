@@ -183,22 +183,23 @@ impl DbLedgerStorage {
 
     fn read_entry_from_log(&self, location: u64) -> Result<Vec<u8>, StorageError> {
         let loc = EntryLocation::from_u64(location);
-        let path = self.entry_log_path(loc.log_id());
-        let file = fs::File::open(&path)?;
-        let fd = file.as_raw_fd();
         let pos = loc.position() as u64;
         if pos < 4 {
             return Err(StorageError::CorruptData("invalid entry position".into()));
         }
-        // Read 4-byte size at (pos - 4)
-        let size_buf = self.ledger_io.read_at(fd, pos - 4, 4)?;
+        // Read 4-byte size prefix via the engine (manages fd lifecycle)
+        let size_buf = self.ledger_io.read_entry(
+            &self.entry_log_dir, loc.log_id(), pos - 4, 4,
+        )?;
         let size = i32::from_be_bytes(size_buf[..4].try_into().unwrap()) as usize;
         if size > MAX_ENTRY_SIZE {
             return Err(StorageError::CorruptData(
                 format!("entry size {} exceeds maximum {}", size, MAX_ENTRY_SIZE)));
         }
-        // Read entry data at pos
-        let entry = self.ledger_io.read_at(fd, pos, size)?;
+        // Read entry data
+        let entry = self.ledger_io.read_entry(
+            &self.entry_log_dir, loc.log_id(), pos, size,
+        )?;
         Ok(entry)
     }
 }

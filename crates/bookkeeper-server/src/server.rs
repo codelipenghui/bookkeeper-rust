@@ -250,6 +250,7 @@ impl BookieServer {
         // Start GC thread if ZK is available
         let gc_handle = if zk_reg.is_some() {
             let gc_storage = storage.clone();
+            let gc_ledger_io = io_engines.ledger.clone();
             let gc_zk = zk_reg.as_ref().unwrap().0.zk_client().clone();
             let gc_paths = zk_reg.as_ref().unwrap().0.paths().clone();
             let gc_wait_ms = config.gc_wait_time as u64;
@@ -261,7 +262,7 @@ impl BookieServer {
 
             Some(tokio::spawn(async move {
                 run_gc_loop(
-                    gc_storage, gc_zk, gc_paths, gc_wait_ms, gc_shutdown,
+                    gc_storage, gc_ledger_io, gc_zk, gc_paths, gc_wait_ms, gc_shutdown,
                     gc_suspend_major_c, gc_suspend_minor_c,
                     gc_force_major_c, gc_force_minor_c,
                 ).await;
@@ -900,6 +901,7 @@ async fn run_sync_thread(
 /// 4. Delete empty entry log files
 async fn run_gc_loop(
     storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
+    ledger_io: Arc<dyn bookkeeper_storage::io_engine::LedgerIo>,
     zk_client: zookeeper_client::Client,
     paths: bookkeeper_metadata::zk_path::ZkPaths,
     gc_wait_ms: u64,
@@ -916,7 +918,7 @@ async fn run_gc_loop(
     use std::sync::atomic::Ordering;
 
     let ledger_manager = ZkLedgerManager::new(zk_client, paths);
-    let gc = GarbageCollector::new(storage);
+    let gc = GarbageCollector::new(storage, ledger_io);
     let interval = tokio::time::Duration::from_millis(gc_wait_ms);
     // Force-trigger checks at a faster cadence (1s) so HTTP-triggered GC is responsive.
     let force_check_interval = tokio::time::Duration::from_secs(1);

@@ -51,7 +51,7 @@ fn gc_deletes_local_ledger_not_in_metadata() {
     let mut active = HashSet::new();
     active.insert(2i64);
 
-    let gc = GarbageCollector::new(storage.clone());
+    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     gc.gc(&active).unwrap();
 
     // After GC, ledgers 1 and 3 should be gone locally
@@ -72,7 +72,7 @@ fn gc_keeps_all_when_metadata_matches_local() {
     active.insert(10i64);
     active.insert(20i64);
 
-    let gc = GarbageCollector::new(storage.clone());
+    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     gc.gc(&active).unwrap();
 
     let local = storage.get_active_ledgers().unwrap();
@@ -88,7 +88,7 @@ fn gc_with_empty_metadata_deletes_all_local() {
     write_entries(&*storage, 200, 5);
 
     let active: HashSet<i64> = HashSet::new();
-    let gc = GarbageCollector::new(storage.clone());
+    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     gc.gc(&active).unwrap();
 
     let local = storage.get_active_ledgers().unwrap();
@@ -106,7 +106,7 @@ fn gc_idempotent_when_run_twice() {
     let mut active = HashSet::new();
     active.insert(1i64);
 
-    let gc = GarbageCollector::new(storage.clone());
+    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     gc.gc(&active).unwrap();
     gc.gc(&active).unwrap(); // second run should be no-op
 
@@ -120,6 +120,6 @@ fn gc_with_no_local_ledgers_succeeds() {
     let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     let active: HashSet<i64> = HashSet::new();
-    let gc = GarbageCollector::new(storage);
+    let gc = GarbageCollector::new(storage, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     gc.gc(&active).unwrap();
 }

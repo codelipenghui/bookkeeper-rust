@@ -52,6 +52,7 @@ impl EntryLogMeta {
 /// 4. Compacts entry log files with low usage (minor/major thresholds)
 pub struct GarbageCollector {
     storage: Arc<dyn LedgerStorage>,
+    ledger_io: Arc<dyn crate::io_engine::LedgerIo>,
     #[allow(dead_code)]
     minor_threshold: f64,
     major_threshold: f64,
@@ -59,9 +60,10 @@ pub struct GarbageCollector {
 
 
 impl GarbageCollector {
-    pub fn new(storage: Arc<dyn LedgerStorage>) -> Self {
+    pub fn new(storage: Arc<dyn LedgerStorage>, ledger_io: Arc<dyn crate::io_engine::LedgerIo>) -> Self {
         Self {
             storage,
+            ledger_io,
             minor_threshold: MINOR_COMPACTION_THRESHOLD,
             major_threshold: MAJOR_COMPACTION_THRESHOLD,
         }
@@ -155,6 +157,7 @@ impl GarbageCollector {
 
             if !meta.has_active_ledgers(active_ledgers) {
                 // No active ledgers — delete the file entirely
+                self.ledger_io.evict_fd(entry_log_dir, log_id);
                 if let Err(e) = fs::remove_file(&path) {
                     tracing::warn!("GC: failed to delete entry log {}: {e}", name);
                 } else {
@@ -374,6 +377,7 @@ impl GarbageCollector {
         // Step 5: Delete old log file AFTER index is updated.
         // If crash between step 4 and 5: old file remains, index points to new locations.
         // Old file will be cleaned up on next GC cycle (safe).
+        self.ledger_io.evict_fd(path.parent().unwrap_or(path), _log_id);
         fs::remove_file(path)?;
 
         Ok(count)

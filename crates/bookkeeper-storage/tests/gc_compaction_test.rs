@@ -108,7 +108,7 @@ fn gc_deletes_entry_log_file_when_all_ledgers_are_dead() {
     );
     assert!(log_path.exists());
 
-    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>);
+    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active_in_metadata: HashSet<i64> = HashSet::new();
     gc.gc(&active_in_metadata).unwrap();
 
@@ -134,7 +134,7 @@ fn gc_deletes_only_files_with_no_active_ledgers() {
     // File 6: only ledger 100 (active) → must be preserved
     let live_path = write_entry_log_file(&entry_log_dir, 6, &[(100, 0), (100, 1)]);
 
-    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>);
+    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
     gc.gc(&active).unwrap();
 
@@ -188,7 +188,7 @@ fn gc_compacts_low_usage_log_file_and_relocates_live_entries() {
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>);
+    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
     gc.gc(&active).unwrap();
 
@@ -248,7 +248,7 @@ fn gc_does_not_compact_high_usage_log_file() {
     );
     let original_size = fs::metadata(&log_path).unwrap().len();
 
-    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>);
+    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100, 200]);
     gc.gc(&active).unwrap();
 
@@ -286,7 +286,7 @@ fn gc_does_not_compact_file_at_exact_threshold_boundary() {
         ],
     );
 
-    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>);
+    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
     gc.gc(&active).unwrap();
 
@@ -331,7 +331,7 @@ fn gc_never_deletes_or_compacts_the_current_log_file() {
     // ledger 100's data, then look at log file 0 which contains only dead
     // entries. The GC must NOT touch the current file even though all its
     // entries are now dead.
-    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>);
+    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active: HashSet<i64> = HashSet::new();
     gc.gc(&active).unwrap();
 
@@ -377,7 +377,7 @@ fn gc_processes_multiple_log_files_in_single_pass() {
         ],
     );
 
-    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>);
+    let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
     gc.gc(&active).unwrap();
 
