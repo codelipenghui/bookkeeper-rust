@@ -75,15 +75,18 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
-  # Rust bookie — implements BookKeeper wire protocol over V2+V3
+  # Rust bookies — 3-node ensemble so Pulsar can run E=3/W=2/A=2 with
+  # real replication and auto-recovery. Each service uses the SAME
+  # image and config file; they differ only by hostname, advertised
+  # address (via `bk serve --advertised-address`), and volume mounts.
   # ---------------------------------------------------------------------------
-  rust-bookie:
+  rust-bookie-1:
     build:
       context: .
       dockerfile: Dockerfile
     image: rust-bookie:latest
-    container_name: rustbk-rust-bookie
-    hostname: rust-bookie
+    container_name: rustbk-rust-bookie-1
+    hostname: rust-bookie-1
     restart: unless-stopped
     depends_on:
       zookeeper:
@@ -91,14 +94,70 @@ services:
       bk-init:
         condition: service_completed_successfully
     ports:
-      - "3181:3181"  # BookKeeper V2/V3 wire protocol
-      - "8081:8080"  # HTTP admin API (mapped to 8081 on host to avoid
-                     # collision with Pulsar broker's 8080)
+      - "3181:3181"
+      - "8081:8080"
     environment:
       RUST_LOG: info
+    command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-1"]
     volumes:
-      - bk_data:/bk/data
-      - bk_journal:/bk/journal
+      - bk1_data:/bk/data
+      - bk1_journal:/bk/journal
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  rust-bookie-2:
+    image: rust-bookie:latest
+    container_name: rustbk-rust-bookie-2
+    hostname: rust-bookie-2
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      bk-init:
+        condition: service_completed_successfully
+      rust-bookie-1:
+        condition: service_started
+    ports:
+      - "3182:3181"
+      - "8082:8080"
+    environment:
+      RUST_LOG: info
+    command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-2"]
+    volumes:
+      - bk2_data:/bk/data
+      - bk2_journal:/bk/journal
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  rust-bookie-3:
+    image: rust-bookie:latest
+    container_name: rustbk-rust-bookie-3
+    hostname: rust-bookie-3
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      bk-init:
+        condition: service_completed_successfully
+      rust-bookie-1:
+        condition: service_started
+    ports:
+      - "3183:3181"
+      - "8083:8080"
+    environment:
+      RUST_LOG: info
+    command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-3"]
+    volumes:
+      - bk3_data:/bk/data
+      - bk3_journal:/bk/journal
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
       interval: 5s
@@ -147,7 +206,11 @@ services:
     depends_on:
       pulsar-init:
         condition: service_completed_successfully
-      rust-bookie:
+      rust-bookie-1:
+        condition: service_healthy
+      rust-bookie-2:
+        condition: service_healthy
+      rust-bookie-3:
         condition: service_healthy
     ports:
       - "6650:6650"  # Pulsar native (binary) protocol
@@ -164,10 +227,13 @@ services:
       PULSAR_PREFIX_brokerServicePort: "6650"
       PULSAR_PREFIX_webServicePort: "8080"
       PULSAR_PREFIX_advertisedAddress: pulsar-broker
-      # Single-bookie cluster — every managed ledger runs on our one bookie
-      PULSAR_PREFIX_managedLedgerDefaultEnsembleSize: "1"
-      PULSAR_PREFIX_managedLedgerDefaultWriteQuorum: "1"
-      PULSAR_PREFIX_managedLedgerDefaultAckQuorum: "1"
+      # Classic Pulsar replication: 3-bookie ensemble, write to all 3,
+      # acknowledge after 2. Survives losing 1 bookie without data loss
+      # and exercises the auto-recovery / fragment-replication paths
+      # that single-bookie setups can't reach.
+      PULSAR_PREFIX_managedLedgerDefaultEnsembleSize: "3"
+      PULSAR_PREFIX_managedLedgerDefaultWriteQuorum: "2"
+      PULSAR_PREFIX_managedLedgerDefaultAckQuorum: "2"
       # Keep memory usage reasonable for a laptop
       PULSAR_MEM: "-Xms512m -Xmx1g -XX:MaxDirectMemorySize=512m"
     command: >
@@ -185,5 +251,9 @@ services:
 volumes:
   zk_data:
   zk_datalog:
-  bk_data:
-  bk_journal:
+  bk1_data:
+  bk1_journal:
+  bk2_data:
+  bk2_journal:
+  bk3_data:
+  bk3_journal:

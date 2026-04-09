@@ -56,6 +56,10 @@ enum Commands {
         /// Override: ZooKeeper ledger root path
         #[arg(long, default_value = "/ledgers")]
         ledger_root: String,
+        /// Override: the bookie ID advertised in ZK (e.g., "rust-bookie-1").
+        /// Required when running multiple bookies behind a shared config file.
+        #[arg(long)]
+        advertised_address: Option<String>,
     },
     /// Run a sanity test: start bookie, write entries, read back, verify
     Bookiesanity {
@@ -447,8 +451,8 @@ async fn main() {
         Commands::Listbookies { zk, ledger_root, rw, ro, all } => {
             cmd_listbookies(&zk, &ledger_root, rw, ro, all).await
         }
-        Commands::Serve { conf, port, data_dir, zk, ledger_root } => {
-            cmd_serve(conf, port, data_dir, zk, ledger_root).await
+        Commands::Serve { conf, port, data_dir, zk, ledger_root, advertised_address } => {
+            cmd_serve(conf, port, data_dir, zk, ledger_root, advertised_address).await
         }
         Commands::Bookiesanity { entries, data_dir } => {
             cmd_bookiesanity(entries, data_dir).await
@@ -672,6 +676,7 @@ async fn cmd_serve(
     data_dir: Option<String>,
     zk: Option<String>,
     ledger_root: String,
+    advertised_address: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bookkeeper_config::server::ServerConfig;
     use bookkeeper_server::server::BookieServer;
@@ -692,6 +697,7 @@ async fn cmd_serve(
         config.journal_directory = d.clone();
     }
     if let Some(ref z) = zk { config.zk_servers = Some(z.clone()); }
+    if let Some(a) = advertised_address { config.advertised_address = Some(a); }
     config.zk_ledger_root = ledger_root;
 
     // Ensure directories exist

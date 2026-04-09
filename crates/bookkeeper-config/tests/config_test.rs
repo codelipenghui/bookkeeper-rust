@@ -75,7 +75,9 @@ fn docker_compose_bk_server_conf_parses() {
         .expect("docker/bk_server.conf should parse");
     assert_eq!(config.bookie_port, 3181);
     assert_eq!(config.listening_interface.as_deref(), Some("0.0.0.0"));
-    assert_eq!(config.advertised_address.as_deref(), Some("rust-bookie"));
+    // advertisedAddress is intentionally absent from the shared config file;
+    // the compose stack overrides it per-bookie via `bk serve --advertised-address`
+    assert_eq!(config.advertised_address, None);
     assert_eq!(config.zk_servers.as_deref(), Some("zookeeper:2181"));
     assert_eq!(config.zk_ledger_root, "/ledgers");
     assert_eq!(config.journal_directory, "/bk/journal");
