@@ -229,11 +229,12 @@ services:
       PULSAR_PREFIX_brokerServicePort: "6650"
       PULSAR_PREFIX_webServicePort: "8080"
       PULSAR_PREFIX_advertisedAddress: pulsar-broker
-      # Classic Pulsar replication: 3-bookie ensemble, write to all 3,
-      # acknowledge after 2. Survives losing 1 bookie without data loss
-      # and exercises the auto-recovery / fragment-replication paths
-      # that single-bookie setups can't reach.
-      PULSAR_PREFIX_managedLedgerDefaultEnsembleSize: "3"
+      # Ensemble=2 / write=2 / ack=2 against a 3-bookie cluster.
+      # Each ledger uses 2 of the 3 bookies; the third is a standby
+      # that can be swapped in via ensemble-change if one of the two
+      # in-use bookies fails (exercised by the Rust client's
+      # `WriteHandle::on_ensemble_change` callback + auditor).
+      PULSAR_PREFIX_managedLedgerDefaultEnsembleSize: "2"
       PULSAR_PREFIX_managedLedgerDefaultWriteQuorum: "2"
       PULSAR_PREFIX_managedLedgerDefaultAckQuorum: "2"
       # Keep memory usage reasonable for a laptop

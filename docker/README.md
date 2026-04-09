@@ -154,18 +154,26 @@ docker compose logs -f rust-bookie-1 | grep -i "auditor\|replicat"
 
 ## Replication config
 
-Pulsar is configured for `E=3 / W=2 / A=2`:
-- **Ensemble size 3** — each managed ledger spans all 3 bookies
-- **Write quorum 2** — every entry is written to 2 of the 3
-- **Ack quorum 2** — the client waits for 2 acknowledgments
+Pulsar is configured for `E=2 / W=2 / A=2` against a 3-bookie cluster:
+- **Ensemble size 2** — each managed ledger uses 2 of the 3 bookies
+- **Write quorum 2** — every entry is written to both bookies in the ensemble
+- **Ack quorum 2** — the client waits for both to acknowledge
+- **The 3rd bookie is a standby** — when one of the two in-use bookies
+  fails, Pulsar's BK client performs an *ensemble change* mid-ledger
+  and swaps the failed bookie for the standby. New entries are then
+  written to the new pair.
 
-This tolerates one bookie failure without data loss or write
-interruption. Killing a bookie triggers the auditor (running in-
-process on every Rust bookie) to mark affected ledgers as
-under-replicated; the replication worker then copies missing
-fragments once the bookie comes back. Both code paths are exercised
-by the integration tests under
-`crates/bookkeeper-replication/tests/worker_e2e_test.rs`.
+Killing a bookie triggers two distinct code paths in the Rust bookie:
+1. **Ensemble change** (live) — the client that was writing detects
+   the failure on its next add, picks the standby bookie, rewrites the
+   in-memory ensemble, and updates the ledger metadata via CAS. Covered
+   by `crates/bookkeeper-client/tests/handle_test.rs`.
+2. **Auto-recovery** (background) — the auditor running in-process on
+   every Rust bookie detects that some ledger fragments are now
+   under-replicated (one of their ensemble bookies is gone), marks
+   them in ZK, and the replication worker copies the missing fragments
+   to the replacement bookie. Covered by
+   `crates/bookkeeper-replication/tests/worker_e2e_test.rs`.
 
 ## Troubleshooting
 
