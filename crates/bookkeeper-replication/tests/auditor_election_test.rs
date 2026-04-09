@@ -18,67 +18,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bookkeeper_metadata::traits::{LedgerLayout, LedgerManager, RegistrationManager};
+use bookkeeper_metadata::traits::LedgerManager;
 use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
-use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
 use bookkeeper_metadata::zk_path::ZkPaths;
 use bookkeeper_replication::auditor_election::AuditorElector;
 use bookkeeper_replication::text_format::parse_auditor_vote;
 use bookkeeper_replication::underreplication::ZkUnderreplicationManager;
-use testcontainers::{
-    core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
-};
-use tokio::sync::{watch, OnceCell};
+use bookkeeper_test_utils::{bootstrap_cluster, shared_zk};
+use tokio::sync::watch;
 use zookeeper_client as zk;
-
-// ---------------------------------------------------------------------------
-// Shared ZK fixture
-// ---------------------------------------------------------------------------
-
-struct ZkFixture {
-    _container: ContainerAsync<GenericImage>,
-    connect: String,
-}
-
-static ZK: OnceCell<Option<Arc<ZkFixture>>> = OnceCell::const_new();
-
-async fn shared_zk() -> Option<String> {
-    let fixture = ZK
-        .get_or_init(|| async {
-            let image = GenericImage::new("zookeeper", "3.8")
-                .with_wait_for(WaitFor::message_on_stdout("binding to port"))
-                .with_exposed_port(2181.into())
-                .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
-
-            match image.start().await {
-                Ok(container) => {
-                    let port = container.get_host_port_ipv4(2181).await.ok()?;
-                    Some(Arc::new(ZkFixture {
-                        _container: container,
-                        connect: format!("127.0.0.1:{port}"),
-                    }))
-                }
-                Err(e) => {
-                    eprintln!("[SKIP] Docker/zookeeper unavailable: {e}");
-                    None
-                }
-            }
-        })
-        .await;
-    fixture.as_ref().map(|f| f.connect.clone())
-}
-
-async fn bootstrap_cluster(connect: &str, root: &str) {
-    let mgr = ZkRegistrationManager::new(connect, root).await.unwrap();
-    let layout = LedgerLayout {
-        manager_factory_class:
-            "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory".to_string(),
-        manager_version: 1,
-    };
-    mgr.init_new_cluster(&layout, &uuid::Uuid::new_v4().to_string())
-        .await
-        .unwrap();
-}
 
 /// Spawn an `AuditorElector::run` in a tokio task, returning the shutdown
 /// channel and the join handle. Each elector gets its own ZK clients

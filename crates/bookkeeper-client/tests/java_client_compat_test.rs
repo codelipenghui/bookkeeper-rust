@@ -29,16 +29,8 @@
 
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
-use std::time::Duration;
 
-use bookkeeper_config::server::ServerConfig;
-use bookkeeper_metadata::traits::{LedgerLayout, RegistrationManager};
-use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
-use bookkeeper_server::server::BookieServer;
-use tempfile::TempDir;
-use testcontainers::{
-    core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
-};
+use bookkeeper_test_utils::{bootstrap_cluster, shared_zk, spawn_bookie};
 
 // ---------------------------------------------------------------------------
 // Prerequisite detection
@@ -48,8 +40,8 @@ fn workspace_root() -> PathBuf {
     // crates/bookkeeper-client/tests/java_client_compat_test.rs → ../../..
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
+        .parent()
+        .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
         .unwrap_or(manifest)
 }
@@ -83,65 +75,6 @@ fn check_prerequisites() -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// Container + bookie fixtures
-// ---------------------------------------------------------------------------
-
-async fn start_zk() -> Option<(ContainerAsync<GenericImage>, String)> {
-    let image = GenericImage::new("zookeeper", "3.8")
-        .with_wait_for(WaitFor::message_on_stdout("binding to port"))
-        .with_exposed_port(2181.into())
-        .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
-
-    match image.start().await {
-        Ok(container) => {
-            let port = container.get_host_port_ipv4(2181).await.ok()?;
-            Some((container, format!("127.0.0.1:{port}")))
-        }
-        Err(e) => {
-            eprintln!("[SKIP] Docker/zookeeper unavailable: {e}");
-            None
-        }
-    }
-}
-
-async fn init_cluster(connect: &str, root: &str) {
-    let mgr = ZkRegistrationManager::new(connect, root).await.unwrap();
-    let layout = LedgerLayout {
-        manager_factory_class: "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"
-            .to_string(),
-        manager_version: 1,
-    };
-    mgr.init_new_cluster(&layout, &uuid::Uuid::new_v4().to_string())
-        .await
-        .unwrap();
-}
-
-async fn spawn_rust_bookie(zk_connect: &str, root: &str) -> (BookieServer, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let mut config = ServerConfig::default();
-    config.bookie_port = 0;
-    // Bind to 127.0.0.1 (not 0.0.0.0) so the bookie registers a connectable
-    // address in ZK. The Java client discovers bookies via ZK and tries to
-    // connect to whatever bookie_id is registered there — `0.0.0.0:port` is
-    // not a valid destination.
-    config.listening_interface = Some("127.0.0.1".to_string());
-    // Disable disk-based read-only mode for the test. The default threshold
-    // (95%) trips on dev machines whose root volume is more full than that,
-    // sending the bookie into ReadOnly at startup and breaking write paths
-    // even though we're testing wire compatibility, not disk monitoring.
-    config.read_only_mode_enabled = false;
-    config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
-    config.journal_directory = dir.path().to_string_lossy().to_string();
-    config.zk_servers = Some(zk_connect.to_string());
-    config.zk_ledger_root = root.to_string();
-    let server = BookieServer::start(config).await.unwrap();
-    // Give ZK ephemeral registration a moment to land before the Java
-    // client starts and queries available bookies.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    (server, dir)
-}
-
-// ---------------------------------------------------------------------------
 // Test
 // ---------------------------------------------------------------------------
 
@@ -151,11 +84,11 @@ async fn java_client_runs_full_compat_suite_against_rust_bookie() {
         eprintln!("[SKIP] java client compat: {reason}");
         return;
     }
-    let Some((_zk, zk_connect)) = start_zk().await else { return; };
+    let Some(zk_connect) = shared_zk().await else { return; };
     let root = "/ledgers"; // hard-coded in pom.xml's metadataServiceUri builder
-    init_cluster(&zk_connect, root).await;
+    bootstrap_cluster(&zk_connect, root).await;
 
-    let (bookie, _dir) = spawn_rust_bookie(&zk_connect, root).await;
+    let (bookie, _dir) = spawn_bookie(&zk_connect, root).await;
     eprintln!(
         "[java-compat] ZK={} bookie={}",
         zk_connect,

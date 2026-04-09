@@ -7,24 +7,9 @@
 //!
 //! Skipped gracefully if Docker is unavailable.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use assert_cmd::Command;
-use bookkeeper_client::zk_client::ZkBookKeeper;
-use bookkeeper_config::server::ServerConfig;
-use bookkeeper_protocol::digest::DigestType;
-use bookkeeper_server::server::BookieServer;
+use bookkeeper_test_utils::{create_ledger_and_close, shared_zk, spawn_bookies};
 use predicates::prelude::*;
-use tempfile::TempDir;
-use testcontainers::{
-    core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
-};
-use tokio::sync::OnceCell;
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
 
 /// Build a `bk` Command with logging suppressed. Without this the CLI's
 /// tracing-subscriber writes INFO lines to stdout, contaminating any output
@@ -35,80 +20,12 @@ fn bk() -> Command {
     cmd
 }
 
-struct ZkFixture {
-    _container: ContainerAsync<GenericImage>,
-    connect: String,
-}
-
-static ZK: OnceCell<Option<Arc<ZkFixture>>> = OnceCell::const_new();
-
-async fn shared_zk() -> Option<String> {
-    let fixture = ZK
-        .get_or_init(|| async {
-            let image = GenericImage::new("zookeeper", "3.8")
-                .with_wait_for(WaitFor::message_on_stdout("binding to port"))
-                .with_exposed_port(2181.into())
-                .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
-
-            match image.start().await {
-                Ok(container) => {
-                    let port = container.get_host_port_ipv4(2181).await.ok()?;
-                    Some(Arc::new(ZkFixture {
-                        _container: container,
-                        connect: format!("127.0.0.1:{port}"),
-                    }))
-                }
-                Err(e) => {
-                    eprintln!("[SKIP] Docker/zookeeper unavailable: {e}");
-                    None
-                }
-            }
-        })
-        .await;
-    fixture.as_ref().map(|f| f.connect.clone())
-}
-
-/// Spawn N in-process Rust bookies registered against the given ZK.
-async fn spawn_bookies(
-    n: usize,
-    zk_connect: &str,
-    ledger_root: &str,
-) -> (Vec<BookieServer>, Vec<TempDir>, Vec<String>) {
-    let mut bookies = Vec::new();
-    let mut dirs = Vec::new();
-    let mut addrs = Vec::new();
-    for _ in 0..n {
-        let dir = TempDir::new().unwrap();
-        let mut config = ServerConfig::default();
-        config.bookie_port = 0;
-        config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
-        config.journal_directory = dir.path().to_string_lossy().to_string();
-        config.zk_servers = Some(zk_connect.to_string());
-        config.zk_ledger_root = ledger_root.to_string();
-        let server = BookieServer::start(config).await.unwrap();
-        addrs.push(server.local_addr().to_string());
-        bookies.push(server);
-        dirs.push(dir);
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    (bookies, dirs, addrs)
-}
-
-/// Create + close a small ledger using ZkBookKeeper. Returns the ledger ID.
+/// Local wrapper preserving this file's `create_test_ledger(zk, root, n)`
+/// signature — all callers in this file use ensemble=3 and the `clitest`
+/// password. Tests that need a different shape can call
+/// `create_ledger_and_close` directly.
 async fn create_test_ledger(zk_connect: &str, root: &str, n_entries: i64) -> i64 {
-    let mut bk = ZkBookKeeper::new(zk_connect, root).await.unwrap();
-    let (mut wh, conns) = bk
-        .create_ledger(3, 3, 3, DigestType::Crc32c, b"clitest")
-        .await
-        .unwrap();
-    let lid = wh.ledger_id();
-    for i in 0..n_entries {
-        wh.append(&conns, format!("entry-{i}").as_bytes())
-            .await
-            .unwrap();
-    }
-    bk.close_ledger(&wh).await.unwrap();
-    lid
+    create_ledger_and_close(zk_connect, root, 3, 3, 3, b"clitest", n_entries).await
 }
 
 // ---------------------------------------------------------------------------

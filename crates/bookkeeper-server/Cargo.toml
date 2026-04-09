@@ -37,6 +37,7 @@ libc = "0.2"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 bookkeeper-config = { workspace = true }
+bookkeeper-test-utils = { workspace = true }
 rcgen = "0.13"
 testcontainers = "0.23"
 uuid = { workspace = true }

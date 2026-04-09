@@ -27,114 +27,32 @@
 //!
 //! Skipped gracefully if Docker is unavailable.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use bookkeeper_client::zk_client::ZkBookKeeper;
-use bookkeeper_config::server::ServerConfig;
-use bookkeeper_metadata::traits::{LedgerLayout, RegistrationManager};
-use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
-use bookkeeper_protocol::digest::DigestType;
 use bookkeeper_server::server::BookieServer;
-use tempfile::TempDir;
-use testcontainers::{
-    core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
+use bookkeeper_test_utils::{
+    bootstrap_cluster, create_ledger_and_close, shared_zk, spawn_bookie_with_http,
 };
-use tokio::sync::OnceCell;
-
-// ---------------------------------------------------------------------------
-// Shared ZK fixture
-// ---------------------------------------------------------------------------
-
-struct ZkFixture {
-    _container: ContainerAsync<GenericImage>,
-    connect: String,
-}
-
-static ZK: OnceCell<Option<Arc<ZkFixture>>> = OnceCell::const_new();
-
-async fn shared_zk() -> Option<String> {
-    let fixture = ZK
-        .get_or_init(|| async {
-            let image = GenericImage::new("zookeeper", "3.8")
-                .with_wait_for(WaitFor::message_on_stdout("binding to port"))
-                .with_exposed_port(2181.into())
-                .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
-
-            match image.start().await {
-                Ok(container) => {
-                    let port = container.get_host_port_ipv4(2181).await.ok()?;
-                    Some(Arc::new(ZkFixture {
-                        _container: container,
-                        connect: format!("127.0.0.1:{port}"),
-                    }))
-                }
-                Err(e) => {
-                    eprintln!("[SKIP] Docker/zookeeper unavailable: {e}");
-                    None
-                }
-            }
-        })
-        .await;
-    fixture.as_ref().map(|f| f.connect.clone())
-}
-
-async fn bootstrap_cluster(connect: &str, root: &str) {
-    let mgr = ZkRegistrationManager::new(connect, root).await.unwrap();
-    let layout = LedgerLayout {
-        manager_factory_class:
-            "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory".to_string(),
-        manager_version: 1,
-    };
-    mgr.init_new_cluster(&layout, &uuid::Uuid::new_v4().to_string())
-        .await
-        .unwrap();
-}
-
-/// Spawn an in-process Rust bookie wired to the given ZK + ledger root,
-/// with the HTTP admin API enabled on an OS-assigned port.
-async fn spawn_bookie(connect: &str, root: &str) -> (BookieServer, TempDir) {
-    let dir = TempDir::new().unwrap();
-    let mut config = ServerConfig::default();
-    config.bookie_port = 0;
-    // Bind to 127.0.0.1 so the bookie's ZK registration is connectable
-    // from any client running on the same machine.
-    config.listening_interface = Some("127.0.0.1".to_string());
-    // Disable disk-based read-only mode: the default 95% threshold trips
-    // on dev machines whose root volume is more full than that.
-    config.read_only_mode_enabled = false;
-    config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
-    config.journal_directory = dir.path().to_string_lossy().to_string();
-    config.zk_servers = Some(connect.to_string());
-    config.zk_ledger_root = root.to_string();
-    config.http_server_enabled = true;
-    config.http_server_port = 0; // OS-assigned
-
-    let server = BookieServer::start(config).await.unwrap();
-    // Brief settle for ZK ephemeral registration + auditor election
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    (server, dir)
-}
 
 fn http_url(server: &BookieServer, path: &str) -> String {
     let addr = server.http_addr().expect("http server enabled");
     format!("http://{addr}{path}")
 }
 
+/// Wrapper for this file's tests — uses ensemble=1 with the `http-test`
+/// password and an `e{i}` payload. Tests needing a different shape can
+/// call `bookkeeper_test_utils::create_ledger_and_close` directly.
 async fn create_test_ledger(connect: &str, root: &str, n_entries: i64) -> i64 {
-    let mut bk = ZkBookKeeper::new(connect, root).await.unwrap();
-    let (mut wh, conns) = bk
-        .create_ledger(1, 1, 1, DigestType::Crc32c, b"http-test")
-        .await
-        .unwrap();
-    let lid = wh.ledger_id();
-    for i in 0..n_entries {
-        wh.append(&conns, format!("e{i}").as_bytes())
-            .await
-            .unwrap();
-    }
-    bk.close_ledger(&wh).await.unwrap();
-    lid
+    create_ledger_and_close(connect, root, 1, 1, 1, b"http-test", n_entries).await
+}
+
+/// Local alias so test bodies can keep calling `spawn_bookie(...)` while
+/// the underlying helper lives in the shared crate.
+async fn spawn_bookie(
+    connect: &str,
+    root: &str,
+) -> (BookieServer, tempfile::TempDir) {
+    spawn_bookie_with_http(connect, root).await
 }
 
 // ---------------------------------------------------------------------------

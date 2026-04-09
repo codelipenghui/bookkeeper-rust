@@ -32,3 +32,4 @@ bookkeeper-storage = { workspace = true }
 assert_cmd = "2"
 predicates = "3"
 testcontainers = "0.23"
+bookkeeper-test-utils = { workspace = true }

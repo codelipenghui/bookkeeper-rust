@@ -6,99 +6,14 @@
 //!   - open-with-recovery on an unclosed ledger
 //!   - password mismatch rejection
 //!
-//! All tests share a single ZK container (started lazily on first use via
-//! `OnceCell`) and isolate themselves via per-test ZK ledger root paths,
-//! so they can run in parallel without collisions. The bookies are spawned
-//! in-process per test, with a fresh tmp dir per bookie.
+//! Shares ZK + bookie-spawning fixtures via `bookkeeper_test_utils`. Each
+//! test uses a distinct ZK ledger root path so they can run in parallel.
 //!
 //! Skipped gracefully if Docker is unavailable.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use bookkeeper_client::zk_client::ZkBookKeeper;
-use bookkeeper_config::server::ServerConfig;
-use bookkeeper_metadata::traits::{LedgerLayout, RegistrationManager};
-use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
 use bookkeeper_protocol::digest::DigestType;
-use bookkeeper_server::server::BookieServer;
-use tempfile::TempDir;
-use testcontainers::{
-    core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
-};
-use tokio::sync::OnceCell;
-
-// ---------------------------------------------------------------------------
-// Shared ZK fixture
-// ---------------------------------------------------------------------------
-
-/// Holds the long-lived ZK container and its host:port. The container handle
-/// must outlive every test, so it sits in a process-global `OnceCell` and is
-/// dropped when the test binary exits.
-struct ZkFixture {
-    _container: ContainerAsync<GenericImage>,
-    connect: String,
-}
-
-static ZK: OnceCell<Option<Arc<ZkFixture>>> = OnceCell::const_new();
-
-/// Lazily start (or reuse) the shared ZK container. Returns `Some(connect)`
-/// if Docker is available, `None` otherwise — every test then skips cleanly.
-async fn shared_zk() -> Option<String> {
-    let fixture = ZK
-        .get_or_init(|| async {
-            let image = GenericImage::new("zookeeper", "3.8")
-                .with_wait_for(WaitFor::message_on_stdout("binding to port"))
-                .with_exposed_port(2181.into())
-                .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
-
-            match image.start().await {
-                Ok(container) => {
-                    let port = container.get_host_port_ipv4(2181).await.ok()?;
-                    Some(Arc::new(ZkFixture {
-                        _container: container,
-                        connect: format!("127.0.0.1:{port}"),
-                    }))
-                }
-                Err(e) => {
-                    eprintln!("[SKIP] Docker/zookeeper unavailable: {e}");
-                    None
-                }
-            }
-        })
-        .await;
-    fixture.as_ref().map(|f| f.connect.clone())
-}
-
-/// Initialize a fresh BK cluster at the given ZK root.
-async fn init_cluster(connect: &str, ledger_root: &str) {
-    let mgr = ZkRegistrationManager::new(connect, ledger_root)
-        .await
-        .unwrap();
-    let layout = LedgerLayout {
-        manager_factory_class:
-            "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory".to_string(),
-        manager_version: 1,
-    };
-    let instance_id = uuid::Uuid::new_v4().to_string();
-    mgr.init_new_cluster(&layout, &instance_id).await.unwrap();
-}
-
-/// Build a bookie config that registers with ZK at the given ledger root.
-fn zk_bookie_config(dir: &TempDir, connect: &str, ledger_root: &str) -> ServerConfig {
-    let mut config = ServerConfig::default();
-    config.bookie_port = 0;
-    config.listening_interface = Some("127.0.0.1".to_string());
-    // Disable disk-based read-only mode: the default 95% threshold trips on
-    // dev machines whose root volume is more full than that, leaving the
-    // bookie stuck in ReadOnly at startup and breaking the write path.
-    config.read_only_mode_enabled = false;
-    config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
-    config.journal_directory = dir.path().to_string_lossy().to_string();
-    config.zk_servers = Some(connect.to_string());
-    config.zk_ledger_root = ledger_root.to_string();
-    config
-}
+use bookkeeper_test_utils::{bootstrap_cluster, shared_zk, spawn_bookie};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -109,14 +24,8 @@ fn zk_bookie_config(dir: &TempDir, connect: &str, ledger_root: &str) -> ServerCo
 async fn zk_create_write_close_open_read_delete() {
     let Some(connect) = shared_zk().await else { return; };
     let root = "/test-lifecycle";
-    init_cluster(&connect, root).await;
-
-    let dir = TempDir::new().unwrap();
-    let server = BookieServer::start(zk_bookie_config(&dir, &connect, root))
-        .await
-        .unwrap();
-    // Brief settle for ZK ephemeral registration
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    bootstrap_cluster(&connect, root).await;
+    let (server, _dir) = spawn_bookie(&connect, root).await;
 
     let mut bk = ZkBookKeeper::new(&connect, root).await.unwrap();
 
@@ -164,13 +73,8 @@ async fn zk_create_write_close_open_read_delete() {
 async fn zk_multiple_ledgers() {
     let Some(connect) = shared_zk().await else { return; };
     let root = "/test-multi";
-    init_cluster(&connect, root).await;
-
-    let dir = TempDir::new().unwrap();
-    let server = BookieServer::start(zk_bookie_config(&dir, &connect, root))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    bootstrap_cluster(&connect, root).await;
+    let (server, _dir) = spawn_bookie(&connect, root).await;
 
     let mut bk = ZkBookKeeper::new(&connect, root).await.unwrap();
     let password = b"multi-test";
@@ -213,13 +117,8 @@ async fn zk_multiple_ledgers() {
 async fn zk_open_with_recovery() {
     let Some(connect) = shared_zk().await else { return; };
     let root = "/test-recovery";
-    init_cluster(&connect, root).await;
-
-    let dir = TempDir::new().unwrap();
-    let server = BookieServer::start(zk_bookie_config(&dir, &connect, root))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    bootstrap_cluster(&connect, root).await;
+    let (server, _dir) = spawn_bookie(&connect, root).await;
 
     let mut bk = ZkBookKeeper::new(&connect, root).await.unwrap();
     let password = b"recovery-test";
@@ -265,13 +164,8 @@ async fn zk_open_with_recovery() {
 async fn zk_password_mismatch() {
     let Some(connect) = shared_zk().await else { return; };
     let root = "/test-password";
-    init_cluster(&connect, root).await;
-
-    let dir = TempDir::new().unwrap();
-    let server = BookieServer::start(zk_bookie_config(&dir, &connect, root))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    bootstrap_cluster(&connect, root).await;
+    let (server, _dir) = spawn_bookie(&connect, root).await;
 
     let mut bk = ZkBookKeeper::new(&connect, root).await.unwrap();
     let (mut wh, conns) = bk

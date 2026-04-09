@@ -1,0 +1,18 @@
+[package]
+name = "bookkeeper-test-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared test fixtures for BookKeeper Rust integration tests (ZK containers, bookie spawning, test ledgers)."
+
+[dependencies]
+bookkeeper-config = { workspace = true }
+bookkeeper-server = { workspace = true }
+bookkeeper-client = { workspace = true }
+bookkeeper-metadata = { workspace = true }
+bookkeeper-protocol = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+testcontainers = "0.23"
+uuid = { workspace = true }
+zookeeper-client = { workspace = true }

@@ -23,4 +23,5 @@ testcontainers = "0.23"
 tokio = { workspace = true, features = ["test-util"] }
 bookkeeper-server = { workspace = true }
 bookkeeper-config = { workspace = true }
+bookkeeper-test-utils = { workspace = true }
 uuid = { workspace = true }

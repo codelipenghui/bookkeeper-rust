@@ -20,6 +20,7 @@ use std::time::Duration;
 use bookkeeper_client::bookie_connection::BookieConnection;
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::v2::response::V2Response;
+use bookkeeper_test_utils::{bootstrap_cluster, shared_zk};
 use bytes::Bytes;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -30,73 +31,34 @@ use tokio::sync::OnceCell;
 use tokio::time::sleep;
 
 // ---------------------------------------------------------------------------
-// Shared fixture
+// Java bookie fixture (ZK comes from bookkeeper_test_utils::shared_zk)
 // ---------------------------------------------------------------------------
 
-/// Holds the long-lived containers and the bookie's host-side address.
-/// The container handles must outlive every test, so we stash them in a
-/// process-global `OnceCell`. They are dropped (and the containers stopped)
-/// when the test binary exits.
-struct SharedFixture {
-    _zk: ContainerAsync<GenericImage>,
+/// Holds the long-lived Java bookie container and its host-side address.
+/// The ZK it's wired to is the process-shared `shared_zk()` fixture.
+struct JavaBookieFixture {
     _bookie: ContainerAsync<GenericImage>,
     bookie_addr: SocketAddr,
 }
 
-/// Process-global fixture. `None` means we tried to bring it up and Docker
-/// (or the bookie) was unavailable — every test then skips gracefully.
-static FIXTURE: OnceCell<Option<SharedFixture>> = OnceCell::const_new();
+static JAVA_BOOKIE: OnceCell<Option<JavaBookieFixture>> = OnceCell::const_new();
 
-/// Lazily build the shared fixture. Returns the bookie address, or `None`
-/// if Docker / the Java bookie image is unavailable on this host.
+/// Lazily start a Java BookKeeper bookie wired to the shared ZK. Returns
+/// the bookie address, or `None` if Docker / the image / the shared ZK are
+/// unavailable.
 async fn shared_bookie_addr() -> Option<SocketAddr> {
-    let fixture = FIXTURE
+    let fixture = JAVA_BOOKIE
         .get_or_init(|| async {
-            let (zk, zk_connect) = start_zk().await?;
-            init_cluster(&zk_connect).await;
+            let zk_connect = shared_zk().await?;
+            bootstrap_cluster(&zk_connect, "/ledgers").await;
             let (bookie, addr) = start_java_bookie(&zk_connect).await?;
-            Some(SharedFixture {
-                _zk: zk,
+            Some(JavaBookieFixture {
                 _bookie: bookie,
                 bookie_addr: addr,
             })
         })
         .await;
     fixture.as_ref().map(|f| f.bookie_addr)
-}
-
-/// Start a ZooKeeper container and return (container, "host:port").
-async fn start_zk() -> Option<(ContainerAsync<GenericImage>, String)> {
-    let image = GenericImage::new("zookeeper", "3.8")
-        .with_wait_for(WaitFor::message_on_stdout("binding to port"))
-        .with_exposed_port(2181.into())
-        .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
-
-    match image.start().await {
-        Ok(container) => {
-            let port = container.get_host_port_ipv4(2181).await.ok()?;
-            Some((container, format!("127.0.0.1:{port}")))
-        }
-        Err(e) => {
-            eprintln!("[SKIP] Docker/zookeeper unavailable: {e}");
-            None
-        }
-    }
-}
-
-/// Initialize the BookKeeper cluster in ZK using the Rust admin helper.
-async fn init_cluster(connect: &str) {
-    use bookkeeper_metadata::traits::{LedgerLayout, RegistrationManager};
-    use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
-
-    let mgr = ZkRegistrationManager::new(connect, "/ledgers").await.unwrap();
-    let layout = LedgerLayout {
-        manager_factory_class: "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"
-            .to_string(),
-        manager_version: 1,
-    };
-    let instance_id = uuid::Uuid::new_v4().to_string();
-    mgr.init_new_cluster(&layout, &instance_id).await.unwrap();
 }
 
 /// Start a Java BookKeeper bookie wired up to the given ZK.

@@ -2,61 +2,12 @@
 //!
 //! Exercises ZkUnderreplicationManager (mark/claim/release) and AuditorElector
 //! (leader election) against a live ZK server via testcontainers. Tests share
-//! a single ZK container via `OnceCell` and isolate themselves with per-test
-//! ZK ledger root paths.
+//! a single ZK container (via `bookkeeper_test_utils::shared_zk`) and isolate
+//! themselves with per-test ZK ledger root paths.
 
-use std::sync::Arc;
-
-use bookkeeper_metadata::traits::{LedgerLayout, RegistrationManager};
-use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
 use bookkeeper_metadata::zk_path::ZkPaths;
 use bookkeeper_replication::underreplication::ZkUnderreplicationManager;
-use testcontainers::{
-    core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
-};
-use tokio::sync::OnceCell;
-
-struct ZkFixture {
-    _container: ContainerAsync<GenericImage>,
-    connect: String,
-}
-
-static ZK: OnceCell<Option<Arc<ZkFixture>>> = OnceCell::const_new();
-
-async fn shared_zk() -> Option<String> {
-    let fixture = ZK
-        .get_or_init(|| async {
-            let image = GenericImage::new("zookeeper", "3.8")
-                .with_wait_for(WaitFor::message_on_stdout("binding to port"))
-                .with_exposed_port(2181.into())
-                .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
-
-            match image.start().await {
-                Ok(container) => {
-                    let port = container.get_host_port_ipv4(2181).await.ok()?;
-                    Some(Arc::new(ZkFixture {
-                        _container: container,
-                        connect: format!("127.0.0.1:{port}"),
-                    }))
-                }
-                Err(e) => {
-                    eprintln!("[SKIP] docker unavailable: {e}");
-                    None
-                }
-            }
-        })
-        .await;
-    fixture.as_ref().map(|f| f.connect.clone())
-}
-
-async fn bootstrap_cluster(connect: &str, root: &str) {
-    let mgr = ZkRegistrationManager::new(connect, root).await.unwrap();
-    let layout = LedgerLayout {
-        manager_factory_class: "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory".into(),
-        manager_version: 1,
-    };
-    mgr.init_new_cluster(&layout, "test-instance").await.unwrap();
-}
+use bookkeeper_test_utils::{bootstrap_cluster, shared_zk};
 
 // ---------------------------------------------------------------------------
 // ZkUnderreplicationManager

@@ -29,5 +29,6 @@ tempfile = "3"
 bookkeeper-storage = { workspace = true }
 bookkeeper-server = { workspace = true }
 bookkeeper-config = { workspace = true }
+bookkeeper-test-utils = { workspace = true }
 uuid = { workspace = true }
 testcontainers = "0.23"

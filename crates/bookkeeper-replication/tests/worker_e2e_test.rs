@@ -17,10 +17,8 @@ use std::time::Duration;
 
 use bookkeeper_client::bookie_connection::BookieConnection;
 use bookkeeper_client::zk_client::ZkBookKeeper;
-use bookkeeper_config::server::ServerConfig;
-use bookkeeper_metadata::traits::{LedgerLayout, LedgerManager, RegistrationManager};
+use bookkeeper_metadata::traits::LedgerManager;
 use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
-use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
 use bookkeeper_metadata::zk_path::ZkPaths;
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::digest::{generate_master_key, DigestType};
@@ -28,89 +26,8 @@ use bookkeeper_protocol::v2::response::V2Response;
 use bookkeeper_replication::auditor::Auditor;
 use bookkeeper_replication::underreplication::ZkUnderreplicationManager;
 use bookkeeper_replication::worker::ReplicationWorker;
-use bookkeeper_server::server::BookieServer;
-use tempfile::TempDir;
-use testcontainers::{
-    core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
-};
+use bookkeeper_test_utils::{bootstrap_cluster, shared_zk, spawn_bookies};
 use tokio::sync::watch;
-
-// ---------------------------------------------------------------------------
-// Test infrastructure
-// ---------------------------------------------------------------------------
-
-struct ZkFixture {
-    _container: ContainerAsync<GenericImage>,
-    connect: String,
-}
-
-static ZK: tokio::sync::OnceCell<Option<Arc<ZkFixture>>> = tokio::sync::OnceCell::const_new();
-
-async fn shared_zk() -> Option<String> {
-    let fixture = ZK
-        .get_or_init(|| async {
-            let image = GenericImage::new("zookeeper", "3.8")
-                .with_wait_for(WaitFor::message_on_stdout("binding to port"))
-                .with_exposed_port(2181.into())
-                .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
-
-            match image.start().await {
-                Ok(container) => {
-                    let port = container.get_host_port_ipv4(2181).await.ok()?;
-                    Some(Arc::new(ZkFixture {
-                        _container: container,
-                        connect: format!("127.0.0.1:{port}"),
-                    }))
-                }
-                Err(e) => {
-                    eprintln!("[SKIP] Docker/zookeeper unavailable: {e}");
-                    None
-                }
-            }
-        })
-        .await;
-    fixture.as_ref().map(|f| f.connect.clone())
-}
-
-async fn bootstrap_cluster(connect: &str, root: &str) {
-    let mgr = ZkRegistrationManager::new(connect, root).await.unwrap();
-    let layout = LedgerLayout {
-        manager_factory_class: "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"
-            .to_string(),
-        manager_version: 1,
-    };
-    mgr.init_new_cluster(&layout, &uuid::Uuid::new_v4().to_string())
-        .await
-        .unwrap();
-}
-
-/// Spawn N in-process Rust bookies registered with the given ZK.
-async fn spawn_bookies(
-    n: usize,
-    zk_connect: &str,
-    ledger_root: &str,
-) -> (Vec<BookieServer>, Vec<TempDir>, Vec<String>) {
-    let mut bookies = Vec::new();
-    let mut dirs = Vec::new();
-    let mut addrs = Vec::new();
-    for _ in 0..n {
-        let dir = TempDir::new().unwrap();
-        let mut config = ServerConfig::default();
-        config.bookie_port = 0;
-        config.ledger_directories = vec![dir.path().to_string_lossy().to_string()];
-        config.journal_directory = dir.path().to_string_lossy().to_string();
-        config.zk_servers = Some(zk_connect.to_string());
-        config.zk_ledger_root = ledger_root.to_string();
-
-        let server = BookieServer::start(config).await.unwrap();
-        addrs.push(server.local_addr().to_string());
-        bookies.push(server);
-        dirs.push(dir);
-    }
-    // Give ZK ephemeral registration a moment to land
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    (bookies, dirs, addrs)
-}
 
 /// Read entry payload from a single bookie via direct V2 read.
 async fn read_entry_from(

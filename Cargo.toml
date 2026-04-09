@@ -11,6 +11,7 @@ members = [
     "crates/bookkeeper-config",
     "crates/bookkeeper-cli",
     "crates/bookkeeper-replication",
+    "crates/bookkeeper-test-utils",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ bookkeeper-client = { path = "crates/bookkeeper-client" }
 bookkeeper-config = { path = "crates/bookkeeper-config" }
 bookkeeper-cli = { path = "crates/bookkeeper-cli" }
 bookkeeper-replication = { path = "crates/bookkeeper-replication" }
+bookkeeper-test-utils = { path = "crates/bookkeeper-test-utils" }
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 rand = "0.8"
