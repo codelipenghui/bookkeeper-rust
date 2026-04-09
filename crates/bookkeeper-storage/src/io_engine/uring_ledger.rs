@@ -29,6 +29,8 @@ const BUF_POOL_SIZE: usize = 64 * 1024;
 const BUF_POOL_COUNT: u16 = 256;
 /// Buffer group ID registered with the kernel.
 const BUF_GROUP_ID: u16 = 0;
+/// CQE flag indicating a provided buffer was consumed (IORING_CQE_F_BUFFER).
+const CQE_F_BUFFER: u32 = 0x1;
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -240,7 +242,14 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
         // ---- 1. Block on the first request ----
         let first = match rx.recv() {
             Ok(req) => req,
-            Err(_) => break, // channel disconnected = shutdown
+            Err(_) => {
+                // Channel disconnected = shutdown.
+                // Unregister buf pool while ring is still alive.
+                if let Some(ref pool) = buf_pool {
+                    pool.unregister(&ring);
+                }
+                break;
+            }
         };
 
         // ---- 2. Drain all immediately available requests ----
@@ -540,7 +549,6 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                 PendingOp::Read {
                     buf, len, reply, ..
                 } => {
-                    let _ = cqe_flags;
                     let result = if ret < 0 {
                         Err(io::Error::from_raw_os_error(-ret))
                     } else if (ret as usize) < len {
@@ -554,8 +562,16 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     let _ = reply.send(result);
                 }
                 PendingOp::PoolRead { len, reply } => {
-                    let has_buffer = cqe_flags & 0x1 != 0; // IORING_CQE_F_BUFFER
-                    let result = if ret < 0 {
+                    let has_buffer = cqe_flags & CQE_F_BUFFER != 0;
+                    let result = if ret == -(libc::ENOBUFS as i32) {
+                        // Pool exhausted — not a real I/O error. Return a
+                        // transient error so the caller can retry. The pool
+                        // refills as other in-flight reads complete.
+                        Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "provided buffer pool exhausted",
+                        ))
+                    } else if ret < 0 {
                         if has_buffer {
                             let buf_id = (cqe_flags >> 16) as u16;
                             buf_pool.as_ref().unwrap().return_buf(buf_id);
@@ -587,24 +603,21 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     reply,
                     ..
                 } => {
-                    let _ = cqe_flags;
                     let result = if ret < 0 {
                         Err(io::Error::from_raw_os_error(-ret))
-                    } else {
-                        // Handle short writes via blocking fallback.
-                        if (ret as usize) < total_bytes {
-                            if let Err(e) =
-                                retry_short_pwrite(fd, &entries, offset, ret as usize)
-                            {
-                                Err(e)
-                            } else {
-                                Ok(build_offset_vec(offset, &entries))
-                            }
+                    } else if (ret as usize) < total_bytes {
+                        if let Err(e) =
+                            retry_short_pwrite(fd, &entries, offset, ret as usize)
+                        {
+                            Err(e)
                         } else {
                             Ok(build_offset_vec(offset, &entries))
                         }
+                    } else {
+                        Ok(build_offset_vec(offset, &entries))
                     };
                     let _ = reply.send(result);
+                    let _ = cqe_flags; // writes don't use CQE flags
                 }
             }
         }
@@ -636,7 +649,6 @@ impl BufferPool {
     fn try_new(ring: &IoUring<io_uring::squeue::Entry>) -> Option<Self> {
         let entries = BUF_POOL_COUNT as usize;
         let entry_size = std::mem::size_of::<io_uring::types::BufRingEntry>();
-        // Ring needs space for entries.  Align to page boundary.
         let ring_size = entry_size * entries;
         let layout = std::alloc::Layout::from_size_align(ring_size, 4096).ok()?;
         let ring_ptr =
@@ -645,7 +657,6 @@ impl BufferPool {
             return None;
         }
 
-        // Register the buffer ring with the kernel.
         if unsafe {
             ring.submitter().register_buf_ring_with_flags(
                 ring_ptr as u64,
@@ -662,10 +673,8 @@ impl BufferPool {
             return None;
         }
 
-        // Allocate contiguous backing storage.
         let storage = vec![0u8; BUF_POOL_SIZE * entries];
 
-        // Fill ring entries and make all buffers available.
         for i in 0..entries {
             let buf_addr = unsafe { storage.as_ptr().add(i * BUF_POOL_SIZE) };
             let entry = unsafe { &mut *ring_ptr.add(i) };
@@ -674,7 +683,6 @@ impl BufferPool {
             entry.set_bid(i as u16);
         }
 
-        // Advance tail to make all entries visible to the kernel.
         let tail_ptr = unsafe {
             io_uring::types::BufRingEntry::tail(
                 ring_ptr as *const io_uring::types::BufRingEntry,
@@ -691,13 +699,11 @@ impl BufferPool {
         })
     }
 
-    /// Get a slice of the completed read data from the buffer pool.
     fn get_buf(&self, buf_id: u16, len: usize) -> &[u8] {
         let offset = (buf_id as usize) * BUF_POOL_SIZE;
         &self.storage[offset..offset + len]
     }
 
-    /// Return a buffer to the ring after copying the data out.
     fn return_buf(&self, buf_id: u16) {
         let entry = unsafe { &mut *self.ring_ptr.add(buf_id as usize) };
         let buf_addr =
@@ -706,23 +712,24 @@ impl BufferPool {
         entry.set_len(BUF_POOL_SIZE as u32);
         entry.set_bid(buf_id);
 
-        // Advance tail atomically.
         let tail_ptr = unsafe {
             io_uring::types::BufRingEntry::tail(
                 self.ring_ptr as *const io_uring::types::BufRingEntry,
             )
         };
         unsafe {
-            let old = (*tail_ptr).load(std::sync::atomic::Ordering::Acquire);
-            (*tail_ptr).store(old.wrapping_add(1), std::sync::atomic::Ordering::Release);
+            (*tail_ptr).fetch_add(1, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    /// Unregister from io_uring. Must be called while the ring is still alive.
+    fn unregister(&self, ring: &IoUring<io_uring::squeue::Entry>) {
+        let _ = ring.submitter().unregister_buf_ring(BUF_GROUP_ID);
     }
 }
 
 impl Drop for BufferPool {
     fn drop(&mut self) {
-        // Note: the io_uring ring is already gone by the time this drops
-        // (ring thread exit), so we just free the memory.
         unsafe {
             std::alloc::dealloc(self.ring_ptr as *mut u8, self.ring_layout);
         }
