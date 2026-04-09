@@ -99,6 +99,7 @@ impl DbLedgerStorage {
         journal_dir: &Path,
         config: crate::journal::writer::JournalConfig,
         journal_io: std::sync::Arc<dyn crate::io_engine::JournalIo>,
+        on_fatal_error: Option<crate::journal::writer::OnFatalError>,
     ) -> Result<usize, StorageError> {
         // Replay existing journal entries (crash recovery)
         let replayed = crate::journal::writer::replay_journal(journal_dir, |entry_data| {
@@ -126,7 +127,7 @@ impl DbLedgerStorage {
 
         // Start journal writer
         self.journal_dir = Some(journal_dir.to_path_buf());
-        self.journal = Some(crate::journal::writer::Journal::start(config, journal_io));
+        self.journal = Some(crate::journal::writer::Journal::start(config, journal_io, on_fatal_error));
 
         Ok(replayed)
     }

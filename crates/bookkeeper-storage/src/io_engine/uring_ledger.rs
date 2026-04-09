@@ -12,10 +12,6 @@ use io_uring::{opcode, types, IoUring};
 
 use super::LedgerIo;
 
-/// Submission-queue depth for ledger operations.
-///
-/// Larger than the journal depth because a future batching strategy may
-/// submit many independent reads in a single ring.
 const LEDGER_SQ_DEPTH: u32 = 256;
 
 /// Ledger I/O backend that uses `io_uring` for positional writes and reads.
@@ -23,11 +19,10 @@ const LEDGER_SQ_DEPTH: u32 = 256;
 /// The ring is created once in `new()` and reused across all calls.
 /// A `Mutex` serializes access since `IoUring` is `!Sync`.
 pub struct UringLedgerIo {
-    ring: Mutex<IoUring>,
+    ring: Mutex<IoUring<io_uring::squeue::Entry>>,
 }
 
 impl UringLedgerIo {
-    /// Create a new instance with a persistent io_uring ring.
     pub fn new() -> io::Result<Self> {
         let ring = IoUring::<io_uring::squeue::Entry>::new(LEDGER_SQ_DEPTH)?;
         Ok(Self {
@@ -46,7 +41,6 @@ impl LedgerIo for UringLedgerIo {
             io::Error::new(io::ErrorKind::Other, "ledger ring lock poisoned")
         })?;
 
-        // Build iovec array for scatter-gather write.
         let iovecs: Vec<libc::iovec> = entries
             .iter()
             .map(|e| libc::iovec {
@@ -54,6 +48,8 @@ impl LedgerIo for UringLedgerIo {
                 iov_len: e.len(),
             })
             .collect();
+
+        let total_bytes: usize = entries.iter().map(|e| e.len()).sum();
 
         let write_sqe = opcode::Writev::new(
             types::Fd(fd),
@@ -64,7 +60,6 @@ impl LedgerIo for UringLedgerIo {
         .build()
         .user_data(1);
 
-        // Safety: iovecs and buffer slices live until submit_and_wait returns.
         unsafe {
             ring.submission()
                 .push(&write_sqe)
@@ -74,12 +69,17 @@ impl LedgerIo for UringLedgerIo {
         ring.submit_and_wait(1)?;
 
         for cqe in ring.completion() {
-            if cqe.result() < 0 {
-                return Err(io::Error::from_raw_os_error(-cqe.result()));
+            let ret = cqe.result();
+            if ret < 0 {
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+            // Short write: retry remainder via blocking fallback
+            if (ret as usize) < total_bytes {
+                let written = ret as usize;
+                retry_short_pwrite(fd, entries, offset, written)?;
             }
         }
 
-        // Compute per-entry offsets.
         let mut offsets = Vec::with_capacity(entries.len());
         let mut pos = offset;
         for entry in entries {
@@ -101,7 +101,6 @@ impl LedgerIo for UringLedgerIo {
             .build()
             .user_data(1);
 
-        // Safety: buf lives until submit_and_wait returns.
         unsafe {
             ring.submission()
                 .push(&read_sqe)
@@ -125,4 +124,29 @@ impl LedgerIo for UringLedgerIo {
 
         Ok(buf)
     }
+}
+
+/// Retry remaining bytes after a short WRITEV using blocking pwrite.
+fn retry_short_pwrite(
+    fd: RawFd,
+    entries: &[&[u8]],
+    base_offset: u64,
+    already_written: usize,
+) -> io::Result<()> {
+    use std::io::Write;
+    let mut file = std::mem::ManuallyDrop::new(unsafe {
+        std::fs::File::from_raw_fd(fd)
+    });
+    // Seek to where the short write left off
+    file.seek(std::io::SeekFrom::Start(base_offset + already_written as u64))?;
+    let mut skip = already_written;
+    for entry in entries {
+        if skip >= entry.len() {
+            skip -= entry.len();
+            continue;
+        }
+        file.write_all(&entry[skip..])?;
+        skip = 0;
+    }
+    Ok(())
 }

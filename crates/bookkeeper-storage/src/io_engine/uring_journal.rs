@@ -13,11 +13,6 @@ use io_uring::{opcode, types, IoUring};
 
 use super::JournalIo;
 
-/// Submission-queue depth for the journal ring.
-///
-/// 64 is more than enough — we only ever submit 2 SQEs (write + fsync)
-/// per call, but a generous depth avoids needing to resize if the
-/// batching strategy changes later.
 const JOURNAL_SQ_DEPTH: u32 = 64;
 
 /// Journal I/O backend that uses `io_uring` for write + fsync.
@@ -25,11 +20,10 @@ const JOURNAL_SQ_DEPTH: u32 = 64;
 /// The ring is created once in `new()` and reused across all calls.
 /// A `Mutex` serializes access since `IoUring` is `!Sync`.
 pub struct UringJournalIo {
-    ring: Mutex<IoUring>,
+    ring: Mutex<IoUring<io_uring::squeue::Entry>>,
 }
 
 impl UringJournalIo {
-    /// Create a new instance with a persistent io_uring ring.
     pub fn new() -> io::Result<Self> {
         let ring = IoUring::<io_uring::squeue::Entry>::new(JOURNAL_SQ_DEPTH)?;
         Ok(Self {
@@ -57,27 +51,24 @@ impl JournalIo for UringJournalIo {
             })
             .collect();
 
-        // SQE 1: WRITEV at current file position.
-        // offset = u64::MAX (i.e. -1 as unsigned) means "use the file's
-        // current position", which for an append-mode journal fd is the
-        // end of file.
+        let total_bytes: usize = entries.iter().map(|e| e.len()).sum();
+
+        // SQE 1: WRITEV at current file position (append).
         let write_sqe = opcode::Writev::new(
             types::Fd(fd),
             iovecs.as_ptr(),
             iovecs.len() as u32,
         )
-        .offset(u64::MAX)
+        .offset(u64::MAX) // -1 = append at current position
         .build()
-        .flags(io_uring::squeue::Flags::IO_LINK) // chain: fsync waits for write
+        .flags(io_uring::squeue::Flags::IO_LINK)
         .user_data(1);
 
-        // SQE 2: FSYNC (fdatasync) linked after the write.
+        // SQE 2: FSYNC linked after the write.
         let fsync_sqe = opcode::Fsync::new(types::Fd(fd))
             .build()
             .user_data(2);
 
-        // Safety: the iovecs, fd, and buffer slices all live for the
-        // duration of the submit_and_wait call.
         unsafe {
             ring.submission()
                 .push(&write_sqe)
@@ -87,17 +78,77 @@ impl JournalIo for UringJournalIo {
                 .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
         }
 
-        // Submit both SQEs and wait for both CQEs.
         ring.submit_and_wait(2)?;
 
-        // Drain completions and check for errors.
+        // Check completions. For WRITEV, verify we wrote all bytes.
+        // For FSYNC, verify no error.
         for cqe in ring.completion() {
             let ret = cqe.result();
             if ret < 0 {
                 return Err(io::Error::from_raw_os_error(-ret));
             }
+            // user_data=1 is the WRITEV CQE — check for short write
+            if cqe.user_data() == 1 && (ret as usize) < total_bytes {
+                // Short write on a regular file is extremely rare (signals,
+                // disk-full). Retry the remainder with a plain write loop
+                // since the linked FSYNC already ran on the partial data.
+                let written = ret as usize;
+                self.retry_short_write(fd, entries, written)?;
+                // Need another fsync for the retried bytes
+                self.submit_fsync(&mut ring, fd)?;
+            }
         }
 
+        Ok(())
+    }
+}
+
+impl UringJournalIo {
+    /// Retry remaining bytes after a short WRITEV via a fallback write loop.
+    fn retry_short_write(
+        &self,
+        fd: RawFd,
+        entries: &[&[u8]],
+        already_written: usize,
+    ) -> io::Result<()> {
+        use std::io::Write;
+        let mut file = std::mem::ManuallyDrop::new(unsafe {
+            std::fs::File::from_raw_fd(fd)
+        });
+        // Skip past the bytes already written
+        let mut skip = already_written;
+        for entry in entries {
+            if skip >= entry.len() {
+                skip -= entry.len();
+                continue;
+            }
+            file.write_all(&entry[skip..])?;
+            skip = 0;
+        }
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Submit a standalone FSYNC after a short-write retry.
+    fn submit_fsync(
+        &self,
+        ring: &mut IoUring<io_uring::squeue::Entry>,
+        fd: RawFd,
+    ) -> io::Result<()> {
+        let fsync_sqe = opcode::Fsync::new(types::Fd(fd))
+            .build()
+            .user_data(99);
+        unsafe {
+            ring.submission()
+                .push(&fsync_sqe)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
+        }
+        ring.submit_and_wait(1)?;
+        for cqe in ring.completion() {
+            if cqe.result() < 0 {
+                return Err(io::Error::from_raw_os_error(-cqe.result()));
+            }
+        }
         Ok(())
     }
 }

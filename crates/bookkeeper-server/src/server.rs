@@ -75,10 +75,26 @@ impl BookieServer {
             alignment_size: config.journal_alignment_size as usize,
             format_version: config.journal_format_version_to_write,
         };
+        // Create state manager early so the journal fatal-error callback can
+        // reference it. Transition to Running happens after DIRTY file setup.
+        let state = Arc::new(BookieStateManager::new());
+
+        // Wire the journal fatal-error callback: on FSYNC EIO, transition
+        // the bookie to read-only. Matches Java's forceToReadOnly() on
+        // journal sync failure.
+        let fatal_state = state.clone();
+        let on_journal_fatal: bookkeeper_storage::journal::writer::OnFatalError =
+            Box::new(move |e| {
+                tracing::error!("Journal fatal error — transitioning to READ-ONLY: {e}");
+                fatal_state.transition_to(BookieState::ReadOnly);
+                crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
+            });
+
         let replayed = storage.init_journal(
             &journal_current,
             journal_config,
             io_engines.journal,
+            Some(on_journal_fatal),
         )?;
         if replayed > 0 {
             tracing::info!("Journal recovery: replayed {replayed} entries");
@@ -116,8 +132,8 @@ impl BookieServer {
                 .map_err(|e| format!("Failed to create DIRTY file in {dir}: {e}"))?;
         }
 
-        // Create state manager and transition to Running
-        let state = Arc::new(BookieStateManager::new());
+        // Transition to Running (state manager was created earlier for the
+        // journal fatal-error callback).
         state.transition_to(BookieState::Running);
         crate::metrics::BOOKIE_STATE.set(1); // 1 = writable/running
 

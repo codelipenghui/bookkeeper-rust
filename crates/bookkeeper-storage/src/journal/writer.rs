@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -47,6 +47,10 @@ pub struct JournalConfig {
 ///
 /// This replaces the previous 2-thread architecture (writer + fsync)
 /// and eliminates the inter-thread hop for the fsync path.
+/// Callback invoked when the journal encounters a fatal I/O error (e.g.,
+/// FSYNC EIO). The bookie should transition to read-only mode.
+pub type OnFatalError = Box<dyn Fn(io::Error) + Send + 'static>;
+
 pub struct Journal {
     tx: mpsc::SyncSender<JournalEntry>,
     _io_thread: Option<std::thread::JoinHandle<()>>,
@@ -56,13 +60,21 @@ pub struct Journal {
 
 impl Journal {
     /// Start the journal I/O thread.
-    pub fn start(config: JournalConfig, journal_io: std::sync::Arc<dyn JournalIo>) -> Self {
+    ///
+    /// `on_fatal_error` is called if write+sync fails — the bookie should
+    /// transition to read-only mode. Pass `None` for tests or standalone
+    /// mode where there's no bookie state manager.
+    pub fn start(
+        config: JournalConfig,
+        journal_io: std::sync::Arc<dyn JournalIo>,
+        on_fatal_error: Option<OnFatalError>,
+    ) -> Self {
         let bound = MAX_QUEUE_MEMORY / 1024;
         let (tx, rx) = mpsc::sync_channel(bound);
 
         let io_thread = std::thread::Builder::new()
             .name("journal-io".into())
-            .spawn(move || journal_io_loop(config, rx, journal_io))
+            .spawn(move || journal_io_loop(config, rx, journal_io, on_fatal_error))
             .expect("failed to spawn journal-io thread");
 
         Self {
@@ -132,6 +144,7 @@ fn journal_io_loop(
     config: JournalConfig,
     rx: mpsc::Receiver<JournalEntry>,
     journal_io: std::sync::Arc<dyn JournalIo>,
+    on_fatal_error: Option<OnFatalError>,
 ) {
     fs::create_dir_all(&config.journal_dir).ok();
 
@@ -172,6 +185,7 @@ fn journal_io_loop(
                     &journal_io,
                     &mut pending_entries,
                     &mut pending_acks,
+                    &on_fatal_error,
                 );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -182,6 +196,7 @@ fn journal_io_loop(
                         &journal_io,
                         &mut pending_entries,
                         &mut pending_acks,
+                        &on_fatal_error,
                     );
                 }
             }
@@ -193,6 +208,7 @@ fn journal_io_loop(
                         &journal_io,
                         &mut pending_entries,
                         &mut pending_acks,
+                        &on_fatal_error,
                     );
                 }
                 break;
@@ -208,6 +224,7 @@ fn flush_batch(
     journal_io: &std::sync::Arc<dyn JournalIo>,
     pending_entries: &mut Vec<Vec<u8>>,
     pending_acks: &mut Vec<mpsc::Sender<()>>,
+    on_fatal_error: &Option<OnFatalError>,
 ) {
     if pending_entries.is_empty() {
         return;
@@ -264,7 +281,12 @@ fn flush_batch(
         }
         Err(e) => {
             tracing::error!("FATAL: journal write+sync failed: {e}");
-            // Don't ACK — clients will timeout. Matches Java's crash-on-fsync.
+            // Signal the bookie to go read-only. Matches Java's behavior
+            // where a journal fsync failure triggers forceToReadOnly().
+            if let Some(ref callback) = on_fatal_error {
+                callback(io::Error::new(e.kind(), format!("journal sync: {e}")));
+            }
+            // Don't ACK — clients will timeout.
         }
     }
     pending_entries.clear();

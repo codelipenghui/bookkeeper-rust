@@ -32,7 +32,7 @@ fn write_then_replay_recovers_all_entries() {
     let cfg = make_config(tmp.path().to_path_buf());
 
     // Phase 1: Write entries
-    let journal = Journal::start(cfg.clone(), default_journal_io());
+    let journal = Journal::start(cfg.clone(), default_journal_io(), None);
     let entries: Vec<Vec<u8>> = (0..50)
         .map(|i| {
             // Build [ledgerId(8)][entryId(8)][lac(8)][length(8)][payload]
@@ -75,7 +75,7 @@ fn empty_journal_dir_replays_zero_entries() {
 fn master_key_journaling_writes_meta_entry() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = make_config(tmp.path().to_path_buf());
-    let journal = Journal::start(cfg, default_journal_io());
+    let journal = Journal::start(cfg, default_journal_io(), None);
 
     // Journal a master key for ledger 42
     let key = b"my-secret-master-key";
@@ -111,7 +111,7 @@ fn master_key_journaling_writes_meta_entry() {
 fn group_commit_batches_multiple_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = make_config(tmp.path().to_path_buf());
-    let journal = Journal::start(cfg, default_journal_io());
+    let journal = Journal::start(cfg, default_journal_io(), None);
 
     // Write 100 entries concurrently — group commit should batch them
     let num_threads = 10;
@@ -148,7 +148,7 @@ fn journal_rollover_replays_across_multiple_files() {
     let mut cfg = make_config(tmp.path().to_path_buf());
     // Small file size to force rollover
     cfg.max_file_size = 8192;
-    let journal = Journal::start(cfg, default_journal_io());
+    let journal = Journal::start(cfg, default_journal_io(), None);
 
     // Write enough entries to span multiple journal files
     let entries: Vec<Vec<u8>> = (0..200)
@@ -189,7 +189,7 @@ fn sync_data_false_still_replays() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = make_config(tmp.path().to_path_buf());
     cfg.sync_data = false;
-    let journal = Journal::start(cfg, default_journal_io());
+    let journal = Journal::start(cfg, default_journal_io(), None);
 
     for i in 0..20 {
         let mut buf = Vec::new();
