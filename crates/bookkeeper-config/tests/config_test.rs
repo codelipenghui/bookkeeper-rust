@@ -60,6 +60,32 @@ fn server_config_from_file() {
     assert_eq!(config.journal_directory, "/custom/journal");
 }
 
+/// Regression test for the docker-compose playground's bookie config.
+/// Pins the field names so a rename in `from_properties` breaks CI
+/// instead of silently making the compose stack start a bookie with
+/// default (wrong) values.
+#[test]
+fn docker_compose_bk_server_conf_parses() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docker")
+        .join("bk_server.conf");
+    let config = ServerConfig::from_file(&path)
+        .expect("docker/bk_server.conf should parse");
+    assert_eq!(config.bookie_port, 3181);
+    assert_eq!(config.listening_interface.as_deref(), Some("0.0.0.0"));
+    assert_eq!(config.advertised_address.as_deref(), Some("rust-bookie"));
+    assert_eq!(config.zk_servers.as_deref(), Some("zookeeper:2181"));
+    assert_eq!(config.zk_ledger_root, "/ledgers");
+    assert_eq!(config.journal_directory, "/bk/journal");
+    assert_eq!(config.ledger_directories, vec!["/bk/data".to_string()]);
+    assert!(!config.read_only_mode_enabled);
+    assert!(config.http_server_enabled);
+    assert_eq!(config.http_server_port, 8080);
+    assert!(config.auto_recovery_daemon_enabled);
+}
+
 #[test]
 fn client_config_defaults() {
     let config = ClientConfig::default();

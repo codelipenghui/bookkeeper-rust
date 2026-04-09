@@ -1,0 +1,8 @@
+target
+.git
+.github
+docs
+tests/java-compat/target
+**/*.swp
+**/.DS_Store
+*.log

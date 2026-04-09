@@ -1,0 +1,189 @@
+# Docker Compose playground for the Rust BookKeeper implementation.
+#
+# Stack:
+#   zookeeper     — metadata store shared by BK and Pulsar
+#   bk-init       — one-shot: `bk initnewcluster`
+#   rust-bookie   — the Rust bookie built from this repo
+#   pulsar-init   — one-shot: `pulsar initialize-cluster-metadata`
+#   pulsar-broker — Apache Pulsar broker using the Rust bookie for storage
+#
+# Usage:
+#   docker compose up            # first run builds the Rust bookie image
+#   docker compose up -d         # detached
+#   docker compose logs -f rust-bookie
+#   docker compose logs -f pulsar-broker
+#   docker compose down          # stop, keep volumes
+#   docker compose down -v       # stop + nuke all data
+#
+# Once up, hit Pulsar:
+#   bin/pulsar-client produce persistent://public/default/demo --messages "hi"
+#   bin/pulsar-client consume persistent://public/default/demo --subscription-name s1 --num-messages 0
+# or via the admin HTTP API at http://localhost:8080
+
+services:
+  # ---------------------------------------------------------------------------
+  # ZooKeeper — shared metadata store for both BookKeeper and Pulsar
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: zookeeper:3.8
+    container_name: rustbk-zookeeper
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: "ruok,stat,mntr,conf,srvr"
+      ZOO_STANDALONE_ENABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    volumes:
+      - zk_data:/data
+      - zk_datalog:/datalog
+
+  # ---------------------------------------------------------------------------
+  # One-shot: initialize BookKeeper cluster metadata (idempotent)
+  # ---------------------------------------------------------------------------
+  bk-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rust-bookie:latest
+    container_name: rustbk-bk-init
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    # Idempotent: `bk initnewcluster` errors with "cluster already
+    # initialized" on the second run — we grep for that and treat it as
+    # success so rerunning `docker compose up` is safe.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        echo "[bk-init] running bk initnewcluster..."
+        if output=$$(bk initnewcluster --zk zookeeper:2181 --ledger-root /ledgers 2>&1); then
+          echo "[bk-init] $$output"
+          echo "[bk-init] done"
+        elif echo "$$output" | grep -qi "already initialized"; then
+          echo "[bk-init] cluster already initialized — skipping"
+        else
+          echo "[bk-init] ERROR: $$output"
+          exit 1
+        fi
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Rust bookie — implements BookKeeper wire protocol over V2+V3
+  # ---------------------------------------------------------------------------
+  rust-bookie:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rust-bookie:latest
+    container_name: rustbk-rust-bookie
+    hostname: rust-bookie
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      bk-init:
+        condition: service_completed_successfully
+    ports:
+      - "3181:3181"  # BookKeeper V2/V3 wire protocol
+      - "8081:8080"  # HTTP admin API (mapped to 8081 on host to avoid
+                     # collision with Pulsar broker's 8080)
+    environment:
+      RUST_LOG: info
+    volumes:
+      - bk_data:/bk/data
+      - bk_journal:/bk/journal
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # One-shot: initialize Pulsar cluster metadata (idempotent)
+  # ---------------------------------------------------------------------------
+  pulsar-init:
+    image: apachepulsar/pulsar:3.3.5
+    container_name: rustbk-pulsar-init
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      bk-init:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        # Skip if the cluster znode already exists
+        if bin/pulsar zookeeper-shell -server zookeeper:2181 ls /admin/clusters 2>/dev/null | grep -q cluster-a; then
+          echo "[pulsar-init] cluster-a already initialized — nothing to do"
+          exit 0
+        fi
+        echo "[pulsar-init] running pulsar initialize-cluster-metadata..."
+        bin/pulsar initialize-cluster-metadata \
+          --cluster cluster-a \
+          --zookeeper zookeeper:2181 \
+          --configuration-store zookeeper:2181 \
+          --web-service-url http://pulsar-broker:8080 \
+          --broker-service-url pulsar://pulsar-broker:6650
+        echo "[pulsar-init] done"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Pulsar broker — uses Rust bookie for managed-ledger storage
+  # ---------------------------------------------------------------------------
+  pulsar-broker:
+    image: apachepulsar/pulsar:3.3.5
+    container_name: rustbk-pulsar-broker
+    hostname: pulsar-broker
+    restart: unless-stopped
+    depends_on:
+      pulsar-init:
+        condition: service_completed_successfully
+      rust-bookie:
+        condition: service_healthy
+    ports:
+      - "6650:6650"  # Pulsar native (binary) protocol
+      - "8080:8080"  # Pulsar admin HTTP API
+    environment:
+      # Required config via PULSAR_PREFIX_ env vars — the Pulsar image's
+      # entrypoint writes these into conf/broker.conf at startup.
+      PULSAR_PREFIX_clusterName: cluster-a
+      PULSAR_PREFIX_zookeeperServers: zookeeper:2181
+      PULSAR_PREFIX_configurationStoreServers: zookeeper:2181
+      PULSAR_PREFIX_metadataStoreUrl: "zk:zookeeper:2181"
+      PULSAR_PREFIX_configurationMetadataStoreUrl: "zk:zookeeper:2181"
+      PULSAR_PREFIX_bookkeeperMetadataServiceUri: "zk+hierarchical://zookeeper:2181/ledgers"
+      PULSAR_PREFIX_brokerServicePort: "6650"
+      PULSAR_PREFIX_webServicePort: "8080"
+      PULSAR_PREFIX_advertisedAddress: pulsar-broker
+      # Single-bookie cluster — every managed ledger runs on our one bookie
+      PULSAR_PREFIX_managedLedgerDefaultEnsembleSize: "1"
+      PULSAR_PREFIX_managedLedgerDefaultWriteQuorum: "1"
+      PULSAR_PREFIX_managedLedgerDefaultAckQuorum: "1"
+      # Keep memory usage reasonable for a laptop
+      PULSAR_MEM: "-Xms512m -Xmx1g -XX:MaxDirectMemorySize=512m"
+    command: >
+      /bin/bash -c "
+      bin/apply-config-from-env.py conf/broker.conf &&
+      bin/pulsar broker
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/admin/v2/brokers/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  zk_data:
+  zk_datalog:
+  bk_data:
+  bk_journal:
