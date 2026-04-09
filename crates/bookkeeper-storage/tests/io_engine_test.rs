@@ -26,8 +26,8 @@ fn std_journal_write_and_sync_persists_entries() {
     assert_eq!(&contents[entry_a.len()..], entry_b);
 }
 
-#[test]
-fn std_ledger_write_batch_returns_correct_offsets() {
+#[tokio::test]
+async fn std_ledger_write_batch_returns_correct_offsets() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let fd = tmp.as_raw_fd();
 
@@ -36,7 +36,8 @@ fn std_ledger_write_batch_returns_correct_offsets() {
     let entry_b = b"bbbbbb"; // 6 bytes
 
     let offsets = engine
-        .write_batch(fd, 0, &[entry_a.as_slice(), entry_b.as_slice()])
+        .write_batch(fd, 0, vec![entry_a.to_vec(), entry_b.to_vec()])
+        .await
         .unwrap();
 
     assert_eq!(offsets, vec![0, 4]);
@@ -46,8 +47,8 @@ fn std_ledger_write_batch_returns_correct_offsets() {
     assert_eq!(meta.len(), 10);
 }
 
-#[test]
-fn std_ledger_read_at_returns_exact_bytes() {
+#[tokio::test]
+async fn std_ledger_read_at_returns_exact_bytes() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let fd = tmp.as_raw_fd();
 
@@ -58,41 +59,43 @@ fn std_ledger_read_at_returns_exact_bytes() {
     let data_b = b"BBBB";
     let data_c = b"CC";
     engine
-        .write_batch(fd, 0, &[data_a.as_slice(), data_b.as_slice(), data_c.as_slice()])
+        .write_batch(fd, 0, vec![data_a.to_vec(), data_b.to_vec(), data_c.to_vec()])
+        .await
         .unwrap();
 
     // Read the middle segment "BBBB" at offset 2, length 4.
-    let buf = engine.read_at(fd, 2, 4).unwrap();
+    let buf = engine.read_at(fd, 2, 4).await.unwrap();
     assert_eq!(&buf, b"BBBB");
 
     // Read from the start.
-    let buf = engine.read_at(fd, 0, 2).unwrap();
+    let buf = engine.read_at(fd, 0, 2).await.unwrap();
     assert_eq!(&buf, b"AA");
 
     // Read from the end.
-    let buf = engine.read_at(fd, 6, 2).unwrap();
+    let buf = engine.read_at(fd, 6, 2).await.unwrap();
     assert_eq!(&buf, b"CC");
 }
 
-#[test]
-fn std_ledger_write_batch_at_nonzero_offset() {
+#[tokio::test]
+async fn std_ledger_write_batch_at_nonzero_offset() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let fd = tmp.as_raw_fd();
 
     let engine = StdEngine;
 
     // Write initial data at offset 0.
-    engine.write_batch(fd, 0, &[b"HEAD".as_slice()]).unwrap();
+    engine.write_batch(fd, 0, vec![b"HEAD".to_vec()]).await.unwrap();
 
     // Append more data starting at offset 4.
     let offsets = engine
-        .write_batch(fd, 4, &[b"AB".as_slice(), b"CD".as_slice()])
+        .write_batch(fd, 4, vec![b"AB".to_vec(), b"CD".to_vec()])
+        .await
         .unwrap();
 
     assert_eq!(offsets, vec![4, 6]);
 
     // Verify full contents.
-    let all = engine.read_at(fd, 0, 8).unwrap();
+    let all = engine.read_at(fd, 0, 8).await.unwrap();
     assert_eq!(&all, b"HEADABCD");
 }
 

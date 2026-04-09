@@ -28,8 +28,8 @@ fn make_entry(ledger_id: i64, entry_id: i64, lac: i64, payload: &[u8]) -> Vec<u8
     entry
 }
 
-#[test]
-fn add_entry_success() {
+#[tokio::test]
+async fn add_entry_success() {
     let (processor, _dir) = setup();
     let entry_data = make_entry(1, 0, -1, b"hello");
     let req = V2Request::AddEntry {
@@ -37,7 +37,7 @@ fn add_entry_success() {
         master_key: [0u8; 20],
         entry_data: Bytes::from(entry_data),
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::Add { error_code, ledger_id, entry_id } => {
             assert_eq!(error_code, V2_EOK);
@@ -48,8 +48,8 @@ fn add_entry_success() {
     }
 }
 
-#[test]
-fn read_entry_success() {
+#[tokio::test]
+async fn read_entry_success() {
     let (processor, _dir) = setup();
     // First write an entry
     let entry_data = make_entry(1, 0, -1, b"hello");
@@ -57,12 +57,12 @@ fn read_entry_success() {
         flags: 0, master_key: [0u8; 20],
         entry_data: Bytes::from(entry_data),
     };
-    processor.process_request(req);
+    processor.process_request(req).await;
     // Now read it
     let req = V2Request::ReadEntry {
         flags: 0, ledger_id: 1, entry_id: 0, master_key: None,
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::Read { error_code, ledger_id, entry_id, data } => {
             assert_eq!(error_code, V2_EOK);
@@ -74,13 +74,13 @@ fn read_entry_success() {
     }
 }
 
-#[test]
-fn read_entry_not_found() {
+#[tokio::test]
+async fn read_entry_not_found() {
     let (processor, _dir) = setup();
     let req = V2Request::ReadEntry {
         flags: 0, ledger_id: 999, entry_id: 0, master_key: None,
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::Read { error_code, .. } => {
             assert_ne!(error_code, V2_EOK);
@@ -89,8 +89,8 @@ fn read_entry_not_found() {
     }
 }
 
-#[test]
-fn add_entry_rejected_when_read_only() {
+#[tokio::test]
+async fn add_entry_rejected_when_read_only() {
     let dir = TempDir::new().unwrap();
     let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
     let state = BookieStateManager::new();
@@ -103,7 +103,7 @@ fn add_entry_rejected_when_read_only() {
         flags: 0, master_key: [0u8; 20],
         entry_data: Bytes::from(entry_data),
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::Add { error_code, .. } => {
             assert_eq!(error_code, bookkeeper_common::error::BKError::ReadOnly.to_v2_code());
@@ -112,26 +112,26 @@ fn add_entry_rejected_when_read_only() {
     }
 }
 
-#[test]
-fn fencing_blocks_subsequent_writes() {
+#[tokio::test]
+async fn fencing_blocks_subsequent_writes() {
     let (processor, _dir) = setup();
     // Write an entry first
     let entry_data = make_entry(1, 0, -1, b"hello");
     processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [0u8; 20],
         entry_data: Bytes::from(entry_data),
-    });
+    }).await;
     // Fence via read with FLAG_DO_FENCING
     processor.process_request(V2Request::ReadEntry {
         flags: FLAG_DO_FENCING, ledger_id: 1, entry_id: 0,
         master_key: Some([0u8; 20]),
-    });
+    }).await;
     // Normal write should be rejected with EFENCED
     let entry_data2 = make_entry(1, 1, 0, b"world");
     let resp = processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [0u8; 20],
         entry_data: Bytes::from(entry_data2),
-    });
+    }).await;
     match resp {
         V2Response::Add { error_code, .. } => {
             assert_eq!(error_code, bookkeeper_common::error::BKError::Fenced.to_v2_code());
@@ -140,25 +140,25 @@ fn fencing_blocks_subsequent_writes() {
     }
 }
 
-#[test]
-fn recovery_add_bypasses_fence() {
+#[tokio::test]
+async fn recovery_add_bypasses_fence() {
     let (processor, _dir) = setup();
     // Write, fence, then recovery add
     let entry_data = make_entry(1, 0, -1, b"hello");
     processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [0u8; 20],
         entry_data: Bytes::from(entry_data),
-    });
+    }).await;
     processor.process_request(V2Request::ReadEntry {
         flags: FLAG_DO_FENCING, ledger_id: 1, entry_id: 0,
         master_key: Some([0u8; 20]),
-    });
+    }).await;
     // Recovery add should succeed
     let entry_data2 = make_entry(1, 1, 0, b"recovery");
     let resp = processor.process_request(V2Request::AddEntry {
         flags: FLAG_RECOVERY_ADD, master_key: [0u8; 20],
         entry_data: Bytes::from(entry_data2),
-    });
+    }).await;
     match resp {
         V2Response::Add { error_code, .. } => {
             assert_eq!(error_code, V2_EOK);
@@ -167,11 +167,11 @@ fn recovery_add_bypasses_fence() {
     }
 }
 
-#[test]
-fn get_bookie_info() {
+#[tokio::test]
+async fn get_bookie_info() {
     let (processor, _dir) = setup();
     let req = V2Request::GetBookieInfo { flags: 0, requested: 0x03 };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::GetBookieInfo { error_code, free_disk_space: _, total_disk_capacity, .. } => {
             assert_eq!(error_code, V2_EOK);
@@ -181,21 +181,21 @@ fn get_bookie_info() {
     }
 }
 
-#[test]
-fn master_key_mismatch_rejected() {
+#[tokio::test]
+async fn master_key_mismatch_rejected() {
     let (processor, _dir) = setup();
     // Write with key A
     let entry_data = make_entry(1, 0, -1, b"hello");
     processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [1u8; 20],
         entry_data: Bytes::from(entry_data),
-    });
+    }).await;
     // Write with key B — should be rejected
     let entry_data2 = make_entry(1, 1, 0, b"world");
     let resp = processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [2u8; 20],
         entry_data: Bytes::from(entry_data2),
-    });
+    }).await;
     match resp {
         V2Response::Add { error_code, .. } => {
             assert_eq!(error_code, bookkeeper_common::error::BKError::Unauthorized.to_v2_code());
@@ -204,20 +204,20 @@ fn master_key_mismatch_rejected() {
     }
 }
 
-#[test]
-fn fencing_with_wrong_key_rejected() {
+#[tokio::test]
+async fn fencing_with_wrong_key_rejected() {
     let (processor, _dir) = setup();
     // Write with key A
     let entry_data = make_entry(1, 0, -1, b"hello");
     processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [1u8; 20],
         entry_data: Bytes::from(entry_data),
-    });
+    }).await;
     // Try to fence with key B — should fail
     let resp = processor.process_request(V2Request::ReadEntry {
         flags: FLAG_DO_FENCING, ledger_id: 1, entry_id: 0,
         master_key: Some([2u8; 20]),
-    });
+    }).await;
     match resp {
         V2Response::Read { error_code, .. } => {
             assert_eq!(error_code, bookkeeper_common::error::BKError::Unauthorized.to_v2_code());
@@ -229,7 +229,7 @@ fn fencing_with_wrong_key_rejected() {
     let resp2 = processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [1u8; 20],
         entry_data: Bytes::from(entry_data3),
-    });
+    }).await;
     match resp2 {
         V2Response::Add { error_code, .. } => {
             assert_eq!(error_code, V2_EOK);

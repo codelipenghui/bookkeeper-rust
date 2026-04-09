@@ -94,8 +94,8 @@ fn entry_log_dir_for(storage: &DbLedgerStorage) -> &Path {
 // Empty file deletion
 // ---------------------------------------------------------------------------
 
-#[test]
-fn gc_deletes_entry_log_file_when_all_ledgers_are_dead() {
+#[tokio::test]
+async fn gc_deletes_entry_log_file_when_all_ledgers_are_dead() {
     let dir = TempDir::new().unwrap();
     let storage = open_storage(&dir);
 
@@ -110,7 +110,7 @@ fn gc_deletes_entry_log_file_when_all_ledgers_are_dead() {
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active_in_metadata: HashSet<i64> = HashSet::new();
-    gc.gc(&active_in_metadata).unwrap();
+    gc.gc(&active_in_metadata).await.unwrap();
 
     assert!(
         !log_path.exists(),
@@ -118,8 +118,8 @@ fn gc_deletes_entry_log_file_when_all_ledgers_are_dead() {
     );
 }
 
-#[test]
-fn gc_deletes_only_files_with_no_active_ledgers() {
+#[tokio::test]
+async fn gc_deletes_only_files_with_no_active_ledgers() {
     let dir = TempDir::new().unwrap();
     let storage = open_storage(&dir);
 
@@ -136,7 +136,7 @@ fn gc_deletes_only_files_with_no_active_ledgers() {
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
-    gc.gc(&active).unwrap();
+    gc.gc(&active).await.unwrap();
 
     assert!(!dead_path.exists(), "dead file (5) should be removed");
     assert!(
@@ -149,8 +149,8 @@ fn gc_deletes_only_files_with_no_active_ledgers() {
 // Compaction (low-usage file) — old file removed, entries relocated
 // ---------------------------------------------------------------------------
 
-#[test]
-fn gc_compacts_low_usage_log_file_and_relocates_live_entries() {
+#[tokio::test]
+async fn gc_compacts_low_usage_log_file_and_relocates_live_entries() {
     let dir = TempDir::new().unwrap();
     let storage = open_storage(&dir);
 
@@ -190,7 +190,7 @@ fn gc_compacts_low_usage_log_file_and_relocates_live_entries() {
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
-    gc.gc(&active).unwrap();
+    gc.gc(&active).await.unwrap();
 
     // Old file should be gone
     assert!(
@@ -209,7 +209,7 @@ fn gc_compacts_low_usage_log_file_and_relocates_live_entries() {
 
     // The relocated entry should now be readable via storage.get_entry —
     // compaction updated the index to point at the new location.
-    let entry = storage.get_entry(100, 42).expect(
+    let entry = storage.get_entry(100, 42).await.expect(
         "ledger 100 entry 42 should be readable from the new location after compaction",
     );
 
@@ -230,8 +230,8 @@ fn gc_compacts_low_usage_log_file_and_relocates_live_entries() {
 // High-usage file is left alone
 // ---------------------------------------------------------------------------
 
-#[test]
-fn gc_does_not_compact_high_usage_log_file() {
+#[tokio::test]
+async fn gc_does_not_compact_high_usage_log_file() {
     let dir = TempDir::new().unwrap();
     let storage = open_storage(&dir);
 
@@ -250,7 +250,7 @@ fn gc_does_not_compact_high_usage_log_file() {
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100, 200]);
-    gc.gc(&active).unwrap();
+    gc.gc(&active).await.unwrap();
 
     assert!(
         log_path.exists(),
@@ -263,8 +263,8 @@ fn gc_does_not_compact_high_usage_log_file() {
     );
 }
 
-#[test]
-fn gc_does_not_compact_file_at_exact_threshold_boundary() {
+#[tokio::test]
+async fn gc_does_not_compact_file_at_exact_threshold_boundary() {
     // 4 active + 1 dead = 80% usage. The compaction predicate is `< 0.8`
     // (strict less-than), so 0.8 should NOT compact. This pins the
     // boundary.
@@ -288,7 +288,7 @@ fn gc_does_not_compact_file_at_exact_threshold_boundary() {
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
-    gc.gc(&active).unwrap();
+    gc.gc(&active).await.unwrap();
 
     assert!(
         log_path.exists(),
@@ -301,8 +301,8 @@ fn gc_does_not_compact_file_at_exact_threshold_boundary() {
 // Current log file is never touched
 // ---------------------------------------------------------------------------
 
-#[test]
-fn gc_never_deletes_or_compacts_the_current_log_file() {
+#[tokio::test]
+async fn gc_never_deletes_or_compacts_the_current_log_file() {
     use bookkeeper_protocol::digest::{DigestManager, DigestType};
     use bookkeeper_protocol::entry::EntryBuilder;
 
@@ -321,8 +321,8 @@ fn gc_never_deletes_or_compacts_the_current_log_file() {
         .payload(bytes::Bytes::from_static(b"keep-me!"))
         .build()
         .freeze();
-    storage.add_entry(&entry).unwrap();
-    storage.flush().unwrap();
+    storage.add_entry(&entry).await.unwrap();
+    storage.flush().await.unwrap();
 
     let current_path = entry_log_path(entry_log_dir_for(&storage), 0);
     assert!(current_path.exists(), "current log file should exist after add_entry+flush");
@@ -333,7 +333,7 @@ fn gc_never_deletes_or_compacts_the_current_log_file() {
     // entries are now dead.
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active: HashSet<i64> = HashSet::new();
-    gc.gc(&active).unwrap();
+    gc.gc(&active).await.unwrap();
 
     assert!(
         current_path.exists(),
@@ -345,8 +345,8 @@ fn gc_never_deletes_or_compacts_the_current_log_file() {
 // Multiple files in one GC pass
 // ---------------------------------------------------------------------------
 
-#[test]
-fn gc_processes_multiple_log_files_in_single_pass() {
+#[tokio::test]
+async fn gc_processes_multiple_log_files_in_single_pass() {
     let dir = TempDir::new().unwrap();
     let storage = open_storage(&dir);
 
@@ -379,7 +379,7 @@ fn gc_processes_multiple_log_files_in_single_pass() {
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
-    gc.gc(&active).unwrap();
+    gc.gc(&active).await.unwrap();
 
     assert!(!dead_path.exists(), "file 5 (all dead) should be deleted");
     assert!(live_path.exists(), "file 6 (100% live) should be preserved");
@@ -389,7 +389,7 @@ fn gc_processes_multiple_log_files_in_single_pass() {
     );
 
     // The compacted entry (100, 100) should still be readable
-    let entry = storage.get_entry(100, 100).expect(
+    let entry = storage.get_entry(100, 100).await.expect(
         "compacted entry should still be readable from its new location",
     );
     assert_eq!(&entry[0..8], &100i64.to_be_bytes());

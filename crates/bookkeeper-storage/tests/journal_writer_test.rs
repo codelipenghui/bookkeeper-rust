@@ -26,8 +26,8 @@ fn make_config(dir: PathBuf) -> JournalConfig {
     }
 }
 
-#[test]
-fn write_then_replay_recovers_all_entries() {
+#[tokio::test]
+async fn write_then_replay_recovers_all_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = make_config(tmp.path().to_path_buf());
 
@@ -47,7 +47,7 @@ fn write_then_replay_recovers_all_entries() {
         .collect();
 
     for entry in &entries {
-        journal.log_add_entry(entry).unwrap();
+        journal.log_add_entry(entry).await.unwrap();
     }
     drop(journal); // shut down
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -107,43 +107,43 @@ fn master_key_journaling_writes_meta_entry() {
     assert!(ledger_ids.contains(&100));
 }
 
-#[test]
-fn group_commit_batches_multiple_entries() {
+#[tokio::test]
+async fn group_commit_batches_multiple_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = make_config(tmp.path().to_path_buf());
     let journal = Journal::start(cfg, default_journal_io(), None);
 
     // Write 100 entries concurrently — group commit should batch them
-    let num_threads = 10;
-    let entries_per_thread = 10;
+    let num_tasks = 10;
+    let entries_per_task = 10;
     let journal = std::sync::Arc::new(journal);
     let mut handles = Vec::new();
-    for tid in 0..num_threads {
+    for tid in 0..num_tasks {
         let j = journal.clone();
-        handles.push(std::thread::spawn(move || {
-            for i in 0..entries_per_thread {
+        handles.push(tokio::spawn(async move {
+            for i in 0..entries_per_task {
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&(tid as i64).to_be_bytes());
                 buf.extend_from_slice(&(i as i64).to_be_bytes());
                 buf.extend_from_slice(&((i - 1) as i64).to_be_bytes());
                 buf.extend_from_slice(&100i64.to_be_bytes());
                 buf.extend_from_slice(b"data");
-                j.log_add_entry(&buf).unwrap();
+                j.log_add_entry(&buf).await.unwrap();
             }
         }));
     }
-    for h in handles { h.join().unwrap(); }
+    for h in handles { h.await.unwrap(); }
 
     drop(journal);
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut count = 0;
     replay_journal(tmp.path(), None, |_| count += 1).unwrap();
-    assert_eq!(count, num_threads * entries_per_thread);
+    assert_eq!(count, num_tasks * entries_per_task);
 }
 
-#[test]
-fn journal_rollover_replays_across_multiple_files() {
+#[tokio::test]
+async fn journal_rollover_replays_across_multiple_files() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = make_config(tmp.path().to_path_buf());
     // Small file size to force rollover
@@ -165,7 +165,7 @@ fn journal_rollover_replays_across_multiple_files() {
         .collect();
 
     for entry in &entries {
-        journal.log_add_entry(entry).unwrap();
+        journal.log_add_entry(entry).await.unwrap();
     }
     drop(journal);
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -184,8 +184,8 @@ fn journal_rollover_replays_across_multiple_files() {
     assert_eq!(count, entries.len());
 }
 
-#[test]
-fn sync_data_false_still_replays() {
+#[tokio::test]
+async fn sync_data_false_still_replays() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = make_config(tmp.path().to_path_buf());
     cfg.sync_data = false;
@@ -198,7 +198,7 @@ fn sync_data_false_still_replays() {
         buf.extend_from_slice(&((i - 1) as i64).to_be_bytes());
         buf.extend_from_slice(&100i64.to_be_bytes());
         buf.extend_from_slice(b"data");
-        journal.log_add_entry(&buf).unwrap();
+        journal.log_add_entry(&buf).await.unwrap();
     }
     drop(journal);
     std::thread::sleep(std::time::Duration::from_millis(200));

@@ -31,8 +31,8 @@ fn make_entry(ledger_id: i64, entry_id: i64, lac: i64, payload: &[u8]) -> Vec<u8
     entry
 }
 
-#[test]
-fn write_lac_and_read_lac_round_trip() {
+#[tokio::test]
+async fn write_lac_and_read_lac_round_trip() {
     let (processor, _dir) = setup();
     let ledger_id = 42;
     let master_key = [7u8; 20];
@@ -43,7 +43,7 @@ fn write_lac_and_read_lac_round_trip() {
         master_key,
         entry_data: Bytes::from(make_entry(ledger_id, 0, -1, b"hello")),
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     assert!(matches!(resp, V2Response::Add { error_code: V2_EOK, .. }));
 
     // WriteLac to advance LAC explicitly
@@ -54,7 +54,7 @@ fn write_lac_and_read_lac_round_trip() {
         master_key,
         body: Bytes::from(lac_body.clone()),
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::WriteLac { error_code, .. } => {
             assert_eq!(error_code, V2_EOK, "WriteLac should succeed");
@@ -64,7 +64,7 @@ fn write_lac_and_read_lac_round_trip() {
 
     // ReadLac should return the explicit LAC body
     let req = V2Request::ReadLac { ledger_id };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::ReadLac { error_code, lac_body: returned_body, .. } => {
             assert_eq!(error_code, V2_EOK);
@@ -75,11 +75,11 @@ fn write_lac_and_read_lac_round_trip() {
     }
 }
 
-#[test]
-fn read_lac_on_nonexistent_ledger() {
+#[tokio::test]
+async fn read_lac_on_nonexistent_ledger() {
     let (processor, _dir) = setup();
     let req = V2Request::ReadLac { ledger_id: 999 };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::ReadLac { error_code, .. } => {
             // Should be an error code (e.g., NoLedger or NoSuchEntry)
@@ -89,8 +89,8 @@ fn read_lac_on_nonexistent_ledger() {
     }
 }
 
-#[test]
-fn batch_read_returns_multiple_entries() {
+#[tokio::test]
+async fn batch_read_returns_multiple_entries() {
     let (processor, _dir) = setup();
     let ledger_id = 100;
     let master_key = [0u8; 20];
@@ -103,7 +103,7 @@ fn batch_read_returns_multiple_entries() {
             master_key,
             entry_data: Bytes::from(make_entry(ledger_id, i, i - 1, payload.as_bytes())),
         };
-        processor.process_request(req);
+        processor.process_request(req).await;
     }
 
     // Batch read entries 0..5
@@ -115,7 +115,7 @@ fn batch_read_returns_multiple_entries() {
         max_count: 5,
         max_size: 1024 * 1024,
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::BatchRead { error_code, entries, request_id, .. } => {
             assert_eq!(error_code, V2_EOK);
@@ -126,8 +126,8 @@ fn batch_read_returns_multiple_entries() {
     }
 }
 
-#[test]
-fn batch_read_respects_max_count() {
+#[tokio::test]
+async fn batch_read_respects_max_count() {
     let (processor, _dir) = setup();
     let ledger_id = 200;
     let master_key = [0u8; 20];
@@ -138,7 +138,7 @@ fn batch_read_respects_max_count() {
             master_key,
             entry_data: Bytes::from(make_entry(ledger_id, i, i - 1, b"data")),
         };
-        processor.process_request(req);
+        processor.process_request(req).await;
     }
 
     // max_count=3 should return at most 3 entries
@@ -150,7 +150,7 @@ fn batch_read_respects_max_count() {
         max_count: 3,
         max_size: 1024 * 1024,
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::BatchRead { entries, request_id, .. } => {
             assert_eq!(request_id, 99);
@@ -160,8 +160,8 @@ fn batch_read_respects_max_count() {
     }
 }
 
-#[test]
-fn write_lac_with_wrong_master_key_rejected() {
+#[tokio::test]
+async fn write_lac_with_wrong_master_key_rejected() {
     let (processor, _dir) = setup();
     let ledger_id = 50;
     let master_key = [1u8; 20];
@@ -172,7 +172,7 @@ fn write_lac_with_wrong_master_key_rejected() {
         master_key,
         entry_data: Bytes::from(make_entry(ledger_id, 0, -1, b"x")),
     };
-    processor.process_request(req);
+    processor.process_request(req).await;
 
     // WriteLac with different master key should fail
     let wrong_key = [2u8; 20];
@@ -182,7 +182,7 @@ fn write_lac_with_wrong_master_key_rejected() {
         master_key: wrong_key,
         body: Bytes::from(make_entry(ledger_id, 0, 0, b"body")),
     };
-    let resp = processor.process_request(req);
+    let resp = processor.process_request(req).await;
     match resp {
         V2Response::WriteLac { error_code, .. } => {
             assert_ne!(error_code, V2_EOK, "WriteLac should reject wrong master key");

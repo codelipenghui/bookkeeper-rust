@@ -7,7 +7,6 @@
 
 use bookkeeper_config::server::ServerConfig;
 use bookkeeper_server::server::BookieServer;
-use std::path::Path;
 use tempfile::TempDir;
 
 const DIRTY_FILENAME: &str = "DIRTY";
