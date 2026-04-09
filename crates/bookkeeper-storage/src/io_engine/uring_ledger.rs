@@ -124,6 +124,14 @@ impl LedgerIo for UringLedgerIo {
 
         Ok(buf)
     }
+
+    fn read_entry(&self, entry_log_dir: &std::path::Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        // Temporary: open + delegate to read_at. Will be replaced by ring thread in Task 4.
+        let path = entry_log_dir.join(format!("{:x}.log", log_id));
+        let file = std::fs::File::open(&path)?;
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        self.read_at(fd, offset, len)
+    }
 }
 
 /// Retry remaining bytes after a short WRITEV using blocking pwrite.

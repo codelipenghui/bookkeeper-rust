@@ -9,6 +9,7 @@ pub mod uring_ledger;
 
 use std::io;
 use std::os::fd::RawFd;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Journal I/O operations: write entries then fsync.
@@ -24,6 +25,14 @@ pub trait LedgerIo: Send + Sync {
 
     /// Read exactly `len` bytes starting at `offset`.
     fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>>;
+
+    /// Read `len` bytes at `offset` from entry log `log_id` in `entry_log_dir`.
+    /// The engine may cache the file descriptor for future reads.
+    fn read_entry(&self, entry_log_dir: &Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>>;
+
+    /// Evict any cached file descriptor for `log_id`. Called by GC before
+    /// deleting the entry log file. No-op if the fd is not cached.
+    fn evict_fd(&self, _entry_log_dir: &Path, _log_id: u32) {}
 }
 
 /// Returns `true` when the io_uring backend is available on this platform.
