@@ -70,7 +70,7 @@ impl GarbageCollector {
     }
 
     /// Run one GC cycle.
-    pub fn gc(&self, active_ledgers_in_metadata: &HashSet<i64>) -> Result<usize, StorageError> {
+    pub async fn gc(&self, active_ledgers_in_metadata: &HashSet<i64>) -> Result<usize, StorageError> {
         // Step 1: Get all local ledgers
         let local_ledgers = self.storage.get_active_ledgers()?;
 
@@ -103,7 +103,7 @@ impl GarbageCollector {
                 .into_iter()
                 .collect();
 
-            if let Err(e) = self.gc_and_compact_entry_logs(entry_log_dir, current_log_id, &active_local) {
+            if let Err(e) = self.gc_and_compact_entry_logs(entry_log_dir, current_log_id, &active_local).await {
                 tracing::warn!("GC: entry log cleanup error: {e}");
             }
         }
@@ -116,7 +116,7 @@ impl GarbageCollector {
     /// Matches Java's doGcEntryLogs() + doCompactEntryLogs():
     /// 1. Delete entirely empty log files
     /// 2. Compact log files with usage below the major threshold
-    fn gc_and_compact_entry_logs(
+    async fn gc_and_compact_entry_logs(
         &self,
         entry_log_dir: &Path,
         current_log_id: Option<u32>,
@@ -168,7 +168,7 @@ impl GarbageCollector {
                 let usage = meta.usage(active_ledgers);
                 if usage < self.major_threshold {
                     // Compact: copy live entries to current log, update index, delete old
-                    match self.compact_entry_log(&path, log_id, active_ledgers) {
+                    match self.compact_entry_log(&path, log_id, active_ledgers).await {
                         Ok(entries_moved) => {
                             if entries_moved > 0 {
                                 compacted_files += 1;
@@ -315,7 +315,7 @@ impl GarbageCollector {
     /// 3. Flush the entry log to ensure durability
     /// 4. Update the entry location index in batch and flush
     /// 5. Delete the old log file (AFTER index is consistent)
-    fn compact_entry_log(
+    async fn compact_entry_log(
         &self,
         path: &Path,
         _log_id: u32,
@@ -328,7 +328,7 @@ impl GarbageCollector {
         }
 
         // Step 1: Flush pending writes before compaction to avoid mixing
-        self.storage.flush()?;
+        self.storage.flush().await?;
 
         file.seek(SeekFrom::Start(LOGFILE_HEADER_SIZE as u64))?;
 
@@ -361,7 +361,7 @@ impl GarbageCollector {
             let entry_id = i64::from_be_bytes(entry[8..16].try_into().unwrap());
 
             // Write to current entry log
-            let new_location = self.storage.write_entry_to_log(&entry)?;
+            let new_location = self.storage.write_entry_to_log(&entry).await?;
             relocated.push((ledger_id, entry_id, new_location));
         }
 
