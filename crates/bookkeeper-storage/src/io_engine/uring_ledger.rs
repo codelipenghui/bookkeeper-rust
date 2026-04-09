@@ -23,6 +23,13 @@ const LEDGER_SQ_DEPTH: u32 = 256;
 const CHANNEL_BOUND: usize = 256;
 const FD_CACHE_CAPACITY: usize = 256;
 
+/// Size of each buffer in the provided buffer pool (64 KB).
+const BUF_POOL_SIZE: usize = 64 * 1024;
+/// Number of buffers in the pool (256 buffers = 16 MB total).
+const BUF_POOL_COUNT: u16 = 256;
+/// Buffer group ID registered with the kernel.
+const BUF_GROUP_ID: u16 = 0;
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
@@ -183,6 +190,10 @@ enum PendingOp {
         len: usize,
         reply: oneshot::Sender<io::Result<Vec<u8>>>,
     },
+    PoolRead {
+        len: usize,
+        reply: oneshot::Sender<io::Result<Vec<u8>>>,
+    },
     Write {
         entries: Vec<Vec<u8>>,
         offset: u64,
@@ -212,6 +223,17 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
         tracing::debug!("ledger-io: registered {} fixed fd slots", FD_CACHE_CAPACITY);
     } else {
         tracing::warn!("ledger-io: register_files failed, using raw fds");
+    }
+
+    let buf_pool: Option<BufferPool> = BufferPool::try_new(&ring);
+    if buf_pool.is_some() {
+        tracing::debug!(
+            "ledger-io: provided buffer pool active ({} x {}KB)",
+            BUF_POOL_COUNT,
+            BUF_POOL_SIZE / 1024
+        );
+    } else {
+        tracing::debug!("ledger-io: provided buffer pool unavailable, using per-read alloc");
     }
 
     loop {
@@ -259,32 +281,54 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                         }
                     };
 
-                    let mut buf = vec![0u8; len];
-                    let sqe_idx = pending.len() as u64;
-
                     let fd_target = if fixed_fds_available {
                         types::Fixed(fixed_index)
                     } else {
                         types::Fd(fd)
                     };
 
-                    let read_sqe =
-                        opcode::Read::new(fd_target, buf.as_mut_ptr(), len as u32)
-                            .offset(offset)
-                            .build()
-                            .user_data(sqe_idx);
+                    let use_pool = buf_pool.is_some() && len <= BUF_POOL_SIZE;
 
-                    let pushed = unsafe { ring.submission().push(&read_sqe) };
-                    if pushed.is_err() {
-                        let _ = reply.send(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "SQ full",
-                        )));
-                        continue;
+                    if use_pool {
+                        let sqe_idx = pending.len() as u64;
+                        let read_sqe =
+                            opcode::Read::new(fd_target, std::ptr::null_mut(), len as u32)
+                                .offset(offset)
+                                .buf_group(BUF_GROUP_ID)
+                                .build()
+                                .flags(io_uring::squeue::Flags::BUFFER_SELECT)
+                                .user_data(sqe_idx);
+
+                        let pushed = unsafe { ring.submission().push(&read_sqe) };
+                        if pushed.is_err() {
+                            let _ = reply.send(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "SQ full",
+                            )));
+                            continue;
+                        }
+                        pending.push(PendingOp::PoolRead { len, reply });
+                        num_sqes += 1;
+                    } else {
+                        let mut buf = vec![0u8; len];
+                        let sqe_idx = pending.len() as u64;
+                        let read_sqe =
+                            opcode::Read::new(fd_target, buf.as_mut_ptr(), len as u32)
+                                .offset(offset)
+                                .build()
+                                .user_data(sqe_idx);
+
+                        let pushed = unsafe { ring.submission().push(&read_sqe) };
+                        if pushed.is_err() {
+                            let _ = reply.send(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "SQ full",
+                            )));
+                            continue;
+                        }
+                        pending.push(PendingOp::Read { buf, len, reply });
+                        num_sqes += 1;
                     }
-
-                    pending.push(PendingOp::Read { buf, len, reply });
-                    num_sqes += 1;
                 }
 
                 LedgerRequest::ReadFramed {
@@ -342,8 +386,6 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     }
 
                     // Submit io_uring READ for the entry data
-                    let mut buf = vec![0u8; size];
-                    let sqe_idx = pending.len() as u64;
                     let data_offset = offset + 4;
 
                     let fd_target = if fixed_fds_available {
@@ -352,24 +394,48 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                         types::Fd(fd)
                     };
 
-                    let read_sqe =
-                        opcode::Read::new(fd_target, buf.as_mut_ptr(), size as u32)
-                            .offset(data_offset)
-                            .build()
-                            .user_data(sqe_idx);
+                    let use_pool = buf_pool.is_some() && size <= BUF_POOL_SIZE;
 
-                    let pushed = unsafe { ring.submission().push(&read_sqe) };
-                    if pushed.is_err() {
-                        let _ = reply.send(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "SQ full",
-                        )));
-                        continue;
+                    if use_pool {
+                        let sqe_idx = pending.len() as u64;
+                        let read_sqe =
+                            opcode::Read::new(fd_target, std::ptr::null_mut(), size as u32)
+                                .offset(data_offset)
+                                .buf_group(BUF_GROUP_ID)
+                                .build()
+                                .flags(io_uring::squeue::Flags::BUFFER_SELECT)
+                                .user_data(sqe_idx);
+
+                        let pushed = unsafe { ring.submission().push(&read_sqe) };
+                        if pushed.is_err() {
+                            let _ = reply.send(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "SQ full",
+                            )));
+                            continue;
+                        }
+                        pending.push(PendingOp::PoolRead { len: size, reply });
+                        num_sqes += 1;
+                    } else {
+                        let mut buf = vec![0u8; size];
+                        let sqe_idx = pending.len() as u64;
+                        let read_sqe =
+                            opcode::Read::new(fd_target, buf.as_mut_ptr(), size as u32)
+                                .offset(data_offset)
+                                .build()
+                                .user_data(sqe_idx);
+
+                        let pushed = unsafe { ring.submission().push(&read_sqe) };
+                        if pushed.is_err() {
+                            let _ = reply.send(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "SQ full",
+                            )));
+                            continue;
+                        }
+                        pending.push(PendingOp::Read { buf, len: size, reply });
+                        num_sqes += 1;
                     }
-
-                    // Reuse PendingOp::Read — CQE dispatch handles it identically
-                    pending.push(PendingOp::Read { buf, len: size, reply });
-                    num_sqes += 1;
                 }
 
                 LedgerRequest::Write {
@@ -444,6 +510,9 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     PendingOp::Read { reply, .. } => {
                         let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
                     }
+                    PendingOp::PoolRead { reply, .. } => {
+                        let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
+                    }
                     PendingOp::Write { reply, .. } => {
                         let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
                     }
@@ -456,21 +525,22 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
         // Unpin fds now that all SQEs have completed — safe to evict again.
         fd_cache.unpin_all();
 
-        let mut results: Vec<Option<i32>> = vec![None; pending.len()];
+        let mut results: Vec<Option<(i32, u32)>> = vec![None; pending.len()];
         for cqe in ring.completion() {
             let idx = cqe.user_data() as usize;
             if idx < results.len() {
-                results[idx] = Some(cqe.result());
+                results[idx] = Some((cqe.result(), cqe.flags()));
             }
         }
 
         // ---- 6. Dispatch results back to callers ----
         for (idx, op) in pending.into_iter().enumerate() {
-            let ret = results[idx].unwrap_or(-libc::EIO);
+            let (ret, cqe_flags) = results[idx].unwrap_or((-libc::EIO, 0));
             match op {
                 PendingOp::Read {
                     buf, len, reply, ..
                 } => {
+                    let _ = cqe_flags;
                     let result = if ret < 0 {
                         Err(io::Error::from_raw_os_error(-ret))
                     } else if (ret as usize) < len {
@@ -483,6 +553,32 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     };
                     let _ = reply.send(result);
                 }
+                PendingOp::PoolRead { len, reply } => {
+                    let has_buffer = cqe_flags & 0x1 != 0; // IORING_CQE_F_BUFFER
+                    let result = if ret < 0 {
+                        if has_buffer {
+                            let buf_id = (cqe_flags >> 16) as u16;
+                            buf_pool.as_ref().unwrap().return_buf(buf_id);
+                        }
+                        Err(io::Error::from_raw_os_error(-ret))
+                    } else if (ret as usize) < len {
+                        if has_buffer {
+                            let buf_id = (cqe_flags >> 16) as u16;
+                            buf_pool.as_ref().unwrap().return_buf(buf_id);
+                        }
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("short read: {} of {} bytes", ret, len),
+                        ))
+                    } else {
+                        let buf_id = (cqe_flags >> 16) as u16;
+                        let pool = buf_pool.as_ref().unwrap();
+                        let data = pool.get_buf(buf_id, ret as usize).to_vec();
+                        pool.return_buf(buf_id);
+                        Ok(data)
+                    };
+                    let _ = reply.send(result);
+                }
                 PendingOp::Write {
                     entries,
                     offset,
@@ -491,6 +587,7 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     reply,
                     ..
                 } => {
+                    let _ = cqe_flags;
                     let result = if ret < 0 {
                         Err(io::Error::from_raw_os_error(-ret))
                     } else {
@@ -510,6 +607,124 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     let _ = reply.send(result);
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Provided buffer pool (kernel 5.19+)
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated buffer pool registered with io_uring's provided buffer ring.
+///
+/// When the kernel supports it, read SQEs can use `BUFFER_SELECT` to let the
+/// kernel pick a buffer from this pool instead of the application allocating
+/// one per read.  After the CQE is reaped the buffer is copied out and
+/// returned to the ring for reuse.
+struct BufferPool {
+    /// Contiguous backing storage for all buffers.
+    storage: Vec<u8>,
+    /// Pointer to the buffer ring memory (page-aligned allocation).
+    ring_ptr: *mut io_uring::types::BufRingEntry,
+    /// Layout used for deallocation.
+    ring_layout: std::alloc::Layout,
+}
+
+unsafe impl Send for BufferPool {}
+
+impl BufferPool {
+    fn try_new(ring: &IoUring<io_uring::squeue::Entry>) -> Option<Self> {
+        let entries = BUF_POOL_COUNT as usize;
+        let entry_size = std::mem::size_of::<io_uring::types::BufRingEntry>();
+        // Ring needs space for entries.  Align to page boundary.
+        let ring_size = entry_size * entries;
+        let layout = std::alloc::Layout::from_size_align(ring_size, 4096).ok()?;
+        let ring_ptr =
+            unsafe { std::alloc::alloc_zeroed(layout) } as *mut io_uring::types::BufRingEntry;
+        if ring_ptr.is_null() {
+            return None;
+        }
+
+        // Register the buffer ring with the kernel.
+        if unsafe {
+            ring.submitter().register_buf_ring_with_flags(
+                ring_ptr as u64,
+                BUF_POOL_COUNT,
+                BUF_GROUP_ID,
+                0,
+            )
+        }
+        .is_err()
+        {
+            unsafe {
+                std::alloc::dealloc(ring_ptr as *mut u8, layout);
+            }
+            return None;
+        }
+
+        // Allocate contiguous backing storage.
+        let storage = vec![0u8; BUF_POOL_SIZE * entries];
+
+        // Fill ring entries and make all buffers available.
+        for i in 0..entries {
+            let buf_addr = unsafe { storage.as_ptr().add(i * BUF_POOL_SIZE) };
+            let entry = unsafe { &mut *ring_ptr.add(i) };
+            entry.set_addr(buf_addr as u64);
+            entry.set_len(BUF_POOL_SIZE as u32);
+            entry.set_bid(i as u16);
+        }
+
+        // Advance tail to make all entries visible to the kernel.
+        let tail_ptr = unsafe {
+            io_uring::types::BufRingEntry::tail(
+                ring_ptr as *const io_uring::types::BufRingEntry,
+            )
+        };
+        unsafe {
+            (*tail_ptr).store(BUF_POOL_COUNT, std::sync::atomic::Ordering::Release);
+        }
+
+        Some(Self {
+            storage,
+            ring_ptr,
+            ring_layout: layout,
+        })
+    }
+
+    /// Get a slice of the completed read data from the buffer pool.
+    fn get_buf(&self, buf_id: u16, len: usize) -> &[u8] {
+        let offset = (buf_id as usize) * BUF_POOL_SIZE;
+        &self.storage[offset..offset + len]
+    }
+
+    /// Return a buffer to the ring after copying the data out.
+    fn return_buf(&self, buf_id: u16) {
+        let entry = unsafe { &mut *self.ring_ptr.add(buf_id as usize) };
+        let buf_addr =
+            unsafe { self.storage.as_ptr().add((buf_id as usize) * BUF_POOL_SIZE) };
+        entry.set_addr(buf_addr as u64);
+        entry.set_len(BUF_POOL_SIZE as u32);
+        entry.set_bid(buf_id);
+
+        // Advance tail atomically.
+        let tail_ptr = unsafe {
+            io_uring::types::BufRingEntry::tail(
+                self.ring_ptr as *const io_uring::types::BufRingEntry,
+            )
+        };
+        unsafe {
+            let old = (*tail_ptr).load(std::sync::atomic::Ordering::Acquire);
+            (*tail_ptr).store(old.wrapping_add(1), std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl Drop for BufferPool {
+    fn drop(&mut self) {
+        // Note: the io_uring ring is already gone by the time this drops
+        // (ring thread exit), so we just free the memory.
+        unsafe {
+            std::alloc::dealloc(self.ring_ptr as *mut u8, self.ring_layout);
         }
     }
 }
