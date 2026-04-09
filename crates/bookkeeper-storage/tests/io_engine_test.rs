@@ -277,40 +277,39 @@ mod uring_tests {
         assert!(data.is_empty());
     }
 
-    #[test]
-    fn uring_ledger_write_and_read_round_trip() {
+    #[tokio::test]
+    async fn uring_ledger_write_and_read_round_trip() {
         let l = UringLedgerIo::new().unwrap();
         let f = NamedTempFile::new().unwrap();
-        // Pre-fill 1024-byte header so writes start at a non-zero offset.
         std::fs::write(f.path(), vec![0u8; 1024]).unwrap();
 
         let offsets = l
-            .write_batch(f.as_raw_fd(), 1024, &[b"aaa", b"bbbbb"])
+            .write_batch(f.as_raw_fd(), 1024, vec![b"aaa".to_vec(), b"bbbbb".to_vec()])
+            .await
             .unwrap();
         assert_eq!(offsets, vec![1024, 1027]);
 
-        let data = l.read_at(f.as_raw_fd(), 1024, 3).unwrap();
+        let data = l.read_at(f.as_raw_fd(), 1024, 3).await.unwrap();
         assert_eq!(&data, b"aaa");
 
-        let data = l.read_at(f.as_raw_fd(), 1027, 5).unwrap();
+        let data = l.read_at(f.as_raw_fd(), 1027, 5).await.unwrap();
         assert_eq!(&data, b"bbbbb");
     }
 
-    #[test]
-    fn uring_ledger_write_batch_empty() {
+    #[tokio::test]
+    async fn uring_ledger_write_batch_empty() {
         let l = UringLedgerIo::new().unwrap();
         let f = NamedTempFile::new().unwrap();
-        let offsets = l.write_batch(f.as_raw_fd(), 0, &[]).unwrap();
+        let offsets = l.write_batch(f.as_raw_fd(), 0, vec![]).await.unwrap();
         assert!(offsets.is_empty());
     }
 
-    #[test]
-    fn uring_ledger_concurrent_reads_return_correct_data() {
+    #[tokio::test]
+    async fn uring_ledger_concurrent_reads_return_correct_data() {
         use std::sync::Arc;
 
         let dir = tempfile::TempDir::new().unwrap();
-        // Build a file: 1024-byte header followed by 10 entries of 10 bytes each.
-        let mut data = vec![0u8; 1024]; // header
+        let mut data = vec![0u8; 1024];
         for i in 0u32..10 {
             let entry = format!("entry-{:04}", i);
             data.extend_from_slice(entry.as_bytes());
@@ -324,8 +323,8 @@ mod uring_tests {
             let engine = engine.clone();
             let dir_path = dir.path().to_path_buf();
             let offset = 1024 + (i as u64 * 10);
-            handles.push(std::thread::spawn(move || {
-                let data = engine.read_entry(&dir_path, 0, offset, 10).unwrap();
+            handles.push(tokio::spawn(async move {
+                let data = engine.read_entry(&dir_path, 0, offset, 10).await.unwrap();
                 assert_eq!(
                     String::from_utf8(data).unwrap(),
                     format!("entry-{:04}", i)
@@ -334,7 +333,7 @@ mod uring_tests {
         }
 
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
     }
 }

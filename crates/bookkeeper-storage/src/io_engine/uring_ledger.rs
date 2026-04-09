@@ -290,54 +290,34 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                         }
                     };
 
-                    let fd_target = if fixed_fds_available {
-                        types::Fixed(fixed_index)
-                    } else {
-                        types::Fd(fd)
-                    };
-
                     let use_pool = buf_pool.is_some() && len <= BUF_POOL_SIZE;
+                    let sqe_idx = pending.len() as u64;
 
                     if use_pool {
-                        let sqe_idx = pending.len() as u64;
-                        let read_sqe =
-                            opcode::Read::new(fd_target, std::ptr::null_mut(), len as u32)
-                                .offset(offset)
-                                .buf_group(BUF_GROUP_ID)
-                                .build()
-                                .flags(io_uring::squeue::Flags::BUFFER_SELECT)
-                                .user_data(sqe_idx);
-
+                        let read_sqe = build_pool_read_sqe(
+                            fixed_fds_available, fd, fixed_index,
+                            len as u32, offset, BUF_GROUP_ID, sqe_idx,
+                        );
                         let pushed = unsafe { ring.submission().push(&read_sqe) };
                         if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "SQ full",
-                            )));
+                            let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "SQ full")));
                             continue;
                         }
                         pending.push(PendingOp::PoolRead { len, reply });
-                        num_sqes += 1;
                     } else {
                         let mut buf = vec![0u8; len];
-                        let sqe_idx = pending.len() as u64;
-                        let read_sqe =
-                            opcode::Read::new(fd_target, buf.as_mut_ptr(), len as u32)
-                                .offset(offset)
-                                .build()
-                                .user_data(sqe_idx);
-
+                        let read_sqe = build_read_sqe(
+                            fixed_fds_available, fd, fixed_index,
+                            buf.as_mut_ptr(), len as u32, offset, sqe_idx,
+                        );
                         let pushed = unsafe { ring.submission().push(&read_sqe) };
                         if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "SQ full",
-                            )));
+                            let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "SQ full")));
                             continue;
                         }
                         pending.push(PendingOp::Read { buf, len, reply });
-                        num_sqes += 1;
                     }
+                    num_sqes += 1;
                 }
 
                 LedgerRequest::ReadFramed {
@@ -394,57 +374,35 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                         continue;
                     }
 
-                    // Submit io_uring READ for the entry data
                     let data_offset = offset + 4;
-
-                    let fd_target = if fixed_fds_available {
-                        types::Fixed(fixed_index)
-                    } else {
-                        types::Fd(fd)
-                    };
-
                     let use_pool = buf_pool.is_some() && size <= BUF_POOL_SIZE;
+                    let sqe_idx = pending.len() as u64;
 
                     if use_pool {
-                        let sqe_idx = pending.len() as u64;
-                        let read_sqe =
-                            opcode::Read::new(fd_target, std::ptr::null_mut(), size as u32)
-                                .offset(data_offset)
-                                .buf_group(BUF_GROUP_ID)
-                                .build()
-                                .flags(io_uring::squeue::Flags::BUFFER_SELECT)
-                                .user_data(sqe_idx);
-
+                        let read_sqe = build_pool_read_sqe(
+                            fixed_fds_available, fd, fixed_index,
+                            size as u32, data_offset, BUF_GROUP_ID, sqe_idx,
+                        );
                         let pushed = unsafe { ring.submission().push(&read_sqe) };
                         if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "SQ full",
-                            )));
+                            let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "SQ full")));
                             continue;
                         }
                         pending.push(PendingOp::PoolRead { len: size, reply });
-                        num_sqes += 1;
                     } else {
                         let mut buf = vec![0u8; size];
-                        let sqe_idx = pending.len() as u64;
-                        let read_sqe =
-                            opcode::Read::new(fd_target, buf.as_mut_ptr(), size as u32)
-                                .offset(data_offset)
-                                .build()
-                                .user_data(sqe_idx);
-
+                        let read_sqe = build_read_sqe(
+                            fixed_fds_available, fd, fixed_index,
+                            buf.as_mut_ptr(), size as u32, data_offset, sqe_idx,
+                        );
                         let pushed = unsafe { ring.submission().push(&read_sqe) };
                         if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "SQ full",
-                            )));
+                            let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "SQ full")));
                             continue;
                         }
                         pending.push(PendingOp::Read { buf, len: size, reply });
-                        num_sqes += 1;
                     }
+                    num_sqes += 1;
                 }
 
                 LedgerRequest::Write {
@@ -683,11 +641,13 @@ impl BufferPool {
             entry.set_bid(i as u16);
         }
 
+        // BufRingEntry::tail() returns *const AtomicU16 — advance tail to
+        // make all entries visible to the kernel.
         let tail_ptr = unsafe {
             io_uring::types::BufRingEntry::tail(
                 ring_ptr as *const io_uring::types::BufRingEntry,
             )
-        };
+        } as *const std::sync::atomic::AtomicU16;
         unsafe {
             (*tail_ptr).store(BUF_POOL_COUNT, std::sync::atomic::Ordering::Release);
         }
@@ -716,7 +676,7 @@ impl BufferPool {
             io_uring::types::BufRingEntry::tail(
                 self.ring_ptr as *const io_uring::types::BufRingEntry,
             )
-        };
+        } as *const std::sync::atomic::AtomicU16;
         unsafe {
             (*tail_ptr).fetch_add(1, std::sync::atomic::Ordering::Release);
         }
@@ -739,6 +699,56 @@ impl Drop for BufferPool {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build a read SQE using either Fixed or Fd depending on availability.
+fn build_read_sqe(
+    fixed_fds: bool,
+    fd: RawFd,
+    fixed_index: u32,
+    buf_ptr: *mut u8,
+    len: u32,
+    offset: u64,
+    user_data: u64,
+) -> io_uring::squeue::Entry {
+    if fixed_fds {
+        opcode::Read::new(types::Fixed(fixed_index), buf_ptr, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data)
+    } else {
+        opcode::Read::new(types::Fd(fd), buf_ptr, len)
+            .offset(offset)
+            .build()
+            .user_data(user_data)
+    }
+}
+
+/// Build a read SQE with buffer selection from the provided buffer pool.
+fn build_pool_read_sqe(
+    fixed_fds: bool,
+    fd: RawFd,
+    fixed_index: u32,
+    len: u32,
+    offset: u64,
+    buf_group: u16,
+    user_data: u64,
+) -> io_uring::squeue::Entry {
+    if fixed_fds {
+        opcode::Read::new(types::Fixed(fixed_index), std::ptr::null_mut(), len)
+            .offset(offset)
+            .buf_group(buf_group)
+            .build()
+            .flags(io_uring::squeue::Flags::BUFFER_SELECT)
+            .user_data(user_data)
+    } else {
+        opcode::Read::new(types::Fd(fd), std::ptr::null_mut(), len)
+            .offset(offset)
+            .buf_group(buf_group)
+            .build()
+            .flags(io_uring::squeue::Flags::BUFFER_SELECT)
+            .user_data(user_data)
+    }
+}
 
 /// Build the per-entry starting-offset vector returned by `write_batch`.
 fn build_offset_vec(base_offset: u64, entries: &[Vec<u8>]) -> Vec<u64> {
