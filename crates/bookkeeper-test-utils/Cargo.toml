@@ -16,3 +16,4 @@ tempfile = { workspace = true }
 testcontainers = "0.23"
 uuid = { workspace = true }
 zookeeper-client = { workspace = true }
+libc = "0.2"

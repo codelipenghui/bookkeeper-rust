@@ -657,6 +657,7 @@ dependencies = [
  "bookkeeper-metadata",
  "bookkeeper-protocol",
  "bookkeeper-server",
+ "libc",
  "tempfile",
  "testcontainers",
  "tokio",

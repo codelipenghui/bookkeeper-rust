@@ -26,7 +26,7 @@
 //! binary. Each test is responsible for using a unique ZK root path
 //! (`/test_<name>`) to avoid colliding with sibling tests.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use bookkeeper_client::zk_client::ZkBookKeeper;
@@ -40,6 +40,42 @@ use testcontainers::{
     core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
 };
 use tokio::sync::OnceCell;
+
+// ---------------------------------------------------------------------------
+// Process-exit container cleanup
+// ---------------------------------------------------------------------------
+//
+// Rust statics are never dropped at process exit, so containers held in
+// `OnceCell<Arc<ZkFixture>>` would leak. We register a libc::atexit
+// callback that `docker rm -f`s every container ID we've started.
+
+/// Container IDs to clean up at process exit.
+static CLEANUP_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static ATEXIT_REGISTERED: Once = Once::new();
+
+/// Register a container ID for cleanup when the process exits.
+fn register_container_cleanup(container_id: &str) {
+    if let Ok(mut ids) = CLEANUP_IDS.lock() {
+        ids.push(container_id.to_string());
+    }
+    ATEXIT_REGISTERED.call_once(|| {
+        unsafe { libc::atexit(cleanup_containers_on_exit); }
+    });
+}
+
+/// Called by libc::atexit — stops and removes all registered containers.
+extern "C" fn cleanup_containers_on_exit() {
+    if let Ok(ids) = CLEANUP_IDS.lock() {
+        for id in ids.iter() {
+            // Best-effort: ignore errors (Docker may already be gone)
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", id])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ZooKeeper container
@@ -85,6 +121,9 @@ pub async fn start_zk() -> Option<(ContainerAsync<GenericImage>, String)> {
         .with_env_var("ZOO_4LW_COMMANDS_WHITELIST", "*");
     match request.start().await {
         Ok(container) => {
+            // Register for cleanup at process exit. Rust statics are never
+            // dropped, so without this the container would leak.
+            register_container_cleanup(container.id());
             let port = container.get_host_port_ipv4(2181).await.ok()?;
             Some((container, format!("127.0.0.1:{port}")))
         }
