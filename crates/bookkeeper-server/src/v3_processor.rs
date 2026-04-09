@@ -15,7 +15,7 @@ pub fn try_decode_v3(data: &[u8]) -> Option<bookkeeper_proto::Request> {
 
 /// Process a V3 protobuf request by converting to V2 internal representation,
 /// running through the same handler, and converting the response back to V3 protobuf.
-pub fn process_v3_request(
+pub async fn process_v3_request(
     processor: &RequestProcessor,
     req: bookkeeper_proto::Request,
 ) -> Vec<u8> {
@@ -42,7 +42,7 @@ pub fn process_v3_request(
                     master_key,
                     entry_data: Bytes::from(add.body),
                 };
-                processor.process_request(v2_req)
+                processor.process_request(v2_req).await
             } else {
                 return build_v3_error_response(txn_id, operation, BKError::BadRequest);
             }
@@ -68,7 +68,6 @@ pub fn process_v3_request(
 
                 if is_long_poll {
                     // Long poll read matching Java's LongPollReadEntryProcessorV3.
-                    // Uses std::sync::mpsc (not tokio) to avoid block_on deadlock.
                     let previous_lac = read.previous_lac.unwrap();
                     let timeout_ms = read.time_out.unwrap_or(10000) as u64;
                     let ledger_id = read.ledger_id;
@@ -82,10 +81,11 @@ pub fn process_v3_request(
                         current_lac // already advanced
                     } else if let Some(watchers) = processor.storage().lac_watchers() {
                         if let Some(rx) = watchers.watch(ledger_id, previous_lac, current_lac) {
-                            // Wait using sync recv_timeout (safe in spawn_blocking context)
-                            match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
-                                Ok(new_lac) => new_lac,
-                                Err(_) => current_lac, // timeout
+                            // Wait using spawn_blocking for the sync recv_timeout call
+                            let timeout = std::time::Duration::from_millis(timeout_ms);
+                            match tokio::task::spawn_blocking(move || rx.recv_timeout(timeout)).await {
+                                Ok(Ok(new_lac)) => new_lac,
+                                _ => current_lac,
                             }
                         } else {
                             // Entry became available between check and watch
@@ -104,7 +104,7 @@ pub fn process_v3_request(
                     let v2_req = V2Request::ReadEntry {
                         flags, ledger_id, entry_id: read_entry_id, master_key: master_key_opt,
                     };
-                    processor.process_request(v2_req)
+                    processor.process_request(v2_req).await
                 } else {
                     // Normal read (not long poll)
                     let v2_req = V2Request::ReadEntry {
@@ -113,7 +113,7 @@ pub fn process_v3_request(
                         entry_id: read.entry_id,
                         master_key: master_key_opt,
                     };
-                    processor.process_request(v2_req)
+                    processor.process_request(v2_req).await
                 }
             } else {
                 return build_v3_error_response(txn_id, operation, BKError::BadRequest);
@@ -130,7 +130,7 @@ pub fn process_v3_request(
                     master_key,
                     body: Bytes::from(wl.body),
                 };
-                processor.process_request(v2_req)
+                processor.process_request(v2_req).await
             } else {
                 return build_v3_error_response(txn_id, operation, BKError::BadRequest);
             }
@@ -138,7 +138,7 @@ pub fn process_v3_request(
         op if op == bookkeeper_proto::OperationType::ReadLac as i32 => {
             if let Some(rl) = req.read_lac_request {
                 let v2_req = V2Request::ReadLac { ledger_id: rl.ledger_id };
-                processor.process_request(v2_req)
+                processor.process_request(v2_req).await
             } else {
                 return build_v3_error_response(txn_id, operation, BKError::BadRequest);
             }
@@ -146,11 +146,11 @@ pub fn process_v3_request(
         op if op == bookkeeper_proto::OperationType::GetBookieInfo as i32 => {
             let requested = req.get_bookie_info_request.map(|r| r.requested.unwrap_or(0x03)).unwrap_or(0x03);
             let v2_req = V2Request::GetBookieInfo { flags: 0, requested };
-            processor.process_request(v2_req)
+            processor.process_request(v2_req).await
         }
         op if op == bookkeeper_proto::OperationType::ForceLedger as i32 => {
             if let Some(fl) = req.force_ledger_request {
-                let _ = processor.force_flush();
+                let _ = processor.force_flush().await;
                 return build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Ok);
             } else {
                 return build_v3_error_response(txn_id, operation, BKError::BadRequest);

@@ -1130,7 +1130,7 @@ async fn read_ledger_endpoint(
 
     let mut entries = serde_json::Map::new();
     for eid in start..=end {
-        match storage.get_entry(query.ledger_id, eid) {
+        match storage.get_entry(query.ledger_id, eid).await {
             Ok(data) => {
                 entries.insert(eid.to_string(), serde_json::json!({
                     "size": data.len(),

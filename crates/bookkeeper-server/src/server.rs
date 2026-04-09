@@ -95,7 +95,7 @@ impl BookieServer {
             journal_config,
             io_engines.journal,
             Some(on_journal_fatal),
-        )?;
+        ).await?;
         if replayed > 0 {
             tracing::info!("Journal recovery: replayed {replayed} entries");
         }
@@ -484,17 +484,10 @@ impl BookieServer {
         tracing::info!("Flushing storage...");
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(300),
-            tokio::task::spawn_blocking({
-                let storage = self.storage.clone();
-                move || {
-                    if let Err(e) = storage.checkpoint() {
-                        tracing::warn!("WARNING: checkpoint failed during shutdown: {e}");
-                    }
-                }
-            })
+            self.storage.checkpoint(),
         ).await {
             Ok(Ok(())) => tracing::info!("Storage flushed."),
-            Ok(Err(e)) => tracing::warn!("WARNING: storage flush task panicked: {e}"),
+            Ok(Err(e)) => tracing::warn!("WARNING: checkpoint failed during shutdown: {e}"),
             Err(_) => tracing::warn!("WARNING: storage flush timed out after 5 minutes"),
         }
 
@@ -880,7 +873,7 @@ async fn run_sync_thread(
                 if *shutdown_rx.borrow() {
                     tracing::info!("SyncThread shutting down");
                     // Final flush before exit
-                    if let Err(e) = storage.checkpoint() {
+                    if let Err(e) = storage.checkpoint().await {
                         tracing::warn!("SyncThread: final checkpoint error: {e}");
                     }
                     break;
@@ -888,7 +881,7 @@ async fn run_sync_thread(
             }
             _ = tokio::time::sleep(interval) => {
                 // Periodic checkpoint: flush write cache → entry logs → clean journals
-                if let Err(e) = storage.checkpoint() {
+                if let Err(e) = storage.checkpoint().await {
                     tracing::warn!("SyncThread: checkpoint error: {e}");
                 }
             }
@@ -958,7 +951,7 @@ async fn run_gc_loop(
                 match ledger_manager.get_ledger_ranges().await {
                     Ok(metadata_ledgers) => {
                         let active: HashSet<i64> = metadata_ledgers.into_iter().collect();
-                        if let Err(e) = gc.gc(&active) {
+                        if let Err(e) = gc.gc(&active).await {
                             tracing::warn!("GC cycle error: {e}");
                         }
                     }
@@ -1214,13 +1207,7 @@ where
                 if use_v3 {
                     is_v3 = Some(true);
                     if let Some(v3_req) = crate::v3_processor::try_decode_v3(&frame_bytes) {
-                        let proc = processor.clone();
-                        let resp = match tokio::task::spawn_blocking(move || {
-                            crate::v3_processor::process_v3_request(&proc, v3_req)
-                        }).await {
-                            Ok(resp) => resp,
-                            Err(_) => break,
-                        };
+                        let resp = crate::v3_processor::process_v3_request(&processor, v3_req).await;
                         response_bytes = Bytes::from(resp);
                     } else {
                         // Sticky V3 connection but frame failed to decode — close
@@ -1230,11 +1217,7 @@ where
                     is_v3 = Some(false);
                     match decode_request(frame_bytes) {
                         Ok(req) => {
-                            let proc = processor.clone();
-                            let resp = match tokio::task::spawn_blocking(move || proc.process_request(req)).await {
-                                Ok(resp) => resp,
-                                Err(_) => break, // task panicked or cancelled
-                            };
+                            let resp = processor.process_request(req).await;
                             let resp_encoded = encode_response(&resp);
                             response_bytes = resp_encoded.freeze();
                         }

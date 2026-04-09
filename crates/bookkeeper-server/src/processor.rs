@@ -23,14 +23,14 @@ impl RequestProcessor {
         &*self.storage
     }
 
-    pub fn process_request(&self, req: V2Request) -> V2Response {
+    pub async fn process_request(&self, req: V2Request) -> V2Response {
         match req {
             V2Request::AddEntry { flags, master_key, entry_data } => {
                 let entry_size = entry_data.len();
                 let is_recovery = flags & FLAG_RECOVERY_ADD != 0;
                 crate::metrics::ADD_ENTRY_IN_PROGRESS.inc();
                 let timer = std::time::Instant::now();
-                let resp = self.handle_add_entry(flags, &master_key, entry_data);
+                let resp = self.handle_add_entry(flags, &master_key, entry_data).await;
                 let elapsed = timer.elapsed().as_secs_f64();
                 crate::metrics::ADD_ENTRY_IN_PROGRESS.dec();
                 let success = matches!(resp, V2Response::Add { error_code, .. } if error_code == V2_EOK);
@@ -52,7 +52,7 @@ impl RequestProcessor {
                 let is_fence = flags & FLAG_DO_FENCING != 0;
                 crate::metrics::READ_ENTRY_IN_PROGRESS.inc();
                 let timer = std::time::Instant::now();
-                let resp = self.handle_read_entry(flags, ledger_id, entry_id, master_key);
+                let resp = self.handle_read_entry(flags, ledger_id, entry_id, master_key).await;
                 let elapsed = timer.elapsed().as_secs_f64();
                 crate::metrics::READ_ENTRY_IN_PROGRESS.dec();
                 let success = matches!(resp, V2Response::Read { error_code, .. } if error_code == V2_EOK);
@@ -83,7 +83,7 @@ impl RequestProcessor {
                 self.handle_write_lac(ledger_id, lac, body)
             }
             V2Request::ReadLac { ledger_id } => {
-                self.handle_read_lac(ledger_id)
+                self.handle_read_lac(ledger_id).await
             }
             V2Request::GetBookieInfo { flags: _, requested } => {
                 self.handle_get_bookie_info(requested)
@@ -94,12 +94,12 @@ impl RequestProcessor {
                 V2Response::Auth { error_code: V2_EOK, payload: bytes::Bytes::new() }
             }
             V2Request::BatchReadEntry { flags, ledger_id, start_entry_id, request_id, max_count, max_size } => {
-                self.handle_batch_read(flags, ledger_id, start_entry_id, request_id, max_count, max_size)
+                self.handle_batch_read(flags, ledger_id, start_entry_id, request_id, max_count, max_size).await
             }
         }
     }
 
-    fn handle_add_entry(&self, flags: u16, master_key: &[u8; MASTER_KEY_LENGTH], entry_data: Bytes) -> V2Response {
+    async fn handle_add_entry(&self, flags: u16, master_key: &[u8; MASTER_KEY_LENGTH], entry_data: Bytes) -> V2Response {
         if entry_data.len() < 16 {
             return self.add_error_response(BKError::BadRequest, 0, 0);
         }
@@ -133,13 +133,13 @@ impl RequestProcessor {
         // 1. Storage write (in-memory write cache — fast)
         // 2. Master key journaling (first write per ledger)
         // 3. Data entry journaling (durability)
-        match self.storage.add_entry(&entry_data) {
+        match self.storage.add_entry(&entry_data).await {
             Ok(()) => {
                 if let Some(journal) = self.storage.journal() {
                     // Journal master key BEFORE data entry (matching Java's ordering)
                     let _ = journal.maybe_journal_master_key(ledger_id, master_key);
-                    // Journal the data entry — blocks until durable
-                    if let Err(_e) = journal.log_add_entry(&entry_data) {
+                    // Journal the data entry — awaits until durable
+                    if let Err(_e) = journal.log_add_entry(&entry_data).await {
                         return self.add_error_response(BKError::Io, ledger_id, entry_id);
                     }
                 }
@@ -149,7 +149,7 @@ impl RequestProcessor {
         }
     }
 
-    fn handle_read_entry(&self, flags: u16, ledger_id: i64, entry_id: i64, master_key: Option<[u8; MASTER_KEY_LENGTH]>) -> V2Response {
+    async fn handle_read_entry(&self, flags: u16, ledger_id: i64, entry_id: i64, master_key: Option<[u8; MASTER_KEY_LENGTH]>) -> V2Response {
         // Check readable state
         if !self.state.is_readable() {
             return self.read_error_response(BKError::ReadOnly, ledger_id, entry_id);
@@ -175,7 +175,7 @@ impl RequestProcessor {
                 Ok(lac) => {
                     // Try to return the actual last entry body for digest verification
                     let data = if lac >= 0 {
-                        self.storage.get_entry(ledger_id, lac).ok()
+                        self.storage.get_entry(ledger_id, lac).await.ok()
                     } else {
                         None
                     };
@@ -193,7 +193,7 @@ impl RequestProcessor {
         }
 
         // Normal read
-        match self.storage.get_entry(ledger_id, entry_id) {
+        match self.storage.get_entry(ledger_id, entry_id).await {
             Ok(data) => V2Response::Read {
                 error_code: V2_EOK,
                 ledger_id,
@@ -229,7 +229,7 @@ impl RequestProcessor {
     /// 1. lac_body: The explicit LAC from the most recent WriteLac request (with digest)
     /// 2. last_entry_body: The actual last entry on disk (piggybacked LAC)
     /// The client compares both to determine the true LAC.
-    fn handle_read_lac(&self, ledger_id: i64) -> V2Response {
+    async fn handle_read_lac(&self, ledger_id: i64) -> V2Response {
         let lac = match self.storage.get_last_add_confirmed(ledger_id) {
             Ok(l) => l,
             Err(e) => {
@@ -253,7 +253,7 @@ impl RequestProcessor {
 
         // Get last entry body from disk (piggybacked LAC)
         let last_entry_body = if lac >= 0 {
-            self.storage.get_entry(ledger_id, lac).ok().map(|b| b)
+            self.storage.get_entry(ledger_id, lac).await.ok()
         } else {
             None
         };
@@ -278,7 +278,7 @@ impl RequestProcessor {
         }
     }
 
-    fn handle_batch_read(&self, flags: u16, ledger_id: i64, start_entry_id: i64, request_id: i64, max_count: i32, max_size: i64) -> V2Response {
+    async fn handle_batch_read(&self, flags: u16, ledger_id: i64, start_entry_id: i64, request_id: i64, max_count: i32, max_size: i64) -> V2Response {
         // Check readable state
         if !self.state.is_readable() {
             return V2Response::BatchRead {
@@ -298,7 +298,7 @@ impl RequestProcessor {
         let mut total_size: i64 = 0;
         for i in 0..max_count as i64 {
             let eid = start_entry_id + i;
-            match self.storage.get_entry(ledger_id, eid) {
+            match self.storage.get_entry(ledger_id, eid).await {
                 Ok(data) => {
                     total_size += data.len() as i64;
                     if total_size > max_size && !entries.is_empty() {
@@ -323,8 +323,8 @@ impl RequestProcessor {
         }
     }
 
-    pub fn force_flush(&self) -> Result<(), bookkeeper_storage::StorageError> {
-        self.storage.flush()
+    pub async fn force_flush(&self) -> Result<(), bookkeeper_storage::StorageError> {
+        self.storage.flush().await
     }
 
     fn add_error_response(&self, err: BKError, ledger_id: i64, entry_id: i64) -> V2Response {
