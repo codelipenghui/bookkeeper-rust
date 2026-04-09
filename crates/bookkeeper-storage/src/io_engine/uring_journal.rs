@@ -7,6 +7,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::os::unix::io::FromRawFd;
 use std::sync::Mutex;
 
 use io_uring::{opcode, types, IoUring};
@@ -80,23 +81,26 @@ impl JournalIo for UringJournalIo {
 
         ring.submit_and_wait(2)?;
 
-        // Check completions. For WRITEV, verify we wrote all bytes.
-        // For FSYNC, verify no error.
-        for cqe in ring.completion() {
-            let ret = cqe.result();
-            if ret < 0 {
-                return Err(io::Error::from_raw_os_error(-ret));
+        // Drain completions into a vec first (avoids holding a borrow on
+        // `ring` that conflicts with submit_fsync if we need a short-write retry).
+        let cqes: Vec<(i32, u64)> = ring.completion()
+            .map(|cqe| (cqe.result(), cqe.user_data()))
+            .collect();
+
+        let mut need_retry_fsync = false;
+        for (ret, user_data) in &cqes {
+            if *ret < 0 {
+                return Err(io::Error::from_raw_os_error(-*ret));
             }
             // user_data=1 is the WRITEV CQE — check for short write
-            if cqe.user_data() == 1 && (ret as usize) < total_bytes {
-                // Short write on a regular file is extremely rare (signals,
-                // disk-full). Retry the remainder with a plain write loop
-                // since the linked FSYNC already ran on the partial data.
-                let written = ret as usize;
+            if *user_data == 1 && (*ret as usize) < total_bytes {
+                let written = *ret as usize;
                 self.retry_short_write(fd, entries, written)?;
-                // Need another fsync for the retried bytes
-                self.submit_fsync(&mut ring, fd)?;
+                need_retry_fsync = true;
             }
+        }
+        if need_retry_fsync {
+            self.submit_fsync(&mut ring, fd)?;
         }
 
         Ok(())
