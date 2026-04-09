@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use super::format::{self, JournalHeader, calculate_padding};
@@ -38,56 +38,42 @@ pub struct JournalConfig {
 
 /// The journal — write-ahead log for crash recovery.
 ///
-/// Matches Java's Journal + ForceWriteThread:
-/// - Journal writer thread: dequeues entries, writes to BufWriter, flushes, ACKs
-/// - ForceWrite thread: batches fsync operations asynchronously
-/// - Master key journaling: first write to a ledger journals the master key
-/// - V5+ alignment padding between flushes
-/// - Memory backpressure: blocks writers when queue exceeds limit
+/// A single `journal-io` thread dequeues entries from a bounded channel,
+/// batches them, and calls `JournalIo::write_and_sync()` which performs
+/// the write + fsync atomically. When the backend is `UringJournalIo`,
+/// this is a single `io_uring_enter()` with linked WRITEV→FSYNC SQEs.
+/// When the backend is `StdEngine`, it falls back to `write_all` +
+/// `sync_data` on the same thread.
+///
+/// This replaces the previous 2-thread architecture (writer + fsync)
+/// and eliminates the inter-thread hop for the fsync path.
 pub struct Journal {
     tx: mpsc::SyncSender<JournalEntry>,
-    _writer_thread: Option<std::thread::JoinHandle<()>>,
-    _fsync_thread: Option<std::thread::JoinHandle<()>>,
-    /// Tracks which ledgers have had master keys journaled (for first-write detection).
+    _io_thread: Option<std::thread::JoinHandle<()>>,
+    /// Tracks which ledgers have had master keys journaled.
     master_key_cache: std::sync::Mutex<HashSet<i64>>,
-    /// Stored for future use by the io_uring write path.
-    _journal_io: Arc<dyn JournalIo>,
 }
 
 impl Journal {
-    /// Start the journal background threads.
-    pub fn start(config: JournalConfig, journal_io: Arc<dyn JournalIo>) -> Self {
-        // Bounded channel for memory backpressure (matching Java's memoryLimitController).
-        // Bound = MAX_QUEUE_MEMORY / avg_entry_size. Conservative estimate: 1KB avg.
+    /// Start the journal I/O thread.
+    pub fn start(config: JournalConfig, journal_io: std::sync::Arc<dyn JournalIo>) -> Self {
         let bound = MAX_QUEUE_MEMORY / 1024;
         let (tx, rx) = mpsc::sync_channel(bound);
 
-        // ForceWrite channel: journal writer sends fsync requests to fsync thread
-        let (fsync_tx, fsync_rx) = mpsc::channel::<FsyncRequest>();
-
-        let writer_config = config.clone();
-        let writer_thread = std::thread::Builder::new()
-            .name("journal-writer".into())
-            .spawn(move || journal_writer_loop(writer_config, rx, fsync_tx))
-            .expect("failed to spawn journal writer thread");
-
-        let fsync_config = config.clone();
-        let fsync_thread = std::thread::Builder::new()
-            .name("journal-fsync".into())
-            .spawn(move || fsync_loop(fsync_config, fsync_rx))
-            .expect("failed to spawn journal fsync thread");
+        let io_thread = std::thread::Builder::new()
+            .name("journal-io".into())
+            .spawn(move || journal_io_loop(config, rx, journal_io))
+            .expect("failed to spawn journal-io thread");
 
         Self {
             tx,
-            _writer_thread: Some(writer_thread),
-            _fsync_thread: Some(fsync_thread),
+            _io_thread: Some(io_thread),
             master_key_cache: std::sync::Mutex::new(HashSet::new()),
-            _journal_io: journal_io,
         }
     }
 
     /// Write an entry to the journal synchronously.
-    /// Blocks until the entry is flushed to OS page cache.
+    /// Blocks until the entry is written and fsynced (data is durable).
     pub fn log_add_entry(&self, data: &[u8]) -> Result<(), StorageError> {
         let (ack_tx, ack_rx) = mpsc::channel();
         self.tx
@@ -104,9 +90,6 @@ impl Journal {
     }
 
     /// Journal a master key entry for a ledger if not already journaled.
-    /// Matches Java's BookieImpl.addEntryInternal which journals
-    /// METAENTRY_ID_LEDGER_KEY on first write to each ledger.
-    /// Journal a master key entry for a ledger if not already journaled.
     /// Atomic: cache insert happens under lock BEFORE journal send,
     /// matching Java's putIfAbsent + journal pattern.
     pub fn maybe_journal_master_key(
@@ -116,12 +99,10 @@ impl Journal {
     ) -> Result<(), StorageError> {
         let mut cache = self.master_key_cache.lock().unwrap();
         if cache.contains(&ledger_id) {
-            return Ok(()); // already journaled
+            return Ok(());
         }
-        // Insert into cache first (under lock) to prevent duplicate journaling.
-        // Matches Java's putIfAbsent semantics.
         cache.insert(ledger_id);
-        drop(cache); // release lock before blocking on channel send
+        drop(cache);
 
         // Build master key entry: [ledgerId(8)][METAENTRY_ID(8)][keyLen(4)][key]
         let entry_len = 8 + 8 + 4 + master_key.len();
@@ -131,7 +112,7 @@ impl Journal {
         entry.extend_from_slice(&(master_key.len() as i32).to_be_bytes());
         entry.extend_from_slice(master_key);
 
-        // Journal it (fire-and-forget, no ACK needed — matches Java's NopWriteCallback)
+        // Fire-and-forget (no ACK needed — matches Java's NopWriteCallback)
         let _ = self.tx.send(JournalEntry {
             data: entry,
             ack_tx: None,
@@ -141,127 +122,78 @@ impl Journal {
     }
 }
 
-/// Request from writer thread to fsync thread.
-struct FsyncRequest {
-    journal_path: PathBuf,
-    /// Pending client ACKs that must wait for fsync (syncData=true).
-    /// These are ACKed AFTER fsync, matching Java's ackBeforeSync=false.
-    pending_acks: Vec<mpsc::Sender<()>>,
-}
+// ---------------------------------------------------------------------------
+// Journal I/O thread — single thread replaces the old writer + fsync pair
+// ---------------------------------------------------------------------------
 
-/// Background journal writer loop (runs on dedicated OS thread).
-fn journal_writer_loop(
+/// Single background thread that owns journal file state and delegates
+/// all I/O to the `JournalIo` trait (uring or std).
+fn journal_io_loop(
     config: JournalConfig,
     rx: mpsc::Receiver<JournalEntry>,
-    fsync_tx: mpsc::Sender<FsyncRequest>,
+    journal_io: std::sync::Arc<dyn JournalIo>,
 ) {
     fs::create_dir_all(&config.journal_dir).ok();
 
-    let mut state = WriterState::new(&config);
+    let mut state = JournalFileState::new(&config);
     let group_wait = Duration::from_millis(config.max_group_wait_ms.max(1));
     let mut pending_acks: Vec<mpsc::Sender<()>> = Vec::new();
-    let mut pending_bytes: usize = 0;
-    let mut pending_count: usize = 0;
+    let mut pending_entries: Vec<Vec<u8>> = Vec::new();
 
     loop {
-        let timeout = if pending_count > 0 { group_wait } else { Duration::from_secs(3600) };
+        let timeout = if !pending_entries.is_empty() {
+            group_wait
+        } else {
+            Duration::from_secs(3600)
+        };
 
         match rx.recv_timeout(timeout) {
             Ok(entry) => {
-                if let Err(e) = state.write_entry(&config, &entry.data) {
-                    tracing::warn!("Journal write error: {e}");
-                }
-                pending_bytes += 4 + entry.data.len();
-                pending_count += 1;
+                // Frame entry: [size(4 BE)][payload]
+                let framed = frame_journal_entry(&entry.data);
+                pending_entries.push(framed);
                 if let Some(ack) = entry.ack_tx {
                     pending_acks.push(ack);
                 }
 
                 // Drain more entries without blocking (batch)
                 while let Ok(entry) = rx.try_recv() {
-                    if let Err(e) = state.write_entry(&config, &entry.data) {
-                        tracing::warn!("Journal write error: {e}");
-                    }
-                    pending_bytes += 4 + entry.data.len();
-                    pending_count += 1;
+                    let framed = frame_journal_entry(&entry.data);
+                    pending_entries.push(framed);
                     if let Some(ack) = entry.ack_tx {
                         pending_acks.push(ack);
                     }
                 }
 
-                // Group commit decision matching Java's Journal.java:1052-1086:
-                // 1. Threshold exceeded (entries or bytes)
-                // 2. Queue drained (all available entries consumed — flush what we have)
-                //
-                // Java uses flushWhenQueueEmpty which flushes when no more entries are
-                // immediately available. The try_recv() loop above already drained
-                // everything available, so we always flush here. The group_wait timeout
-                // applies when the FIRST entry arrives and we wait for more before
-                // the initial recv_timeout. Once we have entries, we drain and flush.
-                let should_flush = pending_count > 0;
-
-                if should_flush {
-                    // V5+ padding before flush
-                    if config.format_version >= 5 && config.alignment_size > 0 {
-                        if let Err(e) = state.write_padding(config.alignment_size) {
-                            tracing::warn!("Journal padding error: {e}");
-                        }
-                    }
-
-                    // Flush to OS page cache
-                    if let Err(e) = state.flush(false) {
-                        tracing::warn!("Journal flush error: {e}");
-                    }
-
-                    if config.sync_data {
-                        // syncData=true: ACK AFTER fsync (matching Java's ackBeforeSync=false).
-                        // Send pending ACKs to ForceWrite thread; it will ACK after fsync.
-                        if let Some(ref path) = state.current_path(&config) {
-                            let _ = fsync_tx.send(FsyncRequest {
-                                journal_path: path.clone(),
-                                pending_acks: pending_acks.drain(..).collect(),
-                            });
-                        }
-                    } else {
-                        // syncData=false: ACK immediately after page cache write.
-                        for ack in pending_acks.drain(..) {
-                            let _ = ack.send(());
-                        }
-                    }
-
-                    pending_bytes = 0;
-                    pending_count = 0;
-                }
+                // Flush the batch
+                flush_batch(
+                    &config,
+                    &mut state,
+                    &journal_io,
+                    &mut pending_entries,
+                    &mut pending_acks,
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if pending_count > 0 {
-                    if config.format_version >= 5 && config.alignment_size > 0 {
-                        let _ = state.write_padding(config.alignment_size);
-                    }
-                    let _ = state.flush(false);
-
-                    if config.sync_data {
-                        if let Some(ref path) = state.current_path(&config) {
-                            let _ = fsync_tx.send(FsyncRequest {
-                                journal_path: path.clone(),
-                                pending_acks: pending_acks.drain(..).collect(),
-                            });
-                        }
-                    } else {
-                        for ack in pending_acks.drain(..) {
-                            let _ = ack.send(());
-                        }
-                    }
-                    pending_bytes = 0;
-                    pending_count = 0;
+                if !pending_entries.is_empty() {
+                    flush_batch(
+                        &config,
+                        &mut state,
+                        &journal_io,
+                        &mut pending_entries,
+                        &mut pending_acks,
+                    );
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if pending_count > 0 {
-                    let _ = state.flush(config.sync_data);
-                    for ack in pending_acks.drain(..) {
-                        let _ = ack.send(());
-                    }
+                if !pending_entries.is_empty() {
+                    flush_batch(
+                        &config,
+                        &mut state,
+                        &journal_io,
+                        &mut pending_entries,
+                        &mut pending_acks,
+                    );
                 }
                 break;
             }
@@ -269,78 +201,97 @@ fn journal_writer_loop(
     }
 }
 
-/// Dedicated fsync thread — batches fsync operations, then ACKs clients.
-///
-/// Matches Java's ForceWriteThread:
-/// 1. Collects all pending FsyncRequests
-/// 2. Fsyncs ALL unique files (handles journal rotation across batch)
-/// 3. ACKs all clients whose entries are now durable
-/// 4. On fsync failure: logs error, does NOT ACK (clients will timeout)
-///    Matching Java which crashes the bookie on fsync failure.
-fn fsync_loop(_config: JournalConfig, rx: mpsc::Receiver<FsyncRequest>) {
-    loop {
-        let first = match rx.recv() {
-            Ok(req) => req,
-            Err(_) => break,
-        };
+/// Flush a batch of framed entries via `JournalIo::write_and_sync`.
+fn flush_batch(
+    config: &JournalConfig,
+    state: &mut JournalFileState,
+    journal_io: &std::sync::Arc<dyn JournalIo>,
+    pending_entries: &mut Vec<Vec<u8>>,
+    pending_acks: &mut Vec<mpsc::Sender<()>>,
+) {
+    if pending_entries.is_empty() {
+        return;
+    }
 
-        let mut all_requests = vec![first];
-        while let Ok(req) = rx.try_recv() {
-            all_requests.push(req);
-        }
+    // Ensure the journal file is open
+    if let Err(e) = state.ensure_open(config) {
+        tracing::warn!("Journal open error: {e}");
+        pending_entries.clear();
+        pending_acks.clear();
+        return;
+    }
 
-        // Collect ALL unique file paths (handles rotation across requests)
-        let mut unique_paths: Vec<PathBuf> = Vec::new();
-        for req in &all_requests {
-            if !unique_paths.contains(&req.journal_path) {
-                unique_paths.push(req.journal_path.clone());
-            }
-        }
-
-        // fsync ALL files (each file may have entries from different batches)
-        let mut fsync_ok = true;
-        for path in &unique_paths {
-            match fs::OpenOptions::new().read(true).open(path) {
-                Ok(file) => {
-                    if let Err(e) = file.sync_data() {
-                        tracing::error!("FATAL: journal fsync failed for {:?}: {e}", path);
-                        fsync_ok = false;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("FATAL: cannot open journal for fsync {:?}: {e}", path);
-                    fsync_ok = false;
-                }
-            }
-        }
-
-        if fsync_ok {
-            // ACK all clients — entries are durable on disk
-            for req in all_requests {
-                for ack in req.pending_acks {
-                    let _ = ack.send(());
-                }
-            }
-        } else {
-            // fsync failed — do NOT ACK clients. They will timeout.
-            // Matching Java's behavior: ForceWriteThread crashes, pending ACKs abandoned.
-            tracing::error!("FATAL: journal fsync failed, abandoning {} pending ACKs",
-                all_requests.iter().map(|r| r.pending_acks.len()).sum::<usize>());
-            // Drop pending_acks without sending — clients will get timeout errors
+    // Check if we need to rotate BEFORE writing (check total batch size)
+    let batch_size: u64 = pending_entries.iter().map(|e| e.len() as u64).sum();
+    if state.position > 0 && state.position + batch_size > config.max_file_size {
+        if let Err(e) = state.rotate(config, journal_io) {
+            tracing::warn!("Journal rotation error: {e}");
         }
     }
+
+    // Add V5+ padding if needed
+    let padding = if config.format_version >= 5 && config.alignment_size > 0 {
+        let p = calculate_padding(state.position, config.alignment_size as u64);
+        if !p.is_empty() { Some(p) } else { None }
+    } else {
+        None
+    };
+
+    // Build the slice array for write_and_sync: [padding?] + entries
+    let mut slices: Vec<&[u8]> = Vec::with_capacity(pending_entries.len() + 1);
+    if let Some(ref pad) = padding {
+        slices.push(pad);
+    }
+    for entry in pending_entries.iter() {
+        slices.push(entry);
+    }
+
+    // Delegate to the I/O engine (uring: WRITEV→linked FSYNC; std: write_all + sync_data)
+    let fd = state.file.as_ref().unwrap().as_raw_fd();
+    match journal_io.write_and_sync(fd, &slices) {
+        Ok(()) => {
+            // Update position tracking
+            if let Some(ref pad) = padding {
+                state.position += pad.len() as u64;
+            }
+            for entry in pending_entries.iter() {
+                state.position += entry.len() as u64;
+            }
+            // ACK all clients — data is durable
+            for ack in pending_acks.drain(..) {
+                let _ = ack.send(());
+            }
+        }
+        Err(e) => {
+            tracing::error!("FATAL: journal write+sync failed: {e}");
+            // Don't ACK — clients will timeout. Matches Java's crash-on-fsync.
+        }
+    }
+    pending_entries.clear();
 }
 
-struct WriterState {
+/// Frame a journal entry: `[size(4 BE)][payload]`.
+fn frame_journal_entry(data: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(4 + data.len());
+    framed.extend_from_slice(&(data.len() as i32).to_be_bytes());
+    framed.extend_from_slice(data);
+    framed
+}
+
+// ---------------------------------------------------------------------------
+// Journal file state — tracks the current .txn file
+// ---------------------------------------------------------------------------
+
+struct JournalFileState {
     log_id: u64,
-    writer: Option<BufWriter<fs::File>>,
+    file: Option<fs::File>,
     position: u64,
 }
 
-impl WriterState {
+impl JournalFileState {
     fn new(config: &JournalConfig) -> Self {
         let log_id = Self::find_next_log_id(&config.journal_dir);
-        Self { log_id, writer: None, position: 0 }
+        Self { log_id, file: None, position: 0 }
     }
 
     fn find_next_log_id(dir: &Path) -> u64 {
@@ -359,103 +310,81 @@ impl WriterState {
         max_id + 1
     }
 
-    fn current_path(&self, config: &JournalConfig) -> Option<PathBuf> {
-        if self.writer.is_some() {
-            Some(config.journal_dir.join(format!("{:x}.txn", self.log_id)))
-        } else {
-            None
-        }
-    }
-
     fn ensure_open(&mut self, config: &JournalConfig) -> Result<(), StorageError> {
-        if self.writer.is_some() { return Ok(()); }
+        if self.file.is_some() {
+            return Ok(());
+        }
         let path = config.journal_dir.join(format!("{:x}.txn", self.log_id));
-        let file = fs::OpenOptions::new().create(true).write(true).open(&path)?;
-        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)?;
+
+        // Write header
         let header = JournalHeader::new(config.format_version);
         let header_bytes = header.to_bytes();
-        let hdr_size = header_bytes.len();
-        writer.write_all(&header_bytes)?;
-        self.position = hdr_size as u64;
-        self.writer = Some(writer);
+        file.write_all(&header_bytes)?;
+        file.flush()?;
+
+        self.position = header_bytes.len() as u64;
+        self.file = Some(file);
         Ok(())
     }
 
-    fn write_entry(&mut self, config: &JournalConfig, data: &[u8]) -> Result<(), StorageError> {
-        if self.position > 0 && self.position + (4 + data.len()) as u64 > config.max_file_size {
-            self.rotate(config)?;
-        }
-        self.ensure_open(config)?;
-        let writer = self.writer.as_mut().unwrap();
-        writer.write_all(&(data.len() as i32).to_be_bytes())?;
-        writer.write_all(data)?;
-        self.position += (4 + data.len()) as u64;
-        Ok(())
-    }
-
-    /// Write V5+ alignment padding at current position.
-    fn write_padding(&mut self, alignment: usize) -> Result<(), StorageError> {
-        if let Some(ref mut writer) = self.writer {
-            let padding = calculate_padding(self.position, alignment as u64);
-            if !padding.is_empty() {
-                writer.write_all(&padding)?;
-                self.position += padding.len() as u64;
-            }
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self, sync_data: bool) -> Result<(), StorageError> {
-        if let Some(ref mut writer) = self.writer {
-            writer.flush()?;
-            if sync_data { writer.get_ref().sync_data()?; }
-        }
-        Ok(())
-    }
-
-    fn rotate(&mut self, config: &JournalConfig) -> Result<(), StorageError> {
-        if let Some(ref mut writer) = self.writer {
-            writer.flush()?;
-            if config.sync_data { writer.get_ref().sync_data()?; }
-        }
-        self.writer = None;
+    fn rotate(
+        &mut self,
+        config: &JournalConfig,
+        _journal_io: &std::sync::Arc<dyn JournalIo>,
+    ) -> Result<(), StorageError> {
+        // Close current file
+        self.file = None;
         self.log_id += 1;
         self.position = 0;
-        Ok(())
+        // Next ensure_open will create the new file
+        self.ensure_open(config)
     }
 }
 
-/// Replay journal files for crash recovery.
-pub fn replay_journal(
-    journal_dir: &Path,
-    mut callback: impl FnMut(&[u8]),
-) -> Result<usize, StorageError> {
-    let mut journal_files: Vec<(u64, PathBuf)> = Vec::new();
+// ---------------------------------------------------------------------------
+// Journal replay (unchanged — reads are always blocking)
+// ---------------------------------------------------------------------------
+
+/// Replay journal entries from disk for crash recovery.
+pub fn replay_journal<F>(journal_dir: &Path, mut callback: F) -> Result<usize, StorageError>
+where
+    F: FnMut(&[u8]),
+{
+    let mut txn_files: Vec<(u64, PathBuf)> = Vec::new();
     if let Ok(entries) = fs::read_dir(journal_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.ends_with(".txn") {
-                if let Ok(id) = u64::from_str_radix(name_str.trim_end_matches(".txn"), 16) {
-                    journal_files.push((id, entry.path()));
+            let name = name.to_string_lossy();
+            if name.ends_with(".txn") {
+                if let Ok(id) = u64::from_str_radix(name.trim_end_matches(".txn"), 16) {
+                    txn_files.push((id, entry.path()));
                 }
             }
         }
     }
-    journal_files.sort_by_key(|(id, _)| *id);
+    txn_files.sort_by_key(|(id, _)| *id);
 
-    let mut total = 0;
-    for (_, path) in &journal_files {
+    let mut total_replayed = 0;
+    for (_id, path) in &txn_files {
         let data = fs::read(path)?;
-        if data.len() < 8 { continue; }
-        let header = JournalHeader::from_bytes(&data)?;
-        let hdr_size = header.header_size();
-        if data.len() < hdr_size { continue; }
-        let entries = format::scan_journal_entries(&data[hdr_size..], header.version());
+        if data.len() < 8 {
+            continue;
+        }
+        let header = format::JournalHeader::from_bytes(&data)?;
+        let header_size = header.header_size();
+        if data.len() <= header_size {
+            continue;
+        }
+        let entries = format::scan_journal_entries(&data[header_size..], header.version());
         for entry_data in entries {
             callback(entry_data);
-            total += 1;
+            total_replayed += 1;
         }
     }
-    Ok(total)
+
+    Ok(total_replayed)
 }
