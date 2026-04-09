@@ -8,6 +8,7 @@ pub mod uring_journal;
 #[cfg(target_os = "linux")]
 pub mod uring_ledger;
 
+use async_trait::async_trait;
 use std::io;
 use std::os::fd::RawFd;
 use std::path::Path;
@@ -20,16 +21,17 @@ pub trait JournalIo: Send + Sync {
 }
 
 /// Ledger (entry-log) I/O operations: batched writes and positional reads.
+#[async_trait]
 pub trait LedgerIo: Send + Sync {
     /// Write `entries` starting at `offset`. Returns the starting offset of each entry.
-    fn write_batch(&self, fd: RawFd, offset: u64, entries: &[&[u8]]) -> io::Result<Vec<u64>>;
+    async fn write_batch(&self, fd: RawFd, offset: u64, entries: Vec<Vec<u8>>) -> io::Result<Vec<u64>>;
 
     /// Read exactly `len` bytes starting at `offset`.
-    fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>>;
+    async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>>;
 
     /// Read `len` bytes at `offset` from entry log `log_id` in `entry_log_dir`.
     /// The engine may cache the file descriptor for future reads.
-    fn read_entry(&self, entry_log_dir: &Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>>;
+    async fn read_entry(&self, entry_log_dir: &Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>>;
 
     /// Evict any cached file descriptor for `log_id`. Called by GC before
     /// deleting the entry log file. No-op if the fd is not cached.

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 bookkeeper-proto = { workspace = true }
 bookkeeper-common = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 prost = { workspace = true }
 thiserror = { workspace = true }
