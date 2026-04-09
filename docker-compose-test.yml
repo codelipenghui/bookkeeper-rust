@@ -1,17 +1,27 @@
 # Test suite for the Rust BookKeeper bookie.
 #
-# Builds the workspace inside Linux (Debian Bookworm, kernel 6.1) and runs
-# tests with the io_uring engine. This is the primary way macOS developers
-# verify the uring code paths before pushing — io_uring is Linux-only and
-# won't compile on macOS.
+# Builds the workspace inside Linux (Debian Bookworm) and runs tests with
+# the io_uring engine. The image is built once and tagged `rustbk-test`;
+# all services share it.
 #
-# Usage:
+# First run (or after code changes):
+#   docker compose -f docker-compose-test.yml build
+#
+# Then run any service:
 #   docker compose -f docker-compose-test.yml run --rm test-uring-only   # fast (~10s)
 #   docker compose -f docker-compose-test.yml run --rm test-all          # full suite
 #   docker compose -f docker-compose-test.yml run --rm test-std          # StdEngine baseline
 #   docker compose -f docker-compose-test.yml run --rm bench-uring       # bench with io_uring
 #   docker compose -f docker-compose-test.yml run --rm bench-std         # bench with StdEngine
 #   docker compose -f docker-compose-test.yml down                       # cleanup ZK
+
+x-test-base: &test-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: test
+  image: rustbk-test
+  restart: "no"
 
 services:
   # ZK for integration tests that need a real metadata store
@@ -29,17 +39,13 @@ services:
   # Full workspace test suite with io_uring engine
   # ---------------------------------------------------------------------------
   test-all:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: test
+    <<: *test-base
     depends_on:
       zookeeper:
         condition: service_healthy
     environment:
       BOOKKEEPER_IO_ENGINE: uring
       RUST_LOG: warn
-    restart: "no"
     command: >
       cargo test --workspace --
       --skip java_bookie_container
@@ -49,14 +55,10 @@ services:
   # Fast: only the io_uring-specific unit tests (no ZK needed)
   # ---------------------------------------------------------------------------
   test-uring-only:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: test
+    <<: *test-base
     environment:
       BOOKKEEPER_IO_ENGINE: uring
       RUST_LOG: info
-    restart: "no"
     command: >
       cargo test -p bookkeeper-storage --test io_engine_test
 
@@ -64,24 +66,16 @@ services:
   # Benchmarks: io_uring vs StdEngine comparison
   # ---------------------------------------------------------------------------
   bench-uring:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: test
+    <<: *test-base
     environment:
       BOOKKEEPER_IO_ENGINE: uring
-    restart: "no"
     command: >
       cargo bench -p bookkeeper-storage --bench storage_bench
 
   bench-std:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: test
+    <<: *test-base
     environment:
       BOOKKEEPER_IO_ENGINE: std
-    restart: "no"
     command: >
       cargo bench -p bookkeeper-storage --bench storage_bench
 
@@ -89,17 +83,13 @@ services:
   # StdEngine baseline (same Linux build, forces blocking I/O)
   # ---------------------------------------------------------------------------
   test-std:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: test
+    <<: *test-base
     depends_on:
       zookeeper:
         condition: service_healthy
     environment:
       BOOKKEEPER_IO_ENGINE: std
       RUST_LOG: warn
-    restart: "no"
     command: >
       cargo test --workspace --
       --skip java_bookie_container
