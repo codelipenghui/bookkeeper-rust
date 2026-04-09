@@ -90,7 +90,12 @@ impl DbLedgerStorage {
     /// Initialize the journal for write-ahead logging.
     /// Should be called after open() and before serving writes.
     /// Replays any existing journal entries for crash recovery.
-    pub fn init_journal(&mut self, journal_dir: &Path, config: crate::journal::writer::JournalConfig) -> Result<usize, StorageError> {
+    pub fn init_journal(
+        &mut self,
+        journal_dir: &Path,
+        config: crate::journal::writer::JournalConfig,
+        journal_io: std::sync::Arc<dyn crate::io_engine::JournalIo>,
+    ) -> Result<usize, StorageError> {
         // Replay existing journal entries (crash recovery)
         let replayed = crate::journal::writer::replay_journal(journal_dir, |entry_data| {
             if entry_data.len() >= 32 {
@@ -117,7 +122,7 @@ impl DbLedgerStorage {
 
         // Start journal writer
         self.journal_dir = Some(journal_dir.to_path_buf());
-        self.journal = Some(crate::journal::writer::Journal::start(config));
+        self.journal = Some(crate::journal::writer::Journal::start(config, journal_io));
 
         Ok(replayed)
     }

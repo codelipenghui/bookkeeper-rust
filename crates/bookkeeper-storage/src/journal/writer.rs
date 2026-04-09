@@ -3,9 +3,11 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::format::{self, JournalHeader, calculate_padding};
+use crate::io_engine::JournalIo;
 use crate::StorageError;
 
 /// Meta-entry ID for master key journaling.
@@ -48,11 +50,13 @@ pub struct Journal {
     _fsync_thread: Option<std::thread::JoinHandle<()>>,
     /// Tracks which ledgers have had master keys journaled (for first-write detection).
     master_key_cache: std::sync::Mutex<HashSet<i64>>,
+    /// Stored for future use by the io_uring write path.
+    _journal_io: Arc<dyn JournalIo>,
 }
 
 impl Journal {
     /// Start the journal background threads.
-    pub fn start(config: JournalConfig) -> Self {
+    pub fn start(config: JournalConfig, journal_io: Arc<dyn JournalIo>) -> Self {
         // Bounded channel for memory backpressure (matching Java's memoryLimitController).
         // Bound = MAX_QUEUE_MEMORY / avg_entry_size. Conservative estimate: 1KB avg.
         let bound = MAX_QUEUE_MEMORY / 1024;
@@ -78,6 +82,7 @@ impl Journal {
             _writer_thread: Some(writer_thread),
             _fsync_thread: Some(fsync_thread),
             master_key_cache: std::sync::Mutex::new(HashSet::new()),
+            _journal_io: journal_io,
         }
     }
 

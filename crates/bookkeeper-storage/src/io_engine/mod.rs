@@ -46,17 +46,34 @@ pub fn uring_available() -> bool {
     }
 }
 
+/// Pre-split `Arc`s for the journal and ledger I/O backends.
+///
+/// Avoids the need to extract trait-object `Arc`s from a single
+/// `Arc<dyn IoEngine>` later — callers simply clone the relevant field.
+pub struct EngineSet {
+    pub journal: Arc<dyn JournalIo>,
+    pub ledger: Arc<dyn LedgerIo>,
+}
+
 /// Select the best available I/O engine for this platform.
 ///
 /// On Linux with a capable kernel this returns the io_uring engine;
 /// everywhere else (or when io_uring probing fails) it returns the
 /// blocking std engine.
-pub fn select_engine() -> Arc<dyn IoEngine> {
+pub fn select_engine() -> EngineSet {
     #[cfg(target_os = "linux")]
     {
         if uring_available() {
-            return Arc::new(uring_engine::UringEngine::new());
+            let engine = Arc::new(uring_engine::UringEngine::new());
+            return EngineSet {
+                journal: engine.clone() as Arc<dyn JournalIo>,
+                ledger: engine as Arc<dyn LedgerIo>,
+            };
         }
     }
-    Arc::new(std_engine::StdEngine)
+    let engine = Arc::new(std_engine::StdEngine);
+    EngineSet {
+        journal: engine.clone() as Arc<dyn JournalIo>,
+        ledger: engine as Arc<dyn LedgerIo>,
+    }
 }

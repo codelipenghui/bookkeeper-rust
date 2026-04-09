@@ -74,9 +74,11 @@ impl BookieServer {
             alignment_size: config.journal_alignment_size as usize,
             format_version: config.journal_format_version_to_write,
         };
+        let io_engines = bookkeeper_storage::io_engine::select_engine();
         let replayed = storage.init_journal(
             &journal_current,
             journal_config,
+            io_engines.journal,
         )?;
         if replayed > 0 {
             tracing::info!("Journal recovery: replayed {replayed} entries");
