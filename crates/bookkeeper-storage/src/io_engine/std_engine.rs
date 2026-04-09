@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
@@ -78,18 +78,11 @@ impl LedgerIo for StdEngine {
     }
 
     async fn read_entry(&self, entry_log_dir: &Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let path: PathBuf = entry_log_dir.join(super::entry_log_filename(log_id));
-        tokio::task::spawn_blocking(move || {
-            let file = File::open(&path)?;
-            let fd = file.as_raw_fd();
-            with_file(fd, |f| {
-                f.seek(SeekFrom::Start(offset))?;
-                let mut buf = vec![0u8; len];
-                f.read_exact(&mut buf)?;
-                Ok(buf)
-            })
-        })
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+        let path = entry_log_dir.join(super::entry_log_filename(log_id));
+        let file = tokio::task::spawn_blocking(move || File::open(&path))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+        let fd = file.as_raw_fd();
+        self.read_at(fd, offset, len).await
     }
 }

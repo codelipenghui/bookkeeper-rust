@@ -421,18 +421,16 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     async fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError> {
-        let (fd, offset, log_id, encoded_size) = {
+        let (fd, offset, log_id) = {
             let mut log_state = self.log_state.lock().unwrap();
 
             let encoded_size = (4 + entry.len()) as u64;
             if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
-                // Close current file before rotating
                 log_state.file = None;
                 log_state.log_id += 1;
                 log_state.offset = LOGFILE_HEADER_SIZE as u64;
             }
 
-            // Open file if not already open
             if log_state.file.is_none() {
                 self.ensure_entry_log_exists(log_state.log_id)?;
                 let path = self.entry_log_path(log_state.log_id);
@@ -443,14 +441,16 @@ impl LedgerStorage for DbLedgerStorage {
             let fd = log_state.file.as_ref().unwrap().as_raw_fd();
             let offset = log_state.offset;
             let log_id = log_state.log_id;
-            // Reserve the space by advancing offset now (before await)
-            log_state.offset += encoded_size;
-            (fd, offset, log_id, encoded_size)
-        }; // MutexGuard dropped here
+            (fd, offset, log_id)
+        };
 
         let framed = Self::frame_entry(entry);
-        let _ = encoded_size; // suppress unused warning
+        let encoded_size = framed.len() as u64;
         self.ledger_io.write_batch(fd, offset, vec![framed]).await?;
+
+        // Advance offset only after successful write
+        let mut log_state = self.log_state.lock().unwrap();
+        log_state.offset = offset + encoded_size;
 
         let position = offset + 4;
         let location = EntryLocation::new(log_id, position as u32).to_u64();
