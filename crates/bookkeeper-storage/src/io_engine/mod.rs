@@ -60,7 +60,46 @@ pub struct EngineSet {
 /// On Linux with a capable kernel this returns the io_uring engine;
 /// everywhere else (or when io_uring probing fails) it returns the
 /// blocking std engine.
+///
+/// Can be overridden via BOOKKEEPER_IO_ENGINE env var:
+/// - "std": force StdEngine
+/// - "uring": force UringEngine (Linux only, falls back to StdEngine on other platforms)
+/// - "auto" or unset: auto-detect based on platform and kernel capabilities
 pub fn select_engine() -> EngineSet {
+    let override_val = std::env::var("BOOKKEEPER_IO_ENGINE").unwrap_or_default();
+    match override_val.as_str() {
+        "std" => {
+            tracing::info!("BOOKKEEPER_IO_ENGINE=std — forcing StdEngine");
+            let engine = Arc::new(std_engine::StdEngine);
+            return EngineSet {
+                journal: engine.clone() as Arc<dyn JournalIo>,
+                ledger: engine as Arc<dyn LedgerIo>,
+            };
+        }
+        "uring" => {
+            #[cfg(target_os = "linux")]
+            {
+                tracing::info!("BOOKKEEPER_IO_ENGINE=uring — forcing UringEngine");
+                let engine = uring_engine::UringEngine::new();
+                return EngineSet {
+                    journal: engine.journal,
+                    ledger: engine.ledger,
+                };
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tracing::warn!("BOOKKEEPER_IO_ENGINE=uring but not on Linux — using StdEngine");
+                let engine = Arc::new(std_engine::StdEngine);
+                return EngineSet {
+                    journal: engine.clone() as Arc<dyn JournalIo>,
+                    ledger: engine as Arc<dyn LedgerIo>,
+                };
+            }
+        }
+        _ => {}
+    }
+
+    // Auto-detect
     #[cfg(target_os = "linux")]
     {
         if uring_available() {
