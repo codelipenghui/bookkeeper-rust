@@ -1,19 +1,21 @@
 use std::path::Path;
+use async_trait::async_trait;
 use bytes::Bytes;
 use crate::StorageError;
 
 /// The LedgerStorage trait defines the interface for bookie storage backends.
+#[async_trait]
 pub trait LedgerStorage: Send + Sync {
     /// Add an entry to storage. Returns after the entry is in the write cache.
     /// If a journal is configured, the entry is journaled first for durability.
-    fn add_entry(&self, entry: &[u8]) -> Result<(), StorageError>;
+    async fn add_entry(&self, entry: &[u8]) -> Result<(), StorageError>;
 
     /// Get journal handle for async journaling (used by the request processor
     /// to journal before acknowledging writes).
     fn journal(&self) -> Option<&crate::journal::writer::Journal>;
 
     /// Get an entry by ledger ID and entry ID.
-    fn get_entry(&self, ledger_id: i64, entry_id: i64) -> Result<Bytes, StorageError>;
+    async fn get_entry(&self, ledger_id: i64, entry_id: i64) -> Result<Bytes, StorageError>;
 
     /// Check if a ledger exists.
     fn ledger_exists(&self, ledger_id: i64) -> Result<bool, StorageError>;
@@ -64,7 +66,7 @@ pub trait LedgerStorage: Send + Sync {
     /// Write an entry directly to the entry log (bypassing write cache) and update
     /// the location index. Used by compaction to move entries between log files.
     /// Returns the new location.
-    fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError>;
+    async fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError>;
 
     /// Update a batch of entry locations in the index.
     fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError>;
@@ -73,10 +75,10 @@ pub trait LedgerStorage: Send + Sync {
     fn lac_watchers(&self) -> Option<&crate::lac_watcher::LacWatcherRegistry>;
 
     /// Flush all pending data to persistent storage.
-    fn flush(&self) -> Result<(), StorageError>;
+    async fn flush(&self) -> Result<(), StorageError>;
 
     /// Perform a checkpoint: flush and return completion.
-    fn checkpoint(&self) -> Result<(), StorageError>;
+    async fn checkpoint(&self) -> Result<(), StorageError>;
 
     /// Validate a ledger for writing: check existence, fencing, and master key in one operation.
     /// Creates the ledger if it doesn't exist. Returns true if the ledger is fenced.

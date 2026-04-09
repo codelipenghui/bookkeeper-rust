@@ -20,7 +20,7 @@ const MAX_QUEUE_MEMORY: usize = 32 * 1024 * 1024;
 /// A journal entry to be written.
 struct JournalEntry {
     data: Vec<u8>,
-    ack_tx: Option<mpsc::Sender<()>>,
+    ack_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Configuration for the journal writer.
@@ -90,10 +90,10 @@ impl Journal {
         }
     }
 
-    /// Write an entry to the journal synchronously.
-    /// Blocks until the entry is written and fsynced (data is durable).
-    pub fn log_add_entry(&self, data: &[u8]) -> Result<(), StorageError> {
-        let (ack_tx, ack_rx) = mpsc::channel();
+    /// Write an entry to the journal asynchronously.
+    /// Awaits until the entry is written and fsynced (data is durable).
+    pub async fn log_add_entry(&self, data: &[u8]) -> Result<(), StorageError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(JournalEntry {
                 data: data.to_vec(),
@@ -102,7 +102,7 @@ impl Journal {
             .map_err(|_| StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe, "journal writer closed",
             )))?;
-        ack_rx.recv().map_err(|_| StorageError::Io(std::io::Error::new(
+        ack_rx.await.map_err(|_| StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe, "journal ack lost",
         )))
     }
@@ -164,7 +164,7 @@ fn journal_io_loop(
 
     let mut state = JournalFileState::new(&config);
     let group_wait = Duration::from_millis(config.max_group_wait_ms.max(1));
-    let mut pending_acks: Vec<mpsc::Sender<()>> = Vec::new();
+    let mut pending_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut pending_entries: Vec<Vec<u8>> = Vec::new();
 
     loop {
@@ -240,7 +240,7 @@ fn flush_batch(
     state: &mut JournalFileState,
     journal_io: &std::sync::Arc<dyn JournalIo>,
     pending_entries: &mut Vec<Vec<u8>>,
-    pending_acks: &mut Vec<mpsc::Sender<()>>,
+    pending_acks: &mut Vec<tokio::sync::oneshot::Sender<()>>,
     on_fatal_error: &Option<OnFatalError>,
     shared_log_id: &Arc<std::sync::atomic::AtomicU64>,
 ) {
