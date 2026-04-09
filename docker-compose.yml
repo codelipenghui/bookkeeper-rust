@@ -28,8 +28,9 @@ services:
     image: zookeeper:3.8
     container_name: rustbk-zookeeper
     restart: unless-stopped
-    ports:
-      - "2181:2181"
+    # ZK is an internal-only service — only bookies and the Pulsar broker
+    # on the compose network reach it. Use `docker compose exec zookeeper
+    # zkCli.sh` for ad-hoc debugging.
     environment:
       ZOO_4LW_COMMANDS_WHITELIST: "ruok,stat,mntr,conf,srvr"
       ZOO_STANDALONE_ENABLED: "true"
@@ -93,8 +94,11 @@ services:
         condition: service_healthy
       bk-init:
         condition: service_completed_successfully
+    # Only the HTTP admin port is exposed on the host. The BK wire
+    # protocol (3181) stays internal — only the Pulsar broker on this
+    # compose network speaks it, and host-side tools have no reason
+    # to open raw connections.
     ports:
-      - "3181:3181"
       - "8081:8080"
     environment:
       RUST_LOG: info
@@ -122,7 +126,6 @@ services:
       rust-bookie-1:
         condition: service_started
     ports:
-      - "3182:3181"
       - "8082:8080"
     environment:
       RUST_LOG: info
@@ -150,7 +153,6 @@ services:
       rust-bookie-1:
         condition: service_started
     ports:
-      - "3183:3181"
       - "8083:8080"
     environment:
       RUST_LOG: info

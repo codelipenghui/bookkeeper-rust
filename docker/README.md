@@ -38,14 +38,14 @@ which identity to register under in ZK.
 
 ## Ports
 
+Only ports that host-side tools actually need are exposed. The BK wire
+protocol (3181) and ZooKeeper (2181) stay internal to the compose
+network — reach them via `docker compose exec` if you need to.
+
 | Service         | Container | Host  | Purpose                       |
 |-----------------|-----------|-------|-------------------------------|
-| `zookeeper`     | 2181      | 2181  | ZK client protocol            |
-| `rust-bookie-1` | 3181      | 3181  | BK V2/V3 wire protocol        |
 | `rust-bookie-1` | 8080      | 8081  | BK HTTP admin API             |
-| `rust-bookie-2` | 3181      | 3182  | BK V2/V3 wire protocol        |
 | `rust-bookie-2` | 8080      | 8082  | BK HTTP admin API             |
-| `rust-bookie-3` | 3181      | 3183  | BK V2/V3 wire protocol        |
 | `rust-bookie-3` | 8080      | 8083  | BK HTTP admin API             |
 | `pulsar-broker` | 6650      | 6650  | Pulsar native binary protocol |
 | `pulsar-broker` | 8080      | 8080  | Pulsar admin HTTP API         |
