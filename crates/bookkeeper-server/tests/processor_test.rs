@@ -1,6 +1,7 @@
 use bookkeeper_server::processor::RequestProcessor;
 use bookkeeper_server::state::BookieStateManager;
 use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
+use bookkeeper_storage::io_engine::std_engine::StdEngine;
 use bookkeeper_protocol::v2::request::V2Request;
 use bookkeeper_protocol::v2::response::V2Response;
 use bookkeeper_protocol::constants::*;
@@ -10,7 +11,7 @@ use tempfile::TempDir;
 
 fn setup() -> (RequestProcessor, TempDir) {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
     let state = BookieStateManager::new();
     state.transition_to(bookkeeper_server::state::BookieState::Running);
     let processor = RequestProcessor::new(Arc::new(storage), Arc::new(state));
@@ -91,7 +92,7 @@ fn read_entry_not_found() {
 #[test]
 fn add_entry_rejected_when_read_only() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
     let state = BookieStateManager::new();
     state.transition_to(bookkeeper_server::state::BookieState::Running);
     state.transition_to(bookkeeper_server::state::BookieState::ReadOnly);

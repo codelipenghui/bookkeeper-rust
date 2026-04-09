@@ -1,6 +1,12 @@
+use std::sync::Arc;
 use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
+use bookkeeper_storage::io_engine::std_engine::StdEngine;
 use bookkeeper_storage::ledger_storage::LedgerStorage;
 use tempfile::TempDir;
+
+fn default_ledger_io() -> Arc<dyn bookkeeper_storage::io_engine::LedgerIo> {
+    Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>
+}
 
 fn make_entry(ledger_id: i64, entry_id: i64, lac: i64, payload: &[u8]) -> Vec<u8> {
     let mut entry = Vec::new();
@@ -15,7 +21,7 @@ fn make_entry(ledger_id: i64, entry_id: i64, lac: i64, payload: &[u8]) -> Vec<u8
 #[test]
 fn add_and_get_entry() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
     let entry = make_entry(1, 0, -1, b"hello");
     storage.add_entry(&entry).unwrap();
     let retrieved = storage.get_entry(1, 0).unwrap();
@@ -25,7 +31,7 @@ fn add_and_get_entry() {
 #[test]
 fn get_missing_entry() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
     let result = storage.get_entry(1, 0);
     assert!(result.is_err());
 }
@@ -33,7 +39,7 @@ fn get_missing_entry() {
 #[test]
 fn fence_ledger() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
     let entry = make_entry(1, 0, -1, b"data");
     storage.add_entry(&entry).unwrap();
     assert!(!storage.is_fenced(1).unwrap());
@@ -44,7 +50,7 @@ fn fence_ledger() {
 #[test]
 fn last_add_confirmed() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
     storage.add_entry(&make_entry(1, 0, -1, b"a")).unwrap();
     storage.add_entry(&make_entry(1, 1, 0, b"b")).unwrap();
     storage.add_entry(&make_entry(1, 2, 1, b"c")).unwrap();
@@ -56,7 +62,7 @@ fn last_add_confirmed() {
 #[test]
 fn flush_and_read_from_disk() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
     storage.add_entry(&make_entry(1, 0, -1, b"persistent")).unwrap();
     storage.flush().unwrap();
     // Entry should now be in RocksDB + entry log, not just write cache
@@ -67,7 +73,7 @@ fn flush_and_read_from_disk() {
 #[test]
 fn delete_ledger() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
     storage.add_entry(&make_entry(1, 0, -1, b"data")).unwrap();
     storage.delete_ledger(1).unwrap();
     assert!(!storage.ledger_exists(1).unwrap());
@@ -76,7 +82,7 @@ fn delete_ledger() {
 #[test]
 fn concurrent_add_during_flush() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
     // Add entry, then flush
     storage.add_entry(&make_entry(1, 0, -1, b"before")).unwrap();
     storage.flush().unwrap();

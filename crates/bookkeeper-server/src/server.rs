@@ -58,7 +58,8 @@ impl BookieServer {
             .ledger_directories
             .first()
             .ok_or("no ledger dirs configured")?;
-        let mut storage = DbLedgerStorage::open(Path::new(ledger_dir))?;
+        let io_engines = bookkeeper_storage::io_engine::select_engine();
+        let mut storage = DbLedgerStorage::open(Path::new(ledger_dir), io_engines.ledger.clone())?;
 
         // Initialize journal for write-ahead logging (crash recovery).
         // Journal files live in `<journalDir>/current/` matching Java's convention.
@@ -74,7 +75,6 @@ impl BookieServer {
             alignment_size: config.journal_alignment_size as usize,
             format_version: config.journal_format_version_to_write,
         };
-        let io_engines = bookkeeper_storage::io_engine::select_engine();
         let replayed = storage.init_journal(
             &journal_current,
             journal_config,

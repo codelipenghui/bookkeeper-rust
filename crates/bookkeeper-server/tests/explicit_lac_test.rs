@@ -8,12 +8,13 @@ use bookkeeper_protocol::v2::response::V2Response;
 use bookkeeper_server::processor::RequestProcessor;
 use bookkeeper_server::state::{BookieState, BookieStateManager};
 use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
+use bookkeeper_storage::io_engine::std_engine::StdEngine;
 use bytes::Bytes;
 use tempfile::TempDir;
 
 fn setup() -> (RequestProcessor, TempDir) {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
     let state = BookieStateManager::new();
     state.transition_to(BookieState::Running);
     let processor = RequestProcessor::new(Arc::new(storage), Arc::new(state));

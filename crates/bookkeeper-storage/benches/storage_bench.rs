@@ -5,7 +5,9 @@ use tempfile::TempDir;
 
 use bookkeeper_protocol::digest::{DigestManager, DigestType};
 use bookkeeper_protocol::entry::EntryBuilder;
+use std::sync::Arc;
 use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
+use bookkeeper_storage::io_engine::std_engine::StdEngine;
 use bookkeeper_storage::ledger_storage::LedgerStorage;
 
 fn random_payload(size: usize) -> Vec<u8> {
@@ -34,7 +36,7 @@ fn bench_add_entry(c: &mut Criterion) {
 
     for &size in &[128, 1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path()).unwrap();
+        let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
         // Pre-create ledger
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
@@ -60,7 +62,7 @@ fn bench_get_entry_cached(c: &mut Criterion) {
 
     for &size in &[128, 1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path()).unwrap();
+        let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
         // Write entries into write cache
@@ -90,7 +92,7 @@ fn bench_get_entry_disk(c: &mut Criterion) {
 
     for &size in &[1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path()).unwrap();
+        let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
         // Write and flush to disk
@@ -120,7 +122,7 @@ fn bench_flush(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_flush");
 
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path()).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
     storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
     let mut eid = 0i64;

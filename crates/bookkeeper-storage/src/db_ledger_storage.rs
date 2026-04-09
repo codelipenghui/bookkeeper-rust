@@ -1,7 +1,7 @@
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use crate::cache::write_cache::WriteCache;
@@ -26,7 +26,8 @@ struct EntryLogState {
     log_id: u32,
     offset: u64,
     /// Persistent file handle for the current entry log. Avoids open/close per write.
-    writer: Option<std::io::BufWriter<fs::File>>,
+    /// Writes go through `LedgerIo::write_batch` using the raw fd from this handle.
+    file: Option<fs::File>,
 }
 
 pub struct DbLedgerStorage {
@@ -40,6 +41,8 @@ pub struct DbLedgerStorage {
     entry_log_dir: PathBuf,
     log_state: Mutex<EntryLogState>,
     flush_mutex: Mutex<()>,
+    /// I/O engine for entry log reads/writes.
+    ledger_io: Arc<dyn crate::io_engine::LedgerIo>,
     /// Journal for write-ahead logging. None if not initialized (standalone mode).
     journal: Option<crate::journal::writer::Journal>,
     /// Journal directory path (for cleanup after checkpoint).
@@ -51,7 +54,7 @@ pub struct DbLedgerStorage {
 }
 
 impl DbLedgerStorage {
-    pub fn open(base_dir: &Path) -> Result<Self, StorageError> {
+    pub fn open(base_dir: &Path, ledger_io: Arc<dyn crate::io_engine::LedgerIo>) -> Result<Self, StorageError> {
         // All data lives under `<base_dir>/current/`, matching Java's
         // BookieImpl.getCurrentDirectory(dir). Entry log files (.log) sit
         // directly in `current/` alongside the RocksDB subdirectories —
@@ -77,9 +80,10 @@ impl DbLedgerStorage {
             log_state: Mutex::new(EntryLogState {
                 log_id: 0,
                 offset: LOGFILE_HEADER_SIZE as u64,
-                writer: None,
+                file: None,
             }),
             flush_mutex: Mutex::new(()),
+            ledger_io,
             journal: None,
             journal_dir: None,
             explicit_lac_cache: dashmap::DashMap::new(),
@@ -169,26 +173,23 @@ impl DbLedgerStorage {
     }
 
     fn read_entry_from_log(&self, location: u64) -> Result<Vec<u8>, StorageError> {
-        use std::io::{Read, Seek, SeekFrom};
         let loc = EntryLocation::from_u64(location);
         let path = self.entry_log_path(loc.log_id());
-        let mut file = fs::File::open(&path)?;
+        let file = fs::File::open(&path)?;
+        let fd = file.as_raw_fd();
         let pos = loc.position() as u64;
         if pos < 4 {
             return Err(StorageError::CorruptData("invalid entry position".into()));
         }
         // Read 4-byte size at (pos - 4)
-        file.seek(SeekFrom::Start(pos - 4))?;
-        let mut size_buf = [0u8; 4];
-        file.read_exact(&mut size_buf)?;
-        let size = i32::from_be_bytes(size_buf) as usize;
+        let size_buf = self.ledger_io.read_at(fd, pos - 4, 4)?;
+        let size = i32::from_be_bytes(size_buf[..4].try_into().unwrap()) as usize;
         if size > MAX_ENTRY_SIZE {
             return Err(StorageError::CorruptData(
                 format!("entry size {} exceeds maximum {}", size, MAX_ENTRY_SIZE)));
         }
         // Read entry data at pos
-        let mut entry = vec![0u8; size];
-        file.read_exact(&mut entry)?;
+        let entry = self.ledger_io.read_at(fd, pos, size)?;
         Ok(entry)
     }
 }
@@ -383,32 +384,31 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError> {
-        use std::io::BufWriter;
         let mut log_state = self.log_state.lock().unwrap();
 
         let encoded_size = (4 + entry.len()) as u64;
         if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
-            // Flush and close current writer before rotating
-            if let Some(ref mut w) = log_state.writer {
-                w.flush()?;
-            }
-            log_state.writer = None;
+            // Close current file before rotating
+            log_state.file = None;
             log_state.log_id += 1;
             log_state.offset = LOGFILE_HEADER_SIZE as u64;
         }
 
-        // Open writer if not already open
-        if log_state.writer.is_none() {
+        // Open file if not already open
+        if log_state.file.is_none() {
             self.ensure_entry_log_exists(log_state.log_id)?;
             let path = self.entry_log_path(log_state.log_id);
-            let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
-            log_state.writer = Some(BufWriter::new(file));
+            let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+            log_state.file = Some(file);
         }
 
-        let writer = log_state.writer.as_mut().unwrap();
-        writer.write_all(&(entry.len() as i32).to_be_bytes())?;
-        writer.write_all(entry)?;
-        // Don't flush per entry — caller flushes after batch via update_entry_locations
+        // Frame entry: 4-byte size prefix + payload
+        let mut framed = Vec::with_capacity(4 + entry.len());
+        framed.extend_from_slice(&(entry.len() as i32).to_be_bytes());
+        framed.extend_from_slice(entry);
+
+        let fd = log_state.file.as_ref().unwrap().as_raw_fd();
+        self.ledger_io.write_batch(fd, log_state.offset, &[&framed])?;
 
         let position = log_state.offset + 4;
         let location = EntryLocation::new(log_state.log_id, position as u32).to_u64();
@@ -417,13 +417,8 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError> {
-        // Flush entry log to disk before updating index (matching Java's flush ordering)
-        {
-            let mut log_state = self.log_state.lock().unwrap();
-            if let Some(ref mut w) = log_state.writer {
-                w.flush()?;
-            }
-        }
+        // No per-entry flush needed — write_batch already wrote to disk.
+        // Just update the RocksDB index.
         self.entry_location_index.put_batch(batch)?;
         self.entry_location_index.flush()
     }
@@ -460,42 +455,84 @@ impl LedgerStorage for DbLedgerStorage {
         {
             let mut log_state = self.log_state.lock().unwrap();
 
-            // Open writer if not already open
-            if log_state.writer.is_none() {
+            // Open file if not already open
+            if log_state.file.is_none() {
                 self.ensure_entry_log_exists(log_state.log_id)?;
                 let path = self.entry_log_path(log_state.log_id);
-                let file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
-                log_state.writer = Some(BufWriter::new(file));
+                let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+                log_state.file = Some(file);
             }
+
+            // Collect framed entries for the current log segment, flushing
+            // the batch via write_batch whenever rotation is needed.
+            let mut framed_entries: Vec<Vec<u8>> = Vec::new();
+            // Track (ledger_id, entry_id, offset_within_segment) for each
+            // framed entry so we can build the final location batch.
+            struct PendingEntry {
+                ledger_id: i64,
+                entry_id: i64,
+                log_id: u32,
+                position: u64,
+            }
+            let mut pending: Vec<PendingEntry> = Vec::new();
 
             for &(ledger_id, entry_id, offset, size) in &entries {
                 let entry_data = &flushing_data[offset..offset + size];
                 let encoded_size = (4 + entry_data.len()) as u64;
 
                 if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
-                    // Rotate: flush + close current, open new
-                    if let Some(ref mut w) = log_state.writer {
-                        w.flush()?;
+                    // Write any accumulated entries to the current log before rotating
+                    if !framed_entries.is_empty() {
+                        let refs: Vec<&[u8]> = framed_entries.iter().map(|v| v.as_slice()).collect();
+                        let fd = log_state.file.as_ref().unwrap().as_raw_fd();
+                        // offset for write_batch is the offset of the first pending entry minus 4
+                        // (the size prefix), which equals pending[0].position - 4
+                        let write_offset = pending.first().unwrap().position - 4;
+                        self.ledger_io.write_batch(fd, write_offset, &refs)?;
+                        for p in &pending {
+                            batch.push((p.ledger_id, p.entry_id,
+                                EntryLocation::new(p.log_id, p.position as u32).to_u64()));
+                        }
+                        framed_entries.clear();
+                        pending.clear();
                     }
-                    log_state.writer = None;
+
+                    // Rotate: close current, open new
+                    log_state.file = None;
                     log_state.log_id += 1;
                     log_state.offset = LOGFILE_HEADER_SIZE as u64;
                     self.ensure_entry_log_exists(log_state.log_id)?;
                     let new_path = self.entry_log_path(log_state.log_id);
-                    let file = fs::OpenOptions::new().create(true).append(true).open(&new_path)?;
-                    log_state.writer = Some(BufWriter::new(file));
+                    let file = fs::OpenOptions::new().read(true).write(true).open(&new_path)?;
+                    log_state.file = Some(file);
                 }
 
-                let w = log_state.writer.as_mut().unwrap();
-                w.write_all(&(entry_data.len() as i32).to_be_bytes())?;
-                w.write_all(entry_data)?;
+                // Frame entry: 4-byte size prefix + payload
+                let mut framed = Vec::with_capacity(4 + entry_data.len());
+                framed.extend_from_slice(&(entry_data.len() as i32).to_be_bytes());
+                framed.extend_from_slice(entry_data);
+
                 let position = log_state.offset + 4;
-                let location = EntryLocation::new(log_state.log_id, position as u32).to_u64();
-                batch.push((ledger_id, entry_id, location));
+                pending.push(PendingEntry {
+                    ledger_id,
+                    entry_id,
+                    log_id: log_state.log_id,
+                    position,
+                });
+                framed_entries.push(framed);
                 log_state.offset += encoded_size;
             }
-            if let Some(ref mut w) = log_state.writer {
-                w.flush()?;
+
+            // Write remaining entries
+            if !framed_entries.is_empty() {
+                let refs: Vec<&[u8]> = framed_entries.iter().map(|v| v.as_slice()).collect();
+                let fd = log_state.file.as_ref().unwrap().as_raw_fd();
+                let write_offset = pending.first().unwrap().position - 4;
+                self.ledger_io.write_batch(fd, write_offset, &refs)?;
+                for p in &pending {
+                    batch.push((p.ledger_id, p.entry_id,
+                        EntryLocation::new(p.log_id, p.position as u32).to_u64()));
+                }
             }
         }
 

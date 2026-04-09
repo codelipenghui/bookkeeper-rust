@@ -29,6 +29,7 @@ use bookkeeper_storage::entry_log::format::{
     encode_entry_log_entry, EntryLogHeader, HEADER_CURRENT_VERSION,
 };
 use bookkeeper_storage::gc::GarbageCollector;
+use bookkeeper_storage::io_engine::std_engine::StdEngine;
 use bookkeeper_storage::ledger_storage::LedgerStorage;
 use tempfile::TempDir;
 
@@ -82,7 +83,7 @@ fn write_entry_log_file(
 }
 
 fn open_storage(dir: &TempDir) -> Arc<DbLedgerStorage> {
-    Arc::new(DbLedgerStorage::open(dir.path()).unwrap())
+    Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap())
 }
 
 fn entry_log_dir_for(storage: &DbLedgerStorage) -> &Path {

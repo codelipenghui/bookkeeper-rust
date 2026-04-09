@@ -8,6 +8,7 @@ use bookkeeper_protocol::digest::{DigestManager, DigestType};
 use bookkeeper_protocol::entry::EntryBuilder;
 use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
 use bookkeeper_storage::gc::GarbageCollector;
+use bookkeeper_storage::io_engine::std_engine::StdEngine;
 use bookkeeper_storage::ledger_storage::LedgerStorage;
 use tempfile::TempDir;
 
@@ -36,7 +37,7 @@ fn write_entries(storage: &dyn LedgerStorage, ledger_id: i64, count: i64) {
 #[test]
 fn gc_deletes_local_ledger_not_in_metadata() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path()).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     write_entries(&*storage, 1, 5);
     write_entries(&*storage, 2, 5);
@@ -62,7 +63,7 @@ fn gc_deletes_local_ledger_not_in_metadata() {
 #[test]
 fn gc_keeps_all_when_metadata_matches_local() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path()).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     write_entries(&*storage, 10, 3);
     write_entries(&*storage, 20, 3);
@@ -81,7 +82,7 @@ fn gc_keeps_all_when_metadata_matches_local() {
 #[test]
 fn gc_with_empty_metadata_deletes_all_local() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path()).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     write_entries(&*storage, 100, 5);
     write_entries(&*storage, 200, 5);
@@ -97,7 +98,7 @@ fn gc_with_empty_metadata_deletes_all_local() {
 #[test]
 fn gc_idempotent_when_run_twice() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path()).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     write_entries(&*storage, 1, 3);
     write_entries(&*storage, 2, 3);
@@ -116,7 +117,7 @@ fn gc_idempotent_when_run_twice() {
 #[test]
 fn gc_with_no_local_ledgers_succeeds() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path()).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     let active: HashSet<i64> = HashSet::new();
     let gc = GarbageCollector::new(storage);
