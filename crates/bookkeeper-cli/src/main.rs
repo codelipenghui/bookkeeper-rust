@@ -99,6 +99,9 @@ enum Commands {
         /// Mixed read/write: percentage of reads (0-100, 0 = write-only)
         #[arg(long, default_value = "0")]
         read_pct: u8,
+        /// I/O engine override: auto, std, uring
+        #[arg(long, default_value = "auto")]
+        io_engine: String,
     },
     /// List all ledgers in the cluster
     Listledgers {
@@ -533,8 +536,8 @@ async fn main() {
         Commands::Nukeexistingcluster { zk, ledger_root, force, instanceid } => {
             admin::cmd_nukeexistingcluster(&zk, &ledger_root, force, instanceid.as_deref()).await
         }
-        Commands::BenchBookie { bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, digest, duration, read_pct } => {
-            bench::cmd_bench_bookie(&bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, &digest, duration, read_pct).await
+        Commands::BenchBookie { bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, digest, duration, read_pct, io_engine } => {
+            bench::cmd_bench_bookie(&bookie, entry_size, warmup, latency_count, throughput_count, max_outstanding, &digest, duration, read_pct, &io_engine).await
         }
         Commands::BenchE2e { zk, ledger_root, entry_size, duration, ensemble, write_quorum, ack_quorum, ledgers, max_outstanding, warmup, digest } => {
             bench::cmd_bench_e2e(&zk, &ledger_root, entry_size, duration, ensemble, write_quorum, ack_quorum, ledgers, max_outstanding, warmup, &digest).await

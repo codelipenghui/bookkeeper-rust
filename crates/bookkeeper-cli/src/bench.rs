@@ -72,7 +72,12 @@ pub async fn cmd_bench_bookie(
     digest_str: &str,
     duration_secs: u64,
     read_pct: u8,
+    io_engine: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if io_engine != "auto" {
+        std::env::set_var("BOOKKEEPER_IO_ENGINE", io_engine);
+    }
+
     let digest_type = parse_digest(digest_str)?;
     let addr: SocketAddr = bookie_addr.parse()?;
     let password = b"bench-password";
