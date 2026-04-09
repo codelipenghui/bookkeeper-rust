@@ -1,14 +1,15 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 
 use bookkeeper_protocol::digest::{DigestManager, DigestType};
 use bookkeeper_protocol::entry::EntryBuilder;
-use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
+use bookkeeper_storage::db_ledger_storage::{DbLedgerStorage, CURRENT_DIR};
 use bookkeeper_storage::io_engine::{select_engine, LedgerIo};
+use bookkeeper_storage::journal::writer::JournalConfig;
 use bookkeeper_storage::ledger_storage::LedgerStorage;
 
-/// Shared tokio runtime for running async storage methods inside criterion.
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -16,9 +17,9 @@ fn rt() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Select the best engine for this platform (io_uring on Linux, StdEngine elsewhere).
-fn best_engine() -> Arc<dyn LedgerIo> {
-    select_engine().ledger
+fn best_engine() -> (Arc<dyn LedgerIo>, Arc<dyn bookkeeper_storage::io_engine::JournalIo>) {
+    let engines = select_engine();
+    (engines.ledger, engines.journal)
 }
 
 fn random_payload(size: usize) -> Vec<u8> {
@@ -28,32 +29,64 @@ fn random_payload(size: usize) -> Vec<u8> {
 fn build_entry(size: usize, ledger_id: i64, entry_id: i64) -> Vec<u8> {
     let dm = DigestManager::new(DigestType::Crc32c);
     let payload = random_payload(size);
-    let entry = EntryBuilder::new(&dm)
+    EntryBuilder::new(&dm)
         .ledger_id(ledger_id)
         .entry_id(entry_id)
         .lac(entry_id.saturating_sub(1))
         .length(size as i64)
         .payload(bytes::Bytes::copy_from_slice(&payload))
-        .build();
-    entry.to_vec()
+        .build()
+        .to_vec()
+}
+
+/// Open storage WITH journal — matches the real bookie write path.
+fn open_storage_with_journal(dir: &Path) -> DbLedgerStorage {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (ledger_io, journal_io) = best_engine();
+    let mut storage = DbLedgerStorage::open(dir, ledger_io).unwrap();
+
+    let journal_dir = dir.join(CURRENT_DIR).join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let config = JournalConfig {
+        journal_dir: journal_dir.clone(),
+        max_file_size: 128 * 1024 * 1024,
+        sync_data: true,
+        max_group_wait_ms: 2,
+        buffered_writes_threshold: 4096,
+        buffered_entries_threshold: 0,
+        alignment_size: 0,
+        format_version: 6,
+    };
+    rt.block_on(storage.init_journal(&journal_dir, config, journal_io, None))
+        .unwrap();
+    storage
+}
+
+/// Open storage WITHOUT journal — pure write-cache performance.
+fn open_storage_no_journal(dir: &Path) -> DbLedgerStorage {
+    let (ledger_io, _) = best_engine();
+    DbLedgerStorage::open(dir, ledger_io).unwrap()
 }
 
 // ---------------------------------------------------------------------------
-// add_entry benchmark
+// add_entry WITHOUT journal (write cache only — in-memory baseline)
 // ---------------------------------------------------------------------------
 
-fn bench_add_entry(c: &mut Criterion) {
+fn bench_add_entry_no_journal(c: &mut Criterion) {
     let rt = rt();
-    let mut group = c.benchmark_group("storage_add_entry");
+    let mut group = c.benchmark_group("add_entry_no_journal");
 
     for &size in &[128, 1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path(), best_engine()).unwrap();
+        let storage = open_storage_no_journal(dir.path());
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
         group.throughput(Throughput::Bytes(size as u64));
         let mut eid = 0i64;
-        group.bench_with_input(BenchmarkId::new("add", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("cache_only", size), &size, |b, _| {
             b.iter(|| {
                 let entry = build_entry(size, 1, eid);
                 rt.block_on(storage.add_entry(&entry)).unwrap();
@@ -65,16 +98,47 @@ fn bench_add_entry(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// get_entry benchmark (cache hit)
+// add_entry WITH journal (write cache + journal write + fsync)
+// This is the real-world hot path. Measures end-to-end write latency.
+// ---------------------------------------------------------------------------
+
+fn bench_add_entry_with_journal(c: &mut Criterion) {
+    let rt = rt();
+    let mut group = c.benchmark_group("add_entry_journaled");
+    group.sample_size(50); // fewer samples — fsync is slow
+
+    for &size in &[128, 1024, 4096] {
+        let dir = TempDir::new().unwrap();
+        let storage = open_storage_with_journal(dir.path());
+        storage.validate_for_write(1, &[0u8; 20]).unwrap();
+
+        group.throughput(Throughput::Bytes(size as u64));
+        let mut eid = 0i64;
+        group.bench_with_input(BenchmarkId::new("journaled", size), &size, |b, _| {
+            b.iter(|| {
+                let entry = build_entry(size, 1, eid);
+                rt.block_on(storage.add_entry(&entry)).unwrap();
+                // Journal the entry — this is the fsync-bound step
+                let journal = storage.journal().unwrap();
+                rt.block_on(journal.log_add_entry(&entry)).unwrap();
+                eid += 1;
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// get_entry benchmark (write cache hit — no disk I/O)
 // ---------------------------------------------------------------------------
 
 fn bench_get_entry_cached(c: &mut Criterion) {
     let rt = rt();
-    let mut group = c.benchmark_group("storage_get_entry_cached");
+    let mut group = c.benchmark_group("get_entry_cached");
 
     for &size in &[128, 1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path(), best_engine()).unwrap();
+        let storage = open_storage_no_journal(dir.path());
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
         for i in 0..100 {
@@ -84,7 +148,7 @@ fn bench_get_entry_cached(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(size as u64));
         let mut read_id = 0i64;
-        group.bench_with_input(BenchmarkId::new("get_cached", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("write_cache", size), &size, |b, _| {
             b.iter(|| {
                 let _ = rt.block_on(storage.get_entry(1, read_id % 100));
                 read_id += 1;
@@ -95,27 +159,30 @@ fn bench_get_entry_cached(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// get_entry benchmark (from disk after flush)
+// get_entry benchmark (from entry log after flush — exercises LedgerIo)
 // ---------------------------------------------------------------------------
 
 fn bench_get_entry_disk(c: &mut Criterion) {
     let rt = rt();
-    let mut group = c.benchmark_group("storage_get_entry_disk");
+    let mut group = c.benchmark_group("get_entry_flushed");
 
     for &size in &[1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path(), best_engine()).unwrap();
+        let storage = open_storage_no_journal(dir.path());
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
+        // Write 1000 entries and flush to entry log
         for i in 0..1000 {
             let entry = build_entry(size, 1, i);
             rt.block_on(storage.add_entry(&entry)).unwrap();
         }
         rt.block_on(storage.flush()).unwrap();
 
+        // Entries are now in entry log + read cache.
+        // This measures read_cache hit + RocksDB index lookup.
         group.throughput(Throughput::Bytes(size as u64));
         let mut read_id = 0i64;
-        group.bench_with_input(BenchmarkId::new("get_disk", size), &size, |b, _| {
+        group.bench_with_input(BenchmarkId::new("entry_log", size), &size, |b, _| {
             b.iter(|| {
                 let _ = rt.block_on(storage.get_entry(1, read_id % 1000));
                 read_id += 1;
@@ -126,19 +193,19 @@ fn bench_get_entry_disk(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// flush benchmark
+// flush benchmark (write cache → entry log + RocksDB index)
 // ---------------------------------------------------------------------------
 
 fn bench_flush(c: &mut Criterion) {
     let rt = rt();
-    let mut group = c.benchmark_group("storage_flush");
+    let mut group = c.benchmark_group("flush");
 
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path(), best_engine()).unwrap();
+    let storage = open_storage_no_journal(dir.path());
     storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
     let mut eid = 0i64;
-    group.bench_function("flush_1000_entries_1kb", |b| {
+    group.bench_function("1000_entries_1kb", |b| {
         b.iter(|| {
             for _ in 0..1000 {
                 let entry = build_entry(1024, 1, eid);
@@ -153,7 +220,7 @@ fn bench_flush(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// RocksDB index operations
+// RocksDB index operations (pure index, no storage layer)
 // ---------------------------------------------------------------------------
 
 fn bench_rocksdb_index(c: &mut Criterion) {
@@ -203,7 +270,8 @@ fn bench_rocksdb_index(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_add_entry,
+    bench_add_entry_no_journal,
+    bench_add_entry_with_journal,
     bench_get_entry_cached,
     bench_get_entry_disk,
     bench_flush,
