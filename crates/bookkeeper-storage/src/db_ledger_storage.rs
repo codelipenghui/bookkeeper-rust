@@ -211,20 +211,9 @@ impl DbLedgerStorage {
         if pos < 4 {
             return Err(StorageError::CorruptData("invalid entry position".into()));
         }
-
-        // Read size prefix first (4 bytes)
-        let size_buf = self.ledger_io.read_entry(
-            &self.entry_log_dir, loc.log_id(), pos - 4, 4,
-        ).await?;
-        let size = i32::from_be_bytes(size_buf[..4].try_into().unwrap()) as usize;
-        if size > MAX_ENTRY_SIZE {
-            return Err(StorageError::CorruptData(
-                format!("entry size {} exceeds maximum {}", size, MAX_ENTRY_SIZE),
-            ));
-        }
-        // Read entry data
-        let entry = self.ledger_io.read_entry(
-            &self.entry_log_dir, loc.log_id(), pos, size,
+        // Single round-trip: read size prefix + data together
+        let entry = self.ledger_io.read_framed_entry(
+            &self.entry_log_dir, loc.log_id(), pos - 4, MAX_ENTRY_SIZE,
         ).await?;
         Ok(entry)
     }

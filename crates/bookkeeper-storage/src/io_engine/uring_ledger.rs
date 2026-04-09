@@ -35,6 +35,13 @@ enum LedgerRequest {
         len: usize,
         reply: oneshot::Sender<io::Result<Vec<u8>>>,
     },
+    ReadFramed {
+        entry_log_dir: PathBuf,
+        log_id: u32,
+        offset: u64,
+        max_size: usize,
+        reply: oneshot::Sender<io::Result<Vec<u8>>>,
+    },
     Write {
         fd: RawFd,
         offset: u64,
@@ -131,6 +138,27 @@ impl LedgerIo for UringLedgerIo {
                 log_id,
                 offset,
                 len,
+                reply: reply_tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ring thread closed"))?;
+        reply_rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ring thread dropped reply"))?
+    }
+
+    async fn read_framed_entry(
+        &self,
+        entry_log_dir: &Path,
+        log_id: u32,
+        offset: u64,
+        max_size: usize,
+    ) -> io::Result<Vec<u8>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(LedgerRequest::ReadFramed {
+                entry_log_dir: entry_log_dir.to_path_buf(),
+                log_id,
+                offset,
+                max_size,
                 reply: reply_tx,
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ring thread closed"))?;
@@ -236,6 +264,80 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     }
 
                     pending.push(PendingOp::Read { buf, len, reply });
+                    num_sqes += 1;
+                }
+
+                LedgerRequest::ReadFramed {
+                    entry_log_dir,
+                    log_id,
+                    offset,
+                    max_size,
+                    reply,
+                } => {
+                    let fd = match fd_cache.get_or_open(&entry_log_dir, log_id) {
+                        Ok((fd, _)) => {
+                            fd_cache.pin(log_id);
+                            fd
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                            continue;
+                        }
+                    };
+
+                    // Read 4-byte size prefix via blocking pread
+                    let mut size_buf = [0u8; 4];
+                    let ret = unsafe {
+                        libc::pread(
+                            fd,
+                            size_buf.as_mut_ptr() as *mut libc::c_void,
+                            4,
+                            offset as libc::off_t,
+                        )
+                    };
+                    if ret < 0 {
+                        let _ = reply.send(Err(io::Error::last_os_error()));
+                        continue;
+                    }
+                    if (ret as usize) < 4 {
+                        let _ = reply.send(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short size prefix read",
+                        )));
+                        continue;
+                    }
+
+                    let size = i32::from_be_bytes(size_buf) as usize;
+                    if size > max_size {
+                        let _ = reply.send(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("entry size {} exceeds max {}", size, max_size),
+                        )));
+                        continue;
+                    }
+
+                    // Submit io_uring READ for the entry data
+                    let mut buf = vec![0u8; size];
+                    let sqe_idx = pending.len() as u64;
+                    let data_offset = offset + 4;
+
+                    let read_sqe =
+                        opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), size as u32)
+                            .offset(data_offset)
+                            .build()
+                            .user_data(sqe_idx);
+
+                    let pushed = unsafe { ring.submission().push(&read_sqe) };
+                    if pushed.is_err() {
+                        let _ = reply.send(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "SQ full",
+                        )));
+                        continue;
+                    }
+
+                    // Reuse PendingOp::Read — CQE dispatch handles it identically
+                    pending.push(PendingOp::Read { buf, len: size, reply });
                     num_sqes += 1;
                 }
 
