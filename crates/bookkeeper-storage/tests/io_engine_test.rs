@@ -97,6 +97,98 @@ fn std_ledger_write_batch_at_nonzero_offset() {
 }
 
 // ---------------------------------------------------------------------------
+// fd_cache tests — platform independent
+// ---------------------------------------------------------------------------
+
+mod fd_cache_tests {
+    use bookkeeper_storage::io_engine::fd_cache::FdCache;
+    use tempfile::TempDir;
+
+    #[test]
+    fn open_and_reuse_returns_same_fd() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("0.log"), vec![0u8; 64]).unwrap();
+
+        let mut cache = FdCache::new(4);
+        let (fd1, idx1) = cache.get_or_open(dir.path(), 0).unwrap();
+        let (fd2, idx2) = cache.get_or_open(dir.path(), 0).unwrap();
+        assert_eq!(fd1, fd2);
+        assert_eq!(idx1, idx2);
+    }
+
+    #[test]
+    fn different_log_ids_get_different_fds() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("0.log"), vec![0u8; 64]).unwrap();
+        std::fs::write(dir.path().join("1.log"), vec![0u8; 64]).unwrap();
+
+        let mut cache = FdCache::new(4);
+        let (fd1, _) = cache.get_or_open(dir.path(), 0).unwrap();
+        let (fd2, _) = cache.get_or_open(dir.path(), 1).unwrap();
+        assert_ne!(fd1, fd2);
+    }
+
+    #[test]
+    fn evicts_lru_when_capacity_exceeded() {
+        let dir = TempDir::new().unwrap();
+        for i in 0..5u32 {
+            std::fs::write(dir.path().join(format!("{:x}.log", i)), vec![0u8; 64]).unwrap();
+        }
+
+        let mut cache = FdCache::new(3);
+        cache.get_or_open(dir.path(), 0).unwrap();
+        cache.get_or_open(dir.path(), 1).unwrap();
+        cache.get_or_open(dir.path(), 2).unwrap();
+        assert_eq!(cache.len(), 3);
+
+        // Opening log_id=3 evicts LRU (log_id=0)
+        cache.get_or_open(dir.path(), 3).unwrap();
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.contains(0));
+        assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn explicit_evict_removes_entry() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("0.log"), vec![0u8; 64]).unwrap();
+
+        let mut cache = FdCache::new(4);
+        cache.get_or_open(dir.path(), 0).unwrap();
+        assert!(cache.contains(0));
+        cache.evict(0);
+        assert!(!cache.contains(0));
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn lru_tracks_access_order() {
+        let dir = TempDir::new().unwrap();
+        for i in 0..4u32 {
+            std::fs::write(dir.path().join(format!("{:x}.log", i)), vec![0u8; 64]).unwrap();
+        }
+
+        let mut cache = FdCache::new(3);
+        cache.get_or_open(dir.path(), 0).unwrap(); // access order: 0
+        cache.get_or_open(dir.path(), 1).unwrap(); // access order: 0, 1
+        cache.get_or_open(dir.path(), 2).unwrap(); // access order: 0, 1, 2
+
+        // Touch 0 again — makes it recently used
+        cache.get_or_open(dir.path(), 0).unwrap(); // access order: 1, 2, 0
+
+        // Opening 3 should evict 1 (oldest), not 0
+        cache.get_or_open(dir.path(), 3).unwrap();
+        assert!(
+            cache.contains(0),
+            "0 was recently accessed, should not be evicted"
+        );
+        assert!(!cache.contains(1), "1 was LRU, should be evicted");
+        assert!(cache.contains(2));
+        assert!(cache.contains(3));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // io_uring tests — Linux only
 // ---------------------------------------------------------------------------
 
