@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
+use async_trait::async_trait;
 use io_uring::{opcode, types, IoUring};
+use tokio::sync::oneshot;
 
 use super::fd_cache::FdCache;
 use super::LedgerIo;
@@ -31,13 +33,13 @@ enum LedgerRequest {
         log_id: u32,
         offset: u64,
         len: usize,
-        reply: SyncSender<io::Result<Vec<u8>>>,
+        reply: oneshot::Sender<io::Result<Vec<u8>>>,
     },
     Write {
         fd: RawFd,
         offset: u64,
         entries: Vec<Vec<u8>>,
-        reply: SyncSender<io::Result<Vec<u64>>>,
+        reply: oneshot::Sender<io::Result<Vec<u64>>>,
     },
     Evict {
         log_id: u32,
@@ -77,29 +79,23 @@ impl UringLedgerIo {
 // LedgerIo trait implementation
 // ---------------------------------------------------------------------------
 
+#[async_trait]
 impl LedgerIo for UringLedgerIo {
-    fn write_batch(&self, fd: RawFd, offset: u64, entries: &[&[u8]]) -> io::Result<Vec<u64>> {
+    async fn write_batch(&self, fd: RawFd, offset: u64, entries: Vec<Vec<u8>>) -> io::Result<Vec<u64>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-        let owned_entries: Vec<Vec<u8>> = entries.iter().map(|e| e.to_vec()).collect();
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(LedgerRequest::Write {
-                fd,
-                offset,
-                entries: owned_entries,
-                reply: reply_tx,
-            })
+            .send(LedgerRequest::Write { fd, offset, entries, reply: reply_tx })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ring thread closed"))?;
-        reply_rx
-            .recv()
+        reply_rx.await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ring thread dropped reply"))?
     }
 
-    fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        // Legacy path used by the write side — blocking pread, no ring
-        // involvement.
+    async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        // Legacy path used by the write side — blocking pread, fast syscall,
+        // no ring involvement.
         let mut buf = vec![0u8; len];
         let ret = unsafe {
             libc::pread(
@@ -121,14 +117,14 @@ impl LedgerIo for UringLedgerIo {
         Ok(buf)
     }
 
-    fn read_entry(
+    async fn read_entry(
         &self,
         entry_log_dir: &Path,
         log_id: u32,
         offset: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
-        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(LedgerRequest::Read {
                 entry_log_dir: entry_log_dir.to_path_buf(),
@@ -138,8 +134,7 @@ impl LedgerIo for UringLedgerIo {
                 reply: reply_tx,
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ring thread closed"))?;
-        reply_rx
-            .recv()
+        reply_rx.await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ring thread dropped reply"))?
     }
 
@@ -158,7 +153,7 @@ enum PendingOp {
     Read {
         buf: Vec<u8>,
         len: usize,
-        reply: SyncSender<io::Result<Vec<u8>>>,
+        reply: oneshot::Sender<io::Result<Vec<u8>>>,
     },
     Write {
         entries: Vec<Vec<u8>>,
@@ -168,7 +163,7 @@ enum PendingOp {
         // Keep iovecs alive until the CQE is reaped — the kernel reads
         // from this memory during submission.
         _iovecs: Vec<libc::iovec>,
-        reply: SyncSender<io::Result<Vec<u64>>>,
+        reply: oneshot::Sender<io::Result<Vec<u64>>>,
     },
 }
 
