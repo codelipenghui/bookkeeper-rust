@@ -205,6 +205,15 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
     };
     let mut fd_cache = FdCache::new(FD_CACHE_CAPACITY);
 
+    // Register fixed file descriptor table (all slots empty = -1)
+    let empty_fds: Vec<RawFd> = vec![-1; FD_CACHE_CAPACITY];
+    let fixed_fds_available = ring.submitter().register_files(&empty_fds).is_ok();
+    if fixed_fds_available {
+        tracing::debug!("ledger-io: registered {} fixed fd slots", FD_CACHE_CAPACITY);
+    } else {
+        tracing::warn!("ledger-io: register_files failed, using raw fds");
+    }
+
     loop {
         // ---- 1. Block on the first request ----
         let first = match rx.recv() {
@@ -233,11 +242,16 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     len,
                     reply,
                 } => {
-                    let fd = match fd_cache.get_or_open(&entry_log_dir, log_id) {
-                        Ok((fd, _)) => {
+                    let (fd, fixed_index) = match fd_cache.get_or_open(&entry_log_dir, log_id) {
+                        Ok((fd, fixed_index, is_new)) => {
                             // Pin to prevent LRU eviction while SQE is in-flight
                             fd_cache.pin(log_id);
-                            fd
+                            if is_new && fixed_fds_available {
+                                let _ = ring.submitter().register_files_update(
+                                    fixed_index, &[fd],
+                                );
+                            }
+                            (fd, fixed_index)
                         }
                         Err(e) => {
                             let _ = reply.send(Err(e));
@@ -248,8 +262,14 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     let mut buf = vec![0u8; len];
                     let sqe_idx = pending.len() as u64;
 
+                    let fd_target = if fixed_fds_available {
+                        types::Fixed(fixed_index)
+                    } else {
+                        types::Fd(fd)
+                    };
+
                     let read_sqe =
-                        opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
+                        opcode::Read::new(fd_target, buf.as_mut_ptr(), len as u32)
                             .offset(offset)
                             .build()
                             .user_data(sqe_idx);
@@ -274,10 +294,15 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     max_size,
                     reply,
                 } => {
-                    let fd = match fd_cache.get_or_open(&entry_log_dir, log_id) {
-                        Ok((fd, _)) => {
+                    let (fd, fixed_index) = match fd_cache.get_or_open(&entry_log_dir, log_id) {
+                        Ok((fd, fixed_index, is_new)) => {
                             fd_cache.pin(log_id);
-                            fd
+                            if is_new && fixed_fds_available {
+                                let _ = ring.submitter().register_files_update(
+                                    fixed_index, &[fd],
+                                );
+                            }
+                            (fd, fixed_index)
                         }
                         Err(e) => {
                             let _ = reply.send(Err(e));
@@ -321,8 +346,14 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     let sqe_idx = pending.len() as u64;
                     let data_offset = offset + 4;
 
+                    let fd_target = if fixed_fds_available {
+                        types::Fixed(fixed_index)
+                    } else {
+                        types::Fd(fd)
+                    };
+
                     let read_sqe =
-                        opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), size as u32)
+                        opcode::Read::new(fd_target, buf.as_mut_ptr(), size as u32)
                             .offset(data_offset)
                             .build()
                             .user_data(sqe_idx);
@@ -388,7 +419,13 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                 }
 
                 LedgerRequest::Evict { log_id } => {
-                    fd_cache.evict(log_id);
+                    if let Some(evicted_idx) = fd_cache.evict(log_id) {
+                        if fixed_fds_available {
+                            let _ = ring.submitter().register_files_update(
+                                evicted_idx, &[-1i32 as RawFd],
+                            );
+                        }
+                    }
                 }
             }
         }

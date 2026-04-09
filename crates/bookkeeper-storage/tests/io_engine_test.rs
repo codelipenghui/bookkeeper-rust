@@ -153,8 +153,8 @@ mod fd_cache_tests {
         std::fs::write(dir.path().join("0.log"), vec![0u8; 64]).unwrap();
 
         let mut cache = FdCache::new(4);
-        let (fd1, idx1) = cache.get_or_open(dir.path(), 0).unwrap();
-        let (fd2, idx2) = cache.get_or_open(dir.path(), 0).unwrap();
+        let (fd1, idx1, _) = cache.get_or_open(dir.path(), 0).unwrap();
+        let (fd2, idx2, _) = cache.get_or_open(dir.path(), 0).unwrap();
         assert_eq!(fd1, fd2);
         assert_eq!(idx1, idx2);
     }
@@ -166,8 +166,8 @@ mod fd_cache_tests {
         std::fs::write(dir.path().join("1.log"), vec![0u8; 64]).unwrap();
 
         let mut cache = FdCache::new(4);
-        let (fd1, _) = cache.get_or_open(dir.path(), 0).unwrap();
-        let (fd2, _) = cache.get_or_open(dir.path(), 1).unwrap();
+        let (fd1, _, _) = cache.get_or_open(dir.path(), 0).unwrap();
+        let (fd2, _, _) = cache.get_or_open(dir.path(), 1).unwrap();
         assert_ne!(fd1, fd2);
     }
 
@@ -228,6 +228,21 @@ mod fd_cache_tests {
         assert!(!cache.contains(1), "1 was LRU, should be evicted");
         assert!(cache.contains(2));
         assert!(cache.contains(3));
+    }
+
+    #[test]
+    fn is_new_flag_on_insert_vs_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("0.log");
+        std::fs::write(&log_path, b"data").unwrap();
+
+        let mut cache = FdCache::new(4);
+
+        let (_, _, is_new) = cache.get_or_open(dir.path(), 0).unwrap();
+        assert!(is_new, "first access should be new");
+
+        let (_, _, is_new) = cache.get_or_open(dir.path(), 0).unwrap();
+        assert!(!is_new, "second access should be cached");
     }
 }
 

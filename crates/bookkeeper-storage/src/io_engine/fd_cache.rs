@@ -36,13 +36,16 @@ impl FdCache {
     }
 
     /// Get the fd and fixed-file index for `log_id`, opening it if needed.
-    pub fn get_or_open(&mut self, entry_log_dir: &Path, log_id: u32) -> io::Result<(RawFd, u32)> {
+    ///
+    /// Returns `(raw_fd, fixed_index, is_new)` where `is_new` is `true` on a
+    /// cache miss (new fd opened) and `false` on a cache hit.
+    pub fn get_or_open(&mut self, entry_log_dir: &Path, log_id: u32) -> io::Result<(RawFd, u32, bool)> {
         self.access_counter += 1;
         let counter = self.access_counter;
 
         if let Some(entry) = self.entries.get_mut(&log_id) {
             entry.last_used = counter;
-            return Ok((entry.file.as_raw_fd(), entry.fixed_index));
+            return Ok((entry.file.as_raw_fd(), entry.fixed_index, false));
         }
 
         // Cache miss — evict LRU if full (only non-pinned entries)
@@ -64,7 +67,7 @@ impl FdCache {
             },
         );
 
-        Ok((fd, fixed_index))
+        Ok((fd, fixed_index, true))
     }
 
     /// Pin a log_id to prevent LRU eviction. Call this after building
@@ -80,10 +83,17 @@ impl FdCache {
     }
 
     /// Explicitly evict a log_id (called by GC before file deletion).
-    pub fn evict(&mut self, log_id: u32) {
+    ///
+    /// Returns the freed `fixed_index` if the entry existed, so the caller
+    /// can unregister it from the io_uring fixed file table.
+    pub fn evict(&mut self, log_id: u32) -> Option<u32> {
         self.pinned.remove(&log_id);
         if let Some(entry) = self.entries.remove(&log_id) {
-            self.free_indices.push(entry.fixed_index);
+            let idx = entry.fixed_index;
+            self.free_indices.push(idx);
+            Some(idx)
+        } else {
+            None
         }
     }
 
