@@ -131,9 +131,32 @@ impl BookieServer {
         let mut session_watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         let zk_reg = if let Some(ref zk_servers) = config.zk_servers {
-            let bookie_id = config.advertised_address.clone().unwrap_or_else(|| {
-                format!("{}:{}", local_addr.ip(), local_addr.port())
-            });
+            // The host to publish in ZK. When `advertisedAddress` is set it
+            // wins (important for docker-compose style deployments where the
+            // bind address is 0.0.0.0 but peers reach us via a DNS name
+            // from the overlay network). Otherwise fall back to the actual
+            // bind address.
+            let (advertised_host, bookie_id) = match &config.advertised_address {
+                Some(adv) => {
+                    // advertisedAddress may or may not include a port
+                    // suffix. Split once on ':' so "rust-bookie-1" →
+                    // ("rust-bookie-1", local_addr.port()), and
+                    // "rust-bookie-1:3181" → ("rust-bookie-1", 3181).
+                    let (host, port) = match adv.split_once(':') {
+                        Some((h, p)) => (
+                            h.to_string(),
+                            p.parse::<u16>().unwrap_or(local_addr.port()),
+                        ),
+                        None => (adv.clone(), local_addr.port()),
+                    };
+                    let id = format!("{}:{}", host, port);
+                    (host, id)
+                }
+                None => {
+                    let host = local_addr.ip().to_string();
+                    (host.clone(), format!("{}:{}", host, local_addr.port()))
+                }
+            };
             let reg_mgr = bookkeeper_metadata::zk::registration::ZkRegistrationManager::new(
                 zk_servers,
                 &config.zk_ledger_root,
@@ -143,7 +166,7 @@ impl BookieServer {
             validate_cookie(&reg_mgr, &bookie_id, &config).await?;
             let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
                 &bookie_id,
-                &local_addr.ip().to_string(),
+                &advertised_host,
                 local_addr.port(),
             );
             reg_mgr
@@ -371,8 +394,15 @@ impl BookieServer {
             use bookkeeper_metadata::traits::RegistrationManager;
             reg_mgr.unregister_bookie(bookie_id, !read_only).await
                 .map_err(|e| format!("unregister from old path: {e}"))?;
+            // Recover the advertised host from the bookie_id (always of the
+            // form `host:port` per the construction in `start`). Falls back
+            // to the bind address if the id is malformed somehow.
+            let host = bookie_id
+                .rsplit_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| self.local_addr.ip().to_string());
             let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
-                bookie_id, &self.local_addr.ip().to_string(), self.local_addr.port(),
+                bookie_id, &host, self.local_addr.port(),
             );
             reg_mgr.register_bookie(bookie_id, read_only, &info).await
                 .map_err(|e| format!("register on new path: {e}"))?;
@@ -728,8 +758,14 @@ async fn update_zk_registration(
     read_only: bool,
 ) {
     if let Some((ref zk_client, ref paths, ref bookie_id)) = zk_info {
+        // Reconstruct host/port from the `host:port` bookie_id so the
+        // BookieServiceInfo znode data has a client-reachable address.
+        let (host, port) = bookie_id
+            .rsplit_once(':')
+            .and_then(|(h, p)| p.parse::<u16>().ok().map(|p| (h.to_string(), p)))
+            .unwrap_or_else(|| (String::new(), 0));
         let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
-            bookie_id, "", 0,
+            bookie_id, &host, port,
         );
         let data = info.to_protobuf_bytes();
         let options = zookeeper_client::CreateMode::Ephemeral

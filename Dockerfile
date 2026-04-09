@@ -4,15 +4,18 @@
 # Stage 2: copy the binary into a slim runtime image, along with a default
 #          docker-compose-friendly config.
 
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.90-bookworm AS builder
 WORKDIR /app
 
-# System deps for the RocksDB crate's C++ build
+# System deps:
+#   libclang-dev / clang / cmake — for the RocksDB crate's C++ build
+#   protobuf-compiler            — for bookkeeper-proto's prost-build
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libclang-dev \
         cmake \
-        clang && \
+        clang \
+        protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy the whole workspace. A .dockerignore keeps target/ and other bulky
