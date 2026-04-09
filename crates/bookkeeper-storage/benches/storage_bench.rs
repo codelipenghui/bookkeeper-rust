@@ -1,14 +1,25 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-#[allow(unused_imports)]
-use std::path::Path;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 use bookkeeper_protocol::digest::{DigestManager, DigestType};
 use bookkeeper_protocol::entry::EntryBuilder;
-use std::sync::Arc;
 use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
-use bookkeeper_storage::io_engine::std_engine::StdEngine;
+use bookkeeper_storage::io_engine::{select_engine, LedgerIo};
 use bookkeeper_storage::ledger_storage::LedgerStorage;
+
+/// Shared tokio runtime for running async storage methods inside criterion.
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// Select the best engine for this platform (io_uring on Linux, StdEngine elsewhere).
+fn best_engine() -> Arc<dyn LedgerIo> {
+    select_engine().ledger
+}
 
 fn random_payload(size: usize) -> Vec<u8> {
     (0..size).map(|i| (i & 0xFF) as u8).collect()
@@ -32,12 +43,12 @@ fn build_entry(size: usize, ledger_id: i64, entry_id: i64) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 fn bench_add_entry(c: &mut Criterion) {
+    let rt = rt();
     let mut group = c.benchmark_group("storage_add_entry");
 
     for &size in &[128, 1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
-        // Pre-create ledger
+        let storage = DbLedgerStorage::open(dir.path(), best_engine()).unwrap();
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
         group.throughput(Throughput::Bytes(size as u64));
@@ -45,7 +56,7 @@ fn bench_add_entry(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("add", size), &size, |b, _| {
             b.iter(|| {
                 let entry = build_entry(size, 1, eid);
-                storage.add_entry(&entry).unwrap();
+                rt.block_on(storage.add_entry(&entry)).unwrap();
                 eid += 1;
             });
         });
@@ -58,24 +69,24 @@ fn bench_add_entry(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_get_entry_cached(c: &mut Criterion) {
+    let rt = rt();
     let mut group = c.benchmark_group("storage_get_entry_cached");
 
     for &size in &[128, 1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
+        let storage = DbLedgerStorage::open(dir.path(), best_engine()).unwrap();
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
-        // Write entries into write cache
         for i in 0..100 {
             let entry = build_entry(size, 1, i);
-            storage.add_entry(&entry).unwrap();
+            rt.block_on(storage.add_entry(&entry)).unwrap();
         }
 
         group.throughput(Throughput::Bytes(size as u64));
         let mut read_id = 0i64;
         group.bench_with_input(BenchmarkId::new("get_cached", size), &size, |b, _| {
             b.iter(|| {
-                let _ = storage.get_entry(1, read_id % 100);
+                let _ = rt.block_on(storage.get_entry(1, read_id % 100));
                 read_id += 1;
             });
         });
@@ -88,25 +99,25 @@ fn bench_get_entry_cached(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_get_entry_disk(c: &mut Criterion) {
+    let rt = rt();
     let mut group = c.benchmark_group("storage_get_entry_disk");
 
     for &size in &[1024, 4096] {
         let dir = TempDir::new().unwrap();
-        let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
+        let storage = DbLedgerStorage::open(dir.path(), best_engine()).unwrap();
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
-        // Write and flush to disk
         for i in 0..1000 {
             let entry = build_entry(size, 1, i);
-            storage.add_entry(&entry).unwrap();
+            rt.block_on(storage.add_entry(&entry)).unwrap();
         }
-        storage.flush().unwrap();
+        rt.block_on(storage.flush()).unwrap();
 
         group.throughput(Throughput::Bytes(size as u64));
         let mut read_id = 0i64;
         group.bench_with_input(BenchmarkId::new("get_disk", size), &size, |b, _| {
             b.iter(|| {
-                let _ = storage.get_entry(1, read_id % 1000);
+                let _ = rt.block_on(storage.get_entry(1, read_id % 1000));
                 read_id += 1;
             });
         });
@@ -119,23 +130,22 @@ fn bench_get_entry_disk(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_flush(c: &mut Criterion) {
+    let rt = rt();
     let mut group = c.benchmark_group("storage_flush");
 
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), best_engine()).unwrap();
     storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
     let mut eid = 0i64;
     group.bench_function("flush_1000_entries_1kb", |b| {
         b.iter(|| {
-            // Fill write cache with 1000 entries
             for _ in 0..1000 {
                 let entry = build_entry(1024, 1, eid);
-                storage.add_entry(&entry).unwrap();
+                rt.block_on(storage.add_entry(&entry)).unwrap();
                 eid += 1;
             }
-            // Flush to disk
-            storage.flush().unwrap();
+            rt.block_on(storage.flush()).unwrap();
         });
     });
 
@@ -155,7 +165,6 @@ fn bench_rocksdb_index(c: &mut Criterion) {
     )
     .unwrap();
 
-    // Populate some entries
     let batch: Vec<(i64, i64, u64)> = (0..10000)
         .map(|i| (1i64, i as i64, ((i as u64) << 32) | 1024))
         .collect();

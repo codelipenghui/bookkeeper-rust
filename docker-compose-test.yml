@@ -9,6 +9,8 @@
 #   docker compose -f docker-compose-test.yml run --rm test-uring-only   # fast (~10s)
 #   docker compose -f docker-compose-test.yml run --rm test-all          # full suite
 #   docker compose -f docker-compose-test.yml run --rm test-std          # StdEngine baseline
+#   docker compose -f docker-compose-test.yml run --rm bench-uring       # bench with io_uring
+#   docker compose -f docker-compose-test.yml run --rm bench-std         # bench with StdEngine
 #   docker compose -f docker-compose-test.yml down                       # cleanup ZK
 
 services:
@@ -57,6 +59,31 @@ services:
     restart: "no"
     command: >
       cargo test -p bookkeeper-storage --test io_engine_test
+
+  # ---------------------------------------------------------------------------
+  # Benchmarks: io_uring vs StdEngine comparison
+  # ---------------------------------------------------------------------------
+  bench-uring:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      BOOKKEEPER_IO_ENGINE: uring
+    restart: "no"
+    command: >
+      cargo bench -p bookkeeper-storage --bench storage_bench
+
+  bench-std:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      BOOKKEEPER_IO_ENGINE: std
+    restart: "no"
+    command: >
+      cargo bench -p bookkeeper-storage --bench storage_bench
 
   # ---------------------------------------------------------------------------
   # StdEngine baseline (same Linux build, forces blocking I/O)
