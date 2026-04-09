@@ -36,6 +36,11 @@ pub trait LedgerIo: Send + Sync {
     fn evict_fd(&self, _entry_log_dir: &Path, _log_id: u32) {}
 }
 
+/// Entry log filename for a given log_id (lowercase hex + `.log`).
+pub fn entry_log_filename(log_id: u32) -> String {
+    format!("{:x}.log", log_id)
+}
+
 /// Returns `true` when the io_uring backend is available on this platform.
 pub fn uring_available() -> bool {
     #[cfg(target_os = "linux")]

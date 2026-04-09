@@ -211,7 +211,11 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     reply,
                 } => {
                     let fd = match fd_cache.get_or_open(&entry_log_dir, log_id) {
-                        Ok((fd, _)) => fd,
+                        Ok((fd, _)) => {
+                            // Pin to prevent LRU eviction while SQE is in-flight
+                            fd_cache.pin(log_id);
+                            fd
+                        }
                         Err(e) => {
                             let _ = reply.send(Err(e));
                             continue;
@@ -315,6 +319,9 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
         }
 
         // ---- 5. Collect CQE results keyed by user_data ----
+        // Unpin fds now that all SQEs have completed — safe to evict again.
+        fd_cache.unpin_all();
+
         let mut results: Vec<Option<i32>> = vec![None; pending.len()];
         for cqe in ring.completion() {
             let idx = cqe.user_data() as usize;
@@ -389,6 +396,8 @@ fn build_offset_vec(base_offset: u64, entries: &[Vec<u8>]) -> Vec<u64> {
 }
 
 /// Retry remaining bytes after a short WRITEV using blocking pwrite.
+/// Loops on each slice until all bytes are written (handles short
+/// pwrite returns correctly).
 fn retry_short_pwrite(
     fd: RawFd,
     entries: &[Vec<u8>],
@@ -402,19 +411,23 @@ fn retry_short_pwrite(
             skip -= entry.len();
             continue;
         }
-        let data = &entry[skip..];
-        let ret = unsafe {
-            libc::pwrite(
-                fd,
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-                off as libc::off_t,
-            )
-        };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
+        let mut data = &entry[skip..];
+        while !data.is_empty() {
+            let ret = unsafe {
+                libc::pwrite(
+                    fd,
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                    off as libc::off_t,
+                )
+            };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let written = ret as usize;
+            off += written as u64;
+            data = &data[written..];
         }
-        off += data.len() as u64;
         skip = 0;
     }
     Ok(())

@@ -67,7 +67,7 @@ impl LedgerIo for StdEngine {
     }
 
     fn read_entry(&self, entry_log_dir: &Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let path = entry_log_dir.join(format!("{:x}.log", log_id));
+        let path = entry_log_dir.join(super::entry_log_filename(log_id));
         let file = File::open(&path)?;
         let fd = file.as_raw_fd();
         self.read_at(fd, offset, len)
