@@ -29,7 +29,7 @@ pub struct UringLedgerIo {
 impl UringLedgerIo {
     /// Create a new instance with a persistent io_uring ring.
     pub fn new() -> io::Result<Self> {
-        let ring = IoUring::new(LEDGER_SQ_DEPTH)?;
+        let ring = IoUring::<io_uring::squeue::Entry>::new(LEDGER_SQ_DEPTH)?;
         Ok(Self {
             ring: Mutex::new(ring),
         })

@@ -32,7 +32,7 @@ pub fn uring_available() -> bool {
     {
         // Probe whether the kernel supports io_uring by trying to build a
         // tiny ring.  If the syscall fails we fall back to std.
-        io_uring::IoUring::builder().build(2).is_ok()
+        io_uring::IoUring::<io_uring::squeue::Entry>::builder().build(2).is_ok()
     }
     #[cfg(not(target_os = "linux"))]
     {

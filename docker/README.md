@@ -240,3 +240,34 @@ If Pulsar's `pulsar-client produce/consume` round-trip works, you've
 just done the same thing the gap-#3 Java compat test suite does, but
 against a real Pulsar broker with real topic/subscription/cursor
 machinery on top.
+
+## Running the test suite (io_uring)
+
+A separate compose file (`docker-compose-test.yml`) builds the
+workspace inside Linux and runs the test suite with the io_uring
+engine. This is the primary way **macOS developers** verify the
+uring code paths — io_uring is Linux-only and won't compile on macOS.
+
+On **Linux CI**, both engines are testable natively without Docker.
+
+```bash
+# Quick: only io_uring-specific tests (~10 seconds after first build)
+docker compose -f docker-compose-test.yml run --rm test-uring-only
+
+# Full: all workspace tests with io_uring engine
+docker compose -f docker-compose-test.yml run --rm test-all
+
+# Comparison: same tests with StdEngine (blocking I/O)
+docker compose -f docker-compose-test.yml run --rm test-std
+
+# Tear down the ZK container used by integration tests
+docker compose -f docker-compose-test.yml down
+```
+
+The first run builds the Rust workspace inside the container (~10 min
+for RocksDB). Subsequent runs reuse cached layers and are much faster.
+
+Container-based integration tests (zk_container_test, worker_e2e,
+auditor_election) will skip gracefully inside Docker because
+testcontainers can't launch nested Docker containers. Those tests
+run natively on Linux CI.

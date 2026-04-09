@@ -1,8 +1,9 @@
 # Multi-stage build for the Rust BookKeeper bookie (`bk` binary).
 #
-# Stage 1: build the release `bk` binary with RocksDB bundled.
-# Stage 2: copy the binary into a slim runtime image, along with a default
-#          docker-compose-friendly config.
+# Stages:
+#   builder  — compile workspace with RocksDB bundled
+#   test     — run cargo test with io_uring (used by docker-compose-test.yml)
+#   runtime  — slim production image with just the `bk` binary
 
 FROM rust:1.90-bookworm AS builder
 WORKDIR /app
@@ -24,6 +25,16 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 RUN cargo build --release -p bookkeeper-cli
+
+# ----------------------------------------------------------------------------
+# Test stage: reuses the builder (all deps + source + compiled artifacts).
+# Used by docker-compose-test.yml to run the test suite inside Linux with
+# io_uring support (Debian Bookworm ships kernel 6.1).
+FROM builder AS test
+WORKDIR /app
+ENV BOOKKEEPER_IO_ENGINE=uring
+CMD ["cargo", "test", "--workspace", "--", \
+     "--skip", "java_bookie_container", "--skip", "java_client"]
 
 # ----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
