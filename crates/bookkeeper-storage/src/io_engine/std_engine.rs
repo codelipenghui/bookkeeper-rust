@@ -7,36 +7,27 @@ use std::os::fd::RawFd;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 
-use super::{IoEngine, JournalIo, LedgerIo};
+use super::{JournalIo, LedgerIo};
 
 /// Blocking I/O engine that uses standard `std::fs` / `std::io` operations.
 ///
-/// All methods temporarily wrap the raw fd into a [`File`] via
-/// [`File::from_raw_fd`], then [`std::mem::forget`] the handle so the
-/// caller retains ownership of the fd.
+/// Implements both `JournalIo` and `LedgerIo`, so an `Arc<StdEngine>` can
+/// be coerced to either trait object. All methods borrow the raw fd via
+/// `ManuallyDrop<File>` which is panic-safe (the fd is never closed).
 pub struct StdEngine;
-
-impl IoEngine for StdEngine {
-    fn journal(&self) -> &dyn JournalIo {
-        self
-    }
-
-    fn ledger(&self) -> &dyn LedgerIo {
-        self
-    }
-}
 
 /// Borrow a raw fd as a [`File`] for the duration of a closure.
 ///
-/// The [`File`] is forgotten afterwards so the fd is **not** closed.
+/// Uses [`ManuallyDrop`] so the fd is **never** closed — even if `f`
+/// panics. The previous `from_raw_fd` + `mem::forget` pattern was
+/// unsound: a panic between construction and forget would run `File`'s
+/// `Drop`, closing the caller's fd.
 fn with_file<F, R>(fd: RawFd, f: F) -> R
 where
     F: FnOnce(&mut File) -> R,
 {
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let result = f(&mut file);
-    std::mem::forget(file);
-    result
+    let mut file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    f(&mut file)
 }
 
 impl JournalIo for StdEngine {

@@ -11,12 +11,6 @@ use std::io;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
-/// Core abstraction over I/O backends (blocking std vs io_uring).
-pub trait IoEngine: Send + Sync + 'static {
-    fn journal(&self) -> &dyn JournalIo;
-    fn ledger(&self) -> &dyn LedgerIo;
-}
-
 /// Journal I/O operations: write entries then fsync.
 pub trait JournalIo: Send + Sync {
     /// Write all entries sequentially to `fd`, then call `fsync_data`.

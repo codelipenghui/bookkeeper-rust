@@ -147,6 +147,14 @@ impl DbLedgerStorage {
         }
     }
 
+    /// Frame an entry for the entry log: `[size(4 BE)][payload]`.
+    fn frame_entry(entry: &[u8]) -> Vec<u8> {
+        let mut framed = Vec::with_capacity(4 + entry.len());
+        framed.extend_from_slice(&(entry.len() as i32).to_be_bytes());
+        framed.extend_from_slice(entry);
+        framed
+    }
+
     fn extract_ledger_id(entry: &[u8]) -> i64 {
         i64::from_be_bytes(entry[0..8].try_into().unwrap())
     }
@@ -402,10 +410,7 @@ impl LedgerStorage for DbLedgerStorage {
             log_state.file = Some(file);
         }
 
-        // Frame entry: 4-byte size prefix + payload
-        let mut framed = Vec::with_capacity(4 + entry.len());
-        framed.extend_from_slice(&(entry.len() as i32).to_be_bytes());
-        framed.extend_from_slice(entry);
+        let framed = Self::frame_entry(entry);
 
         let fd = log_state.file.as_ref().unwrap().as_raw_fd();
         self.ledger_io.write_batch(fd, log_state.offset, &[&framed])?;
@@ -507,10 +512,7 @@ impl LedgerStorage for DbLedgerStorage {
                     log_state.file = Some(file);
                 }
 
-                // Frame entry: 4-byte size prefix + payload
-                let mut framed = Vec::with_capacity(4 + entry_data.len());
-                framed.extend_from_slice(&(entry_data.len() as i32).to_be_bytes());
-                framed.extend_from_slice(entry_data);
+                let framed = Self::frame_entry(entry_data);
 
                 let position = log_state.offset + 4;
                 pending.push(PendingEntry {

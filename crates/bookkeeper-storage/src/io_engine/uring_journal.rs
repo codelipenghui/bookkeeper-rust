@@ -7,12 +7,13 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::Mutex;
 
 use io_uring::{opcode, types, IoUring};
 
 use super::JournalIo;
 
-/// Submission-queue depth for the per-call io_uring instance.
+/// Submission-queue depth for the journal ring.
 ///
 /// 64 is more than enough — we only ever submit 2 SQEs (write + fsync)
 /// per call, but a generous depth avoids needing to resize if the
@@ -20,14 +21,20 @@ use super::JournalIo;
 const JOURNAL_SQ_DEPTH: u32 = 64;
 
 /// Journal I/O backend that uses `io_uring` for write + fsync.
-pub struct UringJournalIo;
+///
+/// The ring is created once in `new()` and reused across all calls.
+/// A `Mutex` serializes access since `IoUring` is `!Sync`.
+pub struct UringJournalIo {
+    ring: Mutex<IoUring>,
+}
 
 impl UringJournalIo {
-    /// Create a new instance, verifying that io_uring is functional on
-    /// this kernel by building (and immediately dropping) a probe ring.
+    /// Create a new instance with a persistent io_uring ring.
     pub fn new() -> io::Result<Self> {
-        let _probe = IoUring::new(2)?;
-        Ok(Self)
+        let ring = IoUring::new(JOURNAL_SQ_DEPTH)?;
+        Ok(Self {
+            ring: Mutex::new(ring),
+        })
     }
 }
 
@@ -37,7 +44,9 @@ impl JournalIo for UringJournalIo {
             return Ok(());
         }
 
-        let mut ring = IoUring::new(JOURNAL_SQ_DEPTH)?;
+        let mut ring = self.ring.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "journal ring lock poisoned")
+        })?;
 
         // Build iovec array for scatter-gather write.
         let iovecs: Vec<libc::iovec> = entries

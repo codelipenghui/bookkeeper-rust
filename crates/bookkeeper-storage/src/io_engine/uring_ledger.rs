@@ -6,6 +6,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::Mutex;
 
 use io_uring::{opcode, types, IoUring};
 
@@ -18,13 +19,20 @@ use super::LedgerIo;
 const LEDGER_SQ_DEPTH: u32 = 256;
 
 /// Ledger I/O backend that uses `io_uring` for positional writes and reads.
-pub struct UringLedgerIo;
+///
+/// The ring is created once in `new()` and reused across all calls.
+/// A `Mutex` serializes access since `IoUring` is `!Sync`.
+pub struct UringLedgerIo {
+    ring: Mutex<IoUring>,
+}
 
 impl UringLedgerIo {
-    /// Create a new instance, verifying that io_uring is functional.
+    /// Create a new instance with a persistent io_uring ring.
     pub fn new() -> io::Result<Self> {
-        let _probe = IoUring::new(2)?;
-        Ok(Self)
+        let ring = IoUring::new(LEDGER_SQ_DEPTH)?;
+        Ok(Self {
+            ring: Mutex::new(ring),
+        })
     }
 }
 
@@ -34,7 +42,9 @@ impl LedgerIo for UringLedgerIo {
             return Ok(Vec::new());
         }
 
-        let mut ring = IoUring::new(LEDGER_SQ_DEPTH)?;
+        let mut ring = self.ring.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "ledger ring lock poisoned")
+        })?;
 
         // Build iovec array for scatter-gather write.
         let iovecs: Vec<libc::iovec> = entries
@@ -80,7 +90,10 @@ impl LedgerIo for UringLedgerIo {
     }
 
     fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let mut ring = IoUring::new(4)?;
+        let mut ring = self.ring.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "ledger ring lock poisoned")
+        })?;
+
         let mut buf = vec![0u8; len];
 
         let read_sqe = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), len as u32)
