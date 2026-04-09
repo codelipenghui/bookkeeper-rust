@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use crate::StorageError;
 use crate::journal::format::LastMark;
 
-const LAST_MARK_FILENAME: &str = ".lastMark";
+/// Matches Java's `LAST_MARK_DEFAULT_NAME = "lastMark"` (no dot prefix).
+const LAST_MARK_FILENAME: &str = "lastMark";
 
 pub fn write_last_mark(path: &Path, mark: &LastMark) -> Result<(), StorageError> {
     fs::write(path, &mark.to_bytes())?;

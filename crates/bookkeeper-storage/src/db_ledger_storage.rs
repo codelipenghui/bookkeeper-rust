@@ -12,6 +12,10 @@ use crate::index::ledger_index::LedgerMetadataIndex;
 use crate::StorageError;
 use crate::ledger_storage::LedgerStorage;
 
+/// Subdirectory under each ledger/journal base dir where all data lives.
+/// Matches Java's `BookKeeperConstants.CURRENT_DIR = "current"`.
+pub const CURRENT_DIR: &str = "current";
+
 const DEFAULT_WRITE_CACHE_SIZE: usize = 64 * 1024 * 1024; // 64MB
 const DEFAULT_READ_CACHE_SIZE: usize = 64 * 1024 * 1024;  // 64MB
 const READ_CACHE_SEGMENTS: usize = 4;
@@ -48,12 +52,16 @@ pub struct DbLedgerStorage {
 
 impl DbLedgerStorage {
     pub fn open(base_dir: &Path) -> Result<Self, StorageError> {
-        let locations_dir = base_dir.join("locations");
-        let ledgers_dir = base_dir.join("ledgers");
-        let entry_log_dir = base_dir.join("entry_logs");
+        // All data lives under `<base_dir>/current/`, matching Java's
+        // BookieImpl.getCurrentDirectory(dir). Entry log files (.log) sit
+        // directly in `current/` alongside the RocksDB subdirectories —
+        // NOT in a separate `entry_logs/` subdir.
+        let current_dir = base_dir.join(CURRENT_DIR);
+        let locations_dir = current_dir.join("locations");
+        let ledgers_dir = current_dir.join("ledgers");
+        let entry_log_dir = current_dir.clone();
         fs::create_dir_all(&locations_dir)?;
         fs::create_dir_all(&ledgers_dir)?;
-        fs::create_dir_all(&entry_log_dir)?;
 
         let entry_location_index = EntryLocationIndex::open(&locations_dir)?;
         let ledger_index = LedgerMetadataIndex::open(&ledgers_dir)?;

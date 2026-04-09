@@ -26,7 +26,7 @@ async fn dirty_file_created_on_startup() {
     let server = BookieServer::start(test_config(&dir)).await.unwrap();
 
     // After successful start, DIRTY file should exist in the ledger dir
-    let dirty_path = dir.path().join(DIRTY_FILENAME);
+    let dirty_path = dir.path().join("current").join(DIRTY_FILENAME);
     assert!(dirty_path.exists(), "DIRTY file should exist after startup");
 
     server.shutdown().await;
@@ -37,7 +37,7 @@ async fn dirty_file_removed_on_clean_shutdown() {
     let dir = TempDir::new().unwrap();
     let server = BookieServer::start(test_config(&dir)).await.unwrap();
 
-    let dirty_path = dir.path().join(DIRTY_FILENAME);
+    let dirty_path = dir.path().join("current").join(DIRTY_FILENAME);
     assert!(dirty_path.exists());
 
     server.shutdown().await;
@@ -55,7 +55,7 @@ async fn restart_with_dirty_file_succeeds() {
     server.shutdown().await;
 
     // Manually create DIRTY file (simulating an unclean shutdown)
-    let dirty_path = dir.path().join(DIRTY_FILENAME);
+    let dirty_path = dir.path().join("current").join(DIRTY_FILENAME);
     std::fs::File::create(&dirty_path).unwrap();
     assert!(dirty_path.exists());
 
@@ -77,7 +77,7 @@ async fn dirty_file_recreated_on_each_start() {
 
     // First start: creates DIRTY
     let server = BookieServer::start(test_config(&dir)).await.unwrap();
-    let dirty_path = dir.path().join(DIRTY_FILENAME);
+    let dirty_path = dir.path().join("current").join(DIRTY_FILENAME);
     assert!(dirty_path.exists());
     server.shutdown().await;
     assert!(!dirty_path.exists());
@@ -106,13 +106,13 @@ async fn dirty_file_in_each_ledger_dir() {
 
     let server = BookieServer::start(config).await.unwrap();
 
-    // DIRTY should exist in BOTH ledger dirs
-    assert!(Path::new(dir1.path()).join(DIRTY_FILENAME).exists());
-    assert!(Path::new(dir2.path()).join(DIRTY_FILENAME).exists());
+    // DIRTY should exist in BOTH ledger dirs (inside current/)
+    assert!(dir1.path().join("current").join(DIRTY_FILENAME).exists());
+    assert!(dir2.path().join("current").join(DIRTY_FILENAME).exists());
 
     server.shutdown().await;
 
     // Both removed on clean shutdown
-    assert!(!Path::new(dir1.path()).join(DIRTY_FILENAME).exists());
-    assert!(!Path::new(dir2.path()).join(DIRTY_FILENAME).exists());
+    assert!(!dir1.path().join("current").join(DIRTY_FILENAME).exists());
+    assert!(!dir2.path().join("current").join(DIRTY_FILENAME).exists());
 }

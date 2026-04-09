@@ -59,7 +59,7 @@ async fn shutdown_after_writes_flushes_data() {
     server.shutdown().await;
 
     // After shutdown, the DIRTY file should be removed (clean shutdown indicator)
-    let dirty_path = dir.path().join("DIRTY");
+    let dirty_path = dir.path().join("current").join("DIRTY");
     assert!(!dirty_path.exists(), "DIRTY file should be removed after clean shutdown");
 }
 
@@ -75,7 +75,7 @@ async fn shutdown_after_writes_flushes_data() {
 async fn shutdown_persists_dirty_file_state() {
     let dir = TempDir::new().unwrap();
     let server = BookieServer::start(test_config(&dir)).await.unwrap();
-    let dirty_path = dir.path().join("DIRTY");
+    let dirty_path = dir.path().join("current").join("DIRTY");
     // DIRTY file present while running
     assert!(dirty_path.exists());
     server.shutdown().await;
@@ -136,5 +136,5 @@ async fn shutdown_idempotency_on_no_op_server() {
     // Immediately shut down with no I/O
     server.shutdown().await;
     // No panics expected; DIRTY file is gone
-    assert!(!dir.path().join("DIRTY").exists());
+    assert!(!dir.path().join("current").join("DIRTY").exists());
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::{Router, Json, extract::State, http::StatusCode, response::IntoResponse};
 use axum::extract::Query;
 use serde::{Deserialize, Serialize};
+use bookkeeper_storage::db_ledger_storage::CURRENT_DIR;
 use crate::state::{BookieState, BookieStateManager};
 
 #[derive(Clone)]
@@ -274,8 +275,9 @@ async fn list_disk_files(
         // Aggregate index info across ALL ledger dirs (not just last one).
         let mut all_index_info = Vec::new();
         for dir in &state.ledger_dirs {
-            let locations = Path::new(dir).join("locations");
-            let ledgers = Path::new(dir).join("ledgers");
+            let current = Path::new(dir).join(CURRENT_DIR);
+            let locations = current.join("locations");
+            let ledgers = current.join("ledgers");
             if locations.exists() {
                 all_index_info.push(format!("{}/locations ({} bytes)", dir, dir_size(&locations)));
             }
@@ -302,7 +304,7 @@ fn list_files_in_dir(dir: &str, filter: impl Fn(&str) -> bool) -> Vec<String> {
         }
     }
     // Also check current/ subdirectory (Java convention)
-    let current = Path::new(dir).join("current");
+    let current = Path::new(dir).join(CURRENT_DIR);
     if let Ok(entries) = std::fs::read_dir(&current) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();

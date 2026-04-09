@@ -11,7 +11,7 @@ use tokio_util::codec::{Decoder, Encoder};
 use bookkeeper_protocol::framing::BookieCodec;
 use bookkeeper_protocol::v2::request::decode_request;
 use bookkeeper_protocol::v2::response::encode_response;
-use bookkeeper_storage::db_ledger_storage::DbLedgerStorage;
+use bookkeeper_storage::db_ledger_storage::{DbLedgerStorage, CURRENT_DIR};
 
 use bookkeeper_metadata::traits::RegistrationManager;
 
@@ -60,9 +60,12 @@ impl BookieServer {
             .ok_or("no ledger dirs configured")?;
         let mut storage = DbLedgerStorage::open(Path::new(ledger_dir))?;
 
-        // Initialize journal for write-ahead logging (crash recovery)
+        // Initialize journal for write-ahead logging (crash recovery).
+        // Journal files live in `<journalDir>/current/` matching Java's convention.
+        let journal_current = Path::new(&config.journal_directory).join(CURRENT_DIR);
+        std::fs::create_dir_all(&journal_current)?;
         let journal_config = bookkeeper_storage::journal::writer::JournalConfig {
-            journal_dir: std::path::PathBuf::from(&config.journal_directory),
+            journal_dir: journal_current.clone(),
             max_file_size: (config.journal_max_size_mb as u64) * 1024 * 1024,
             sync_data: config.journal_sync_data,
             max_group_wait_ms: config.journal_max_group_wait_ms as u64,
@@ -72,7 +75,7 @@ impl BookieServer {
             format_version: config.journal_format_version_to_write,
         };
         let replayed = storage.init_journal(
-            Path::new(&config.journal_directory),
+            &journal_current,
             journal_config,
         )?;
         if replayed > 0 {
@@ -82,7 +85,7 @@ impl BookieServer {
         // Check for unclean shutdown (DIRTY file in any ledger directory).
         // Java defaults to unclean=true on any I/O error (fail-safe).
         let was_unclean = config.ledger_directories.iter().any(|dir| {
-            let dirty_path = Path::new(dir).join(DIRTY_FILENAME);
+            let dirty_path = Path::new(dir).join(CURRENT_DIR).join(DIRTY_FILENAME);
             match dirty_path.try_exists() {
                 Ok(exists) => exists,
                 Err(e) => {
@@ -103,7 +106,10 @@ impl BookieServer {
         // Matches Java: written AFTER bookie.start() succeeds, BEFORE accepting connections.
         // Java aborts startup if DIRTY creation fails (re-throws IOException).
         for dir in &config.ledger_directories {
-            let dirty_path = Path::new(dir).join(DIRTY_FILENAME);
+            let current = Path::new(dir).join(CURRENT_DIR);
+            std::fs::create_dir_all(&current)
+                .map_err(|e| format!("Failed to create {}/current: {e}", dir))?;
+            let dirty_path = current.join(DIRTY_FILENAME);
             std::fs::File::create(&dirty_path)
                 .map_err(|e| format!("Failed to create DIRTY file in {dir}: {e}"))?;
         }
@@ -476,7 +482,7 @@ impl BookieServer {
         // Step 6: Remove DIRTY files — clean shutdown confirmed.
         // Matches Java: deleted AFTER bookie.shutdown() completes (all flushed).
         for dir in &self.ledger_directories {
-            let dirty_path = Path::new(dir).join(DIRTY_FILENAME);
+            let dirty_path = Path::new(dir).join(CURRENT_DIR).join(DIRTY_FILENAME);
             if dirty_path.exists() {
                 if let Err(e) = std::fs::remove_file(&dirty_path) {
                     tracing::warn!("Failed to remove DIRTY file in {dir}: {e}");
@@ -505,8 +511,11 @@ async fn validate_cookie(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bookkeeper_metadata::cookie::Cookie;
 
-    let journal_dir = std::path::Path::new(&config.journal_directory);
-    let disk_cookie_path = journal_dir.join("COOKIE");
+    // Java stores the cookie as a `VERSION` file inside each `current/`
+    // directory. Match that convention so an in-place upgrade from Java
+    // finds the file where it expects it.
+    let journal_current = std::path::Path::new(&config.journal_directory).join(CURRENT_DIR);
+    let disk_cookie_path = journal_current.join("VERSION");
 
     // Read cookie from ZK
     let zk_cookie = zk_reg.read_cookie(bookie_id).await
@@ -546,7 +555,7 @@ async fn validate_cookie(
             let cookie_str = cookie.serialize();
             zk_reg.create_cookie(bookie_id, cookie_str.as_bytes()).await
                 .map_err(|e| format!("create ZK cookie: {e}"))?;
-            std::fs::create_dir_all(journal_dir)
+            std::fs::create_dir_all(&journal_current)
                 .map_err(|e| format!("create journal dir: {e}"))?;
             std::fs::write(&disk_cookie_path, &cookie_str)
                 .map_err(|e| format!("write disk cookie: {e}"))?;
