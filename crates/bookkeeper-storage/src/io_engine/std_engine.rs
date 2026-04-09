@@ -3,10 +3,12 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
+
+use async_trait::async_trait;
 
 use super::{JournalIo, LedgerIo};
 
@@ -42,34 +44,52 @@ impl JournalIo for StdEngine {
     }
 }
 
+#[async_trait]
 impl LedgerIo for StdEngine {
-    fn write_batch(&self, fd: RawFd, offset: u64, entries: &[&[u8]]) -> io::Result<Vec<u64>> {
-        with_file(fd, |file| {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut current = offset;
-            let mut offsets = Vec::with_capacity(entries.len());
-            for entry in entries {
-                offsets.push(current);
-                file.write_all(entry)?;
-                current += entry.len() as u64;
-            }
-            Ok(offsets)
+    async fn write_batch(&self, fd: RawFd, offset: u64, entries: Vec<Vec<u8>>) -> io::Result<Vec<u64>> {
+        tokio::task::spawn_blocking(move || {
+            with_file(fd, |file| {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut current = offset;
+                let mut offsets = Vec::with_capacity(entries.len());
+                for entry in &entries {
+                    offsets.push(current);
+                    file.write_all(entry)?;
+                    current += entry.len() as u64;
+                }
+                Ok(offsets)
+            })
         })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
 
-    fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        with_file(fd, |file| {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut buf = vec![0u8; len];
-            file.read_exact(&mut buf)?;
-            Ok(buf)
+    async fn read_at(&self, fd: RawFd, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        tokio::task::spawn_blocking(move || {
+            with_file(fd, |file| {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; len];
+                file.read_exact(&mut buf)?;
+                Ok(buf)
+            })
         })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
 
-    fn read_entry(&self, entry_log_dir: &Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let path = entry_log_dir.join(super::entry_log_filename(log_id));
-        let file = File::open(&path)?;
-        let fd = file.as_raw_fd();
-        self.read_at(fd, offset, len)
+    async fn read_entry(&self, entry_log_dir: &Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let path: PathBuf = entry_log_dir.join(super::entry_log_filename(log_id));
+        tokio::task::spawn_blocking(move || {
+            let file = File::open(&path)?;
+            let fd = file.as_raw_fd();
+            with_file(fd, |f| {
+                f.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; len];
+                f.read_exact(&mut buf)?;
+                Ok(buf)
+            })
+        })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     }
 }
