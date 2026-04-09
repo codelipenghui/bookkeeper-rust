@@ -85,4 +85,36 @@ impl LedgerIo for StdEngine {
         let fd = file.as_raw_fd();
         self.read_at(fd, offset, len).await
     }
+
+    async fn read_framed_entry(
+        &self,
+        entry_log_dir: &Path,
+        log_id: u32,
+        offset: u64,
+        max_size: usize,
+    ) -> io::Result<Vec<u8>> {
+        let path = entry_log_dir.join(super::entry_log_filename(log_id));
+        tokio::task::spawn_blocking(move || {
+            let mut file = File::open(&path)?;
+            file.seek(SeekFrom::Start(offset))?;
+
+            // Read 4-byte size prefix
+            let mut size_buf = [0u8; 4];
+            file.read_exact(&mut size_buf)?;
+            let size = i32::from_be_bytes(size_buf) as usize;
+            if size > max_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("entry size {} exceeds max {}", size, max_size),
+                ));
+            }
+
+            // Read entry data
+            let mut buf = vec![0u8; size];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    }
 }

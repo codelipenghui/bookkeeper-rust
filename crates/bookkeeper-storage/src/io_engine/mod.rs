@@ -33,6 +33,33 @@ pub trait LedgerIo: Send + Sync {
     /// The engine may cache the file descriptor for future reads.
     async fn read_entry(&self, entry_log_dir: &Path, log_id: u32, offset: u64, len: usize) -> io::Result<Vec<u8>>;
 
+    /// Read a framed entry: parse the 4-byte big-endian size prefix at
+    /// `offset`, then read `size` bytes of entry data starting at
+    /// `offset + 4`. Returns only the entry data (without the prefix).
+    ///
+    /// Default implementation does two calls. Engines can override to
+    /// combine into a single I/O round-trip.
+    async fn read_framed_entry(
+        &self,
+        entry_log_dir: &Path,
+        log_id: u32,
+        offset: u64,
+        max_size: usize,
+    ) -> io::Result<Vec<u8>> {
+        let size_buf = self.read_entry(entry_log_dir, log_id, offset, 4).await?;
+        if size_buf.len() < 4 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short size prefix read"));
+        }
+        let size = i32::from_be_bytes(size_buf[..4].try_into().unwrap()) as usize;
+        if size > max_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("entry size {} exceeds max {}", size, max_size),
+            ));
+        }
+        self.read_entry(entry_log_dir, log_id, offset + 4, size).await
+    }
+
     /// Evict any cached file descriptor for `log_id`. Called by GC before
     /// deleting the entry log file. No-op if the fd is not cached.
     fn evict_fd(&self, _entry_log_dir: &Path, _log_id: u32) {}

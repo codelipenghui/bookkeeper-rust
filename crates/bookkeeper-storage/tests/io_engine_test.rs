@@ -99,6 +99,46 @@ async fn std_ledger_write_batch_at_nonzero_offset() {
     assert_eq!(&all, b"HEADABCD");
 }
 
+#[tokio::test]
+async fn test_std_read_framed_entry() {
+    use bookkeeper_storage::io_engine::LedgerIo;
+    use bookkeeper_storage::io_engine::std_engine::StdEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StdEngine;
+
+    // Create "0.log" with a framed entry: [size(4 BE)][data]
+    let log_path = dir.path().join("0.log");
+    let data = b"hello world";
+    let size = (data.len() as i32).to_be_bytes();
+    let mut contents = Vec::new();
+    contents.extend_from_slice(&size);
+    contents.extend_from_slice(data);
+    std::fs::write(&log_path, &contents).unwrap();
+
+    let result = engine.read_framed_entry(dir.path(), 0, 0, 1024).await.unwrap();
+    assert_eq!(&result, b"hello world");
+}
+
+#[tokio::test]
+async fn test_std_read_framed_entry_rejects_oversized() {
+    use bookkeeper_storage::io_engine::LedgerIo;
+    use bookkeeper_storage::io_engine::std_engine::StdEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StdEngine;
+
+    let log_path = dir.path().join("0.log");
+    let size = (1000i32).to_be_bytes();
+    let mut contents = Vec::new();
+    contents.extend_from_slice(&size);
+    contents.extend_from_slice(b"short");
+    std::fs::write(&log_path, &contents).unwrap();
+
+    let err = engine.read_framed_entry(dir.path(), 0, 0, 100).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
 // ---------------------------------------------------------------------------
 // fd_cache tests — platform independent
 // ---------------------------------------------------------------------------
