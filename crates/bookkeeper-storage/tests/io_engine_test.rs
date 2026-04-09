@@ -95,3 +95,62 @@ fn std_ledger_write_batch_at_nonzero_offset() {
     let all = engine.read_at(fd, 0, 8).unwrap();
     assert_eq!(&all, b"HEADABCD");
 }
+
+// ---------------------------------------------------------------------------
+// io_uring tests — Linux only
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod uring_tests {
+    use bookkeeper_storage::io_engine::uring_journal::UringJournalIo;
+    use bookkeeper_storage::io_engine::uring_ledger::UringLedgerIo;
+    use bookkeeper_storage::io_engine::{JournalIo, LedgerIo};
+    use std::os::fd::AsRawFd;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn uring_journal_write_and_sync() {
+        let j = UringJournalIo::new().unwrap();
+        let f = NamedTempFile::new().unwrap();
+        j.write_and_sync(f.as_raw_fd(), &[b"hello", b"world"])
+            .unwrap();
+        let data = std::fs::read(f.path()).unwrap();
+        assert_eq!(&data, b"helloworld");
+    }
+
+    #[test]
+    fn uring_journal_empty_entries_is_noop() {
+        let j = UringJournalIo::new().unwrap();
+        let f = NamedTempFile::new().unwrap();
+        j.write_and_sync(f.as_raw_fd(), &[]).unwrap();
+        let data = std::fs::read(f.path()).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn uring_ledger_write_and_read_round_trip() {
+        let l = UringLedgerIo::new().unwrap();
+        let f = NamedTempFile::new().unwrap();
+        // Pre-fill 1024-byte header so writes start at a non-zero offset.
+        std::fs::write(f.path(), vec![0u8; 1024]).unwrap();
+
+        let offsets = l
+            .write_batch(f.as_raw_fd(), 1024, &[b"aaa", b"bbbbb"])
+            .unwrap();
+        assert_eq!(offsets, vec![1024, 1027]);
+
+        let data = l.read_at(f.as_raw_fd(), 1024, 3).unwrap();
+        assert_eq!(&data, b"aaa");
+
+        let data = l.read_at(f.as_raw_fd(), 1027, 5).unwrap();
+        assert_eq!(&data, b"bbbbb");
+    }
+
+    #[test]
+    fn uring_ledger_write_batch_empty() {
+        let l = UringLedgerIo::new().unwrap();
+        let f = NamedTempFile::new().unwrap();
+        let offsets = l.write_batch(f.as_raw_fd(), 0, &[]).unwrap();
+        assert!(offsets.is_empty());
+    }
+}

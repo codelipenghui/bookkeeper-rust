@@ -64,13 +64,15 @@ pub fn select_engine() -> EngineSet {
     #[cfg(target_os = "linux")]
     {
         if uring_available() {
-            let engine = Arc::new(uring_engine::UringEngine::new());
+            tracing::info!("io_uring available — using UringEngine");
+            let engine = uring_engine::UringEngine::new();
             return EngineSet {
-                journal: engine.clone() as Arc<dyn JournalIo>,
-                ledger: engine as Arc<dyn LedgerIo>,
+                journal: engine.journal,
+                ledger: engine.ledger,
             };
         }
     }
+    tracing::info!("Using StdEngine (standard blocking I/O)");
     let engine = Arc::new(std_engine::StdEngine);
     EngineSet {
         journal: engine.clone() as Arc<dyn JournalIo>,
