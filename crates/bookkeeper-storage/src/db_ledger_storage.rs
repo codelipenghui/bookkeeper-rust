@@ -133,15 +133,30 @@ impl DbLedgerStorage {
     }
 
     /// Remove old journal files after successful flush/checkpoint.
-    /// All entries have been flushed to entry logs + RocksDB, so journals are no longer needed.
-    /// Matches Java's SyncThread journal cleanup after lastMark rollover.
+    ///
+    /// Only deletes journal files whose ID is strictly less than the
+    /// current journal file's ID. The current file (and any newer ones)
+    /// are preserved because they may contain entries not yet flushed
+    /// to entry logs. This matches Java's SyncThread cleanup which
+    /// only removes journals older than the lastMark.
     fn cleanup_journals(&self) {
+        let current_id = self.journal.as_ref()
+            .and_then(|j| j.current_log_id());
+        let Some(current_id) = current_id else { return; };
+
         if let Some(ref journal_dir) = self.journal_dir {
             if let Ok(entries) = fs::read_dir(journal_dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
-                    if name.to_string_lossy().ends_with(".txn") {
-                        let _ = fs::remove_file(entry.path());
+                    let name = name.to_string_lossy();
+                    if name.ends_with(".txn") {
+                        if let Ok(id) = u64::from_str_radix(
+                            name.trim_end_matches(".txn"), 16,
+                        ) {
+                            if id < current_id {
+                                let _ = fs::remove_file(entry.path());
+                            }
+                        }
                     }
                 }
             }

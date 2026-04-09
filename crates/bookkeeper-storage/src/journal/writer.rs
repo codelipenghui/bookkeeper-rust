@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use super::format::{self, JournalHeader, calculate_padding};
@@ -56,6 +56,8 @@ pub struct Journal {
     _io_thread: Option<std::thread::JoinHandle<()>>,
     /// Tracks which ledgers have had master keys journaled.
     master_key_cache: std::sync::Mutex<HashSet<i64>>,
+    /// Current journal file ID (shared with the io thread for cleanup).
+    current_log_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Journal {
@@ -72,15 +74,19 @@ impl Journal {
         let bound = MAX_QUEUE_MEMORY / 1024;
         let (tx, rx) = mpsc::sync_channel(bound);
 
+        let current_log_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let shared_log_id = current_log_id.clone();
+
         let io_thread = std::thread::Builder::new()
             .name("journal-io".into())
-            .spawn(move || journal_io_loop(config, rx, journal_io, on_fatal_error))
+            .spawn(move || journal_io_loop(config, rx, journal_io, on_fatal_error, shared_log_id))
             .expect("failed to spawn journal-io thread");
 
         Self {
             tx,
             _io_thread: Some(io_thread),
             master_key_cache: std::sync::Mutex::new(HashSet::new()),
+            current_log_id,
         }
     }
 
@@ -132,6 +138,13 @@ impl Journal {
 
         Ok(())
     }
+
+    /// The current journal file ID. Used by `cleanup_journals` to avoid
+    /// deleting the active journal or any files newer than it.
+    pub fn current_log_id(&self) -> Option<u64> {
+        let id = self.current_log_id.load(std::sync::atomic::Ordering::Relaxed);
+        if id == 0 { None } else { Some(id) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +158,7 @@ fn journal_io_loop(
     rx: mpsc::Receiver<JournalEntry>,
     journal_io: std::sync::Arc<dyn JournalIo>,
     on_fatal_error: Option<OnFatalError>,
+    shared_log_id: Arc<std::sync::atomic::AtomicU64>,
 ) {
     fs::create_dir_all(&config.journal_dir).ok();
 
@@ -186,6 +200,7 @@ fn journal_io_loop(
                     &mut pending_entries,
                     &mut pending_acks,
                     &on_fatal_error,
+                    &shared_log_id,
                 );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -197,6 +212,7 @@ fn journal_io_loop(
                         &mut pending_entries,
                         &mut pending_acks,
                         &on_fatal_error,
+                        &shared_log_id,
                     );
                 }
             }
@@ -209,6 +225,7 @@ fn journal_io_loop(
                         &mut pending_entries,
                         &mut pending_acks,
                         &on_fatal_error,
+                        &shared_log_id,
                     );
                 }
                 break;
@@ -225,6 +242,7 @@ fn flush_batch(
     pending_entries: &mut Vec<Vec<u8>>,
     pending_acks: &mut Vec<mpsc::Sender<()>>,
     on_fatal_error: &Option<OnFatalError>,
+    shared_log_id: &Arc<std::sync::atomic::AtomicU64>,
 ) {
     if pending_entries.is_empty() {
         return;
@@ -237,6 +255,8 @@ fn flush_batch(
         pending_acks.clear();
         return;
     }
+    // Publish the current log ID so cleanup_journals can skip it
+    shared_log_id.store(state.log_id, std::sync::atomic::Ordering::Relaxed);
 
     // Check if we need to rotate BEFORE writing (check total batch size)
     let batch_size: u64 = pending_entries.iter().map(|e| e.len() as u64).sum();
