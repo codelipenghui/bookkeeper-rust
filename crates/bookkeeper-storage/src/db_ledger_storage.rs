@@ -101,8 +101,14 @@ impl DbLedgerStorage {
         journal_io: std::sync::Arc<dyn crate::io_engine::JournalIo>,
         on_fatal_error: Option<crate::journal::writer::OnFatalError>,
     ) -> Result<usize, StorageError> {
+        // Read lastMark from the ledger directory. This tells us where
+        // the last successful checkpoint was, so we only replay journal
+        // entries from that point forward. Matches Java's replay logic.
+        let mark_path = self.base_dir.join(CURRENT_DIR).join("lastMark");
+        let last_mark = crate::checkpoint::read_last_mark(&mark_path).ok();
+
         // Replay existing journal entries (crash recovery)
-        let replayed = crate::journal::writer::replay_journal(journal_dir, |entry_data| {
+        let replayed = crate::journal::writer::replay_journal(journal_dir, last_mark, |entry_data| {
             if entry_data.len() >= 32 {
                 // Replay into write cache (same as add_entry, but without re-journaling)
                 let ledger_id = Self::extract_ledger_id(entry_data);
@@ -569,8 +575,23 @@ impl LedgerStorage for DbLedgerStorage {
 
     fn checkpoint(&self) -> Result<(), StorageError> {
         self.flush()?;
-        // After flush, all write cache entries are in entry logs + RocksDB index.
-        // Old journal files are no longer needed — clean them up.
+
+        // Write lastMark to each ledger directory. This records the
+        // current journal position so that:
+        // 1. Crash recovery knows where to start replaying
+        // 2. cleanup_journals knows which files are safe to delete
+        // 3. A Java bookie restarting on this data dir finds a valid mark
+        // Matches Java's checkpointComplete → rollLog → writeLogMark flow.
+        if let Some(log_id) = self.journal.as_ref().and_then(|j| j.current_log_id()) {
+            let mark = crate::journal::format::LastMark::new(log_id as i64, 0);
+            // Write to the ledger directory's current/ subdir.
+            // Java writes to ALL ledger dirs; we have one (base_dir).
+            let mark_path = self.base_dir.join(CURRENT_DIR).join("lastMark");
+            if let Err(e) = crate::checkpoint::write_last_mark(&mark_path, &mark) {
+                tracing::warn!("Failed to write lastMark: {e}");
+            }
+        }
+
         self.cleanup_journals();
         Ok(())
     }

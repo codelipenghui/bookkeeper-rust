@@ -54,7 +54,7 @@ fn write_then_replay_recovers_all_entries() {
 
     // Phase 2: Replay
     let mut replayed: Vec<Vec<u8>> = Vec::new();
-    let count = replay_journal(tmp.path(), |data| {
+    let count = replay_journal(tmp.path(), None, |data| {
         replayed.push(data.to_vec());
     }).unwrap();
 
@@ -66,7 +66,7 @@ fn write_then_replay_recovers_all_entries() {
 fn empty_journal_dir_replays_zero_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let mut count = 0;
-    let n = replay_journal(tmp.path(), |_| count += 1).unwrap();
+    let n = replay_journal(tmp.path(), None, |_| count += 1).unwrap();
     assert_eq!(n, 0);
     assert_eq!(count, 0);
 }
@@ -90,7 +90,7 @@ fn master_key_journaling_writes_meta_entry() {
 
     let mut master_key_count = 0;
     let mut ledger_ids = Vec::new();
-    replay_journal(tmp.path(), |data| {
+    replay_journal(tmp.path(), None, |data| {
         if data.len() >= 16 {
             let lid = i64::from_be_bytes(data[0..8].try_into().unwrap());
             let eid = i64::from_be_bytes(data[8..16].try_into().unwrap());
@@ -138,7 +138,7 @@ fn group_commit_batches_multiple_entries() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut count = 0;
-    replay_journal(tmp.path(), |_| count += 1).unwrap();
+    replay_journal(tmp.path(), None, |_| count += 1).unwrap();
     assert_eq!(count, num_threads * entries_per_thread);
 }
 
@@ -180,7 +180,7 @@ fn journal_rollover_replays_across_multiple_files() {
 
     // Replay should recover all entries across all files
     let mut count = 0;
-    replay_journal(tmp.path(), |_| count += 1).unwrap();
+    replay_journal(tmp.path(), None, |_| count += 1).unwrap();
     assert_eq!(count, entries.len());
 }
 
@@ -204,6 +204,6 @@ fn sync_data_false_still_replays() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut count = 0;
-    replay_journal(tmp.path(), |_| count += 1).unwrap();
+    replay_journal(tmp.path(), None, |_| count += 1).unwrap();
     assert_eq!(count, 20);
 }
