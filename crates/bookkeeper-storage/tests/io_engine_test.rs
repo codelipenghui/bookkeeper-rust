@@ -245,4 +245,38 @@ mod uring_tests {
         let offsets = l.write_batch(f.as_raw_fd(), 0, &[]).unwrap();
         assert!(offsets.is_empty());
     }
+
+    #[test]
+    fn uring_ledger_concurrent_reads_return_correct_data() {
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // Build a file: 1024-byte header followed by 10 entries of 10 bytes each.
+        let mut data = vec![0u8; 1024]; // header
+        for i in 0u32..10 {
+            let entry = format!("entry-{:04}", i);
+            data.extend_from_slice(entry.as_bytes());
+        }
+        std::fs::write(dir.path().join("0.log"), &data).unwrap();
+
+        let engine = Arc::new(UringLedgerIo::new().unwrap());
+        let mut handles = Vec::new();
+
+        for i in 0u32..10 {
+            let engine = engine.clone();
+            let dir_path = dir.path().to_path_buf();
+            let offset = 1024 + (i as u64 * 10);
+            handles.push(std::thread::spawn(move || {
+                let data = engine.read_entry(&dir_path, 0, offset, 10).unwrap();
+                assert_eq!(
+                    String::from_utf8(data).unwrap(),
+                    format!("entry-{:04}", i)
+                );
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 }
