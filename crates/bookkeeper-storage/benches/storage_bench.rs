@@ -54,7 +54,7 @@ fn open_storage_with_journal(dir: &Path) -> DbLedgerStorage {
         journal_dir: journal_dir.clone(),
         max_file_size: 128 * 1024 * 1024,
         sync_data: true,
-        max_group_wait_ms: 2,
+        max_group_wait_ms: 1,
         buffered_writes_threshold: 4096,
         buffered_entries_threshold: 0,
         alignment_size: 0,
