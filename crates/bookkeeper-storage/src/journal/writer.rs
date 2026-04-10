@@ -190,37 +190,37 @@ fn journal_io_loop(
             pending_acks.push(ack);
         }
 
-        // Group commit: wait up to max_group_wait_ms for more entries to
-        // accumulate. With async callers (tokio::sync::oneshot ACK), many
-        // concurrent writers will queue entries during this window. Each
-        // additional entry that batches here avoids a separate fsync.
-        // Matches Java's BookieRequestProcessor → Journal.forceLedger()
-        // grouping via journalMaxGroupWaitMSec.
-        let deadline = std::time::Instant::now() + group_wait;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(entry) => {
-                    let framed = frame_journal_entry(&entry.data);
-                    pending_entries.push(framed);
-                    if let Some(ack) = entry.ack_tx {
-                        pending_acks.push(ack);
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        // Drain any remaining entries that arrived without blocking.
+        // Drain entries already in the queue without blocking.
         while let Ok(entry) = rx.try_recv() {
             let framed = frame_journal_entry(&entry.data);
             pending_entries.push(framed);
             if let Some(ack) = entry.ack_tx {
                 pending_acks.push(ack);
+            }
+        }
+
+        // Group commit: if we got more than one entry (concurrent writers),
+        // wait up to max_group_wait_ms for even more to accumulate. If only
+        // one entry arrived (single writer, queue was empty), flush
+        // immediately — waiting would add pure latency with no batching
+        // benefit. Matches Java's journalFlushWhenQueueEmpty behavior.
+        if pending_entries.len() > 1 {
+            let deadline = std::time::Instant::now() + group_wait;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(entry) => {
+                        let framed = frame_journal_entry(&entry.data);
+                        pending_entries.push(framed);
+                        if let Some(ack) = entry.ack_tx {
+                            pending_acks.push(ack);
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
         }
 
