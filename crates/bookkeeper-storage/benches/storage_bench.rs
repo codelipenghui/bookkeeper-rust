@@ -55,7 +55,7 @@ fn open_storage_with_journal(dir: &Path) -> DbLedgerStorage {
         max_file_size: 128 * 1024 * 1024,
         sync_data: true,
         max_group_wait_ms: 1,
-        buffered_writes_threshold: 4096,
+        buffered_writes_threshold: 512 * 1024, // 512KB, matches Java default
         buffered_entries_threshold: 0,
         alignment_size: 0,
         format_version: 6,

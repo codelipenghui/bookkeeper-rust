@@ -164,15 +164,17 @@ fn journal_io_loop(
 
     let mut state = JournalFileState::new(&config);
     let group_wait = Duration::from_millis(config.max_group_wait_ms.max(1));
+    let buffered_entries_threshold = config.buffered_entries_threshold;
+    let buffered_writes_threshold = config.buffered_writes_threshold;
     let mut pending_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut pending_entries: Vec<Vec<u8>> = Vec::new();
+    let mut pending_bytes: usize = 0;
 
     loop {
         // Block until the first entry arrives.
         let first = match rx.recv() {
             Ok(entry) => entry,
             Err(_) => {
-                // Channel disconnected — flush remaining and exit.
                 if !pending_entries.is_empty() {
                     flush_batch(
                         &config, &mut state, &journal_io,
@@ -185,6 +187,7 @@ fn journal_io_loop(
         };
 
         let framed = frame_journal_entry(&first.data);
+        pending_bytes += framed.len();
         pending_entries.push(framed);
         if let Some(ack) = first.ack_tx {
             pending_acks.push(ack);
@@ -193,20 +196,47 @@ fn journal_io_loop(
         // Drain entries already in the queue without blocking.
         while let Ok(entry) = rx.try_recv() {
             let framed = frame_journal_entry(&entry.data);
+            pending_bytes += framed.len();
             pending_entries.push(framed);
             if let Some(ack) = entry.ack_tx {
                 pending_acks.push(ack);
             }
         }
 
-        // Group commit: if we got more than one entry (concurrent writers),
-        // wait up to max_group_wait_ms for even more to accumulate. If only
-        // one entry arrived (single writer, queue was empty), flush
-        // immediately — waiting would add pure latency with no batching
-        // benefit. Matches Java's journalFlushWhenQueueEmpty behavior.
-        if pending_entries.len() > 1 {
+        // Decide whether to flush now or wait for more entries.
+        // Matches Java's Journal.run() flush decision logic:
+        //
+        // 1. Queue empty after drain (single writer) → flush immediately.
+        //    No benefit in waiting; adds pure latency.
+        //    (Java: journalFlushWhenQueueEmpty)
+        //
+        // 2. Buffered entries exceed threshold → flush immediately.
+        //    Batch is already large; flushing now amortizes fsync well.
+        //    (Java: bufferedEntriesThreshold)
+        //
+        // 3. Buffered bytes exceed threshold → flush immediately.
+        //    Same rationale as (2) but byte-based.
+        //    (Java: bufferedWritesThreshold)
+        //
+        // 4. Otherwise → wait up to max_group_wait_ms for more entries.
+        //    (Java: journalMaxGroupWaitMSec)
+        let should_wait = pending_entries.len() > 1
+            && (buffered_entries_threshold == 0
+                || pending_entries.len() < buffered_entries_threshold)
+            && (buffered_writes_threshold == 0
+                || pending_bytes < buffered_writes_threshold);
+
+        if should_wait {
             let deadline = std::time::Instant::now() + group_wait;
             loop {
+                // Check thresholds before waiting
+                if (buffered_entries_threshold > 0
+                    && pending_entries.len() >= buffered_entries_threshold)
+                    || (buffered_writes_threshold > 0
+                        && pending_bytes >= buffered_writes_threshold)
+                {
+                    break;
+                }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -214,6 +244,7 @@ fn journal_io_loop(
                 match rx.recv_timeout(remaining) {
                     Ok(entry) => {
                         let framed = frame_journal_entry(&entry.data);
+                        pending_bytes += framed.len();
                         pending_entries.push(framed);
                         if let Some(ack) = entry.ack_tx {
                             pending_acks.push(ack);
@@ -230,6 +261,7 @@ fn journal_io_loop(
             &mut pending_entries, &mut pending_acks,
             &on_fatal_error, &shared_log_id,
         );
+        pending_bytes = 0;
     }
 }
 
