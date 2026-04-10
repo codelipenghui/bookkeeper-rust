@@ -50,6 +50,8 @@ pub fn create_router(http_state: HttpState) -> Router {
             axum::routing::put(expand_storage_endpoint))
         .route("/api/v1/bookie/list_bookie_info",
             axum::routing::get(list_bookie_info_endpoint))
+        // Profiling
+        .route("/debug/pprof/flamegraph", axum::routing::get(pprof_flamegraph))
         // Configuration
         .route("/api/v1/config/server_config", axum::routing::get(get_server_config))
         // Cluster info (requires ZK)
@@ -1275,4 +1277,51 @@ async fn decommission_endpoint(
         "triggered": true,
         "note": "decommission scheduled asynchronously"
     })))
+}
+
+// ---------------------------------------------------------------------------
+// /debug/pprof — CPU profiling endpoints
+// ---------------------------------------------------------------------------
+
+/// CPU flamegraph SVG for `seconds` (default 30).
+/// Usage: curl http://localhost:8080/debug/pprof/flamegraph?seconds=10 > flamegraph.svg
+async fn pprof_flamegraph(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let seconds = params.get("seconds")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(99)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+        .unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(seconds)).await;
+
+    match guard.report().build() {
+        Ok(report) => {
+            let mut body = Vec::new();
+            if let Err(e) = report.flamegraph(&mut body) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [("content-type", "text/plain")],
+                    format!("Failed to generate flamegraph: {e}").into_bytes(),
+                );
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "image/svg+xml")],
+                body,
+            )
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "text/plain")],
+                format!("Failed to build report: {e}").into_bytes(),
+            )
+        }
+    }
 }

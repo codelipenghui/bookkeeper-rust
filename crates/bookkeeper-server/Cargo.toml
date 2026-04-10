@@ -30,6 +30,7 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 async-trait = { workspace = true }
+pprof = { version = "0.14", features = ["flamegraph"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

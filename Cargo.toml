@@ -65,3 +65,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 io-uring = "0.7"
 libc = "0.2"
+pprof = { version = "0.14", features = ["flamegraph"] }
+
+# Include debug symbols in release builds for profiling (flamegraphs).
+# This adds ~20% to binary size but doesn't affect runtime performance.
+[profile.release]
+debug = 1
