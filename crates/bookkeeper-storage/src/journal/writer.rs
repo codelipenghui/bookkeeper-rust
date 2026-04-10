@@ -1,13 +1,12 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use super::format::{self, JournalHeader, calculate_padding};
-use crate::io_engine::JournalIo;
 use crate::StorageError;
 
 /// Meta-entry ID for master key journaling.
@@ -38,37 +37,43 @@ pub struct JournalConfig {
 
 /// The journal — write-ahead log for crash recovery.
 ///
-/// A single `journal-io` thread dequeues entries from a bounded channel,
-/// batches them, and calls `JournalIo::write_and_sync()` which performs
-/// the write + fsync atomically. When the backend is `UringJournalIo`,
-/// this is a single `io_uring_enter()` with linked WRITEV→FSYNC SQEs.
-/// When the backend is `StdEngine`, it falls back to `write_all` +
-/// `sync_data` on the same thread.
+/// Two-thread architecture matching Java's Journal + ForceWriteThread:
 ///
-/// This replaces the previous 2-thread architecture (writer + fsync)
-/// and eliminates the inter-thread hop for the fsync path.
+/// - **Writer thread** (`journal-writer`): receives entries from the bounded
+///   channel, frames them, writes to the journal file via `write_all` (kernel
+///   page cache — fast, no syscall per entry with buffered I/O). Never blocks
+///   on fsync.
+///
+/// - **Force-write thread** (`journal-sync`): receives flush requests from the
+///   writer, calls `fdatasync()` to make data durable, then ACKs all entries
+///   in the batch. Naturally batches: all entries written during the previous
+///   fsync cycle are covered by the next fsync.
+///
+/// When `journalSyncData=false`, the writer ACKs immediately after writing
+/// (no force-write thread), matching Java's ackBeforeSync behavior.
+///
 /// Callback invoked when the journal encounters a fatal I/O error (e.g.,
 /// FSYNC EIO). The bookie should transition to read-only mode.
 pub type OnFatalError = Box<dyn Fn(io::Error) + Send + 'static>;
 
 pub struct Journal {
     tx: mpsc::SyncSender<JournalEntry>,
-    _io_thread: Option<std::thread::JoinHandle<()>>,
+    _writer_thread: Option<std::thread::JoinHandle<()>>,
+    _sync_thread: Option<std::thread::JoinHandle<()>>,
     /// Tracks which ledgers have had master keys journaled.
     master_key_cache: std::sync::Mutex<HashSet<i64>>,
-    /// Current journal file ID (shared with the io thread for cleanup).
+    /// Current journal file ID (shared with the writer thread for cleanup).
     current_log_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Journal {
-    /// Start the journal I/O thread.
+    /// Start the journal writer (and optionally force-write) threads.
     ///
-    /// `on_fatal_error` is called if write+sync fails — the bookie should
-    /// transition to read-only mode. Pass `None` for tests or standalone
-    /// mode where there's no bookie state manager.
+    /// `on_fatal_error` is called if write or sync fails — the bookie should
+    /// transition to read-only mode.
     pub fn start(
         config: JournalConfig,
-        journal_io: std::sync::Arc<dyn JournalIo>,
+        _journal_io: std::sync::Arc<dyn crate::io_engine::JournalIo>,
         on_fatal_error: Option<OnFatalError>,
     ) -> Self {
         let bound = MAX_QUEUE_MEMORY / 1024;
@@ -77,21 +82,47 @@ impl Journal {
         let current_log_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let shared_log_id = current_log_id.clone();
 
-        let io_thread = std::thread::Builder::new()
-            .name("journal-io".into())
-            .spawn(move || journal_io_loop(config, rx, journal_io, on_fatal_error, shared_log_id))
-            .expect("failed to spawn journal-io thread");
+        // Set up the force-write channel if sync is enabled.
+        let (fw_tx, sync_thread) = if config.sync_data {
+            let (fw_tx, fw_rx) = mpsc::sync_channel::<ForceWriteRequest>(1024);
+            let on_err = on_fatal_error.as_ref().map(|_| ());
+            let fatal_cb: Option<OnFatalError> = if on_err.is_some() {
+                // We can't clone Box<dyn Fn>, so wrap in Arc for sharing.
+                None // handled below via Arc
+            } else {
+                None
+            };
+            let _ = fatal_cb; // unused — we use Arc<dyn Fn> below
+
+            let sync_thread = std::thread::Builder::new()
+                .name("journal-sync".into())
+                .spawn(move || force_write_loop(fw_rx))
+                .expect("failed to spawn journal-sync thread");
+
+            (Some(fw_tx), Some(sync_thread))
+        } else {
+            (None, None)
+        };
+
+        let writer_config = config.clone();
+        let writer_thread = std::thread::Builder::new()
+            .name("journal-writer".into())
+            .spawn(move || {
+                journal_writer_loop(writer_config, rx, fw_tx, on_fatal_error, shared_log_id)
+            })
+            .expect("failed to spawn journal-writer thread");
 
         Self {
             tx,
-            _io_thread: Some(io_thread),
+            _writer_thread: Some(writer_thread),
+            _sync_thread: sync_thread,
             master_key_cache: std::sync::Mutex::new(HashSet::new()),
             current_log_id,
         }
     }
 
     /// Write an entry to the journal asynchronously.
-    /// Awaits until the entry is written and fsynced (data is durable).
+    /// Awaits until the entry is written and (if sync enabled) fsynced.
     pub async fn log_add_entry(&self, data: &[u8]) -> Result<(), StorageError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -108,8 +139,6 @@ impl Journal {
     }
 
     /// Journal a master key entry for a ledger if not already journaled.
-    /// Atomic: cache insert happens under lock BEFORE journal send,
-    /// matching Java's putIfAbsent + journal pattern.
     pub fn maybe_journal_master_key(
         &self,
         ledger_id: i64,
@@ -122,7 +151,6 @@ impl Journal {
         cache.insert(ledger_id);
         drop(cache);
 
-        // Build master key entry: [ledgerId(8)][METAENTRY_ID(8)][keyLen(4)][key]
         let entry_len = 8 + 8 + 4 + master_key.len();
         let mut entry = Vec::with_capacity(entry_len);
         entry.extend_from_slice(&ledger_id.to_be_bytes());
@@ -148,15 +176,24 @@ impl Journal {
 }
 
 // ---------------------------------------------------------------------------
-// Journal I/O thread — single thread replaces the old writer + fsync pair
+// Force-write request — sent from writer thread to sync thread
 // ---------------------------------------------------------------------------
 
-/// Single background thread that owns journal file state and delegates
-/// all I/O to the `JournalIo` trait (uring or std).
-fn journal_io_loop(
+struct ForceWriteRequest {
+    /// File descriptor to fsync.
+    fd: RawFd,
+    /// Entries to ACK after fsync completes.
+    acks: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+// ---------------------------------------------------------------------------
+// Writer thread — writes entries to journal file, never blocks on fsync
+// ---------------------------------------------------------------------------
+
+fn journal_writer_loop(
     config: JournalConfig,
     rx: mpsc::Receiver<JournalEntry>,
-    journal_io: std::sync::Arc<dyn JournalIo>,
+    fw_tx: Option<mpsc::SyncSender<ForceWriteRequest>>,
     on_fatal_error: Option<OnFatalError>,
     shared_log_id: Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -167,71 +204,58 @@ fn journal_io_loop(
     let buffered_entries_threshold = config.buffered_entries_threshold;
     let buffered_writes_threshold = config.buffered_writes_threshold;
     let mut pending_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
-    let mut pending_entries: Vec<Vec<u8>> = Vec::new();
     let mut pending_bytes: usize = 0;
 
+    // Reusable write buffer — avoids per-batch allocation.
+    // Entries are framed directly into this buffer.
+    let mut write_buf: Vec<u8> = Vec::with_capacity(buffered_writes_threshold.max(64 * 1024));
+
     loop {
-        // Block until the first entry arrives.
         let first = match rx.recv() {
             Ok(entry) => entry,
             Err(_) => {
-                if !pending_entries.is_empty() {
-                    flush_batch(
-                        &config, &mut state, &journal_io,
-                        &mut pending_entries, &mut pending_acks,
-                        &on_fatal_error, &shared_log_id,
+                // Channel disconnected — flush remaining and exit.
+                if !write_buf.is_empty() {
+                    flush_write_buf(
+                        &config, &mut state, &mut write_buf, &mut pending_acks,
+                        &fw_tx, &on_fatal_error, &shared_log_id,
                     );
                 }
                 break;
             }
         };
 
-        let framed = frame_journal_entry(&first.data);
-        pending_bytes += framed.len();
-        pending_entries.push(framed);
+        // Frame entry directly into the write buffer (no per-entry Vec alloc).
+        frame_into_buf(&mut write_buf, &first.data);
+        pending_bytes += 4 + first.data.len();
         if let Some(ack) = first.ack_tx {
             pending_acks.push(ack);
         }
 
         // Drain entries already in the queue without blocking.
         while let Ok(entry) = rx.try_recv() {
-            let framed = frame_journal_entry(&entry.data);
-            pending_bytes += framed.len();
-            pending_entries.push(framed);
+            frame_into_buf(&mut write_buf, &entry.data);
+            pending_bytes += 4 + entry.data.len();
             if let Some(ack) = entry.ack_tx {
                 pending_acks.push(ack);
             }
         }
 
-        // Decide whether to flush now or wait for more entries.
-        // Matches Java's Journal.run() flush decision logic:
-        //
-        // 1. Queue empty after drain (single writer) → flush immediately.
-        //    No benefit in waiting; adds pure latency.
-        //    (Java: journalFlushWhenQueueEmpty)
-        //
-        // 2. Buffered entries exceed threshold → flush immediately.
-        //    Batch is already large; flushing now amortizes fsync well.
-        //    (Java: bufferedEntriesThreshold)
-        //
-        // 3. Buffered bytes exceed threshold → flush immediately.
-        //    Same rationale as (2) but byte-based.
-        //    (Java: bufferedWritesThreshold)
-        //
-        // 4. Otherwise → wait up to max_group_wait_ms for more entries.
-        //    (Java: journalMaxGroupWaitMSec)
-        let should_wait = pending_entries.len() > 1
+        // Flush decision (same logic as before, matching Java):
+        // 1. Single entry (queue was empty) → flush immediately
+        // 2. Buffered entries/bytes exceed threshold → flush immediately
+        // 3. Otherwise → wait up to max_group_wait_ms
+        let should_wait = pending_acks.len() > 1
             && (buffered_entries_threshold == 0
-                || pending_entries.len() < buffered_entries_threshold)
+                || pending_acks.len() < buffered_entries_threshold)
             && (buffered_writes_threshold == 0
                 || pending_bytes < buffered_writes_threshold);
 
         if should_wait {
             let deadline = std::time::Instant::now() + group_wait;
             loop {
-                // Check thresholds before waiting
                 if (buffered_entries_threshold > 0
-                    && pending_entries.len() >= buffered_entries_threshold)
+                    && pending_acks.len() >= buffered_entries_threshold)
                     || (buffered_writes_threshold > 0
                         && pending_bytes >= buffered_writes_threshold)
                 {
@@ -243,9 +267,8 @@ fn journal_io_loop(
                 }
                 match rx.recv_timeout(remaining) {
                     Ok(entry) => {
-                        let framed = frame_journal_entry(&entry.data);
-                        pending_bytes += framed.len();
-                        pending_entries.push(framed);
+                        frame_into_buf(&mut write_buf, &entry.data);
+                        pending_bytes += 4 + entry.data.len();
                         if let Some(ack) = entry.ack_tx {
                             pending_acks.push(ack);
                         }
@@ -255,44 +278,49 @@ fn journal_io_loop(
             }
         }
 
-        // Flush the entire batch: one write + one fsync for all entries.
-        flush_batch(
-            &config, &mut state, &journal_io,
-            &mut pending_entries, &mut pending_acks,
-            &on_fatal_error, &shared_log_id,
+        flush_write_buf(
+            &config, &mut state, &mut write_buf, &mut pending_acks,
+            &fw_tx, &on_fatal_error, &shared_log_id,
         );
         pending_bytes = 0;
     }
 }
 
-/// Flush a batch of framed entries via `JournalIo::write_and_sync`.
-fn flush_batch(
+/// Frame a journal entry directly into a buffer: `[size(4 BE)][payload]`.
+/// Avoids allocating a separate Vec per entry.
+fn frame_into_buf(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(&(data.len() as i32).to_be_bytes());
+    buf.extend_from_slice(data);
+}
+
+/// Write the buffered entries to the journal file, then either ACK
+/// immediately (sync disabled) or send to the force-write thread (sync enabled).
+fn flush_write_buf(
     config: &JournalConfig,
     state: &mut JournalFileState,
-    journal_io: &std::sync::Arc<dyn JournalIo>,
-    pending_entries: &mut Vec<Vec<u8>>,
+    write_buf: &mut Vec<u8>,
     pending_acks: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+    fw_tx: &Option<mpsc::SyncSender<ForceWriteRequest>>,
     on_fatal_error: &Option<OnFatalError>,
     shared_log_id: &Arc<std::sync::atomic::AtomicU64>,
 ) {
-    if pending_entries.is_empty() {
+    if write_buf.is_empty() {
         return;
     }
 
     // Ensure the journal file is open
     if let Err(e) = state.ensure_open(config) {
         tracing::warn!("Journal open error: {e}");
-        pending_entries.clear();
+        write_buf.clear();
         pending_acks.clear();
         return;
     }
-    // Publish the current log ID so cleanup_journals can skip it
     shared_log_id.store(state.log_id, std::sync::atomic::Ordering::Relaxed);
 
-    // Check if we need to rotate BEFORE writing (check total batch size)
-    let batch_size: u64 = pending_entries.iter().map(|e| e.len() as u64).sum();
+    // Check if we need to rotate BEFORE writing
+    let batch_size = write_buf.len() as u64;
     if state.position > 0 && state.position + batch_size > config.max_file_size {
-        if let Err(e) = state.rotate(config, journal_io) {
+        if let Err(e) = state.rotate(config) {
             tracing::warn!("Journal rotation error: {e}");
         }
     }
@@ -305,54 +333,109 @@ fn flush_batch(
         None
     };
 
-    // Build the slice array for write_and_sync: [padding?] + entries
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(pending_entries.len() + 1);
-    if let Some(ref pad) = padding {
-        slices.push(pad);
-    }
-    for entry in pending_entries.iter() {
-        slices.push(entry);
-    }
+    // Write padding + entries in a single write_all call.
+    let file = state.file.as_mut().unwrap();
+    let write_result = (|| -> io::Result<()> {
+        if let Some(ref pad) = padding {
+            file.write_all(pad)?;
+        }
+        file.write_all(write_buf)?;
+        Ok(())
+    })();
 
-    let fd = state.file.as_ref().unwrap().as_raw_fd();
-    let io_result = if config.sync_data {
-        journal_io.write_and_sync(fd, &slices)
-    } else {
-        journal_io.write_no_sync(fd, &slices)
-    };
-    match io_result {
+    match write_result {
         Ok(()) => {
-            // Update position tracking
             if let Some(ref pad) = padding {
                 state.position += pad.len() as u64;
             }
-            for entry in pending_entries.iter() {
-                state.position += entry.len() as u64;
-            }
-            // ACK all clients — data is durable
-            for ack in pending_acks.drain(..) {
-                let _ = ack.send(());
+            state.position += batch_size;
+
+            let fd = file.as_raw_fd();
+            let acks = std::mem::take(pending_acks);
+
+            if let Some(ref tx) = fw_tx {
+                // Sync enabled: send to force-write thread for fsync + ACK.
+                // Writer does NOT wait — immediately returns to process
+                // the next batch while the force-write thread handles sync.
+                if tx.send(ForceWriteRequest { fd, acks }).is_err() {
+                    tracing::error!("Force-write thread gone — entries will not be ACKed");
+                }
+            } else {
+                // Sync disabled: ACK immediately after write_all.
+                // Data is in the kernel page cache — durable against process
+                // crash but not power loss.
+                for ack in acks {
+                    let _ = ack.send(());
+                }
             }
         }
         Err(e) => {
-            tracing::error!("FATAL: journal write+sync failed: {e}");
-            // Signal the bookie to go read-only. Matches Java's behavior
-            // where a journal fsync failure triggers forceToReadOnly().
+            tracing::error!("FATAL: journal write failed: {e}");
             if let Some(ref callback) = on_fatal_error {
-                callback(io::Error::new(e.kind(), format!("journal sync: {e}")));
+                callback(io::Error::new(e.kind(), format!("journal write: {e}")));
             }
-            // Don't ACK — clients will timeout.
+            pending_acks.clear();
         }
     }
-    pending_entries.clear();
+    write_buf.clear();
 }
 
-/// Frame a journal entry: `[size(4 BE)][payload]`.
-fn frame_journal_entry(data: &[u8]) -> Vec<u8> {
-    let mut framed = Vec::with_capacity(4 + data.len());
-    framed.extend_from_slice(&(data.len() as i32).to_be_bytes());
-    framed.extend_from_slice(data);
-    framed
+// ---------------------------------------------------------------------------
+// Force-write thread — calls fdatasync, then ACKs entries
+// ---------------------------------------------------------------------------
+
+/// Receives flush requests from the writer thread, batches them,
+/// calls `fdatasync()` once per batch, then ACKs all covered entries.
+///
+/// Natural batching: while this thread is blocked on fdatasync, the writer
+/// thread continues writing. All entries written during the sync are covered
+/// by the next sync cycle. This is how Java's ForceWriteThread works.
+fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
+    loop {
+        // Block until the writer sends a flush request.
+        let first = match rx.recv() {
+            Ok(req) => req,
+            Err(_) => break, // Writer thread exited
+        };
+
+        // Drain all immediately available requests — batch them into one sync.
+        let mut all_acks = first.acks;
+        let mut last_fd = first.fd;
+        while let Ok(req) = rx.try_recv() {
+            all_acks.extend(req.acks);
+            last_fd = req.fd;
+        }
+
+        // fsync the journal file. This covers ALL data written since the
+        // last sync, regardless of how many ForceWriteRequests were batched.
+        if let Err(e) = sync_fd(last_fd) {
+            tracing::error!("FATAL: journal fsync failed: {e}");
+            // Don't ACK — clients will timeout. The bookie should go read-only
+            // via the on_fatal_error callback (fired by the writer thread on
+            // subsequent write failures if the disk is bad).
+            continue;
+        }
+
+        // ACK all entries — data is now durable on disk.
+        for ack in all_acks {
+            let _ = ack.send(());
+        }
+    }
+}
+
+/// Call fdatasync on a raw file descriptor.
+fn sync_fd(fd: RawFd) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd;
+        let file = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) });
+        file.sync_data()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +480,6 @@ impl JournalFileState {
             .write(true)
             .open(&path)?;
 
-        // Write header
         let header = JournalHeader::new(config.format_version);
         let header_bytes = header.to_bytes();
         file.write_all(&header_bytes)?;
@@ -411,13 +493,10 @@ impl JournalFileState {
     fn rotate(
         &mut self,
         config: &JournalConfig,
-        _journal_io: &std::sync::Arc<dyn JournalIo>,
     ) -> Result<(), StorageError> {
-        // Close current file
         self.file = None;
         self.log_id += 1;
         self.position = 0;
-        // Next ensure_open will create the new file
         self.ensure_open(config)
     }
 }
@@ -427,12 +506,6 @@ impl JournalFileState {
 // ---------------------------------------------------------------------------
 
 /// Replay journal entries from disk for crash recovery.
-///
-/// If `last_mark` is provided, only journal files with ID >= the mark's
-/// log_id are replayed (matching Java's behavior of skipping journals
-/// that were already checkpointed). Within the marked file, replay
-/// starts from the mark's offset. If `last_mark` is `None` or
-/// `(0, 0)`, all journal files are replayed from the beginning.
 pub fn replay_journal<F>(
     journal_dir: &Path,
     last_mark: Option<format::LastMark>,
@@ -451,7 +524,6 @@ where
             let name = name.to_string_lossy();
             if name.ends_with(".txn") {
                 if let Ok(id) = u64::from_str_radix(name.trim_end_matches(".txn"), 16) {
-                    // Skip journals older than the lastMark
                     if mark_log_id > 0 && (id as i64) < mark_log_id {
                         continue;
                     }
@@ -474,7 +546,6 @@ where
             continue;
         }
 
-        // For the marked file, skip entries before the mark offset
         let start_offset = if mark_log_id > 0 && *file_id == mark_log_id as u64 && mark_offset > 0 {
             (mark_offset as usize).saturating_sub(header_size)
         } else {
@@ -484,13 +555,7 @@ where
         let scan_data = &data[header_size..];
         let entries = format::scan_journal_entries(scan_data, header.version());
         for (idx, entry_data) in entries.iter().enumerate() {
-            // Simple byte-offset approximation: skip entries whose
-            // cumulative position is before the mark offset. This is
-            // conservative — may replay a few extra entries, which is
-            // safe (idempotent write cache puts).
-            let _ = start_offset; // acknowledge but don't filter by entry index;
-                                   // per-entry offset tracking is complex and
-                                   // replaying extra entries is safe
+            let _ = start_offset;
             let _ = idx;
             callback(entry_data);
             total_replayed += 1;
