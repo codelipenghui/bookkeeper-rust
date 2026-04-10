@@ -221,6 +221,13 @@ fn journal_uring_loop(
     let mut syncing_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut fsync_in_flight = false;
 
+    // Instrumentation
+    let mut loop_count: u64 = 0;
+    let mut total_entries: u64 = 0;
+    let mut total_syncs: u64 = 0;
+    let mut total_sync_us: u64 = 0;
+    let mut total_acked: u64 = 0;
+
     loop {
         // If fsync is in flight, don't block — poll for entries and CQE.
         let first = if fsync_in_flight {
@@ -410,6 +417,9 @@ fn journal_uring_loop(
                 }
 
                 // Move pending acks to syncing (they'll be ACK'd when fsync completes)
+                let batch_size = pending_acks.len() as u64;
+                total_entries += batch_size;
+                total_acked += batch_size;
                 syncing_acks.append(&mut pending_acks);
 
                 // Submit FSYNC if no fsync is in flight
@@ -427,9 +437,18 @@ fn journal_uring_loop(
                         tracing::error!("journal-uring: submit failed: {e}");
                     }
                     fsync_in_flight = true;
+                    total_syncs += 1;
                 }
-                // If fsync already in flight, entries will be covered by it
-                // (fsync covers all data written before it completes)
+
+                loop_count += 1;
+                if loop_count % 1000 == 0 {
+                    let avg_batch = if loop_count > 0 { total_entries / loop_count } else { 0 };
+                    let avg_acked = if total_syncs > 0 { total_acked / total_syncs } else { 0 };
+                    tracing::info!(
+                        "journal-uring: loops={loop_count} entries={total_entries} syncs={total_syncs} \
+                         avg_batch={avg_batch} avg_acked_per_sync={avg_acked} pending_sync={}", syncing_acks.len()
+                    );
+                }
             }
             Err(e) => {
                 tracing::error!("FATAL: journal write failed: {e}");
