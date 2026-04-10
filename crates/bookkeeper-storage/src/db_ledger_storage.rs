@@ -35,6 +35,16 @@ struct EntryLogState {
     file: Option<fs::File>,
 }
 
+/// In-memory snapshot of a ledger's metadata (master key + fenced flag).
+/// Mirrors Java's `TransientLedgerInfo` pattern: keeps the hot `validate_for_write`
+/// path off RocksDB after the first touch. `lac` and `explicit_lac` live in their
+/// own caches — this struct only covers the fields read on every add_entry.
+#[derive(Clone)]
+struct LedgerMetaCacheEntry {
+    fenced: bool,
+    master_key: Option<Vec<u8>>,
+}
+
 pub struct DbLedgerStorage {
     #[allow(dead_code)]
     base_dir: PathBuf,
@@ -59,6 +69,10 @@ pub struct DbLedgerStorage {
     lac_cache: dashmap::DashMap<i64, i64>,
     /// In-memory cache of explicit LAC bodies (matching Java's TransientLedgerInfo).
     explicit_lac_cache: dashmap::DashMap<i64, Vec<u8>>,
+    /// In-memory cache of ledger metadata (master key + fenced flag).
+    /// Keeps the hot `validate_for_write` path off RocksDB after first touch.
+    /// Mirrors Java's TransientLedgerInfo which caches per-ledger state in memory.
+    meta_cache: dashmap::DashMap<i64, Arc<LedgerMetaCacheEntry>>,
     /// LAC watcher registry for long poll reads.
     lac_watchers: crate::lac_watcher::LacWatcherRegistry,
 }
@@ -98,6 +112,7 @@ impl DbLedgerStorage {
             journal_dir: None,
             lac_cache: dashmap::DashMap::new(),
             explicit_lac_cache: dashmap::DashMap::new(),
+            meta_cache: dashmap::DashMap::new(),
             lac_watchers: crate::lac_watcher::LacWatcherRegistry::new(),
         })
     }
@@ -238,9 +253,16 @@ impl LedgerStorage for DbLedgerStorage {
         let entry_id = Self::extract_entry_id(entry);
         let lac = Self::extract_lac(entry);
 
-        // Ensure ledger exists in index (no-op if validate_for_write already created it)
-        if self.ledger_index.get(ledger_id)?.is_none() {
+        // Ensure ledger exists in index (no-op if validate_for_write already created it).
+        // Cache hit means RocksDB already has the row — skip the read entirely.
+        if !self.meta_cache.contains_key(&ledger_id)
+            && self.ledger_index.get(ledger_id)?.is_none()
+        {
             self.ledger_index.set(ledger_id, false, None, None)?;
+            self.meta_cache.insert(
+                ledger_id,
+                Arc::new(LedgerMetaCacheEntry { fenced: false, master_key: None }),
+            );
         }
 
         // Update LAC in memory only (no RocksDB write per entry).
@@ -311,52 +333,87 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn ledger_exists(&self, ledger_id: i64) -> Result<bool, StorageError> {
+        if self.meta_cache.contains_key(&ledger_id) {
+            return Ok(true);
+        }
         Ok(self.ledger_index.get(ledger_id)?.is_some())
     }
 
     fn set_fenced(&self, ledger_id: i64) -> Result<bool, StorageError> {
         self.ledger_index.set_fenced(ledger_id)?;
+        // Mirror the fenced bit into the cache so validate_for_write sees it
+        // without going back to RocksDB. Preserve master_key if already cached.
+        let master_key = self
+            .meta_cache
+            .get(&ledger_id)
+            .and_then(|e| e.master_key.clone());
+        self.meta_cache.insert(
+            ledger_id,
+            Arc::new(LedgerMetaCacheEntry { fenced: true, master_key }),
+        );
         Ok(true)
     }
 
     fn is_fenced(&self, ledger_id: i64) -> Result<bool, StorageError> {
+        if let Some(meta) = self.meta_cache.get(&ledger_id) {
+            return Ok(meta.fenced);
+        }
         Ok(self.ledger_index.get(ledger_id)?.map_or(false, |d| d.fenced))
     }
 
     fn set_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(), StorageError> {
-        match self.ledger_index.get(ledger_id)? {
-            Some(existing) => {
-                self.ledger_index.set(
-                    ledger_id,
-                    existing.fenced,
-                    Some(master_key),
-                    existing.lac,
-                )
-            }
-            None => {
-                self.ledger_index.set(ledger_id, false, Some(master_key), None)
-            }
-        }
+        let (fenced, existing_lac) = match self.ledger_index.get(ledger_id)? {
+            Some(existing) => (existing.fenced, existing.lac),
+            None => (false, None),
+        };
+        self.ledger_index.set(ledger_id, fenced, Some(master_key), existing_lac)?;
+        self.meta_cache.insert(
+            ledger_id,
+            Arc::new(LedgerMetaCacheEntry {
+                fenced,
+                master_key: Some(master_key.to_vec()),
+            }),
+        );
+        Ok(())
     }
 
     fn check_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(), StorageError> {
+        // Fast path: cached ledger with a master key already set.
+        if let Some(meta) = self.meta_cache.get(&ledger_id) {
+            if let Some(stored) = &meta.master_key {
+                if stored.as_slice() != master_key {
+                    return Err(StorageError::Unauthorized(ledger_id));
+                }
+                return Ok(());
+            }
+            // Cached but master key not yet set — fall through to store it.
+        }
         match self.ledger_index.get(ledger_id)? {
             Some(data) => {
-                // Ledger exists — check key
                 if let Some(stored_key) = &data.master_key {
                     if stored_key != master_key {
                         return Err(StorageError::Unauthorized(ledger_id));
                     }
+                    self.meta_cache.insert(
+                        ledger_id,
+                        Arc::new(LedgerMetaCacheEntry {
+                            fenced: data.fenced,
+                            master_key: Some(stored_key.clone()),
+                        }),
+                    );
+                    return Ok(());
                 }
-                // No key stored yet — store it
-                if data.master_key.is_none() {
-                    self.set_master_key(ledger_id, master_key)?;
-                }
-                Ok(())
+                self.set_master_key(ledger_id, master_key)
             }
             None => {
-                // Ledger doesn't exist — create with key
                 self.ledger_index.set(ledger_id, false, Some(master_key), None)?;
+                self.meta_cache.insert(
+                    ledger_id,
+                    Arc::new(LedgerMetaCacheEntry {
+                        fenced: false,
+                        master_key: Some(master_key.to_vec()),
+                    }),
+                );
                 Ok(())
             }
         }
@@ -483,6 +540,9 @@ impl LedgerStorage for DbLedgerStorage {
         self.lac_watchers.notify_ledger_closed(ledger_id);
         self.ledger_index.delete(ledger_id)?;
         self.entry_location_index.delete_ledger(ledger_id)?;
+        self.meta_cache.remove(&ledger_id);
+        self.lac_cache.remove(&ledger_id);
+        self.explicit_lac_cache.remove(&ledger_id);
         Ok(())
     }
 
@@ -657,22 +717,56 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn validate_for_write(&self, ledger_id: i64, master_key: &[u8]) -> Result<bool, StorageError> {
+        // Fast path: cache hit with master key already set.
+        // Skips RocksDB entirely on the hot add_entry path — this was ~20% of CPU
+        // before, since every request re-read the ledger metadata row.
+        if let Some(meta) = self.meta_cache.get(&ledger_id) {
+            if let Some(stored) = &meta.master_key {
+                if stored.as_slice() != master_key {
+                    return Err(StorageError::Unauthorized(ledger_id));
+                }
+                return Ok(meta.fenced);
+            }
+            // Cached entry with no master key — fall through so we store one.
+        }
+        // Slow path: first write to this ledger since process start. Read RocksDB
+        // once, then populate the cache so subsequent writes take the fast path.
         match self.ledger_index.get(ledger_id)? {
             Some(data) => {
-                // Check master key
                 if let Some(stored_key) = &data.master_key {
                     if stored_key != master_key {
                         return Err(StorageError::Unauthorized(ledger_id));
                     }
+                    self.meta_cache.insert(
+                        ledger_id,
+                        Arc::new(LedgerMetaCacheEntry {
+                            fenced: data.fenced,
+                            master_key: Some(stored_key.clone()),
+                        }),
+                    );
                 } else {
                     // No key stored — store it (preserving existing fenced/lac)
                     self.ledger_index.set(ledger_id, data.fenced, Some(master_key), data.lac)?;
+                    self.meta_cache.insert(
+                        ledger_id,
+                        Arc::new(LedgerMetaCacheEntry {
+                            fenced: data.fenced,
+                            master_key: Some(master_key.to_vec()),
+                        }),
+                    );
                 }
                 Ok(data.fenced)
             }
             None => {
                 // Create new ledger with key
                 self.ledger_index.set(ledger_id, false, Some(master_key), None)?;
+                self.meta_cache.insert(
+                    ledger_id,
+                    Arc::new(LedgerMetaCacheEntry {
+                        fenced: false,
+                        master_key: Some(master_key.to_vec()),
+                    }),
+                );
                 Ok(false)
             }
         }
