@@ -1217,7 +1217,12 @@ where
             if codec.encode(response_bytes, &mut out).is_err() {
                 break;
             }
-            if writer.write_all(&out).await.is_err() {
+            let write_start = std::time::Instant::now();
+            let write_ok = writer.write_all(&out).await.is_ok();
+            let elapsed = write_start.elapsed().as_secs_f64();
+            let label = if write_ok { "true" } else { "false" };
+            crate::metrics::CHANNEL_WRITE.with_label_values(&[label]).observe(elapsed);
+            if !write_ok {
                 break;
             }
         }

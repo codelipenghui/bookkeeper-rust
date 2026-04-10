@@ -54,6 +54,14 @@ lazy_static! {
         &["success"]
     ).unwrap();
 
+    /// TCP response write latency. Matches Java's RequestStats.CHANNEL_WRITE.
+    /// Measures time from response ready to TCP write_all complete.
+    pub static ref CHANNEL_WRITE: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("bookkeeper_server_CHANNEL_WRITE", "Channel write latency")
+            .buckets(latency_buckets()),
+        &["success"]
+    ).unwrap();
+
     // -----------------------------------------------------------------------
     // Bookie storage metrics (scope: bookie)
     // Matches Java's BookieStats.java
@@ -189,6 +197,7 @@ pub fn register_metrics() {
     reg!(ADD_ENTRY_IN_PROGRESS);
     reg!(READ_ENTRY_IN_PROGRESS);
     reg!(READ_ENTRY_FENCE_REQUEST);
+    reg!(CHANNEL_WRITE);
     // Bookie storage
     reg!(WRITE_BYTES);
     reg!(READ_BYTES);
