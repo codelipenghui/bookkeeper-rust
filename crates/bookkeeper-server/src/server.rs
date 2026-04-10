@@ -1055,6 +1055,10 @@ async fn accept_loop(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _peer_addr)) => {
+                        // Disable Nagle's algorithm. BK responses are small
+                        // (~100 bytes); without NODELAY, Nagle batches them
+                        // and waits for the delayed-ACK timer (~10ms).
+                        let _ = stream.set_nodelay(true);
                         let proc = processor.clone();
                         if let Some(ref tls) = tls_acceptor {
                             let tls = tls.clone();
