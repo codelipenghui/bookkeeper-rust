@@ -99,7 +99,7 @@ services:
       - "8081:8080"
     environment:
       RUST_LOG: info
-      BOOKKEEPER_IO_ENGINE: std
+      BOOKKEEPER_IO_ENGINE: auto
     command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-1"]
     volumes:
       - bk1_data:/bk/data
@@ -127,7 +127,7 @@ services:
       - "8082:8080"
     environment:
       RUST_LOG: info
-      BOOKKEEPER_IO_ENGINE: std
+      BOOKKEEPER_IO_ENGINE: auto
     command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-2"]
     volumes:
       - bk2_data:/bk/data

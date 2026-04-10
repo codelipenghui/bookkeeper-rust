@@ -10,7 +10,6 @@ use super::format::{self, JournalHeader, calculate_padding};
 use crate::StorageError;
 
 /// Meta-entry ID for master key journaling.
-/// Matches Java's BookieImpl.METAENTRY_ID_LEDGER_KEY = -0x1000.
 pub const METAENTRY_ID_LEDGER_KEY: i64 = -0x1000;
 
 /// Maximum journal queue memory in bytes (default 32MB, matching Java).
@@ -37,40 +36,30 @@ pub struct JournalConfig {
 
 /// The journal — write-ahead log for crash recovery.
 ///
-/// Two-thread architecture matching Java's Journal + ForceWriteThread:
+/// Three operating modes depending on platform and config:
 ///
-/// - **Writer thread** (`journal-writer`): receives entries from the bounded
-///   channel, frames them, writes to the journal file via `write_all` (kernel
-///   page cache — fast, no syscall per entry with buffered I/O). Never blocks
-///   on fsync.
+/// 1. **io_uring + sync** (Linux): Single `journal-uring` thread. Writes
+///    entries via `write_all`, submits FSYNC as a non-blocking io_uring SQE,
+///    then continues collecting + writing entries while the kernel syncs.
+///    ACKs all entries when the CQE completes. Maximum batching — entries
+///    written during the fsync are covered by the next fsync.
 ///
-/// - **Force-write thread** (`journal-sync`): receives flush requests from the
-///   writer, calls `fdatasync()` to make data durable, then ACKs all entries
-///   in the batch. Naturally batches: all entries written during the previous
-///   fsync cycle are covered by the next fsync.
+/// 2. **StdEngine + sync**: Two threads. Writer thread does `write_all` and
+///    sends to force-write thread. Force-write thread calls blocking
+///    `fdatasync()` and ACKs. Matches Java's Journal + ForceWriteThread.
 ///
-/// When `journalSyncData=false`, the writer ACKs immediately after writing
-/// (no force-write thread), matching Java's ackBeforeSync behavior.
-///
-/// Callback invoked when the journal encounters a fatal I/O error (e.g.,
-/// FSYNC EIO). The bookie should transition to read-only mode.
+/// 3. **No sync** (any engine): Single writer thread. ACKs immediately
+///    after `write_all`. No force-write thread.
 pub type OnFatalError = Box<dyn Fn(io::Error) + Send + 'static>;
 
 pub struct Journal {
     tx: mpsc::SyncSender<JournalEntry>,
-    _writer_thread: Option<std::thread::JoinHandle<()>>,
-    _sync_thread: Option<std::thread::JoinHandle<()>>,
-    /// Tracks which ledgers have had master keys journaled.
+    _threads: Vec<std::thread::JoinHandle<()>>,
     master_key_cache: std::sync::Mutex<HashSet<i64>>,
-    /// Current journal file ID (shared with the writer thread for cleanup).
     current_log_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Journal {
-    /// Start the journal writer (and optionally force-write) threads.
-    ///
-    /// `on_fatal_error` is called if write or sync fails — the bookie should
-    /// transition to read-only mode.
     pub fn start(
         config: JournalConfig,
         _journal_io: std::sync::Arc<dyn crate::io_engine::JournalIo>,
@@ -82,47 +71,64 @@ impl Journal {
         let current_log_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let shared_log_id = current_log_id.clone();
 
-        // Set up the force-write channel if sync is enabled.
-        let (fw_tx, sync_thread) = if config.sync_data {
+        let mut threads = Vec::new();
+
+        #[cfg(target_os = "linux")]
+        let use_uring = config.sync_data && crate::io_engine::uring_available();
+        #[cfg(not(target_os = "linux"))]
+        let use_uring = false;
+
+        if use_uring {
+            // Mode 1: single io_uring thread (write + async fsync)
+            #[cfg(target_os = "linux")]
+            {
+                let uring_config = config.clone();
+                let t = std::thread::Builder::new()
+                    .name("journal-uring".into())
+                    .spawn(move || {
+                        journal_uring_loop(uring_config, rx, on_fatal_error, shared_log_id)
+                    })
+                    .expect("failed to spawn journal-uring thread");
+                threads.push(t);
+            }
+        } else if config.sync_data {
+            // Mode 2: two threads (writer + blocking force-write)
             let (fw_tx, fw_rx) = mpsc::channel::<ForceWriteRequest>();
-            let on_err = on_fatal_error.as_ref().map(|_| ());
-            let fatal_cb: Option<OnFatalError> = if on_err.is_some() {
-                // We can't clone Box<dyn Fn>, so wrap in Arc for sharing.
-                None // handled below via Arc
-            } else {
-                None
-            };
-            let _ = fatal_cb; // unused — we use Arc<dyn Fn> below
 
             let sync_thread = std::thread::Builder::new()
                 .name("journal-sync".into())
                 .spawn(move || force_write_loop(fw_rx))
                 .expect("failed to spawn journal-sync thread");
+            threads.push(sync_thread);
 
-            (Some(fw_tx), Some(sync_thread))
+            let writer_config = config.clone();
+            let writer_thread = std::thread::Builder::new()
+                .name("journal-writer".into())
+                .spawn(move || {
+                    journal_writer_loop(writer_config, rx, Some(fw_tx), on_fatal_error, shared_log_id)
+                })
+                .expect("failed to spawn journal-writer thread");
+            threads.push(writer_thread);
         } else {
-            (None, None)
-        };
-
-        let writer_config = config.clone();
-        let writer_thread = std::thread::Builder::new()
-            .name("journal-writer".into())
-            .spawn(move || {
-                journal_writer_loop(writer_config, rx, fw_tx, on_fatal_error, shared_log_id)
-            })
-            .expect("failed to spawn journal-writer thread");
+            // Mode 3: single writer thread, no sync
+            let writer_config = config.clone();
+            let writer_thread = std::thread::Builder::new()
+                .name("journal-writer".into())
+                .spawn(move || {
+                    journal_writer_loop(writer_config, rx, None, on_fatal_error, shared_log_id)
+                })
+                .expect("failed to spawn journal-writer thread");
+            threads.push(writer_thread);
+        }
 
         Self {
             tx,
-            _writer_thread: Some(writer_thread),
-            _sync_thread: sync_thread,
+            _threads: threads,
             master_key_cache: std::sync::Mutex::new(HashSet::new()),
             current_log_id,
         }
     }
 
-    /// Write an entry to the journal asynchronously.
-    /// Awaits until the entry is written and (if sync enabled) fsynced.
     pub async fn log_add_entry(&self, data: &[u8]) -> Result<(), StorageError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -138,7 +144,6 @@ impl Journal {
         )))
     }
 
-    /// Journal a master key entry for a ledger if not already journaled.
     pub fn maybe_journal_master_key(
         &self,
         ledger_id: i64,
@@ -158,7 +163,6 @@ impl Journal {
         entry.extend_from_slice(&(master_key.len() as i32).to_be_bytes());
         entry.extend_from_slice(master_key);
 
-        // Fire-and-forget (no ACK needed — matches Java's NopWriteCallback)
         let _ = self.tx.send(JournalEntry {
             data: entry,
             ack_tx: None,
@@ -167,8 +171,6 @@ impl Journal {
         Ok(())
     }
 
-    /// The current journal file ID. Used by `cleanup_journals` to avoid
-    /// deleting the active journal or any files newer than it.
     pub fn current_log_id(&self) -> Option<u64> {
         let id = self.current_log_id.load(std::sync::atomic::Ordering::Relaxed);
         if id == 0 { None } else { Some(id) }
@@ -180,14 +182,270 @@ impl Journal {
 // ---------------------------------------------------------------------------
 
 struct ForceWriteRequest {
-    /// File descriptor to fsync.
     fd: RawFd,
-    /// Entries to ACK after fsync completes.
     acks: Vec<tokio::sync::oneshot::Sender<()>>,
 }
 
 // ---------------------------------------------------------------------------
-// Writer thread — writes entries to journal file, never blocks on fsync
+// Mode 1: io_uring single-thread (write + async fsync)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn journal_uring_loop(
+    config: JournalConfig,
+    rx: mpsc::Receiver<JournalEntry>,
+    on_fatal_error: Option<OnFatalError>,
+    shared_log_id: Arc<std::sync::atomic::AtomicU64>,
+) {
+    use io_uring::{opcode, types, IoUring};
+
+    fs::create_dir_all(&config.journal_dir).ok();
+
+    let mut ring = match IoUring::<io_uring::squeue::Entry>::new(64) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("journal-uring: failed to create io_uring: {e}");
+            return;
+        }
+    };
+
+    let mut state = JournalFileState::new(&config);
+    let group_wait = Duration::from_millis(config.max_group_wait_ms.max(1));
+    let buffered_entries_threshold = config.buffered_entries_threshold;
+    let buffered_writes_threshold = config.buffered_writes_threshold;
+    let mut write_buf: Vec<u8> = Vec::with_capacity(buffered_writes_threshold.max(64 * 1024));
+    let mut pending_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+    let mut pending_bytes: usize = 0;
+
+    // Acks waiting for the in-flight fsync to complete.
+    let mut syncing_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+    let mut fsync_in_flight = false;
+
+    loop {
+        // If fsync is in flight, don't block — poll for entries and CQE.
+        let first = if fsync_in_flight {
+            // Non-blocking: try to get entries while waiting for fsync
+            match rx.try_recv() {
+                Ok(entry) => Some(entry),
+                Err(mpsc::TryRecvError::Empty) => {
+                    // No entries available. Check if fsync completed.
+                    if let Some(cqe) = ring.completion().next() {
+                        if cqe.result() < 0 {
+                            tracing::error!("FATAL: journal fsync failed: {}",
+                                io::Error::from_raw_os_error(-cqe.result()));
+                            if let Some(ref cb) = on_fatal_error {
+                                cb(io::Error::from_raw_os_error(-cqe.result()));
+                            }
+                            syncing_acks.clear();
+                        } else {
+                            // Fsync complete — ACK all entries
+                            for ack in syncing_acks.drain(..) {
+                                let _ = ack.send(());
+                            }
+                        }
+                        fsync_in_flight = false;
+                    }
+                    // If fsync still in flight and no entries, do a short wait
+                    if fsync_in_flight {
+                        match rx.recv_timeout(Duration::from_micros(100)) {
+                            Ok(entry) => Some(entry),
+                            Err(_) => {
+                                // Check CQE again
+                                if let Some(cqe) = ring.completion().next() {
+                                    if cqe.result() < 0 {
+                                        tracing::error!("FATAL: journal fsync failed: {}",
+                                            io::Error::from_raw_os_error(-cqe.result()));
+                                        if let Some(ref cb) = on_fatal_error {
+                                            cb(io::Error::from_raw_os_error(-cqe.result()));
+                                        }
+                                        syncing_acks.clear();
+                                    } else {
+                                        for ack in syncing_acks.drain(..) {
+                                            let _ = ack.send(());
+                                        }
+                                    }
+                                    fsync_in_flight = false;
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        continue; // loop back, fsync just completed
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Channel closed — wait for in-flight fsync then exit
+                    if fsync_in_flight {
+                        ring.submit_and_wait(1).ok();
+                        if let Some(cqe) = ring.completion().next() {
+                            if cqe.result() >= 0 {
+                                for ack in syncing_acks.drain(..) {
+                                    let _ = ack.send(());
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        } else {
+            // No fsync in flight — block for first entry
+            match rx.recv() {
+                Ok(entry) => Some(entry),
+                Err(_) => break,
+            }
+        };
+
+        if let Some(entry) = first {
+            frame_into_buf(&mut write_buf, &entry.data);
+            pending_bytes += 4 + entry.data.len();
+            if let Some(ack) = entry.ack_tx {
+                pending_acks.push(ack);
+            }
+        }
+
+        // Drain more entries
+        while let Ok(entry) = rx.try_recv() {
+            frame_into_buf(&mut write_buf, &entry.data);
+            pending_bytes += 4 + entry.data.len();
+            if let Some(ack) = entry.ack_tx {
+                pending_acks.push(ack);
+            }
+        }
+
+        if write_buf.is_empty() {
+            continue;
+        }
+
+        // Group wait (always wait when sync enabled to batch more per fsync)
+        let should_wait = (buffered_entries_threshold == 0
+                || pending_acks.len() < buffered_entries_threshold)
+            && (buffered_writes_threshold == 0
+                || pending_bytes < buffered_writes_threshold);
+
+        if should_wait && !fsync_in_flight {
+            let deadline = std::time::Instant::now() + group_wait;
+            loop {
+                if (buffered_entries_threshold > 0
+                    && pending_acks.len() >= buffered_entries_threshold)
+                    || (buffered_writes_threshold > 0
+                        && pending_bytes >= buffered_writes_threshold)
+                {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(entry) => {
+                        frame_into_buf(&mut write_buf, &entry.data);
+                        pending_bytes += 4 + entry.data.len();
+                        if let Some(ack) = entry.ack_tx {
+                            pending_acks.push(ack);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Write entries to file
+        if let Err(e) = state.ensure_open(&config) {
+            tracing::warn!("Journal open error: {e}");
+            write_buf.clear();
+            pending_acks.clear();
+            pending_bytes = 0;
+            continue;
+        }
+        shared_log_id.store(state.log_id, std::sync::atomic::Ordering::Relaxed);
+
+        let batch_size = write_buf.len() as u64;
+        if state.position > 0 && state.position + batch_size > config.max_file_size {
+            if let Err(e) = state.rotate(&config) {
+                tracing::warn!("Journal rotation error: {e}");
+            }
+        }
+
+        let padding = if config.format_version >= 5 && config.alignment_size > 0 {
+            let p = calculate_padding(state.position, config.alignment_size as u64);
+            if !p.is_empty() { Some(p) } else { None }
+        } else {
+            None
+        };
+
+        let file = state.file.as_mut().unwrap();
+        let write_result = (|| -> io::Result<()> {
+            if let Some(ref pad) = padding {
+                file.write_all(pad)?;
+            }
+            file.write_all(&write_buf)?;
+            Ok(())
+        })();
+
+        match write_result {
+            Ok(()) => {
+                if let Some(ref pad) = padding {
+                    state.position += pad.len() as u64;
+                }
+                state.position += batch_size;
+
+                // If a previous fsync completed, check CQE
+                if fsync_in_flight {
+                    if let Some(cqe) = ring.completion().next() {
+                        if cqe.result() < 0 {
+                            tracing::error!("FATAL: journal fsync failed: {}",
+                                io::Error::from_raw_os_error(-cqe.result()));
+                            if let Some(ref cb) = on_fatal_error {
+                                cb(io::Error::from_raw_os_error(-cqe.result()));
+                            }
+                            syncing_acks.clear();
+                        } else {
+                            for ack in syncing_acks.drain(..) {
+                                let _ = ack.send(());
+                            }
+                        }
+                        fsync_in_flight = false;
+                    }
+                }
+
+                // Move pending acks to syncing (they'll be ACK'd when fsync completes)
+                syncing_acks.append(&mut pending_acks);
+
+                // Submit FSYNC if no fsync is in flight
+                if !fsync_in_flight {
+                    let fd = file.as_raw_fd();
+                    let fsync_sqe = opcode::Fsync::new(types::Fd(fd))
+                        .build()
+                        .user_data(1);
+                    unsafe {
+                        if ring.submission().push(&fsync_sqe).is_err() {
+                            tracing::error!("journal-uring: SQ full");
+                        }
+                    }
+                    if let Err(e) = ring.submit() {
+                        tracing::error!("journal-uring: submit failed: {e}");
+                    }
+                    fsync_in_flight = true;
+                }
+                // If fsync already in flight, entries will be covered by it
+                // (fsync covers all data written before it completes)
+            }
+            Err(e) => {
+                tracing::error!("FATAL: journal write failed: {e}");
+                if let Some(ref cb) = on_fatal_error {
+                    cb(io::Error::new(e.kind(), format!("journal write: {e}")));
+                }
+                pending_acks.clear();
+            }
+        }
+        write_buf.clear();
+        pending_bytes = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mode 2/3: StdEngine writer thread
 // ---------------------------------------------------------------------------
 
 fn journal_writer_loop(
@@ -205,8 +463,8 @@ fn journal_writer_loop(
     let buffered_writes_threshold = config.buffered_writes_threshold;
     let mut pending_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut pending_bytes: usize = 0;
-
     let mut write_buf: Vec<u8> = Vec::with_capacity(buffered_writes_threshold.max(64 * 1024));
+
     let mut loop_count: u64 = 0;
     let mut total_recv_us: u64 = 0;
     let mut total_flush_us: u64 = 0;
@@ -217,7 +475,6 @@ fn journal_writer_loop(
         let first = match rx.recv() {
             Ok(entry) => entry,
             Err(_) => {
-                // Channel disconnected — flush remaining and exit.
                 if !write_buf.is_empty() {
                     flush_write_buf(
                         &config, &mut state, &mut write_buf, &mut pending_acks,
@@ -228,14 +485,12 @@ fn journal_writer_loop(
             }
         };
 
-        // Frame entry directly into the write buffer (no per-entry Vec alloc).
         frame_into_buf(&mut write_buf, &first.data);
         pending_bytes += 4 + first.data.len();
         if let Some(ack) = first.ack_tx {
             pending_acks.push(ack);
         }
 
-        // Drain entries already in the queue without blocking.
         while let Ok(entry) = rx.try_recv() {
             frame_into_buf(&mut write_buf, &entry.data);
             pending_bytes += 4 + entry.data.len();
@@ -244,30 +499,20 @@ fn journal_writer_loop(
             }
         }
 
-        // Flush decision:
-        // - When sync enabled: always wait for group_wait to batch entries,
-        //   since fdatasync takes ~1-2ms anyway. Batching reduces the number
-        //   of ForceWriteRequests and amortizes the sync cost.
-        // - When sync disabled: flush immediately for single entries (no
-        //   benefit in waiting — write_all returns in ~1µs).
-        // - In both cases: if buffered entries/bytes exceed threshold, flush
-        //   immediately regardless.
+        total_recv_us += recv_start.elapsed().as_micros() as u64;
+
         let should_wait = if fw_tx.is_some() {
-            // Sync enabled: always wait unless thresholds exceeded
             (buffered_entries_threshold == 0
                 || pending_acks.len() < buffered_entries_threshold)
                 && (buffered_writes_threshold == 0
                     || pending_bytes < buffered_writes_threshold)
         } else {
-            // Sync disabled: only wait if multiple entries and below thresholds
             pending_acks.len() > 1
                 && (buffered_entries_threshold == 0
                     || pending_acks.len() < buffered_entries_threshold)
                 && (buffered_writes_threshold == 0
                     || pending_bytes < buffered_writes_threshold)
         };
-
-        total_recv_us += recv_start.elapsed().as_micros() as u64;
 
         if should_wait {
             let deadline = std::time::Instant::now() + group_wait;
@@ -319,14 +564,12 @@ fn journal_writer_loop(
 }
 
 /// Frame a journal entry directly into a buffer: `[size(4 BE)][payload]`.
-/// Avoids allocating a separate Vec per entry.
 fn frame_into_buf(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(&(data.len() as i32).to_be_bytes());
     buf.extend_from_slice(data);
 }
 
-/// Write the buffered entries to the journal file, then either ACK
-/// immediately (sync disabled) or send to the force-write thread (sync enabled).
+/// Write buffered entries, then ACK or forward to force-write thread.
 fn flush_write_buf(
     config: &JournalConfig,
     state: &mut JournalFileState,
@@ -340,7 +583,6 @@ fn flush_write_buf(
         return;
     }
 
-    // Ensure the journal file is open
     if let Err(e) = state.ensure_open(config) {
         tracing::warn!("Journal open error: {e}");
         write_buf.clear();
@@ -349,7 +591,6 @@ fn flush_write_buf(
     }
     shared_log_id.store(state.log_id, std::sync::atomic::Ordering::Relaxed);
 
-    // Check if we need to rotate BEFORE writing
     let batch_size = write_buf.len() as u64;
     if state.position > 0 && state.position + batch_size > config.max_file_size {
         if let Err(e) = state.rotate(config) {
@@ -357,7 +598,6 @@ fn flush_write_buf(
         }
     }
 
-    // Add V5+ padding if needed
     let padding = if config.format_version >= 5 && config.alignment_size > 0 {
         let p = calculate_padding(state.position, config.alignment_size as u64);
         if !p.is_empty() { Some(p) } else { None }
@@ -365,7 +605,6 @@ fn flush_write_buf(
         None
     };
 
-    // Write padding + entries in a single write_all call.
     let file = state.file.as_mut().unwrap();
     let write_result = (|| -> io::Result<()> {
         if let Some(ref pad) = padding {
@@ -386,16 +625,10 @@ fn flush_write_buf(
             let acks = std::mem::take(pending_acks);
 
             if let Some(ref tx) = fw_tx {
-                // Sync enabled: send to force-write thread for fsync + ACK.
-                // Writer does NOT wait — immediately returns to process
-                // the next batch while the force-write thread handles sync.
                 if tx.send(ForceWriteRequest { fd, acks }).is_err() {
-                    tracing::error!("Force-write thread gone — entries will not be ACKed");
+                    tracing::error!("Force-write thread gone");
                 }
             } else {
-                // Sync disabled: ACK immediately after write_all.
-                // Data is in the kernel page cache — durable against process
-                // crash but not power loss.
                 for ack in acks {
                     let _ = ack.send(());
                 }
@@ -413,15 +646,9 @@ fn flush_write_buf(
 }
 
 // ---------------------------------------------------------------------------
-// Force-write thread — calls fdatasync, then ACKs entries
+// Force-write thread (StdEngine only)
 // ---------------------------------------------------------------------------
 
-/// Receives flush requests from the writer thread, batches them,
-/// calls `fdatasync()` once per batch, then ACKs all covered entries.
-///
-/// Natural batching: while this thread is blocked on fdatasync, the writer
-/// thread continues writing. All entries written during the sync are covered
-/// by the next sync cycle. This is how Java's ForceWriteThread works.
 fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
     let mut sync_count: u64 = 0;
     let mut total_sync_us: u64 = 0;
@@ -455,11 +682,8 @@ fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
             max_sync_us = elapsed_us;
         }
 
-        // Log stats every 100 syncs
         if sync_count % 100 == 0 {
             let avg_us = total_sync_us / sync_count;
-            let queue_depth = rx.try_iter().count(); // peek at pending
-            // Note: try_iter() consumes, so we can't use it. Just log what we know.
             tracing::info!(
                 "journal-sync: syncs={sync_count} avg={avg_us}µs max={max_sync_us}µs batch={entries_in_batch}"
             );
@@ -471,7 +695,6 @@ fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
     }
 }
 
-/// Call fdatasync on a raw file descriptor.
 fn sync_fd(fd: RawFd) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -487,7 +710,7 @@ fn sync_fd(fd: RawFd) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Journal file state — tracks the current .txn file
+// Journal file state
 // ---------------------------------------------------------------------------
 
 struct JournalFileState {
@@ -538,10 +761,7 @@ impl JournalFileState {
         Ok(())
     }
 
-    fn rotate(
-        &mut self,
-        config: &JournalConfig,
-    ) -> Result<(), StorageError> {
+    fn rotate(&mut self, config: &JournalConfig) -> Result<(), StorageError> {
         self.file = None;
         self.log_id += 1;
         self.position = 0;
@@ -550,10 +770,9 @@ impl JournalFileState {
 }
 
 // ---------------------------------------------------------------------------
-// Journal replay (unchanged — reads are always blocking)
+// Journal replay
 // ---------------------------------------------------------------------------
 
-/// Replay journal entries from disk for crash recovery.
 pub fn replay_journal<F>(
     journal_dir: &Path,
     last_mark: Option<format::LastMark>,

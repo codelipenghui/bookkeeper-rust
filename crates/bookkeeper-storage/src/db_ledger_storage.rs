@@ -19,7 +19,7 @@ use crate::ledger_storage::LedgerStorage;
 /// Matches Java's `BookKeeperConstants.CURRENT_DIR = "current"`.
 pub const CURRENT_DIR: &str = "current";
 
-const DEFAULT_WRITE_CACHE_SIZE: usize = 64 * 1024 * 1024; // 64MB
+const DEFAULT_WRITE_CACHE_SIZE: usize = 256 * 1024 * 1024; // 256MB
 const DEFAULT_READ_CACHE_SIZE: usize = 64 * 1024 * 1024;  // 64MB
 const READ_CACHE_SEGMENTS: usize = 4;
 const MAX_ENTRY_LOG_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
