@@ -1184,6 +1184,18 @@ async fn handle_connection(
     handle_connection_io(reader, writer, processor, max_frame_size).await;
 }
 
+/// Pipelined connection handler: reads frames concurrently with request
+/// processing. Each request is dispatched as a separate tokio task so
+/// journal writes from multiple in-flight requests can batch naturally.
+///
+/// Architecture:
+///   Reader loop → decode frame → spawn processing task
+///   Processing task → process_request().await → send response to writer channel
+///   Writer task → recv responses → write to socket
+///
+/// This matches Java BookKeeper's pipelined request processing where
+/// multiple add_entry requests can be in-flight simultaneously, allowing
+/// the journal's group commit to batch their writes.
 async fn handle_connection_io<R, W>(
     mut reader: R,
     mut writer: W,
@@ -1192,81 +1204,83 @@ async fn handle_connection_io<R, W>(
 )
 where
     R: tokio::io::AsyncReadExt + Unpin,
-    W: tokio::io::AsyncWriteExt + Unpin,
+    W: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
 {
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+
+    // Writer task: sends framed responses to the socket.
+    let writer_handle = tokio::spawn(async move {
+        let mut codec = BookieCodec::new(max_frame_size);
+        let mut out = BytesMut::with_capacity(256);
+        while let Some(response_bytes) = resp_rx.recv().await {
+            out.clear();
+            if codec.encode(response_bytes, &mut out).is_err() {
+                break;
+            }
+            if writer.write_all(&out).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Reader loop: decode frames, dispatch for concurrent processing.
     let mut codec = BookieCodec::new(max_frame_size);
     let mut buf = BytesMut::with_capacity(4096);
-    let mut out = BytesMut::with_capacity(256);
-    let mut is_v3: Option<bool> = None; // None = not yet detected
+    let mut is_v3: Option<bool> = None;
 
     loop {
-        // Try to decode a complete frame from the buffer first
         match codec.decode(&mut buf) {
             Ok(Some(frame)) => {
                 let frame_bytes = frame.freeze();
-                let response_bytes: Bytes;
 
-                // Auto-detect protocol version on first frame
                 let use_v3 = is_v3.unwrap_or_else(|| {
-                    // Try V3 protobuf decode first (Java client defaults to V3)
                     crate::v3_processor::try_decode_v3(&frame_bytes).is_some()
                 });
 
                 if use_v3 {
                     is_v3 = Some(true);
                     if let Some(v3_req) = crate::v3_processor::try_decode_v3(&frame_bytes) {
-                        let resp = crate::v3_processor::process_v3_request(&processor, v3_req).await;
-                        response_bytes = Bytes::from(resp);
+                        let proc = processor.clone();
+                        let tx = resp_tx.clone();
+                        tokio::spawn(async move {
+                            let resp = crate::v3_processor::process_v3_request(&proc, v3_req).await;
+                            let _ = tx.send(Bytes::from(resp)).await;
+                        });
                     } else {
-                        // Sticky V3 connection but frame failed to decode — close
                         break;
                     }
                 } else {
                     is_v3 = Some(false);
                     match decode_request(frame_bytes) {
                         Ok(req) => {
-                            let resp = processor.process_request(req).await;
-                            let resp_encoded = encode_response(&resp);
-                            response_bytes = resp_encoded.freeze();
+                            let proc = processor.clone();
+                            let tx = resp_tx.clone();
+                            tokio::spawn(async move {
+                                let resp = proc.process_request(req).await;
+                                let resp_encoded = encode_response(&resp);
+                                let _ = tx.send(resp_encoded.freeze()).await;
+                            });
                         }
                         Err(_) => {
-                            // Unknown or malformed request — close connection
                             break;
                         }
                     }
                 }
-
-                // Encode the response with length-prefix framing
-                out.clear();
-                if codec.encode(response_bytes, &mut out).is_ok() {
-                    if writer.write_all(&out).await.is_err() {
-                        break;
-                    }
-                } else {
-                    break;
-                }
             }
             Ok(None) => {
-                // Need more data — read from socket
                 match reader.read_buf(&mut buf).await {
-                    Ok(0) => {
-                        // EOF — client closed connection
-                        break;
-                    }
-                    Ok(_) => {
-                        // Got more data — loop back to decode
-                        continue;
-                    }
-                    Err(_) => {
-                        // Read error
-                        break;
-                    }
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
                 }
             }
             Err(_) => {
-                // Frame decode error (e.g. too large)
                 break;
             }
         }
     }
+
+    // Drop the sender so the writer task exits after draining.
+    drop(resp_tx);
+    let _ = writer_handle.await;
 }

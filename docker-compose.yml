@@ -76,10 +76,7 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
-  # Rust bookies — 3-node ensemble so Pulsar can run E=3/W=2/A=2 with
-  # real replication and auto-recovery. Each service uses the SAME
-  # image and config file; they differ only by hostname, advertised
-  # address (via `bk serve --advertised-address`), and volume mounts.
+  # Rust bookies — 2-node cluster with E=2/W=2/A=2.
   # ---------------------------------------------------------------------------
   rust-bookie-1:
     build:
@@ -102,6 +99,7 @@ services:
       - "8081:8080"
     environment:
       RUST_LOG: info
+      BOOKKEEPER_IO_ENGINE: std
     command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-1"]
     volumes:
       - bk1_data:/bk/data
@@ -129,6 +127,7 @@ services:
       - "8082:8080"
     environment:
       RUST_LOG: info
+      BOOKKEEPER_IO_ENGINE: std
     command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-2"]
     volumes:
       - bk2_data:/bk/data
@@ -140,38 +139,11 @@ services:
       retries: 10
       start_period: 10s
 
-  rust-bookie-3:
-    image: rust-bookie:latest
-    container_name: rustbk-rust-bookie-3
-    hostname: rust-bookie-3
-    restart: unless-stopped
-    depends_on:
-      zookeeper:
-        condition: service_healthy
-      bk-init:
-        condition: service_completed_successfully
-      rust-bookie-1:
-        condition: service_started
-    ports:
-      - "8083:8080"
-    environment:
-      RUST_LOG: info
-    command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-3"]
-    volumes:
-      - bk3_data:/bk/data
-      - bk3_journal:/bk/journal
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
-
   # ---------------------------------------------------------------------------
   # One-shot: initialize Pulsar cluster metadata (idempotent)
   # ---------------------------------------------------------------------------
   pulsar-init:
-    image: apachepulsar/pulsar:3.3.5
+    image: apachepulsar/pulsar:4.2.0
     container_name: rustbk-pulsar-init
     depends_on:
       zookeeper:
@@ -201,7 +173,7 @@ services:
   # Pulsar broker — uses Rust bookie for managed-ledger storage
   # ---------------------------------------------------------------------------
   pulsar-broker:
-    image: apachepulsar/pulsar:3.3.5
+    image: apachepulsar/pulsar:4.2.0
     container_name: rustbk-pulsar-broker
     hostname: pulsar-broker
     restart: unless-stopped
@@ -211,8 +183,6 @@ services:
       rust-bookie-1:
         condition: service_healthy
       rust-bookie-2:
-        condition: service_healthy
-      rust-bookie-3:
         condition: service_healthy
     ports:
       - "6650:6650"  # Pulsar native (binary) protocol
@@ -258,5 +228,3 @@ volumes:
   bk1_journal:
   bk2_data:
   bk2_journal:
-  bk3_data:
-  bk3_journal:

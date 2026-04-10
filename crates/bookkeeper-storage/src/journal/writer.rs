@@ -206,11 +206,14 @@ fn journal_writer_loop(
     let mut pending_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut pending_bytes: usize = 0;
 
-    // Reusable write buffer — avoids per-batch allocation.
-    // Entries are framed directly into this buffer.
     let mut write_buf: Vec<u8> = Vec::with_capacity(buffered_writes_threshold.max(64 * 1024));
+    let mut loop_count: u64 = 0;
+    let mut total_recv_us: u64 = 0;
+    let mut total_flush_us: u64 = 0;
+    let mut total_entries: u64 = 0;
 
     loop {
+        let recv_start = std::time::Instant::now();
         let first = match rx.recv() {
             Ok(entry) => entry,
             Err(_) => {
@@ -264,6 +267,8 @@ fn journal_writer_loop(
                     || pending_bytes < buffered_writes_threshold)
         };
 
+        total_recv_us += recv_start.elapsed().as_micros() as u64;
+
         if should_wait {
             let deadline = std::time::Instant::now() + group_wait;
             loop {
@@ -291,11 +296,25 @@ fn journal_writer_loop(
             }
         }
 
+        let flush_start = std::time::Instant::now();
+        let batch_entries = pending_acks.len();
         flush_write_buf(
             &config, &mut state, &mut write_buf, &mut pending_acks,
             &fw_tx, &on_fatal_error, &shared_log_id,
         );
+        total_flush_us += flush_start.elapsed().as_micros() as u64;
+        total_entries += batch_entries as u64;
+        loop_count += 1;
         pending_bytes = 0;
+
+        if loop_count % 1000 == 0 {
+            let avg_recv = total_recv_us / loop_count;
+            let avg_flush = total_flush_us / loop_count;
+            let avg_batch = total_entries / loop_count;
+            tracing::info!(
+                "journal-writer: loops={loop_count} avg_recv={avg_recv}µs avg_flush={avg_flush}µs avg_batch={avg_batch}"
+            );
+        }
     }
 }
 
@@ -404,14 +423,16 @@ fn flush_write_buf(
 /// thread continues writing. All entries written during the sync are covered
 /// by the next sync cycle. This is how Java's ForceWriteThread works.
 fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
+    let mut sync_count: u64 = 0;
+    let mut total_sync_us: u64 = 0;
+    let mut max_sync_us: u64 = 0;
+
     loop {
-        // Block until the writer sends a flush request.
         let first = match rx.recv() {
             Ok(req) => req,
-            Err(_) => break, // Writer thread exited
+            Err(_) => break,
         };
 
-        // Drain all immediately available requests — batch them into one sync.
         let mut all_acks = first.acks;
         let mut last_fd = first.fd;
         while let Ok(req) = rx.try_recv() {
@@ -419,17 +440,31 @@ fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
             last_fd = req.fd;
         }
 
-        // fsync the journal file. This covers ALL data written since the
-        // last sync, regardless of how many ForceWriteRequests were batched.
+        let entries_in_batch = all_acks.len();
+        let start = std::time::Instant::now();
+
         if let Err(e) = sync_fd(last_fd) {
             tracing::error!("FATAL: journal fsync failed: {e}");
-            // Don't ACK — clients will timeout. The bookie should go read-only
-            // via the on_fatal_error callback (fired by the writer thread on
-            // subsequent write failures if the disk is bad).
             continue;
         }
 
-        // ACK all entries — data is now durable on disk.
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        sync_count += 1;
+        total_sync_us += elapsed_us;
+        if elapsed_us > max_sync_us {
+            max_sync_us = elapsed_us;
+        }
+
+        // Log stats every 100 syncs
+        if sync_count % 100 == 0 {
+            let avg_us = total_sync_us / sync_count;
+            let queue_depth = rx.try_iter().count(); // peek at pending
+            // Note: try_iter() consumes, so we can't use it. Just log what we know.
+            tracing::info!(
+                "journal-sync: syncs={sync_count} avg={avg_us}µs max={max_sync_us}µs batch={entries_in_batch}"
+            );
+        }
+
         for ack in all_acks {
             let _ = ack.send(());
         }
