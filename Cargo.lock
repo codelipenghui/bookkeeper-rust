@@ -679,6 +679,7 @@ dependencies = [
  "bookkeeper-protocol",
  "bytes",
  "criterion",
+ "crossbeam-channel",
  "dashmap",
  "io-uring",
  "lazy_static",

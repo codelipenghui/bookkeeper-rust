@@ -37,6 +37,7 @@ rand = "0.8"
 rocksdb = "0.22"
 parking_lot = "0.12"
 dashmap = "6"
+crossbeam-channel = "0.5"
 async-trait = "0.1"
 
 bytes = "1"

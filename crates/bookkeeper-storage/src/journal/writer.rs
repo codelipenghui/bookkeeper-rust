@@ -3,8 +3,10 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crossbeam_channel as mpsc;
 
 use super::format::{self, JournalHeader, calculate_padding};
 use super::metrics;
@@ -55,7 +57,7 @@ pub struct JournalConfig {
 pub type OnFatalError = Box<dyn Fn(io::Error) + Send + 'static>;
 
 pub struct Journal {
-    tx: mpsc::SyncSender<JournalEntry>,
+    tx: mpsc::Sender<JournalEntry>,
     _threads: Vec<std::thread::JoinHandle<()>>,
     master_key_cache: std::sync::Mutex<HashSet<i64>>,
     current_log_id: Arc<std::sync::atomic::AtomicU64>,
@@ -68,7 +70,7 @@ impl Journal {
         on_fatal_error: Option<OnFatalError>,
     ) -> Self {
         let bound = MAX_QUEUE_MEMORY / 1024;
-        let (tx, rx) = mpsc::sync_channel(bound);
+        let (tx, rx) = mpsc::bounded(bound);
 
         let current_log_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let shared_log_id = current_log_id.clone();
@@ -95,7 +97,7 @@ impl Journal {
             }
         } else if config.sync_data {
             // Mode 2: two threads (writer + blocking force-write)
-            let (fw_tx, fw_rx) = mpsc::channel::<ForceWriteRequest>();
+            let (fw_tx, fw_rx) = mpsc::unbounded::<ForceWriteRequest>();
 
             let sync_thread = std::thread::Builder::new()
                 .name("journal-sync".into())
