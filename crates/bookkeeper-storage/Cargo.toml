@@ -13,6 +13,8 @@ prost = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
 rocksdb = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }

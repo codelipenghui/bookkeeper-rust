@@ -4,9 +4,10 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::format::{self, JournalHeader, calculate_padding};
+use super::metrics;
 use crate::StorageError;
 
 /// Meta-entry ID for master key journaling.
@@ -19,6 +20,7 @@ const MAX_QUEUE_MEMORY: usize = 32 * 1024 * 1024;
 struct JournalEntry {
     data: Vec<u8>,
     ack_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    enqueue_time: Instant,
 }
 
 /// Configuration for the journal writer.
@@ -131,14 +133,20 @@ impl Journal {
 
     pub async fn log_add_entry(&self, data: &[u8]) -> Result<(), StorageError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let enqueue_time = Instant::now();
+        metrics::JOURNAL_QUEUE_SIZE.inc();
         self.tx
             .send(JournalEntry {
                 data: data.to_vec(),
                 ack_tx: Some(ack_tx),
+                enqueue_time,
             })
-            .map_err(|_| StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe, "journal writer closed",
-            )))?;
+            .map_err(|_| {
+                metrics::JOURNAL_QUEUE_SIZE.dec();
+                StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe, "journal writer closed",
+                ))
+            })?;
         ack_rx.await.map_err(|_| StorageError::Io(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe, "journal ack lost",
         )))
@@ -163,9 +171,11 @@ impl Journal {
         entry.extend_from_slice(&(master_key.len() as i32).to_be_bytes());
         entry.extend_from_slice(master_key);
 
+        metrics::JOURNAL_QUEUE_SIZE.inc();
         let _ = self.tx.send(JournalEntry {
             data: entry,
             ack_tx: None,
+            enqueue_time: Instant::now(),
         });
 
         Ok(())
@@ -184,6 +194,8 @@ impl Journal {
 struct ForceWriteRequest {
     fd: RawFd,
     acks: Vec<tokio::sync::oneshot::Sender<()>>,
+    /// Earliest enqueue time among entries in this batch (for e2e latency).
+    oldest_enqueue_time: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +210,51 @@ fn journal_uring_loop(
     shared_log_id: Arc<std::sync::atomic::AtomicU64>,
 ) {
     use io_uring::{opcode, types, IoUring};
+
+    // Helper: complete an in-flight fsync from a CQE, recording metrics.
+    // Returns true if the CQE was consumed (fsync completed), false if no CQE available.
+    #[inline]
+    fn try_complete_fsync(
+        ring: &mut IoUring,
+        syncing_acks: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+        syncing_oldest_enqueue: &mut Option<Instant>,
+        syncing_fw_count: &mut u64,
+        fsync_start: &mut Option<Instant>,
+        fsync_in_flight: &mut bool,
+        on_fatal_error: &Option<OnFatalError>,
+    ) -> bool {
+        if let Some(cqe) = ring.completion().next() {
+            // Record JOURNAL_SYNC latency
+            if let Some(start) = fsync_start.take() {
+                metrics::JOURNAL_SYNC.observe(start.elapsed().as_secs_f64());
+            }
+            if cqe.result() < 0 {
+                tracing::error!("FATAL: journal fsync failed: {}",
+                    io::Error::from_raw_os_error(-cqe.result()));
+                if let Some(ref cb) = on_fatal_error {
+                    cb(io::Error::from_raw_os_error(-cqe.result()));
+                }
+                syncing_acks.clear();
+            } else {
+                // Record JOURNAL_ADD_ENTRY (e2e) for all acked entries
+                if let Some(oldest) = syncing_oldest_enqueue.take() {
+                    metrics::JOURNAL_ADD_ENTRY.observe(oldest.elapsed().as_secs_f64());
+                }
+                // Record JOURNAL_FORCE_WRITE_GROUPING_COUNT
+                if *syncing_fw_count > 0 {
+                    metrics::JOURNAL_FORCE_WRITE_GROUPING_COUNT.observe(*syncing_fw_count as f64);
+                }
+                for ack in syncing_acks.drain(..) {
+                    let _ = ack.send(());
+                }
+            }
+            *syncing_fw_count = 0;
+            *fsync_in_flight = false;
+            true
+        } else {
+            false
+        }
+    }
 
     fs::create_dir_all(&config.journal_dir).ok();
 
@@ -216,63 +273,40 @@ fn journal_uring_loop(
     let mut write_buf: Vec<u8> = Vec::with_capacity(buffered_writes_threshold.max(64 * 1024));
     let mut pending_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut pending_bytes: usize = 0;
+    // Track the oldest enqueue time of pending (not-yet-syncing) entries.
+    let mut pending_oldest_enqueue: Option<Instant> = None;
 
     // Acks waiting for the in-flight fsync to complete.
     let mut syncing_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+    let mut syncing_oldest_enqueue: Option<Instant> = None;
+    let mut syncing_fw_count: u64 = 0; // force-write requests grouped in current fsync
     let mut fsync_in_flight = false;
-
-    // Instrumentation
-    let mut loop_count: u64 = 0;
-    let mut total_entries: u64 = 0;
-    let mut total_syncs: u64 = 0;
-    let mut total_sync_us: u64 = 0;
-    let mut total_acked: u64 = 0;
+    let mut fsync_start: Option<Instant> = None;
 
     loop {
-        // If fsync is in flight, don't block — poll for entries and CQE.
+        // If fsync is in flight, don't block -- poll for entries and CQE.
         let first = if fsync_in_flight {
             // Non-blocking: try to get entries while waiting for fsync
             match rx.try_recv() {
                 Ok(entry) => Some(entry),
                 Err(mpsc::TryRecvError::Empty) => {
                     // No entries available. Check if fsync completed.
-                    if let Some(cqe) = ring.completion().next() {
-                        if cqe.result() < 0 {
-                            tracing::error!("FATAL: journal fsync failed: {}",
-                                io::Error::from_raw_os_error(-cqe.result()));
-                            if let Some(ref cb) = on_fatal_error {
-                                cb(io::Error::from_raw_os_error(-cqe.result()));
-                            }
-                            syncing_acks.clear();
-                        } else {
-                            // Fsync complete — ACK all entries
-                            for ack in syncing_acks.drain(..) {
-                                let _ = ack.send(());
-                            }
-                        }
-                        fsync_in_flight = false;
-                    }
+                    try_complete_fsync(
+                        &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
+                        &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
+                        &on_fatal_error,
+                    );
                     // If fsync still in flight and no entries, do a short wait
                     if fsync_in_flight {
                         match rx.recv_timeout(Duration::from_micros(100)) {
                             Ok(entry) => Some(entry),
                             Err(_) => {
                                 // Check CQE again
-                                if let Some(cqe) = ring.completion().next() {
-                                    if cqe.result() < 0 {
-                                        tracing::error!("FATAL: journal fsync failed: {}",
-                                            io::Error::from_raw_os_error(-cqe.result()));
-                                        if let Some(ref cb) = on_fatal_error {
-                                            cb(io::Error::from_raw_os_error(-cqe.result()));
-                                        }
-                                        syncing_acks.clear();
-                                    } else {
-                                        for ack in syncing_acks.drain(..) {
-                                            let _ = ack.send(());
-                                        }
-                                    }
-                                    fsync_in_flight = false;
-                                }
+                                try_complete_fsync(
+                                    &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
+                                    &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
+                                    &on_fatal_error,
+                                );
                                 continue;
                             }
                         }
@@ -281,38 +315,50 @@ fn journal_uring_loop(
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // Channel closed — wait for in-flight fsync then exit
+                    // Channel closed -- wait for in-flight fsync then exit
                     if fsync_in_flight {
                         ring.submit_and_wait(1).ok();
-                        if let Some(cqe) = ring.completion().next() {
-                            if cqe.result() >= 0 {
-                                for ack in syncing_acks.drain(..) {
-                                    let _ = ack.send(());
-                                }
-                            }
-                        }
+                        try_complete_fsync(
+                            &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
+                            &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
+                            &on_fatal_error,
+                        );
                     }
                     break;
                 }
             }
         } else {
-            // No fsync in flight — block for first entry
+            // No fsync in flight -- block for first entry
             match rx.recv() {
                 Ok(entry) => Some(entry),
                 Err(_) => break,
             }
         };
 
+        // Process the first entry: record queue latency, track enqueue time
         if let Some(entry) = first {
+            let dequeue_time = Instant::now();
+            metrics::JOURNAL_QUEUE_LATENCY.observe(entry.enqueue_time.elapsed().as_secs_f64());
+            metrics::JOURNAL_QUEUE_SIZE.dec();
+            if pending_oldest_enqueue.is_none() {
+                pending_oldest_enqueue = Some(entry.enqueue_time);
+            }
             frame_into_buf(&mut write_buf, &entry.data);
             pending_bytes += 4 + entry.data.len();
             if let Some(ack) = entry.ack_tx {
                 pending_acks.push(ack);
             }
+            // Start process time tracking from when first entry was dequeued
+            let _ = dequeue_time; // used below via process_start
         }
 
         // Drain more entries
         while let Ok(entry) = rx.try_recv() {
+            metrics::JOURNAL_QUEUE_LATENCY.observe(entry.enqueue_time.elapsed().as_secs_f64());
+            metrics::JOURNAL_QUEUE_SIZE.dec();
+            if pending_oldest_enqueue.is_none() {
+                pending_oldest_enqueue = Some(entry.enqueue_time);
+            }
             frame_into_buf(&mut write_buf, &entry.data);
             pending_bytes += 4 + entry.data.len();
             if let Some(ack) = entry.ack_tx {
@@ -324,14 +370,20 @@ fn journal_uring_loop(
             continue;
         }
 
+        let process_start = Instant::now();
+
+        // Determine flush trigger reason
+        let entries_threshold_met = buffered_entries_threshold > 0
+            && pending_acks.len() >= buffered_entries_threshold;
+        let bytes_threshold_met = buffered_writes_threshold > 0
+            && pending_bytes >= buffered_writes_threshold;
+
         // Group wait (always wait when sync enabled to batch more per fsync)
-        let should_wait = (buffered_entries_threshold == 0
-                || pending_acks.len() < buffered_entries_threshold)
-            && (buffered_writes_threshold == 0
-                || pending_bytes < buffered_writes_threshold);
+        let should_wait = !entries_threshold_met && !bytes_threshold_met;
 
         if should_wait && !fsync_in_flight {
-            let deadline = std::time::Instant::now() + group_wait;
+            let deadline = Instant::now() + group_wait;
+            let mut timed_out = false;
             loop {
                 if (buffered_entries_threshold > 0
                     && pending_acks.len() >= buffered_entries_threshold)
@@ -340,21 +392,43 @@ fn journal_uring_loop(
                 {
                     break;
                 }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
+                    timed_out = true;
                     break;
                 }
                 match rx.recv_timeout(remaining) {
                     Ok(entry) => {
+                        metrics::JOURNAL_QUEUE_LATENCY.observe(entry.enqueue_time.elapsed().as_secs_f64());
+                        metrics::JOURNAL_QUEUE_SIZE.dec();
+                        if pending_oldest_enqueue.is_none() {
+                            pending_oldest_enqueue = Some(entry.enqueue_time);
+                        }
                         frame_into_buf(&mut write_buf, &entry.data);
                         pending_bytes += 4 + entry.data.len();
                         if let Some(ack) = entry.ack_tx {
                             pending_acks.push(ack);
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        timed_out = true;
+                        break;
+                    }
                 }
             }
+            // Record flush trigger reason after group wait
+            if timed_out {
+                metrics::JOURNAL_NUM_FLUSH_MAX_WAIT.inc();
+            } else if buffered_writes_threshold > 0
+                && pending_bytes >= buffered_writes_threshold
+            {
+                metrics::JOURNAL_NUM_FLUSH_MAX_OUTSTANDING_BYTES.inc();
+            }
+        } else if bytes_threshold_met {
+            metrics::JOURNAL_NUM_FLUSH_MAX_OUTSTANDING_BYTES.inc();
+        } else if !should_wait {
+            // entries threshold met -- still record as max outstanding bytes if applicable
+            // (Java counts this as threshold-triggered flush)
         }
 
         // Write entries to file
@@ -363,12 +437,14 @@ fn journal_uring_loop(
             write_buf.clear();
             pending_acks.clear();
             pending_bytes = 0;
+            pending_oldest_enqueue = None;
             continue;
         }
         shared_log_id.store(state.log_id, std::sync::atomic::Ordering::Relaxed);
 
-        let batch_size = write_buf.len() as u64;
-        if state.position > 0 && state.position + batch_size > config.max_file_size {
+        let batch_bytes = write_buf.len() as u64;
+        let batch_entries = pending_acks.len();
+        if state.position > 0 && state.position + batch_bytes > config.max_file_size {
             if let Err(e) = state.rotate(&config) {
                 tracing::warn!("Journal rotation error: {e}");
             }
@@ -382,6 +458,9 @@ fn journal_uring_loop(
         };
 
         let file = state.file.as_mut().unwrap();
+
+        // Measure flush (write_all) latency
+        let flush_start = Instant::now();
         let write_result = (|| -> io::Result<()> {
             if let Some(ref pad) = padding {
                 file.write_all(pad)?;
@@ -389,38 +468,48 @@ fn journal_uring_loop(
             file.write_all(&write_buf)?;
             Ok(())
         })();
+        let flush_elapsed = flush_start.elapsed();
 
         match write_result {
             Ok(()) => {
+                // Record flush metrics
+                metrics::JOURNAL_FLUSH_LATENCY.observe(flush_elapsed.as_secs_f64());
+                metrics::JOURNAL_FORCE_WRITE_BATCH_ENTRIES.observe(batch_entries as f64);
+                metrics::JOURNAL_FORCE_WRITE_BATCH_BYTES.observe(batch_bytes as f64);
+                metrics::JOURNAL_WRITE_BYTES.inc_by(batch_bytes);
+
                 if let Some(ref pad) = padding {
                     state.position += pad.len() as u64;
                 }
-                state.position += batch_size;
+                state.position += batch_bytes;
 
                 // If a previous fsync completed, check CQE
                 if fsync_in_flight {
-                    if let Some(cqe) = ring.completion().next() {
-                        if cqe.result() < 0 {
-                            tracing::error!("FATAL: journal fsync failed: {}",
-                                io::Error::from_raw_os_error(-cqe.result()));
-                            if let Some(ref cb) = on_fatal_error {
-                                cb(io::Error::from_raw_os_error(-cqe.result()));
-                            }
-                            syncing_acks.clear();
-                        } else {
-                            for ack in syncing_acks.drain(..) {
-                                let _ = ack.send(());
-                            }
-                        }
-                        fsync_in_flight = false;
-                    }
+                    try_complete_fsync(
+                        &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
+                        &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
+                        &on_fatal_error,
+                    );
                 }
 
                 // Move pending acks to syncing (they'll be ACK'd when fsync completes)
-                let batch_size = pending_acks.len() as u64;
-                total_entries += batch_size;
-                total_acked += batch_size;
                 syncing_acks.append(&mut pending_acks);
+                if syncing_oldest_enqueue.is_none() {
+                    syncing_oldest_enqueue = pending_oldest_enqueue.take();
+                } else {
+                    // Keep the older of the two
+                    if let Some(pe) = pending_oldest_enqueue.take() {
+                        if let Some(ref se) = syncing_oldest_enqueue {
+                            if pe < *se {
+                                syncing_oldest_enqueue = Some(pe);
+                            }
+                        }
+                    }
+                }
+                syncing_fw_count += 1;
+
+                // Record JOURNAL_PROCESS_TIME_LATENCY
+                metrics::JOURNAL_PROCESS_TIME_LATENCY.observe(process_start.elapsed().as_secs_f64());
 
                 // Submit FSYNC if no fsync is in flight
                 if !fsync_in_flight {
@@ -437,17 +526,7 @@ fn journal_uring_loop(
                         tracing::error!("journal-uring: submit failed: {e}");
                     }
                     fsync_in_flight = true;
-                    total_syncs += 1;
-                }
-
-                loop_count += 1;
-                if loop_count % 1000 == 0 {
-                    let avg_batch = if loop_count > 0 { total_entries / loop_count } else { 0 };
-                    let avg_acked = if total_syncs > 0 { total_acked / total_syncs } else { 0 };
-                    tracing::info!(
-                        "journal-uring: loops={loop_count} entries={total_entries} syncs={total_syncs} \
-                         avg_batch={avg_batch} avg_acked_per_sync={avg_acked} pending_sync={}", syncing_acks.len()
-                    );
+                    fsync_start = Some(Instant::now());
                 }
             }
             Err(e) => {
@@ -456,6 +535,7 @@ fn journal_uring_loop(
                     cb(io::Error::new(e.kind(), format!("journal write: {e}")));
                 }
                 pending_acks.clear();
+                pending_oldest_enqueue = None;
             }
         }
         write_buf.clear();
@@ -483,26 +563,31 @@ fn journal_writer_loop(
     let mut pending_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut pending_bytes: usize = 0;
     let mut write_buf: Vec<u8> = Vec::with_capacity(buffered_writes_threshold.max(64 * 1024));
-
-    let mut loop_count: u64 = 0;
-    let mut total_recv_us: u64 = 0;
-    let mut total_flush_us: u64 = 0;
-    let mut total_entries: u64 = 0;
+    // Track the oldest enqueue time of pending entries for e2e latency.
+    let mut pending_oldest_enqueue: Option<Instant> = None;
 
     loop {
-        let recv_start = std::time::Instant::now();
         let first = match rx.recv() {
             Ok(entry) => entry,
             Err(_) => {
                 if !write_buf.is_empty() {
                     flush_write_buf(
                         &config, &mut state, &mut write_buf, &mut pending_acks,
+                        &mut pending_oldest_enqueue,
                         &fw_tx, &on_fatal_error, &shared_log_id,
+                        FlushTrigger::EmptyQueue,
                     );
                 }
                 break;
             }
         };
+
+        // Record queue latency for first entry
+        metrics::JOURNAL_QUEUE_LATENCY.observe(first.enqueue_time.elapsed().as_secs_f64());
+        metrics::JOURNAL_QUEUE_SIZE.dec();
+        if pending_oldest_enqueue.is_none() {
+            pending_oldest_enqueue = Some(first.enqueue_time);
+        }
 
         frame_into_buf(&mut write_buf, &first.data);
         pending_bytes += 4 + first.data.len();
@@ -511,6 +596,11 @@ fn journal_writer_loop(
         }
 
         while let Ok(entry) = rx.try_recv() {
+            metrics::JOURNAL_QUEUE_LATENCY.observe(entry.enqueue_time.elapsed().as_secs_f64());
+            metrics::JOURNAL_QUEUE_SIZE.dec();
+            if pending_oldest_enqueue.is_none() {
+                pending_oldest_enqueue = Some(entry.enqueue_time);
+            }
             frame_into_buf(&mut write_buf, &entry.data);
             pending_bytes += 4 + entry.data.len();
             if let Some(ack) = entry.ack_tx {
@@ -518,67 +608,79 @@ fn journal_writer_loop(
             }
         }
 
-        total_recv_us += recv_start.elapsed().as_micros() as u64;
+        // Determine flush trigger before group wait
+        let entries_threshold_met = buffered_entries_threshold > 0
+            && pending_acks.len() >= buffered_entries_threshold;
+        let bytes_threshold_met = buffered_writes_threshold > 0
+            && pending_bytes >= buffered_writes_threshold;
 
         let should_wait = if fw_tx.is_some() {
-            (buffered_entries_threshold == 0
-                || pending_acks.len() < buffered_entries_threshold)
-                && (buffered_writes_threshold == 0
-                    || pending_bytes < buffered_writes_threshold)
+            !entries_threshold_met && !bytes_threshold_met
         } else {
-            pending_acks.len() > 1
-                && (buffered_entries_threshold == 0
-                    || pending_acks.len() < buffered_entries_threshold)
-                && (buffered_writes_threshold == 0
-                    || pending_bytes < buffered_writes_threshold)
+            pending_acks.len() > 1 && !entries_threshold_met && !bytes_threshold_met
         };
 
+        let flush_trigger;
         if should_wait {
-            let deadline = std::time::Instant::now() + group_wait;
+            let deadline = Instant::now() + group_wait;
+            let mut timed_out = false;
             loop {
-                if (buffered_entries_threshold > 0
-                    && pending_acks.len() >= buffered_entries_threshold)
-                    || (buffered_writes_threshold > 0
-                        && pending_bytes >= buffered_writes_threshold)
-                {
+                let ent_met = buffered_entries_threshold > 0
+                    && pending_acks.len() >= buffered_entries_threshold;
+                let bytes_met = buffered_writes_threshold > 0
+                    && pending_bytes >= buffered_writes_threshold;
+                if ent_met || bytes_met {
                     break;
                 }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
+                    timed_out = true;
                     break;
                 }
                 match rx.recv_timeout(remaining) {
                     Ok(entry) => {
+                        metrics::JOURNAL_QUEUE_LATENCY.observe(entry.enqueue_time.elapsed().as_secs_f64());
+                        metrics::JOURNAL_QUEUE_SIZE.dec();
+                        if pending_oldest_enqueue.is_none() {
+                            pending_oldest_enqueue = Some(entry.enqueue_time);
+                        }
                         frame_into_buf(&mut write_buf, &entry.data);
                         pending_bytes += 4 + entry.data.len();
                         if let Some(ack) = entry.ack_tx {
                             pending_acks.push(ack);
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        timed_out = true;
+                        break;
+                    }
                 }
             }
+            if timed_out {
+                flush_trigger = FlushTrigger::MaxWait;
+            } else if buffered_writes_threshold > 0
+                && pending_bytes >= buffered_writes_threshold
+            {
+                flush_trigger = FlushTrigger::MaxOutstandingBytes;
+            } else {
+                flush_trigger = FlushTrigger::MaxWait;
+            }
+        } else if fw_tx.is_none() && pending_acks.len() <= 1 {
+            // No-sync mode with single entry: empty queue trigger
+            flush_trigger = FlushTrigger::EmptyQueue;
+        } else if bytes_threshold_met {
+            flush_trigger = FlushTrigger::MaxOutstandingBytes;
+        } else {
+            flush_trigger = FlushTrigger::MaxWait;
         }
 
-        let flush_start = std::time::Instant::now();
-        let batch_entries = pending_acks.len();
         flush_write_buf(
             &config, &mut state, &mut write_buf, &mut pending_acks,
+            &mut pending_oldest_enqueue,
             &fw_tx, &on_fatal_error, &shared_log_id,
+            flush_trigger,
         );
-        total_flush_us += flush_start.elapsed().as_micros() as u64;
-        total_entries += batch_entries as u64;
-        loop_count += 1;
         pending_bytes = 0;
-
-        if loop_count % 1000 == 0 {
-            let avg_recv = total_recv_us / loop_count;
-            let avg_flush = total_flush_us / loop_count;
-            let avg_batch = total_entries / loop_count;
-            tracing::info!(
-                "journal-writer: loops={loop_count} avg_recv={avg_recv}µs avg_flush={avg_flush}µs avg_batch={avg_batch}"
-            );
-        }
     }
 }
 
@@ -588,30 +690,51 @@ fn frame_into_buf(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
 }
 
+/// Flush trigger reason, for recording the appropriate counter metric.
+#[derive(Debug, Clone, Copy)]
+enum FlushTrigger {
+    MaxWait,
+    MaxOutstandingBytes,
+    EmptyQueue,
+}
+
 /// Write buffered entries, then ACK or forward to force-write thread.
 fn flush_write_buf(
     config: &JournalConfig,
     state: &mut JournalFileState,
     write_buf: &mut Vec<u8>,
     pending_acks: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+    pending_oldest_enqueue: &mut Option<Instant>,
     fw_tx: &Option<mpsc::Sender<ForceWriteRequest>>,
     on_fatal_error: &Option<OnFatalError>,
     shared_log_id: &Arc<std::sync::atomic::AtomicU64>,
+    flush_trigger: FlushTrigger,
 ) {
     if write_buf.is_empty() {
         return;
+    }
+
+    let process_start = Instant::now();
+
+    // Record flush trigger counter
+    match flush_trigger {
+        FlushTrigger::MaxWait => metrics::JOURNAL_NUM_FLUSH_MAX_WAIT.inc(),
+        FlushTrigger::MaxOutstandingBytes => metrics::JOURNAL_NUM_FLUSH_MAX_OUTSTANDING_BYTES.inc(),
+        FlushTrigger::EmptyQueue => metrics::JOURNAL_NUM_FLUSH_EMPTY_QUEUE.inc(),
     }
 
     if let Err(e) = state.ensure_open(config) {
         tracing::warn!("Journal open error: {e}");
         write_buf.clear();
         pending_acks.clear();
+        *pending_oldest_enqueue = None;
         return;
     }
     shared_log_id.store(state.log_id, std::sync::atomic::Ordering::Relaxed);
 
-    let batch_size = write_buf.len() as u64;
-    if state.position > 0 && state.position + batch_size > config.max_file_size {
+    let batch_bytes = write_buf.len() as u64;
+    let batch_entries = pending_acks.len();
+    if state.position > 0 && state.position + batch_bytes > config.max_file_size {
         if let Err(e) = state.rotate(config) {
             tracing::warn!("Journal rotation error: {e}");
         }
@@ -625,6 +748,9 @@ fn flush_write_buf(
     };
 
     let file = state.file.as_mut().unwrap();
+
+    // Measure flush (write_all) latency
+    let flush_start = Instant::now();
     let write_result = (|| -> io::Result<()> {
         if let Some(ref pad) = padding {
             file.write_all(pad)?;
@@ -632,22 +758,42 @@ fn flush_write_buf(
         file.write_all(write_buf)?;
         Ok(())
     })();
+    let flush_elapsed = flush_start.elapsed();
 
     match write_result {
         Ok(()) => {
+            // Record flush metrics
+            metrics::JOURNAL_FLUSH_LATENCY.observe(flush_elapsed.as_secs_f64());
+            metrics::JOURNAL_FORCE_WRITE_BATCH_ENTRIES.observe(batch_entries as f64);
+            metrics::JOURNAL_FORCE_WRITE_BATCH_BYTES.observe(batch_bytes as f64);
+            metrics::JOURNAL_WRITE_BYTES.inc_by(batch_bytes);
+
             if let Some(ref pad) = padding {
                 state.position += pad.len() as u64;
             }
-            state.position += batch_size;
+            state.position += batch_bytes;
 
             let fd = file.as_raw_fd();
             let acks = std::mem::take(pending_acks);
+            let oldest_enqueue = pending_oldest_enqueue.take().unwrap_or_else(Instant::now);
+
+            // Record JOURNAL_PROCESS_TIME_LATENCY (dequeue to finish processing)
+            metrics::JOURNAL_PROCESS_TIME_LATENCY.observe(process_start.elapsed().as_secs_f64());
 
             if let Some(ref tx) = fw_tx {
-                if tx.send(ForceWriteRequest { fd, acks }).is_err() {
+                // Mode 2: forward to force-write thread for sync
+                metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.inc();
+                if tx.send(ForceWriteRequest {
+                    fd,
+                    acks,
+                    oldest_enqueue_time: oldest_enqueue,
+                }).is_err() {
                     tracing::error!("Force-write thread gone");
+                    metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
                 }
             } else {
+                // Mode 3: no sync -- ACK immediately, record e2e latency
+                metrics::JOURNAL_ADD_ENTRY.observe(oldest_enqueue.elapsed().as_secs_f64());
                 for ack in acks {
                     let _ = ack.send(());
                 }
@@ -659,6 +805,7 @@ fn flush_write_buf(
                 callback(io::Error::new(e.kind(), format!("journal write: {e}")));
             }
             pending_acks.clear();
+            *pending_oldest_enqueue = None;
         }
     }
     write_buf.clear();
@@ -669,44 +816,40 @@ fn flush_write_buf(
 // ---------------------------------------------------------------------------
 
 fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
-    let mut sync_count: u64 = 0;
-    let mut total_sync_us: u64 = 0;
-    let mut max_sync_us: u64 = 0;
-
     loop {
         let first = match rx.recv() {
             Ok(req) => req,
             Err(_) => break,
         };
+        metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
 
         let mut all_acks = first.acks;
         let mut last_fd = first.fd;
+        let mut oldest_enqueue = first.oldest_enqueue_time;
+        let mut grouped_count: u64 = 1; // count of ForceWriteRequests grouped
+
         while let Ok(req) = rx.try_recv() {
+            metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
             all_acks.extend(req.acks);
             last_fd = req.fd;
+            // Keep the oldest enqueue time across all grouped requests
+            if req.oldest_enqueue_time < oldest_enqueue {
+                oldest_enqueue = req.oldest_enqueue_time;
+            }
+            grouped_count += 1;
         }
 
-        let entries_in_batch = all_acks.len();
-        let start = std::time::Instant::now();
-
+        let sync_start = Instant::now();
         if let Err(e) = sync_fd(last_fd) {
             tracing::error!("FATAL: journal fsync failed: {e}");
             continue;
         }
+        let sync_elapsed = sync_start.elapsed();
 
-        let elapsed_us = start.elapsed().as_micros() as u64;
-        sync_count += 1;
-        total_sync_us += elapsed_us;
-        if elapsed_us > max_sync_us {
-            max_sync_us = elapsed_us;
-        }
-
-        if sync_count % 100 == 0 {
-            let avg_us = total_sync_us / sync_count;
-            tracing::info!(
-                "journal-sync: syncs={sync_count} avg={avg_us}µs max={max_sync_us}µs batch={entries_in_batch}"
-            );
-        }
+        // Record metrics
+        metrics::JOURNAL_SYNC.observe(sync_elapsed.as_secs_f64());
+        metrics::JOURNAL_ADD_ENTRY.observe(oldest_enqueue.elapsed().as_secs_f64());
+        metrics::JOURNAL_FORCE_WRITE_GROUPING_COUNT.observe(grouped_count as f64);
 
         for ack in all_acks {
             let _ = ack.send(());
@@ -764,6 +907,7 @@ impl JournalFileState {
         if self.file.is_some() {
             return Ok(());
         }
+        let creation_start = Instant::now();
         let path = config.journal_dir.join(format!("{:x}.txn", self.log_id));
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -777,6 +921,7 @@ impl JournalFileState {
 
         self.position = header_bytes.len() as u64;
         self.file = Some(file);
+        metrics::JOURNAL_CREATION_LATENCY.observe(creation_start.elapsed().as_secs_f64());
         Ok(())
     }
 

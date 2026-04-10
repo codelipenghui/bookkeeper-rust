@@ -265,6 +265,8 @@ pub fn register_metrics() {
     reg!(ELECTION_ATTEMPTS);
     // Server
     reg!(BOOKIE_STATE);
+    // Journal (defined in bookkeeper-storage crate)
+    bookkeeper_storage::journal::metrics::register_journal_metrics(&REGISTRY);
 }
 
 /// Encode all metrics as Prometheus text format.
