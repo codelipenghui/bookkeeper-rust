@@ -435,10 +435,8 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Initialize structured logging.
-    // Default: INFO level. Override via RUST_LOG env var (e.g., RUST_LOG=debug).
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -447,6 +445,30 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    // Determine tokio worker thread count. For the serve command, read
+    // serverNumIOThreads from the config file. For other commands, use
+    // the default (number of CPU cores).
+    let num_threads = match &cli.command {
+        Commands::Serve { conf, .. } => {
+            let config = conf.as_ref().map(|path| {
+                bookkeeper_config::server::ServerConfig::from_file(std::path::Path::new(path))
+            });
+            match config {
+                Some(Ok(c)) if c.server_num_io_threads > 0 => c.server_num_io_threads,
+                _ => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            }
+        }
+        _ => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_threads)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    rt.block_on(async {
     let result = match cli.command {
         Commands::Initnewcluster { zk, ledger_root } => {
             cmd_initnewcluster(&zk, &ledger_root).await
@@ -547,6 +569,7 @@ async fn main() {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
+    }); // rt.block_on
 }
 
 async fn cmd_initnewcluster(zk: &str, ledger_root: &str) -> Result<(), Box<dyn std::error::Error>> {

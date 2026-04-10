@@ -44,6 +44,12 @@ pub struct ServerConfig {
     pub db_storage_rocksdb_block_size: i32,
     pub db_storage_rocksdb_bloom_filter_bits_per_key: i32,
 
+    // Runtime
+    /// Number of server I/O threads (tokio workers). Handles TCP connections
+    /// and request processing. 0 = 2 × CPU cores (matching Java's default).
+    /// Config key: serverNumIOThreads
+    pub server_num_io_threads: usize,
+
     // Network
     pub server_tcp_no_delay: bool,
     pub server_sock_keepalive: bool,
@@ -123,6 +129,7 @@ impl Default for ServerConfig {
             db_storage_rocksdb_write_buffer_size_mb: 64,
             db_storage_rocksdb_block_size: 65536,
             db_storage_rocksdb_bloom_filter_bits_per_key: 10,
+            server_num_io_threads: 0,
             server_tcp_no_delay: true,
             server_sock_keepalive: true,
             max_frame_size: 5 * 1024 * 1024,
@@ -193,6 +200,7 @@ impl ServerConfig {
         if let Some(v) = props.get("serverTcpNoDelay") { config.server_tcp_no_delay = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("serverSockKeepalive") { config.server_sock_keepalive = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("nettyMaxFrameSizeBytes") { if let Ok(n) = v.parse() { config.max_frame_size = n; } }
+        if let Some(v) = props.get("serverNumIOThreads") { if let Ok(n) = v.parse() { config.server_num_io_threads = n; } }
         if let Some(v) = props.get("numAddWorkerThreads") { if let Ok(n) = v.parse() { config.num_add_worker_threads = n; } }
         if let Some(v) = props.get("numReadWorkerThreads") { if let Ok(n) = v.parse() { config.num_read_worker_threads = n; } }
         if let Some(v) = props.get("tlsCertificatePath") { config.tls_certificate_path = Some(v.clone()); }

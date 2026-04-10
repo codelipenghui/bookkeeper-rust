@@ -207,6 +207,8 @@ services:
       PULSAR_PREFIX_managedLedgerDefaultEnsembleSize: "2"
       PULSAR_PREFIX_managedLedgerDefaultWriteQuorum: "2"
       PULSAR_PREFIX_managedLedgerDefaultAckQuorum: "2"
+      # Enable BK client metrics (exposes add_entry, read_entry, channel_write etc.)
+      PULSAR_PREFIX_bookkeeperClientExposeStatsToPrometheus: "true"
       # Keep memory usage reasonable for a laptop
       PULSAR_MEM: "-Xms512m -Xmx1g -XX:MaxDirectMemorySize=512m"
     command: >
