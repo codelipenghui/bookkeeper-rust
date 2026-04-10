@@ -4,6 +4,7 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -14,6 +15,7 @@ use crate::index::entry_location::EntryLocationIndex;
 use crate::index::ledger_index::LedgerMetadataIndex;
 use crate::StorageError;
 use crate::ledger_storage::LedgerStorage;
+use crate::storage_metrics;
 
 /// Subdirectory under each ledger/journal base dir where all data lives.
 /// Matches Java's `BookKeeperConstants.CURRENT_DIR = "current"`.
@@ -222,6 +224,7 @@ impl DbLedgerStorage {
 #[async_trait]
 impl LedgerStorage for DbLedgerStorage {
     async fn add_entry(&self, entry: &[u8]) -> Result<(), StorageError> {
+        let add_start = Instant::now();
         if entry.len() < 32 {
             return Err(StorageError::CorruptData("entry too short".into()));
         }
@@ -256,34 +259,53 @@ impl LedgerStorage for DbLedgerStorage {
         {
             let cache = self.write_cache.read();
             if cache.put(ledger_id, entry_id, entry).is_ok() {
+                storage_metrics::ADD_ENTRY.observe(add_start.elapsed().as_secs_f64());
                 return Ok(());
             }
         }
-        // Cache full — flush and retry
+        // Cache full — flush and retry (throttled write)
+        storage_metrics::THROTTLED_WRITE_REQUESTS.inc();
+        let throttle_start = Instant::now();
         self.flush().await?;
+        storage_metrics::THROTTLED_WRITE.observe(throttle_start.elapsed().as_secs_f64());
         let cache = self.write_cache.read();
-        cache.put(ledger_id, entry_id, entry)
+        let result = cache.put(ledger_id, entry_id, entry);
+        storage_metrics::ADD_ENTRY.observe(add_start.elapsed().as_secs_f64());
+        result
     }
 
     async fn get_entry(&self, ledger_id: i64, entry_id: i64) -> Result<Bytes, StorageError> {
+        let read_start = Instant::now();
         // 1. Check active write cache (most recent writes)
         if let Some(data) = self.write_cache.read().get(ledger_id, entry_id) {
+            storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
             return Ok(Bytes::from(data));
         }
         // 2. Check write cache being flushed
         if let Some(data) = self.write_cache_being_flushed.read().get(ledger_id, entry_id) {
+            storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
             return Ok(Bytes::from(data));
         }
         // 3. Check read cache
         if let Some(data) = self.read_cache.get(ledger_id, entry_id) {
+            storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
             return Ok(Bytes::from(data));
         }
         // 4. Check RocksDB index → entry log file
-        if let Some(location) = self.entry_location_index.get(ledger_id, entry_id)? {
+        let index_start = Instant::now();
+        let location = self.entry_location_index.get(ledger_id, entry_id)?;
+        storage_metrics::READ_LOCATIONS_INDEX_TIME.inc_by(index_start.elapsed().as_nanos() as u64);
+
+        if let Some(location) = location {
+            let entrylog_start = Instant::now();
             let data = self.read_entry_from_log(location).await?;
+            storage_metrics::READ_ENTRYLOG_TIME.inc_by(entrylog_start.elapsed().as_nanos() as u64);
+
             self.read_cache.put(ledger_id, entry_id, &data);
+            storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
             return Ok(Bytes::from(data));
         }
+        storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
         Err(StorageError::EntryNotFound { ledger_id, entry_id })
     }
 
@@ -462,6 +484,7 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     async fn flush(&self) -> Result<(), StorageError> {
+        let flush_start = Instant::now();
         let _lock = self.flush_mutex.lock().await;
 
         // Swap: active → being_flushed, being_flushed (cleared) → active
@@ -483,6 +506,7 @@ impl LedgerStorage for DbLedgerStorage {
         }
         let segments: Vec<FlushSegment>;
         let entry_count: usize;
+        let total_bytes: u64;
 
         {
             let flushing = self.write_cache_being_flushed.read();
@@ -490,6 +514,7 @@ impl LedgerStorage for DbLedgerStorage {
             if entries.is_empty() {
                 drop(flushing);
                 self.write_cache_being_flushed.write().clear();
+                storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
                 return Ok(());
             }
 
@@ -497,6 +522,7 @@ impl LedgerStorage for DbLedgerStorage {
             let flushing_data = flushing.data();
 
             let mut segs: Vec<FlushSegment> = Vec::new();
+            let mut flush_bytes: u64 = 0;
 
             {
                 let mut log_state = self.log_state.lock().unwrap();
@@ -548,6 +574,7 @@ impl LedgerStorage for DbLedgerStorage {
                     current.locations.push((ledger_id, entry_id, log_state.log_id, position));
                     current.framed_entries.push(framed);
                     log_state.offset += encoded_size;
+                    flush_bytes += encoded_size;
                 }
 
                 if !current.framed_entries.is_empty() {
@@ -556,9 +583,11 @@ impl LedgerStorage for DbLedgerStorage {
             } // log_state MutexGuard dropped
 
             segments = segs;
+            total_bytes = flush_bytes;
         } // flushing RwLockReadGuard dropped
 
         // Phase 2: Async I/O (no non-Send guards held)
+        let entrylog_start = Instant::now();
         let mut batch = Vec::with_capacity(entry_count);
         for segment in segments {
             self.ledger_io.write_batch(
@@ -571,13 +600,24 @@ impl LedgerStorage for DbLedgerStorage {
                     EntryLocation::new(log_id, position as u32).to_u64()));
             }
         }
+        storage_metrics::FLUSH_ENTRYLOG.observe(entrylog_start.elapsed().as_secs_f64());
 
         if !batch.is_empty() {
             self.entry_location_index.put_batch(&batch)?;
         }
+
+        let locations_start = Instant::now();
         self.entry_location_index.flush()?;
+        storage_metrics::FLUSH_LOCATIONS_INDEX.observe(locations_start.elapsed().as_secs_f64());
+
+        let ledger_start = Instant::now();
         self.ledger_index.flush()?;
+        storage_metrics::FLUSH_LEDGER_INDEX.observe(ledger_start.elapsed().as_secs_f64());
+
         self.write_cache_being_flushed.write().clear();
+
+        storage_metrics::FLUSH_SIZE.observe(total_bytes as f64);
+        storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
         Ok(())
     }
 

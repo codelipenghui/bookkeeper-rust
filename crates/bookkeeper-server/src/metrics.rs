@@ -101,47 +101,6 @@ lazy_static! {
     ).unwrap();
 
     // -----------------------------------------------------------------------
-    // Cache metrics (scope: bookie)
-    // Matches Java's DbLedgerStorageStats.java
-    // -----------------------------------------------------------------------
-
-    pub static ref WRITE_CACHE_HITS: IntCounter = IntCounter::new(
-        "bookie_write_cache_hits", "Write cache hit count"
-    ).unwrap();
-
-    pub static ref WRITE_CACHE_MISSES: IntCounter = IntCounter::new(
-        "bookie_write_cache_misses", "Write cache miss count"
-    ).unwrap();
-
-    pub static ref READ_CACHE_HITS: IntCounter = IntCounter::new(
-        "bookie_read_cache_hits", "Read cache hit count"
-    ).unwrap();
-
-    pub static ref READ_CACHE_MISSES: IntCounter = IntCounter::new(
-        "bookie_read_cache_misses", "Read cache miss count"
-    ).unwrap();
-
-    /// Write cache current size in bytes. Matches Java's write_cache_size.
-    pub static ref WRITE_CACHE_SIZE: IntGauge = IntGauge::new(
-        "bookie_write_cache_size", "Write cache current size in bytes"
-    ).unwrap();
-
-    /// Write cache current entry count. Matches Java's write_cache_count.
-    pub static ref WRITE_CACHE_COUNT: IntGauge = IntGauge::new(
-        "bookie_write_cache_count", "Write cache current entry count"
-    ).unwrap();
-
-    /// Read cache current size in bytes. Matches Java's read_cache_size.
-    pub static ref READ_CACHE_SIZE: IntGauge = IntGauge::new(
-        "bookie_read_cache_size", "Read cache current size in bytes"
-    ).unwrap();
-
-    /// Read cache current entry count. Matches Java's read_cache_count.
-    pub static ref READ_CACHE_COUNT: IntGauge = IntGauge::new(
-        "bookie_read_cache_count", "Read cache current entry count"
-    ).unwrap();
-
-    // -----------------------------------------------------------------------
     // GC & Compaction metrics (scope: bookie)
     // Matches Java's GarbageCollectorStats.java
     // -----------------------------------------------------------------------
@@ -238,15 +197,6 @@ pub fn register_metrics() {
     reg!(BOOKIE_RECOVERY_ADD_ENTRY);
     reg!(BOOKIE_ADD_ENTRY_BYTES);
     reg!(BOOKIE_READ_ENTRY_BYTES);
-    // Cache
-    reg!(WRITE_CACHE_HITS);
-    reg!(WRITE_CACHE_MISSES);
-    reg!(READ_CACHE_HITS);
-    reg!(READ_CACHE_MISSES);
-    reg!(WRITE_CACHE_SIZE);
-    reg!(WRITE_CACHE_COUNT);
-    reg!(READ_CACHE_SIZE);
-    reg!(READ_CACHE_COUNT);
     // GC
     reg!(ACTIVE_LEDGER_TOTAL);
     reg!(DELETED_LEDGER_TOTAL);
@@ -267,6 +217,8 @@ pub fn register_metrics() {
     reg!(BOOKIE_STATE);
     // Journal (defined in bookkeeper-storage crate)
     bookkeeper_storage::journal::metrics::register_journal_metrics(&REGISTRY);
+    // Storage (defined in bookkeeper-storage crate)
+    bookkeeper_storage::storage_metrics::register_storage_metrics(&REGISTRY);
 }
 
 /// Encode all metrics as Prometheus text format.
