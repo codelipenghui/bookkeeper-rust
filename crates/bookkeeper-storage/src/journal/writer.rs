@@ -168,69 +168,68 @@ fn journal_io_loop(
     let mut pending_entries: Vec<Vec<u8>> = Vec::new();
 
     loop {
-        let timeout = if !pending_entries.is_empty() {
-            group_wait
-        } else {
-            Duration::from_secs(3600)
+        // Block until the first entry arrives.
+        let first = match rx.recv() {
+            Ok(entry) => entry,
+            Err(_) => {
+                // Channel disconnected — flush remaining and exit.
+                if !pending_entries.is_empty() {
+                    flush_batch(
+                        &config, &mut state, &journal_io,
+                        &mut pending_entries, &mut pending_acks,
+                        &on_fatal_error, &shared_log_id,
+                    );
+                }
+                break;
+            }
         };
 
-        match rx.recv_timeout(timeout) {
-            Ok(entry) => {
-                // Frame entry: [size(4 BE)][payload]
-                let framed = frame_journal_entry(&entry.data);
-                pending_entries.push(framed);
-                if let Some(ack) = entry.ack_tx {
-                    pending_acks.push(ack);
-                }
+        let framed = frame_journal_entry(&first.data);
+        pending_entries.push(framed);
+        if let Some(ack) = first.ack_tx {
+            pending_acks.push(ack);
+        }
 
-                // Drain more entries without blocking (batch)
-                while let Ok(entry) = rx.try_recv() {
+        // Group commit: wait up to max_group_wait_ms for more entries to
+        // accumulate. With async callers (tokio::sync::oneshot ACK), many
+        // concurrent writers will queue entries during this window. Each
+        // additional entry that batches here avoids a separate fsync.
+        // Matches Java's BookieRequestProcessor → Journal.forceLedger()
+        // grouping via journalMaxGroupWaitMSec.
+        let deadline = std::time::Instant::now() + group_wait;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(entry) => {
                     let framed = frame_journal_entry(&entry.data);
                     pending_entries.push(framed);
                     if let Some(ack) = entry.ack_tx {
                         pending_acks.push(ack);
                     }
                 }
-
-                // Flush the batch
-                flush_batch(
-                    &config,
-                    &mut state,
-                    &journal_io,
-                    &mut pending_entries,
-                    &mut pending_acks,
-                    &on_fatal_error,
-                    &shared_log_id,
-                );
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !pending_entries.is_empty() {
-                    flush_batch(
-                        &config,
-                        &mut state,
-                        &journal_io,
-                        &mut pending_entries,
-                        &mut pending_acks,
-                        &on_fatal_error,
-                        &shared_log_id,
-                    );
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if !pending_entries.is_empty() {
-                    flush_batch(
-                        &config,
-                        &mut state,
-                        &journal_io,
-                        &mut pending_entries,
-                        &mut pending_acks,
-                        &on_fatal_error,
-                        &shared_log_id,
-                    );
-                }
-                break;
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+
+        // Drain any remaining entries that arrived without blocking.
+        while let Ok(entry) = rx.try_recv() {
+            let framed = frame_journal_entry(&entry.data);
+            pending_entries.push(framed);
+            if let Some(ack) = entry.ack_tx {
+                pending_acks.push(ack);
+            }
+        }
+
+        // Flush the entire batch: one write + one fsync for all entries.
+        flush_batch(
+            &config, &mut state, &journal_io,
+            &mut pending_entries, &mut pending_acks,
+            &on_fatal_error, &shared_log_id,
+        );
     }
 }
 

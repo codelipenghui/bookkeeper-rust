@@ -193,6 +193,58 @@ fn bench_get_entry_disk(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Concurrent journaled writes — measures group commit effect.
+// N tokio tasks write simultaneously; the journal batches their entries
+// into fewer fsyncs. Reports throughput in entries/sec.
+// ---------------------------------------------------------------------------
+
+fn bench_concurrent_journaled_writes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("journal_group_commit");
+    group.sample_size(20);
+
+    for &concurrency in &[1, 10, 50] {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(open_storage_with_journal(dir.path()));
+        storage.validate_for_write(1, &[0u8; 20]).unwrap();
+
+        let entries_per_iter = concurrency * 10; // total entries per measurement
+        group.throughput(Throughput::Elements(entries_per_iter as u64));
+
+        let eid = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        group.bench_function(format!("{}writers_1kb", concurrency), |b| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let mut handles = Vec::with_capacity(concurrency);
+                    for _ in 0..concurrency {
+                        let storage = storage.clone();
+                        let eid = eid.clone();
+                        handles.push(tokio::spawn(async move {
+                            for _ in 0..10 {
+                                let id = eid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let entry = build_entry(1024, 1, id);
+                                storage.add_entry(&entry).await.unwrap();
+                                let journal = storage.journal().unwrap();
+                                journal.log_add_entry(&entry).await.unwrap();
+                            }
+                        }));
+                    }
+                    for h in handles {
+                        h.await.unwrap();
+                    }
+                });
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // flush benchmark (write cache → entry log + RocksDB index)
 // ---------------------------------------------------------------------------
 
@@ -272,6 +324,7 @@ criterion_group!(
     benches,
     bench_add_entry_no_journal,
     bench_add_entry_with_journal,
+    bench_concurrent_journaled_writes,
     bench_get_entry_cached,
     bench_get_entry_disk,
     bench_flush,
