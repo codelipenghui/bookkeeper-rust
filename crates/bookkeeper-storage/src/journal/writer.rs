@@ -84,7 +84,7 @@ impl Journal {
 
         // Set up the force-write channel if sync is enabled.
         let (fw_tx, sync_thread) = if config.sync_data {
-            let (fw_tx, fw_rx) = mpsc::sync_channel::<ForceWriteRequest>(1024);
+            let (fw_tx, fw_rx) = mpsc::channel::<ForceWriteRequest>();
             let on_err = on_fatal_error.as_ref().map(|_| ());
             let fatal_cb: Option<OnFatalError> = if on_err.is_some() {
                 // We can't clone Box<dyn Fn>, so wrap in Arc for sharing.
@@ -193,7 +193,7 @@ struct ForceWriteRequest {
 fn journal_writer_loop(
     config: JournalConfig,
     rx: mpsc::Receiver<JournalEntry>,
-    fw_tx: Option<mpsc::SyncSender<ForceWriteRequest>>,
+    fw_tx: Option<mpsc::Sender<ForceWriteRequest>>,
     on_fatal_error: Option<OnFatalError>,
     shared_log_id: Arc<std::sync::atomic::AtomicU64>,
 ) {
@@ -313,7 +313,7 @@ fn flush_write_buf(
     state: &mut JournalFileState,
     write_buf: &mut Vec<u8>,
     pending_acks: &mut Vec<tokio::sync::oneshot::Sender<()>>,
-    fw_tx: &Option<mpsc::SyncSender<ForceWriteRequest>>,
+    fw_tx: &Option<mpsc::Sender<ForceWriteRequest>>,
     on_fatal_error: &Option<OnFatalError>,
     shared_log_id: &Arc<std::sync::atomic::AtomicU64>,
 ) {
