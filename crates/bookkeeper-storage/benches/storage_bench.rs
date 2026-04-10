@@ -193,14 +193,17 @@ fn bench_get_entry_disk(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Concurrent journaled writes — measures group commit effect.
-// N tokio tasks write simultaneously; the journal batches their entries
-// into fewer fsyncs. Reports throughput in entries/sec.
+// Concurrent journaled writes — measures per-entry latency distribution.
+// N tokio tasks write simultaneously; each entry's latency is measured
+// from send to journal ACK. Reports P50/P99/P999/max.
 // ---------------------------------------------------------------------------
 
 fn bench_concurrent_journaled_writes(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::Instant;
+
     let mut group = c.benchmark_group("journal_group_commit");
-    group.sample_size(20);
+    group.sample_size(10);
 
     for &concurrency in &[1, 10, 50] {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -213,33 +216,59 @@ fn bench_concurrent_journaled_writes(c: &mut Criterion) {
         let storage = std::sync::Arc::new(open_storage_with_journal(dir.path()));
         storage.validate_for_write(1, &[0u8; 20]).unwrap();
 
-        let entries_per_iter = concurrency * 10; // total entries per measurement
-        group.throughput(Throughput::Elements(entries_per_iter as u64));
+        let entries_per_writer = 100;
+        let total_entries = concurrency * entries_per_writer;
+        group.throughput(Throughput::Elements(total_entries as u64));
 
-        let eid = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let eid = Arc::new(AtomicI64::new(0));
+        let last_latencies: Arc<std::sync::Mutex<Vec<std::time::Duration>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let last_lats = last_latencies.clone();
         group.bench_function(format!("{}writers_1kb", concurrency), |b| {
             b.iter(|| {
-                rt.block_on(async {
+                let latencies = rt.block_on(async {
+                    let latencies = Arc::new(std::sync::Mutex::new(Vec::with_capacity(total_entries)));
                     let mut handles = Vec::with_capacity(concurrency);
                     for _ in 0..concurrency {
                         let storage = storage.clone();
                         let eid = eid.clone();
+                        let latencies = latencies.clone();
                         handles.push(tokio::spawn(async move {
-                            for _ in 0..10 {
-                                let id = eid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            for _ in 0..entries_per_writer {
+                                let id = eid.fetch_add(1, Ordering::Relaxed);
                                 let entry = build_entry(1024, 1, id);
+                                let start = Instant::now();
                                 storage.add_entry(&entry).await.unwrap();
                                 let journal = storage.journal().unwrap();
                                 journal.log_add_entry(&entry).await.unwrap();
+                                let elapsed = start.elapsed();
+                                latencies.lock().unwrap().push(elapsed);
                             }
                         }));
                     }
                     for h in handles {
                         h.await.unwrap();
                     }
+                    let mut lats = latencies.lock().unwrap().clone();
+                    lats.sort();
+                    lats
                 });
+                *last_lats.lock().unwrap() = latencies;
             });
         });
+        // Print percentiles from the last iteration
+        let lats = last_latencies.lock().unwrap();
+        if !lats.is_empty() {
+            let len = lats.len();
+            let p50 = lats[len * 50 / 100];
+            let p99 = lats[len * 99 / 100];
+            let p999 = lats[len.saturating_sub(1).min((len as f64 * 0.999) as usize)];
+            let max = lats[len - 1];
+            eprintln!(
+                "  [{concurrency} writers x {entries_per_writer} entries] \
+                 P50={p50:?} P99={p99:?} P999={p999:?} max={max:?}"
+            );
+        }
     }
     group.finish();
 }
