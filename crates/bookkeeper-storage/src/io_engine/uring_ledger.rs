@@ -204,6 +204,8 @@ enum PendingOp {
         // Keep iovecs alive until the CQE is reaped — the kernel reads
         // from this memory during submission.
         _iovecs: Vec<libc::iovec>,
+        // Concatenated buffer for large writes (> UIO_MAXIOV iovecs).
+        _flat_buf: Option<Vec<u8>>,
         reply: oneshot::Sender<io::Result<Vec<u64>>>,
     },
 }
@@ -411,44 +413,84 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     entries,
                     reply,
                 } => {
-                    let iovecs: Vec<libc::iovec> = entries
-                        .iter()
-                        .map(|e| libc::iovec {
-                            iov_base: e.as_ptr() as *mut _,
-                            iov_len: e.len(),
-                        })
-                        .collect();
-
                     let total_bytes: usize = entries.iter().map(|e| e.len()).sum();
-                    let sqe_idx = pending.len() as u64;
 
-                    let write_sqe = opcode::Writev::new(
-                        types::Fd(fd),
-                        iovecs.as_ptr(),
-                        iovecs.len() as u32,
-                    )
-                    .offset(offset)
-                    .build()
-                    .user_data(sqe_idx);
+                    // UIO_MAXIOV is 1024 — Writev with more iovecs returns EINVAL.
+                    // For large batches, concatenate into a single buffer and use
+                    // Write instead of Writev.
+                    if entries.len() > 1024 {
+                        let mut buf = Vec::with_capacity(total_bytes);
+                        for e in &entries {
+                            buf.extend_from_slice(e);
+                        }
+                        let sqe_idx = pending.len() as u64;
+                        let write_sqe = opcode::Write::new(
+                            types::Fd(fd),
+                            buf.as_ptr(),
+                            buf.len() as u32,
+                        )
+                        .offset(offset)
+                        .build()
+                        .user_data(sqe_idx);
 
-                    let pushed = unsafe { ring.submission().push(&write_sqe) };
-                    if pushed.is_err() {
-                        let _ = reply.send(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "SQ full",
-                        )));
-                        continue;
+                        let pushed = unsafe { ring.submission().push(&write_sqe) };
+                        if pushed.is_err() {
+                            let _ = reply.send(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "SQ full",
+                            )));
+                            continue;
+                        }
+
+                        pending.push(PendingOp::Write {
+                            entries,
+                            offset,
+                            total_bytes,
+                            fd,
+                            _iovecs: Vec::new(),
+                            _flat_buf: Some(buf),
+                            reply,
+                        });
+                        num_sqes += 1;
+                    } else {
+                        let iovecs: Vec<libc::iovec> = entries
+                            .iter()
+                            .map(|e| libc::iovec {
+                                iov_base: e.as_ptr() as *mut _,
+                                iov_len: e.len(),
+                            })
+                            .collect();
+
+                        let sqe_idx = pending.len() as u64;
+                        let write_sqe = opcode::Writev::new(
+                            types::Fd(fd),
+                            iovecs.as_ptr(),
+                            iovecs.len() as u32,
+                        )
+                        .offset(offset)
+                        .build()
+                        .user_data(sqe_idx);
+
+                        let pushed = unsafe { ring.submission().push(&write_sqe) };
+                        if pushed.is_err() {
+                            let _ = reply.send(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "SQ full",
+                            )));
+                            continue;
+                        }
+
+                        pending.push(PendingOp::Write {
+                            entries,
+                            offset,
+                            total_bytes,
+                            fd,
+                            _iovecs: iovecs,
+                            _flat_buf: None,
+                            reply,
+                        });
+                        num_sqes += 1;
                     }
-
-                    pending.push(PendingOp::Write {
-                        entries,
-                        offset,
-                        total_bytes,
-                        fd,
-                        _iovecs: iovecs,
-                        reply,
-                    });
-                    num_sqes += 1;
                 }
 
                 LedgerRequest::Evict { log_id } => {
