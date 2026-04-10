@@ -52,6 +52,11 @@ pub struct DbLedgerStorage {
     journal: Option<crate::journal::writer::Journal>,
     /// Journal directory path (for cleanup after checkpoint).
     journal_dir: Option<PathBuf>,
+    /// In-memory LAC cache. Updated on every add_entry (in-memory only).
+    /// Persisted to RocksDB during flush/checkpoint. Matches Java's
+    /// TransientLedgerInfo which keeps LAC in memory and only writes to
+    /// the ledger index during checkpoint.
+    lac_cache: dashmap::DashMap<i64, i64>,
     /// In-memory cache of explicit LAC bodies (matching Java's TransientLedgerInfo).
     explicit_lac_cache: dashmap::DashMap<i64, Vec<u8>>,
     /// LAC watcher registry for long poll reads.
@@ -91,6 +96,7 @@ impl DbLedgerStorage {
             ledger_io,
             journal: None,
             journal_dir: None,
+            lac_cache: dashmap::DashMap::new(),
             explicit_lac_cache: dashmap::DashMap::new(),
             lac_watchers: crate::lac_watcher::LacWatcherRegistry::new(),
         })
@@ -124,7 +130,7 @@ impl DbLedgerStorage {
                     let _ = self.ledger_index.set(ledger_id, false, None, None);
                 }
                 if lac >= 0 {
-                    let _ = self.ledger_index.update_lac(ledger_id, lac);
+                    self.lac_cache.insert(ledger_id, lac);
                 }
                 let _ = self.write_cache.read().put(ledger_id, entry_id, entry_data);
             }
@@ -237,15 +243,10 @@ impl LedgerStorage for DbLedgerStorage {
             self.ledger_index.set(ledger_id, false, None, None)?;
         }
 
-        // Update LAC if valid
+        // Update LAC in memory only (no RocksDB write per entry).
+        // Persisted to RocksDB during flush/checkpoint.
         if lac >= 0 {
-            if let Err(e) = self.ledger_index.update_lac(ledger_id, lac) {
-                // LAC update is best-effort during add_entry; LAC is also recoverable from entry data
-                // Only ignore LedgerNotFound; propagate other errors
-                if !matches!(e, StorageError::LedgerNotFound(_)) {
-                    return Err(e);
-                }
-            }
+            self.lac_cache.insert(ledger_id, lac);
         }
 
         // Notify long poll watchers that LAC has advanced.
@@ -362,24 +363,25 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn get_last_add_confirmed(&self, ledger_id: i64) -> Result<i64, StorageError> {
-        // Return the highest entry_id stored for this ledger. This represents the
-        // bookie's view of the last add confirmed: if entry N is durably stored,
-        // entries 0..=N are all considered confirmed on this bookie. This is the
-        // value returned during fencing reads (FLAG_DO_FENCING with LAST_ADD_CONFIRMED).
+        // 1. Check write cache (max entry_id = effective LAC on this bookie)
         {
             let cache = self.write_cache.read();
             if let Some(entry_id) = cache.last_entry_id(ledger_id) {
                 return Ok(entry_id);
             }
         }
-        // Check write cache being flushed
+        // 2. Check write cache being flushed
         {
             let cache = self.write_cache_being_flushed.read();
             if let Some(entry_id) = cache.last_entry_id(ledger_id) {
                 return Ok(entry_id);
             }
         }
-        // Fall back to RocksDB ledger index (highest persisted LAC)
+        // 3. Check in-memory LAC cache
+        if let Some(lac) = self.lac_cache.get(&ledger_id) {
+            return Ok(*lac);
+        }
+        // 4. Fall back to RocksDB ledger index (persisted LAC)
         match self.ledger_index.get(ledger_id)? {
             Some(data) => Ok(data.lac.unwrap_or(-1)),
             None => Err(StorageError::LedgerNotFound(ledger_id)),
@@ -387,7 +389,8 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn set_explicit_lac(&self, ledger_id: i64, lac: i64) -> Result<(), StorageError> {
-        self.ledger_index.update_lac(ledger_id, lac)
+        self.lac_cache.insert(ledger_id, lac);
+        Ok(())
     }
 
     fn set_explicit_lac_body(&self, ledger_id: i64, body: &[u8]) -> Result<(), StorageError> {
@@ -609,6 +612,15 @@ impl LedgerStorage for DbLedgerStorage {
         let locations_start = Instant::now();
         self.entry_location_index.flush()?;
         storage_metrics::FLUSH_LOCATIONS_INDEX.observe(locations_start.elapsed().as_secs_f64());
+
+        // Persist in-memory LAC cache to RocksDB (batch write, not per-entry).
+        // This replaces the per-add_entry RocksDB write with one batch per flush.
+        let lac_entries: Vec<(i64, i64)> = self.lac_cache.iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
+        for (ledger_id, lac) in &lac_entries {
+            let _ = self.ledger_index.update_lac(*ledger_id, *lac);
+        }
 
         let ledger_start = Instant::now();
         self.ledger_index.flush()?;
