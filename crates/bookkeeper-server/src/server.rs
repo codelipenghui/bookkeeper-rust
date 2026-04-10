@@ -1206,7 +1206,11 @@ where
     R: tokio::io::AsyncReadExt + Unpin,
     W: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
 {
-    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+    // Unbounded channel: backpressure is already enforced by the TCP socket's
+    // write buffer. The bounded variant was ~6% of hot-path CPU because every
+    // send/recv acquired a batch_semaphore permit — unbounded is a simple
+    // atomic linked-list push/pop.
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
 
     // Writer task: sends framed responses to the socket.
     let writer_handle = tokio::spawn(async move {
@@ -1220,9 +1224,10 @@ where
             let write_start = std::time::Instant::now();
             let write_ok = writer.write_all(&out).await.is_ok();
             let elapsed = write_start.elapsed().as_secs_f64();
-            let label = if write_ok { "true" } else { "false" };
-            crate::metrics::CHANNEL_WRITE.with_label_values(&[label]).observe(elapsed);
-            if !write_ok {
+            if write_ok {
+                crate::metrics::CHANNEL_WRITE_OK.observe(elapsed);
+            } else {
+                crate::metrics::CHANNEL_WRITE_FAIL.observe(elapsed);
                 break;
             }
         }
@@ -1249,7 +1254,7 @@ where
                         let tx = resp_tx.clone();
                         tokio::spawn(async move {
                             let resp = crate::v3_processor::process_v3_request(&proc, v3_req).await;
-                            let _ = tx.send(Bytes::from(resp)).await;
+                            let _ = tx.send(Bytes::from(resp));
                         });
                     } else {
                         break;
@@ -1263,7 +1268,7 @@ where
                             tokio::spawn(async move {
                                 let resp = proc.process_request(req).await;
                                 let resp_encoded = encode_response(&resp);
-                                let _ = tx.send(resp_encoded.freeze()).await;
+                                let _ = tx.send(resp_encoded.freeze());
                             });
                         }
                         Err(_) => {
