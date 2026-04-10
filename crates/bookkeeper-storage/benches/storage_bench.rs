@@ -65,6 +65,32 @@ fn open_storage_with_journal(dir: &Path) -> DbLedgerStorage {
     storage
 }
 
+/// Open storage WITH journal but WITHOUT fsync (journalSyncData=false).
+fn open_storage_journal_no_sync(dir: &Path) -> DbLedgerStorage {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (ledger_io, journal_io) = best_engine();
+    let mut storage = DbLedgerStorage::open(dir, ledger_io).unwrap();
+
+    let journal_dir = dir.join(CURRENT_DIR).join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let config = JournalConfig {
+        journal_dir: journal_dir.clone(),
+        max_file_size: 128 * 1024 * 1024,
+        sync_data: false,
+        max_group_wait_ms: 1,
+        buffered_writes_threshold: 512 * 1024,
+        buffered_entries_threshold: 0,
+        alignment_size: 0,
+        format_version: 6,
+    };
+    rt.block_on(storage.init_journal(&journal_dir, config, journal_io, None))
+        .unwrap();
+    storage
+}
+
 /// Open storage WITHOUT journal — pure write-cache performance.
 fn open_storage_no_journal(dir: &Path) -> DbLedgerStorage {
     let (ledger_io, _) = best_engine();
@@ -186,6 +212,35 @@ fn bench_get_entry_disk(c: &mut Criterion) {
             b.iter(|| {
                 let _ = rt.block_on(storage.get_entry(1, read_id % 1000));
                 read_id += 1;
+            });
+        });
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// add_entry WITH journal but WITHOUT fsync (journalSyncData=false)
+// Data reaches OS page cache but not forced to disk.
+// ---------------------------------------------------------------------------
+
+fn bench_add_entry_journal_no_sync(c: &mut Criterion) {
+    let rt = rt();
+    let mut group = c.benchmark_group("add_entry_journal_no_sync");
+
+    for &size in &[128, 1024, 4096] {
+        let dir = TempDir::new().unwrap();
+        let storage = open_storage_journal_no_sync(dir.path());
+        storage.validate_for_write(1, &[0u8; 20]).unwrap();
+
+        group.throughput(Throughput::Bytes(size as u64));
+        let mut eid = 0i64;
+        group.bench_with_input(BenchmarkId::new("no_sync", size), &size, |b, _| {
+            b.iter(|| {
+                let entry = build_entry(size, 1, eid);
+                rt.block_on(storage.add_entry(&entry)).unwrap();
+                let journal = storage.journal().unwrap();
+                rt.block_on(journal.log_add_entry(&entry)).unwrap();
+                eid += 1;
             });
         });
     }
@@ -353,6 +408,7 @@ criterion_group!(
     benches,
     bench_add_entry_no_journal,
     bench_add_entry_with_journal,
+    bench_add_entry_journal_no_sync,
     bench_concurrent_journaled_writes,
     bench_get_entry_cached,
     bench_get_entry_disk,

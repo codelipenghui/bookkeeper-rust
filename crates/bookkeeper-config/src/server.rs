@@ -21,6 +21,7 @@ pub struct ServerConfig {
     // Journal
     pub journal_max_size_mb: i32,
     pub journal_max_backups: i32,
+    pub journal_write_data: bool,
     pub journal_sync_data: bool,
     pub journal_adaptive_group_writes: bool,
     pub journal_max_group_wait_ms: i32,
@@ -106,6 +107,7 @@ impl Default for ServerConfig {
             allow_storage_expansion: true,
             journal_max_size_mb: 2048,
             journal_max_backups: 5,
+            journal_write_data: true,
             journal_sync_data: false,
             journal_adaptive_group_writes: true,
             journal_max_group_wait_ms: 1,
@@ -172,6 +174,7 @@ impl ServerConfig {
         if let Some(v) = props.get("allowStorageExpansion") { config.allow_storage_expansion = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("journalMaxSizeMB") { if let Ok(n) = v.parse() { config.journal_max_size_mb = n; } }
         if let Some(v) = props.get("journalMaxBackups") { if let Ok(n) = v.parse() { config.journal_max_backups = n; } }
+        if let Some(v) = props.get("journalWriteData") { config.journal_write_data = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("journalSyncData") { config.journal_sync_data = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("journalAdaptiveGroupWrites") { config.journal_adaptive_group_writes = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("journalMaxGroupWaitMSec") { if let Ok(n) = v.parse() { config.journal_max_group_wait_ms = n; } }

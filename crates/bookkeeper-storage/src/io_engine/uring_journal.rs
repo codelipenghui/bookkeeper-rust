@@ -105,6 +105,55 @@ impl JournalIo for UringJournalIo {
 
         Ok(())
     }
+
+    fn write_no_sync(&self, fd: RawFd, entries: &[&[u8]]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut ring = self.ring.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "journal ring lock poisoned")
+        })?;
+
+        let iovecs: Vec<libc::iovec> = entries
+            .iter()
+            .map(|e| libc::iovec {
+                iov_base: e.as_ptr() as *mut _,
+                iov_len: e.len(),
+            })
+            .collect();
+
+        let total_bytes: usize = entries.iter().map(|e| e.len()).sum();
+
+        // WRITEV only — no linked FSYNC.
+        let write_sqe = opcode::Writev::new(
+            types::Fd(fd),
+            iovecs.as_ptr(),
+            iovecs.len() as u32,
+        )
+        .offset(u64::MAX)
+        .build()
+        .user_data(1);
+
+        unsafe {
+            ring.submission()
+                .push(&write_sqe)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        ring.submit_and_wait(1)?;
+
+        for cqe in ring.completion() {
+            if cqe.result() < 0 {
+                return Err(io::Error::from_raw_os_error(-cqe.result()));
+            }
+            if cqe.user_data() == 1 && (cqe.result() as usize) < total_bytes {
+                self.retry_short_write(fd, entries, cqe.result() as usize)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl UringJournalIo {

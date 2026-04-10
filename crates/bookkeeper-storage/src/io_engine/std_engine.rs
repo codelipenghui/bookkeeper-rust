@@ -42,6 +42,15 @@ impl JournalIo for StdEngine {
             file.sync_data()
         })
     }
+
+    fn write_no_sync(&self, fd: RawFd, entries: &[&[u8]]) -> io::Result<()> {
+        with_file(fd, |file| {
+            for entry in entries {
+                file.write_all(entry)?;
+            }
+            Ok(())
+        })
+    }
 }
 
 #[async_trait]

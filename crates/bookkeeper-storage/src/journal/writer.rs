@@ -314,9 +314,13 @@ fn flush_batch(
         slices.push(entry);
     }
 
-    // Delegate to the I/O engine (uring: WRITEV→linked FSYNC; std: write_all + sync_data)
     let fd = state.file.as_ref().unwrap().as_raw_fd();
-    match journal_io.write_and_sync(fd, &slices) {
+    let io_result = if config.sync_data {
+        journal_io.write_and_sync(fd, &slices)
+    } else {
+        journal_io.write_no_sync(fd, &slices)
+    };
+    match io_result {
         Ok(()) => {
             // Update position tracking
             if let Some(ref pad) = padding {

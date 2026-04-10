@@ -14,10 +14,16 @@ use std::os::fd::RawFd;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Journal I/O operations: write entries then fsync.
+/// Journal I/O operations: write entries then optionally fsync.
 pub trait JournalIo: Send + Sync {
     /// Write all entries sequentially to `fd`, then call `fsync_data`.
     fn write_and_sync(&self, fd: RawFd, entries: &[&[u8]]) -> io::Result<()>;
+
+    /// Write all entries sequentially to `fd` without fsync.
+    /// Used when `journalSyncData=false` — data reaches the OS page cache
+    /// but is not forced to disk. Durable against process crashes but not
+    /// power loss. Matches Java's behavior when syncData is disabled.
+    fn write_no_sync(&self, fd: RawFd, entries: &[&[u8]]) -> io::Result<()>;
 }
 
 /// Ledger (entry-log) I/O operations: batched writes and positional reads.

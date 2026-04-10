@@ -61,43 +61,47 @@ impl BookieServer {
         let io_engines = bookkeeper_storage::io_engine::select_engine();
         let mut storage = DbLedgerStorage::open(Path::new(ledger_dir), io_engines.ledger.clone())?;
 
-        // Initialize journal for write-ahead logging (crash recovery).
-        // Journal files live in `<journalDir>/current/` matching Java's convention.
-        let journal_current = Path::new(&config.journal_directory).join(CURRENT_DIR);
-        std::fs::create_dir_all(&journal_current)?;
-        let journal_config = bookkeeper_storage::journal::writer::JournalConfig {
-            journal_dir: journal_current.clone(),
-            max_file_size: (config.journal_max_size_mb as u64) * 1024 * 1024,
-            sync_data: config.journal_sync_data,
-            max_group_wait_ms: config.journal_max_group_wait_ms as u64,
-            buffered_writes_threshold: config.journal_buffered_writes_threshold as usize,
-            buffered_entries_threshold: config.journal_buffered_entries_threshold as usize,
-            alignment_size: config.journal_alignment_size as usize,
-            format_version: config.journal_format_version_to_write,
-        };
         // Create state manager early so the journal fatal-error callback can
         // reference it. Transition to Running happens after DIRTY file setup.
         let state = Arc::new(BookieStateManager::new());
 
-        // Wire the journal fatal-error callback: on FSYNC EIO, transition
-        // the bookie to read-only. Matches Java's forceToReadOnly() on
-        // journal sync failure.
-        let fatal_state = state.clone();
-        let on_journal_fatal: bookkeeper_storage::journal::writer::OnFatalError =
-            Box::new(move |e| {
-                tracing::error!("Journal fatal error — transitioning to READ-ONLY: {e}");
-                fatal_state.transition_to(BookieState::ReadOnly);
-                crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
-            });
+        // Initialize journal for write-ahead logging (crash recovery).
+        // Controlled by `journalWriteData` (default true). When false, the
+        // journal is skipped entirely — writes go directly to the write cache
+        // without durability guarantees. Matches Java's behavior.
+        if config.journal_write_data {
+            let journal_current = Path::new(&config.journal_directory).join(CURRENT_DIR);
+            std::fs::create_dir_all(&journal_current)?;
+            let journal_config = bookkeeper_storage::journal::writer::JournalConfig {
+                journal_dir: journal_current.clone(),
+                max_file_size: (config.journal_max_size_mb as u64) * 1024 * 1024,
+                sync_data: config.journal_sync_data,
+                max_group_wait_ms: config.journal_max_group_wait_ms as u64,
+                buffered_writes_threshold: config.journal_buffered_writes_threshold as usize,
+                buffered_entries_threshold: config.journal_buffered_entries_threshold as usize,
+                alignment_size: config.journal_alignment_size as usize,
+                format_version: config.journal_format_version_to_write,
+            };
 
-        let replayed = storage.init_journal(
-            &journal_current,
-            journal_config,
-            io_engines.journal,
-            Some(on_journal_fatal),
-        ).await?;
-        if replayed > 0 {
-            tracing::info!("Journal recovery: replayed {replayed} entries");
+            let fatal_state = state.clone();
+            let on_journal_fatal: bookkeeper_storage::journal::writer::OnFatalError =
+                Box::new(move |e| {
+                    tracing::error!("Journal fatal error — transitioning to READ-ONLY: {e}");
+                    fatal_state.transition_to(BookieState::ReadOnly);
+                    crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
+                });
+
+            let replayed = storage.init_journal(
+                &journal_current,
+                journal_config,
+                io_engines.journal,
+                Some(on_journal_fatal),
+            ).await?;
+            if replayed > 0 {
+                tracing::info!("Journal recovery: replayed {replayed} entries");
+            }
+        } else {
+            tracing::info!("Journal disabled (journalWriteData=false)");
         }
 
         // Check for unclean shutdown (DIRTY file in any ledger directory).
