@@ -34,16 +34,20 @@ impl RequestProcessor {
                 let elapsed = timer.elapsed().as_secs_f64();
                 crate::metrics::ADD_ENTRY_IN_PROGRESS.dec();
                 let success = matches!(resp, V2Response::Add { error_code, .. } if error_code == V2_EOK);
-                let label = if success { "true" } else { "false" };
-                crate::metrics::ADD_ENTRY_REQUEST.with_label_values(&[label]).observe(elapsed);
-                crate::metrics::BOOKIE_ADD_ENTRY.with_label_values(&[label]).observe(elapsed);
-                if is_recovery {
-                    crate::metrics::BOOKIE_RECOVERY_ADD_ENTRY.with_label_values(&[label]).observe(elapsed);
-                }
                 if success {
+                    crate::metrics::ADD_ENTRY_REQUEST_OK.observe(elapsed);
+                    crate::metrics::BOOKIE_ADD_ENTRY_OK.observe(elapsed);
+                    if is_recovery {
+                        crate::metrics::BOOKIE_RECOVERY_ADD_ENTRY_OK.observe(elapsed);
+                    }
                     crate::metrics::WRITE_BYTES.inc_by(entry_size as u64);
-                    crate::metrics::BOOKIE_ADD_ENTRY_BYTES.with_label_values(&["true"]).observe(entry_size as f64);
+                    crate::metrics::BOOKIE_ADD_ENTRY_BYTES_OK.observe(entry_size as f64);
                 } else {
+                    crate::metrics::ADD_ENTRY_REQUEST_FAIL.observe(elapsed);
+                    crate::metrics::BOOKIE_ADD_ENTRY_FAIL.observe(elapsed);
+                    if is_recovery {
+                        crate::metrics::BOOKIE_RECOVERY_ADD_ENTRY_FAIL.observe(elapsed);
+                    }
                     crate::metrics::ADD_ENTRY_REJECTED.inc();
                 }
                 resp
@@ -56,17 +60,22 @@ impl RequestProcessor {
                 let elapsed = timer.elapsed().as_secs_f64();
                 crate::metrics::READ_ENTRY_IN_PROGRESS.dec();
                 let success = matches!(resp, V2Response::Read { error_code, .. } if error_code == V2_EOK);
-                let label = if success { "true" } else { "false" };
-                crate::metrics::READ_ENTRY_REQUEST.with_label_values(&[label]).observe(elapsed);
-                crate::metrics::BOOKIE_READ_ENTRY.with_label_values(&[label]).observe(elapsed);
-                if is_fence {
-                    crate::metrics::READ_ENTRY_FENCE_REQUEST.with_label_values(&[label]).observe(elapsed);
-                }
                 if success {
+                    crate::metrics::READ_ENTRY_REQUEST_OK.observe(elapsed);
+                    crate::metrics::BOOKIE_READ_ENTRY_OK.observe(elapsed);
+                    if is_fence {
+                        crate::metrics::READ_ENTRY_FENCE_REQUEST_OK.observe(elapsed);
+                    }
                     if let V2Response::Read { data: Some(ref d), .. } = resp {
                         let sz = d.len() as u64;
                         crate::metrics::READ_BYTES.inc_by(sz);
-                        crate::metrics::BOOKIE_READ_ENTRY_BYTES.with_label_values(&["true"]).observe(sz as f64);
+                        crate::metrics::BOOKIE_READ_ENTRY_BYTES_OK.observe(sz as f64);
+                    }
+                } else {
+                    crate::metrics::READ_ENTRY_REQUEST_FAIL.observe(elapsed);
+                    crate::metrics::BOOKIE_READ_ENTRY_FAIL.observe(elapsed);
+                    if is_fence {
+                        crate::metrics::READ_ENTRY_FENCE_REQUEST_FAIL.observe(elapsed);
                     }
                 }
                 resp

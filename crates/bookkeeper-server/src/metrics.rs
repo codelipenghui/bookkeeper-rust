@@ -6,7 +6,7 @@
 
 use lazy_static::lazy_static;
 use prometheus::{
-    self, Encoder, HistogramOpts, HistogramVec, IntCounter, IntGauge, Registry, TextEncoder,
+    self, Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntGauge, Registry, TextEncoder,
 };
 
 lazy_static! {
@@ -182,6 +182,40 @@ lazy_static! {
     pub static ref BOOKIE_STATE: IntGauge = IntGauge::new(
         "bookie_SERVER_STATUS", "Bookie server status (1=writable, 2=readonly, 0=other)"
     ).unwrap();
+
+    // -----------------------------------------------------------------------
+    // Pre-resolved Histogram handles for the hot path.
+    //
+    // `HistogramVec::with_label_values(&["true"])` hashes the label, takes an
+    // RwLock on the shared map, and looks up the child metric — that was ~5%
+    // of CPU on the add_entry fast path. All request histograms use a single
+    // binary "success" label, so we can resolve both variants once at startup
+    // and index into them with a bool.
+    // -----------------------------------------------------------------------
+
+    pub static ref ADD_ENTRY_REQUEST_OK: Histogram = ADD_ENTRY_REQUEST.with_label_values(&["true"]);
+    pub static ref ADD_ENTRY_REQUEST_FAIL: Histogram = ADD_ENTRY_REQUEST.with_label_values(&["false"]);
+
+    pub static ref READ_ENTRY_REQUEST_OK: Histogram = READ_ENTRY_REQUEST.with_label_values(&["true"]);
+    pub static ref READ_ENTRY_REQUEST_FAIL: Histogram = READ_ENTRY_REQUEST.with_label_values(&["false"]);
+
+    pub static ref READ_ENTRY_FENCE_REQUEST_OK: Histogram = READ_ENTRY_FENCE_REQUEST.with_label_values(&["true"]);
+    pub static ref READ_ENTRY_FENCE_REQUEST_FAIL: Histogram = READ_ENTRY_FENCE_REQUEST.with_label_values(&["false"]);
+
+    pub static ref CHANNEL_WRITE_OK: Histogram = CHANNEL_WRITE.with_label_values(&["true"]);
+    pub static ref CHANNEL_WRITE_FAIL: Histogram = CHANNEL_WRITE.with_label_values(&["false"]);
+
+    pub static ref BOOKIE_ADD_ENTRY_OK: Histogram = BOOKIE_ADD_ENTRY.with_label_values(&["true"]);
+    pub static ref BOOKIE_ADD_ENTRY_FAIL: Histogram = BOOKIE_ADD_ENTRY.with_label_values(&["false"]);
+
+    pub static ref BOOKIE_READ_ENTRY_OK: Histogram = BOOKIE_READ_ENTRY.with_label_values(&["true"]);
+    pub static ref BOOKIE_READ_ENTRY_FAIL: Histogram = BOOKIE_READ_ENTRY.with_label_values(&["false"]);
+
+    pub static ref BOOKIE_RECOVERY_ADD_ENTRY_OK: Histogram = BOOKIE_RECOVERY_ADD_ENTRY.with_label_values(&["true"]);
+    pub static ref BOOKIE_RECOVERY_ADD_ENTRY_FAIL: Histogram = BOOKIE_RECOVERY_ADD_ENTRY.with_label_values(&["false"]);
+
+    pub static ref BOOKIE_ADD_ENTRY_BYTES_OK: Histogram = BOOKIE_ADD_ENTRY_BYTES.with_label_values(&["true"]);
+    pub static ref BOOKIE_READ_ENTRY_BYTES_OK: Histogram = BOOKIE_READ_ENTRY_BYTES.with_label_values(&["true"]);
 }
 
 /// Register all metrics with the registry.
