@@ -241,15 +241,28 @@ fn journal_writer_loop(
             }
         }
 
-        // Flush decision (same logic as before, matching Java):
-        // 1. Single entry (queue was empty) → flush immediately
-        // 2. Buffered entries/bytes exceed threshold → flush immediately
-        // 3. Otherwise → wait up to max_group_wait_ms
-        let should_wait = pending_acks.len() > 1
-            && (buffered_entries_threshold == 0
+        // Flush decision:
+        // - When sync enabled: always wait for group_wait to batch entries,
+        //   since fdatasync takes ~1-2ms anyway. Batching reduces the number
+        //   of ForceWriteRequests and amortizes the sync cost.
+        // - When sync disabled: flush immediately for single entries (no
+        //   benefit in waiting — write_all returns in ~1µs).
+        // - In both cases: if buffered entries/bytes exceed threshold, flush
+        //   immediately regardless.
+        let should_wait = if fw_tx.is_some() {
+            // Sync enabled: always wait unless thresholds exceeded
+            (buffered_entries_threshold == 0
                 || pending_acks.len() < buffered_entries_threshold)
-            && (buffered_writes_threshold == 0
-                || pending_bytes < buffered_writes_threshold);
+                && (buffered_writes_threshold == 0
+                    || pending_bytes < buffered_writes_threshold)
+        } else {
+            // Sync disabled: only wait if multiple entries and below thresholds
+            pending_acks.len() > 1
+                && (buffered_entries_threshold == 0
+                    || pending_acks.len() < buffered_entries_threshold)
+                && (buffered_writes_threshold == 0
+                    || pending_bytes < buffered_writes_threshold)
+        };
 
         if should_wait {
             let deadline = std::time::Instant::now() + group_wait;
