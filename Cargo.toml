@@ -88,7 +88,19 @@ predicates = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 rcgen = "0.14"
 
-# Include debug symbols in release builds for profiling (flamegraphs).
-# This adds ~20% to binary size but doesn't affect runtime performance.
+# Production release profile: optimize for the smallest binary.
+# Stripped of debug info and symbols. Use this for the `runtime` Docker
+# image and any deployment that doesn't need profiling.
 [profile.release]
-debug = 1
+strip = "symbols"
+debug = false
+lto = "thin"
+
+# Debug-friendly release profile: same optimization level as `release`,
+# but keeps `line-tables-only` DWARF so that pprof flamegraphs have
+# meaningful function names. Use this for the `debug-runtime` Docker
+# image and the `--features profiling` build.
+[profile.release-debug]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"

@@ -24,7 +24,7 @@ pub struct HttpState {
 }
 
 pub fn create_router(http_state: HttpState) -> Router {
-    Router::new()
+    let router = Router::new()
         // Existing
         .route("/heartbeat", axum::routing::get(heartbeat))
         .route("/api/v1/bookie/is_ready", axum::routing::get(is_ready))
@@ -50,8 +50,6 @@ pub fn create_router(http_state: HttpState) -> Router {
             axum::routing::put(expand_storage_endpoint))
         .route("/api/v1/bookie/list_bookie_info",
             axum::routing::get(list_bookie_info_endpoint))
-        // Profiling
-        .route("/debug/pprof/flamegraph", axum::routing::get(pprof_flamegraph))
         // Configuration
         .route("/api/v1/config/server_config", axum::routing::get(get_server_config))
         // Cluster info (requires ZK)
@@ -76,8 +74,17 @@ pub fn create_router(http_state: HttpState) -> Router {
         .route("/api/v1/autorecovery/bookie",
             axum::routing::put(recover_bookie_endpoint))
         .route("/api/v1/autorecovery/decommission",
-            axum::routing::put(decommission_endpoint))
-        .with_state(http_state)
+            axum::routing::put(decommission_endpoint));
+
+    // Profiling endpoint — only present in builds compiled with the
+    // `profiling` feature (e.g. the debug-runtime Docker image).
+    #[cfg(feature = "profiling")]
+    let router = router.route(
+        "/debug/pprof/flamegraph",
+        axum::routing::get(pprof_flamegraph),
+    );
+
+    router.with_state(http_state)
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,11 +1287,12 @@ async fn decommission_endpoint(
 }
 
 // ---------------------------------------------------------------------------
-// /debug/pprof — CPU profiling endpoints
+// /debug/pprof — CPU profiling endpoints (gated on the `profiling` feature)
 // ---------------------------------------------------------------------------
 
 /// CPU flamegraph SVG for `seconds` (default 30).
 /// Usage: curl http://localhost:8080/debug/pprof/flamegraph?seconds=10 > flamegraph.svg
+#[cfg(feature = "profiling")]
 async fn pprof_flamegraph(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {

@@ -8,6 +8,12 @@ license.workspace = true
 name = "bk"
 path = "src/main.rs"
 
+[features]
+default = []
+# Forwards to `bookkeeper-server/profiling`. Use this when building the
+# debug image: `cargo build --features profiling -p bookkeeper-cli`.
+profiling = ["bookkeeper-server/profiling"]
+
 [dependencies]
 bookkeeper-metadata = { workspace = true }
 bookkeeper-client = { workspace = true }

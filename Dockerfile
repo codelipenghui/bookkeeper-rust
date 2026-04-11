@@ -5,24 +5,27 @@
 # full rebuild of rocksdb-sys (~60s of C++ compile). With chef, deps are
 # rebuilt only when Cargo.lock or a Cargo.toml manifest changes.
 #
-# cargo-chef caches deps PER-PROFILE. We need both release deps (for the
-# production runtime image) AND dev deps (for the test stage and the
-# debug-runtime image), so we have parallel `*-builder` stages.
+# Two production-shaped images:
 #
-# Stages:
-#   chef           — base image: rust + system deps + cargo-chef
-#   planner        — compute recipe.json from Cargo.toml/Cargo.lock
-#   builder        — release-profile cook + cargo build (used by `runtime`)
-#   debug-builder  — dev-profile cook + cargo build (used by `test` and
-#                    `debug-runtime`)
-#   test           — runs `cargo test` against debug-builder
-#   runtime        — slim production image with the release `bk` binary
-#   debug-runtime  — slim image with the debug `bk` binary (assertions on)
+#   runtime        — production binary. `--release` profile, no debug
+#                    info, no symbols, no `pprof` dependency. Smallest
+#                    image and fastest binary, but no profiling endpoint.
+#   debug-runtime  — debugging binary. `--profile release-debug` (same
+#                    optimization as `release` plus line-tables-only
+#                    DWARF) with `--features profiling`. The
+#                    `/debug/pprof/flamegraph` endpoint is compiled in
+#                    and stack traces are usable.
+#
+# Plus a `test` stage used by docker-compose-test.yml that runs the
+# workspace test suite in dev profile.
+#
+# Each profile has its own cargo-chef cache, so cold builds are paid
+# only once per profile and source edits never recompile rocksdb-sys.
 #
 # Build targets:
-#   docker build --target runtime .         # production image
-#   docker build --target debug-runtime .   # debug image
-#   docker build --target test .            # test runner image
+#   docker build --target runtime .         # production (default)
+#   docker build --target debug-runtime .   # debug image with profiling
+#   docker build --target test .            # test runner
 
 FROM rust:1.90-bookworm AS chef
 WORKDIR /app
@@ -50,8 +53,9 @@ COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ----------------------------------------------------------------------------
-# Release builder: compiles all deps in release profile (cached on
-# recipe.json), then copies source and builds the workspace itself.
+# Release builder: production binary. Stripped, no pprof, no debug info.
+# Compiles all deps in release profile (cached on recipe.json), then
+# copies source and builds the workspace itself.
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json -p bookkeeper-cli
@@ -60,13 +64,27 @@ COPY crates ./crates
 RUN cargo build --release -p bookkeeper-cli
 
 # ----------------------------------------------------------------------------
-# Debug builder: parallel cache for the dev profile. Used by the test stage
-# (which runs `cargo test --workspace`, dev profile by default) and by the
-# debug-runtime image. The cook only includes deps reachable from the cli
-# binary; the test stage's full-workspace test will re-cook a few extra
-# transitive deps the first time but the heavy ones (rocksdb-sys etc.)
-# are already cached.
+# Debug builder: same optimization as release, but with line-tables-only
+# debug info AND the `profiling` feature so the pprof flamegraph endpoint
+# is compiled in. Output goes to target/release-debug/bk (custom profile).
 FROM chef AS debug-builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook \
+        --profile release-debug \
+        --features bookkeeper-cli/profiling \
+        --recipe-path recipe.json \
+        -p bookkeeper-cli
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build \
+        --profile release-debug \
+        --features profiling \
+        -p bookkeeper-cli
+
+# ----------------------------------------------------------------------------
+# Test builder: dev profile, no features. Cached separately because dev
+# differs from both release and release-debug.
+FROM chef AS test-builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --recipe-path recipe.json -p bookkeeper-cli
 COPY Cargo.toml Cargo.lock ./
@@ -74,10 +92,9 @@ COPY crates ./crates
 RUN cargo build -p bookkeeper-cli
 
 # ----------------------------------------------------------------------------
-# Test stage: reuses the debug-builder (deps + source + compiled artifacts).
-# Used by docker-compose-test.yml to run the test suite inside Linux with
-# io_uring support (Debian Bookworm ships kernel 6.1).
-FROM debug-builder AS test
+# Test stage: runs the workspace test suite. Used by docker-compose-test.yml
+# to run tests inside Linux with io_uring (Debian Bookworm has kernel 6.1).
+FROM test-builder AS test
 WORKDIR /app
 ENV BOOKKEEPER_IO_ENGINE=uring
 CMD ["cargo", "test", "--workspace", "--", \
@@ -115,10 +132,11 @@ ENTRYPOINT ["bk"]
 CMD ["serve", "--conf", "/etc/bookkeeper/bk_server.conf"]
 
 # ----------------------------------------------------------------------------
-# Debug runtime image: same shape as `runtime`, but with the dev-profile
-# binary (debug assertions enabled, faster compile time, larger binary).
-# Use for in-cluster reproduction of bugs that only show up under debug
-# assertions.
+# Debug runtime image: same Debian base as `runtime`, but with the
+# release-debug binary (release-level optimization + line-tables debug
+# info + the `profiling` feature so /debug/pprof/flamegraph is available).
+# Use this when you need to capture flamegraphs or investigate a problem
+# in a production-like cluster.
 FROM debian:bookworm-slim AS debug-runtime
 
 RUN apt-get update && \
@@ -129,7 +147,7 @@ RUN apt-get update && \
 
 RUN useradd --system --create-home --home-dir /bk --shell /bin/bash bookkeeper
 
-COPY --from=debug-builder /app/target/debug/bk /usr/local/bin/bk
+COPY --from=debug-builder /app/target/release-debug/bk /usr/local/bin/bk
 COPY docker/bk_server.conf /etc/bookkeeper/bk_server.conf
 
 RUN mkdir -p /bk/data /bk/journal && chown -R bookkeeper:bookkeeper /bk /etc/bookkeeper
