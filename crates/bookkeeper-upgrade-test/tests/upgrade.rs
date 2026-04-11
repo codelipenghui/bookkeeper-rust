@@ -407,6 +407,23 @@ impl BookieSlot {
         Ok(())
     }
 
+    async fn stop(&mut self) -> Result<()> {
+        if let Some(container) = self.container.take() {
+            // testcontainers' default stop_timeout is 10s; a bookie's
+            // checkpoint() can take longer when write_cache is full.
+            // Give it 120s so a clean flush always completes. (See
+            // commit bc4e7922 on the bookie side for why this matters.)
+            container
+                .stop_with_timeout(Some(120))
+                .await
+                .map_err(|e| anyhow::anyhow!("stop bookie {}: {e}", self.alias))?;
+            // Drop the container handle to release testcontainers resources.
+            drop(container);
+            info!("Stopped bookie {}", self.alias);
+        }
+        Ok(())
+    }
+
     async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
         let container = self
             .container
@@ -438,6 +455,37 @@ impl BookieSlot {
                 );
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZK helpers
+// ---------------------------------------------------------------------------
+
+/// After stopping a bookie, ZK doesn't immediately remove its ephemeral
+/// registration node — it has to wait for the session timeout. If the new
+/// bookie tries to register before that, ZK returns NODE_EXISTS. Poll the
+/// registration path until it disappears, or until 30s.
+async fn wait_for_zk_ephemeral_to_clear(
+    zk: &zookeeper_client::Client,
+    alias: &str,
+) -> Result<()> {
+    let path = format!("/ledgers/available/{alias}:3181");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match zk.check_stat(&path).await {
+            Ok(None) => {
+                info!("ZK ephemeral {path} cleared");
+                return Ok(());
+            }
+            Ok(Some(_)) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("ZK ephemeral {path} did not clear within 30s");
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => anyhow::bail!("zk check_stat {path}: {e}"),
         }
     }
 }
@@ -599,6 +647,37 @@ async fn smoke_zk_container() -> Result<()> {
         children.iter().any(|c| c == "zookeeper"),
         "/zookeeper subtree expected"
     );
+
+    env.mark_success();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn smoke_stop_and_zk_clear() -> Result<()> {
+    init_tracing();
+    check_prerequisites()?;
+    let mut env = TestEnv::new()?;
+    let zk = ZkContainer::start(&env).await?;
+    let zk_in_net = zk.in_network_addr();
+    init_bk_cluster(&env, &zk_in_net).await?;
+
+    let mut slot = BookieSlot::new(1, &env);
+    slot.start_java(&zk_in_net).await?;
+    slot.wait_healthy(Duration::from_secs(180)).await?;
+
+    // Connect the test's ZK client (host-side) for the ephemeral check.
+    let zk_host = zk.host_addr().await?;
+    let zk_client = zookeeper_client::Client::connect(&zk_host).await?;
+
+    // Sanity: bookie is registered before stop.
+    let path = format!("/ledgers/available/{}:3181", slot.alias);
+    let stat = zk_client.check_stat(&path).await?;
+    assert!(stat.is_some(), "expected {path} registered before stop");
+
+    // Stop and wait for the ephemeral to disappear.
+    slot.stop().await?;
+    wait_for_zk_ephemeral_to_clear(&zk_client, &slot.alias).await?;
 
     env.mark_success();
     Ok(())
