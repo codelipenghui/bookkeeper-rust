@@ -4,6 +4,12 @@
 use anyhow::Result;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use testcontainers::{
+    core::{IntoContainerPort, WaitFor},
+    runners::AsyncRunner,
+    ContainerAsync, GenericImage, ImageExt,
+};
 use tracing::{info, warn};
 
 const JAVA_BK_IMAGE: &str = "apache/bookkeeper:4.17.3";
@@ -150,6 +156,43 @@ impl Drop for TestEnv {
 }
 
 // ---------------------------------------------------------------------------
+// ZooKeeper container fixture
+// ---------------------------------------------------------------------------
+
+/// ZooKeeper container, attached to the test network as `zookeeper:2181`.
+struct ZkContainer {
+    container: ContainerAsync<GenericImage>,
+}
+
+impl ZkContainer {
+    async fn start(env: &TestEnv) -> Result<Self> {
+        let img = GenericImage::new("zookeeper", "3.8")
+            .with_exposed_port(2181.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("binding to port"))
+            .with_network(env.network.clone())
+            .with_container_name(format!("bk-upgrade-zk-{}", env.run_id));
+        let container = img
+            .start()
+            .await
+            .map_err(|e| anyhow::anyhow!("start zookeeper: {e}"))?;
+        info!("ZooKeeper container started");
+        Ok(Self { container })
+    }
+
+    /// Hostname:port other containers in the same network use to reach ZK.
+    fn in_network_addr(&self) -> &'static str {
+        "zookeeper:2181"
+    }
+
+    /// host:port for the test process (running outside Docker) to reach ZK.
+    async fn host_addr(&self) -> Result<String> {
+        let host = self.container.get_host().await?;
+        let port = self.container.get_host_port_ipv4(2181).await?;
+        Ok(format!("{host}:{port}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Smoke tests — one per fixture, useful for diagnosing failures of the main
 // test in isolation.
 // ---------------------------------------------------------------------------
@@ -173,6 +216,30 @@ async fn smoke_test_env() -> Result<()> {
         assert!(out.status.success(), "volume {vol} not found after create");
     }
 
+    env.mark_success();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn smoke_zk_container() -> Result<()> {
+    init_tracing();
+    check_prerequisites()?;
+    let mut env = TestEnv::new()?;
+    let zk = ZkContainer::start(&env).await?;
+
+    let host_addr = zk.host_addr().await?;
+    info!("ZK host_addr: {host_addr}");
+    let client = zookeeper_client::Client::connect(&host_addr).await?;
+
+    let children = client.list_children("/").await?;
+    info!("ZK root children: {:?}", children);
+    assert!(
+        children.iter().any(|c| c == "zookeeper"),
+        "/zookeeper subtree expected"
+    );
+
+    let _ = Duration::from_secs(0); // touch the import so it doesn't go unused yet
     env.mark_success();
     Ok(())
 }
