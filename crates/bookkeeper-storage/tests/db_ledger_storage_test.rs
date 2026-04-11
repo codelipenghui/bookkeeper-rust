@@ -118,6 +118,53 @@ async fn flush_with_platform_engine() {
     assert_eq!(retrieved.len(), 32 + 128); // header + payload
 }
 
+/// Regression: when the bookie restarts, the next flush must NOT overwrite
+/// any existing entry log file. Previously `EntryLogState` was hard-coded to
+/// `log_id = 0, offset = LOGFILE_HEADER_SIZE` on every `open()`, which meant
+/// the second run would scribble new data on top of `0.log` and corrupt every
+/// entry the location index pointed at. The bookie should always roll forward
+/// to a fresh `<max+1>.log` on restart, matching Java's EntryLogger.
+#[tokio::test]
+async fn restart_does_not_overwrite_existing_entry_logs() {
+    let dir = TempDir::new().unwrap();
+
+    // First "run": add and flush an entry, then drop the storage handle.
+    {
+        let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+        storage.add_entry(&make_entry(1, 0, -1, b"first-run")).await.unwrap();
+        storage.flush().await.unwrap();
+        // Sanity: entry should be readable from disk after flush.
+        let got = storage.get_entry(1, 0).await.unwrap();
+        assert_eq!(&got[32..], b"first-run");
+    }
+
+    // Second "run": reopen the same dir. The next flush must land in a NEW
+    // log file, leaving the entry from run 1 intact and readable.
+    {
+        let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+        storage.add_entry(&make_entry(2, 0, -1, b"second-run")).await.unwrap();
+        storage.flush().await.unwrap();
+
+        // Both entries must still be readable. If the new flush had landed
+        // on top of `0.log`, get_entry(1, 0) would either fail or return
+        // garbage bytes that don't match the original payload.
+        let entry1 = storage.get_entry(1, 0).await.unwrap();
+        assert_eq!(&entry1[32..], b"first-run");
+        let entry2 = storage.get_entry(2, 0).await.unwrap();
+        assert_eq!(&entry2[32..], b"second-run");
+    }
+
+    // Third "run": same check across multiple restarts.
+    {
+        let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+        storage.add_entry(&make_entry(3, 0, -1, b"third-run")).await.unwrap();
+        storage.flush().await.unwrap();
+        assert_eq!(&storage.get_entry(1, 0).await.unwrap()[32..], b"first-run");
+        assert_eq!(&storage.get_entry(2, 0).await.unwrap()[32..], b"second-run");
+        assert_eq!(&storage.get_entry(3, 0).await.unwrap()[32..], b"third-run");
+    }
+}
+
 /// Tests add_entry overflow → implicit flush with the platform engine.
 /// The bench hits this when the write cache fills during iteration.
 #[tokio::test]

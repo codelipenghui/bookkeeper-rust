@@ -93,6 +93,15 @@ impl DbLedgerStorage {
         let entry_location_index = EntryLocationIndex::open(&locations_dir)?;
         let ledger_index = LedgerMetadataIndex::open(&ledgers_dir)?;
 
+        // CRITICAL: scan existing entry log files and start writing into a
+        // brand-new file (max_existing + 1). Without this we'd reopen
+        // `0.log` at offset = LOGFILE_HEADER_SIZE on every restart and
+        // overwrite previously-written entries — readers using the
+        // existing entry-location index would then get garbage bytes back
+        // and fail digest verification. Matches Java's EntryLogger which
+        // also rolls forward on startup.
+        let initial_log_id = Self::next_entry_log_id(&entry_log_dir)?;
+
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
             write_cache: RwLock::new(WriteCache::new(DEFAULT_WRITE_CACHE_SIZE)),
@@ -102,7 +111,7 @@ impl DbLedgerStorage {
             ledger_index,
             entry_log_dir,
             log_state: Mutex::new(EntryLogState {
-                log_id: 0,
+                log_id: initial_log_id,
                 offset: LOGFILE_HEADER_SIZE as u64,
                 file: None,
             }),
@@ -115,6 +124,27 @@ impl DbLedgerStorage {
             meta_cache: dashmap::DashMap::new(),
             lac_watchers: crate::lac_watcher::LacWatcherRegistry::new(),
         })
+    }
+
+    /// Scan `entry_log_dir` for `<hex>.log` files and return the next
+    /// log id to use (one past the highest existing id). Returns 0 when
+    /// the directory is empty (i.e. fresh bookie).
+    fn next_entry_log_id(entry_log_dir: &Path) -> Result<u32, StorageError> {
+        let mut max_id: Option<u32> = None;
+        let read_dir = match fs::read_dir(entry_log_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in read_dir {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else { continue };
+            let Some(stem) = name_str.strip_suffix(".log") else { continue };
+            let Ok(id) = u32::from_str_radix(stem, 16) else { continue };
+            max_id = Some(max_id.map_or(id, |m| m.max(id)));
+        }
+        Ok(max_id.map_or(0, |m| m + 1))
     }
 
     /// Initialize the journal for write-ahead logging.
