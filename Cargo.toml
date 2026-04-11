@@ -12,6 +12,7 @@ members = [
     "crates/bookkeeper-cli",
     "crates/bookkeeper-replication",
     "crates/bookkeeper-test-utils",
+    "crates/bookkeeper-upgrade-test",
 ]
 
 [workspace.package]
