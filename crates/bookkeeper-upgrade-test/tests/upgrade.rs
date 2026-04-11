@@ -159,29 +159,37 @@ impl Drop for TestEnv {
 // ZooKeeper container fixture
 // ---------------------------------------------------------------------------
 
-/// ZooKeeper container, attached to the test network as `zookeeper:2181`.
+/// ZooKeeper container. Reachable from other containers on the test network
+/// by its container name (Docker auto-DNS on user-defined bridges).
 struct ZkContainer {
     container: ContainerAsync<GenericImage>,
+    in_network_name: String,
 }
 
 impl ZkContainer {
     async fn start(env: &TestEnv) -> Result<Self> {
+        let in_network_name = format!("bk-upgrade-zk-{}", env.run_id);
         let img = GenericImage::new("zookeeper", "3.8")
             .with_exposed_port(2181.tcp())
             .with_wait_for(WaitFor::message_on_stdout("binding to port"))
             .with_network(env.network.clone())
-            .with_container_name(format!("bk-upgrade-zk-{}", env.run_id));
+            .with_container_name(in_network_name.clone());
         let container = img
             .start()
             .await
             .map_err(|e| anyhow::anyhow!("start zookeeper: {e}"))?;
-        info!("ZooKeeper container started");
-        Ok(Self { container })
+        info!("ZooKeeper container started ({})", in_network_name);
+        Ok(Self {
+            container,
+            in_network_name,
+        })
     }
 
-    /// Hostname:port other containers in the same network use to reach ZK.
-    fn in_network_addr(&self) -> &'static str {
-        "zookeeper:2181"
+    /// `host:port` other containers on the test network use to reach ZK.
+    /// Docker resolves the container name as a DNS alias on user-defined
+    /// bridge networks.
+    fn in_network_addr(&self) -> String {
+        format!("{}:2181", self.in_network_name)
     }
 
     /// host:port for the test process (running outside Docker) to reach ZK.
@@ -189,6 +197,177 @@ impl ZkContainer {
         let host = self.container.get_host().await?;
         let port = self.container.get_host_port_ipv4(2181).await?;
         Ok(format!("{host}:{port}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster bootstrap — Java BK requires `metaformat` against ZK before any
+// bookie can start. Runs once per test, after ZK is up.
+// ---------------------------------------------------------------------------
+
+async fn init_bk_cluster(env: &TestEnv, zk_in_network: &str) -> Result<()> {
+    // One-shot run of `bookkeeper shell metaformat` against the test ZK.
+    //
+    // The apache/bookkeeper image's entrypoint applies BK_* env vars to
+    // bk_server.conf via `apply-config-from-env.py`. We want to use a
+    // custom command (`bookkeeper shell metaformat`) instead of the
+    // default `bookie` command, so we override the entrypoint AND run
+    // apply-config-from-env.py ourselves before invoking the shell.
+    let zk_servers = zk_in_network.to_string();
+    let metadata_uri = format!("zk://{zk_in_network}/ledgers");
+    let cmd = "/opt/bookkeeper/scripts/apply-config-from-env.py /opt/bookkeeper/conf/bk_server.conf && \
+               /opt/bookkeeper/bin/bookkeeper shell metaformat -nonInteractive -force";
+    let out = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            &env.network,
+            "-e",
+            &format!("BK_zkServers={zk_servers}"),
+            "-e",
+            &format!("BK_metadataServiceUri={metadata_uri}"),
+            "--entrypoint",
+            "bash",
+            JAVA_BK_IMAGE,
+            "-c",
+            cmd,
+        ])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "bookkeeper metaformat failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    info!("Initialized BK cluster metadata in ZK");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BookieSlot — per-bookie state, swappable Java/Rust on the same volumes
+// ---------------------------------------------------------------------------
+
+/// Per-bookie slot. Owns the volumes (via TestEnv), the network alias, and
+/// the currently-running container handle (Java OR Rust).
+///
+/// `alias` is the per-slot DNS name used inside the test network. We use
+/// the (run-id-suffixed) container name as the alias because Docker resolves
+/// container names on user-defined bridge networks; this avoids needing
+/// testcontainers' (currently-not-exposed) `with_network_aliases` API.
+/// The bookieId stored on disk and in ZK is therefore `<alias>:3181`, which
+/// is stable across image swaps within a single test run.
+struct BookieSlot {
+    #[allow(dead_code)]
+    slot_id: u32,
+    alias: String,
+    data_volume: String,
+    journal_volume: String,
+    network: String,
+    #[allow(dead_code)]
+    run_id: String,
+    container: Option<ContainerAsync<GenericImage>>,
+}
+
+impl BookieSlot {
+    fn new(slot_id: u32, env: &TestEnv) -> Self {
+        let alias = format!("bk-upgrade-bookie-{}-{}", slot_id, env.run_id);
+        let data_volume = env
+            .volumes
+            .iter()
+            .find(|v| v.ends_with(&format!("-bk{slot_id}-data")))
+            .expect("data volume should exist for slot")
+            .clone();
+        let journal_volume = env
+            .volumes
+            .iter()
+            .find(|v| v.ends_with(&format!("-bk{slot_id}-journal")))
+            .expect("journal volume should exist for slot")
+            .clone();
+        Self {
+            slot_id,
+            alias,
+            data_volume,
+            journal_volume,
+            network: env.network.clone(),
+            run_id: env.run_id.clone(),
+            container: None,
+        }
+    }
+
+    async fn start_java(&mut self, zk_in_network: &str) -> Result<()> {
+        use testcontainers::core::Mount;
+
+        // The container is named after `self.alias` (which already includes
+        // the run_id suffix). Docker will register that name as a DNS alias
+        // on the user-defined bridge so other containers can reach this
+        // bookie at `<alias>:3181`.
+        let img = GenericImage::new("apache/bookkeeper", "4.17.3")
+            .with_exposed_port(3181.tcp())
+            .with_exposed_port(8080.tcp())
+            // The Java bookie's `bookie` subcommand goes through
+            // ComponentStarter which logs "Started component bookie-server."
+            // — note this is NOT the same as standalone mode's
+            // "Started bookie server successfully" (different code path).
+            .with_wait_for(WaitFor::message_on_stdout("Started component bookie-server."))
+            .with_startup_timeout(Duration::from_secs(180))
+            .with_network(self.network.clone())
+            .with_container_name(self.alias.clone())
+            .with_mount(Mount::volume_mount(self.data_volume.clone(), "/bk/data"))
+            .with_mount(Mount::volume_mount(
+                self.journal_volume.clone(),
+                "/bk/journal",
+            ))
+            .with_env_var("BK_zkServers", zk_in_network)
+            .with_env_var("BK_advertisedAddress", &self.alias)
+            .with_env_var("BK_useHostNameAsBookieID", "true")
+            .with_env_var("BK_journalDirectory", "/bk/journal")
+            .with_env_var("BK_ledgerDirectories", "/bk/data")
+            .with_env_var("BK_bookiePort", "3181")
+            .with_env_var("BK_httpServerEnabled", "true")
+            .with_env_var("BK_httpServerPort", "8080");
+        let container = img
+            .start()
+            .await
+            .map_err(|e| anyhow::anyhow!("start java bookie {}: {e}", self.alias))?;
+        self.container = Some(container);
+        info!("Started Java bookie {}", self.alias);
+        Ok(())
+    }
+
+    async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
+        let container = self
+            .container
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no container in slot {}", self.alias))?;
+        let host = container.get_host().await?;
+        let http_port = container.get_host_port_ipv4(8080).await?;
+        let url = format!("http://{host}:{http_port}/heartbeat");
+
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let out = Command::new("curl")
+                .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &url])
+                .output();
+            if let Ok(out) = out {
+                if out.status.success() {
+                    let code = String::from_utf8_lossy(&out.stdout);
+                    if code.trim() == "200" {
+                        info!("Bookie {} healthy ({})", self.alias, url);
+                        return Ok(());
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "bookie {} did not become healthy within {:?}",
+                    self.alias,
+                    timeout
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 }
 
@@ -229,7 +408,10 @@ async fn smoke_zk_container() -> Result<()> {
     let zk = ZkContainer::start(&env).await?;
 
     let host_addr = zk.host_addr().await?;
-    info!("ZK host_addr: {host_addr}");
+    info!(
+        "ZK host_addr={host_addr} in_network_addr={}",
+        zk.in_network_addr()
+    );
     let client = zookeeper_client::Client::connect(&host_addr).await?;
 
     let children = client.list_children("/").await?;
@@ -239,7 +421,24 @@ async fn smoke_zk_container() -> Result<()> {
         "/zookeeper subtree expected"
     );
 
-    let _ = Duration::from_secs(0); // touch the import so it doesn't go unused yet
+    env.mark_success();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn smoke_java_bookie() -> Result<()> {
+    init_tracing();
+    check_prerequisites()?;
+    let mut env = TestEnv::new()?;
+    let zk = ZkContainer::start(&env).await?;
+    let zk_addr = zk.in_network_addr();
+    init_bk_cluster(&env, &zk_addr).await?;
+
+    let mut slot = BookieSlot::new(1, &env);
+    slot.start_java(&zk_addr).await?;
+    slot.wait_healthy(Duration::from_secs(180)).await?;
+
     env.mark_success();
     Ok(())
 }
