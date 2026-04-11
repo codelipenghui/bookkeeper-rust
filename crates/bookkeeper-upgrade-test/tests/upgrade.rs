@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 const JAVA_BK_IMAGE: &str = "apache/bookkeeper:4.17.3";
 const RUST_BK_IMAGE: &str = "rust-bookie:latest";
+const HELPER_IMAGE: &str = "bk-upgrade-helper:latest";
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -48,6 +49,12 @@ fn check_prerequisites() -> Result<()> {
         "docker build --target runtime -t rust-bookie:latest .",
     )?;
     info!("✓ {} present", RUST_BK_IMAGE);
+
+    require_image(
+        HELPER_IMAGE,
+        "docker build -t bk-upgrade-helper:latest crates/bookkeeper-upgrade-test/helper",
+    )?;
+    info!("✓ {} present", HELPER_IMAGE);
 
     Ok(())
 }
@@ -436,6 +443,114 @@ impl BookieSlot {
 }
 
 // ---------------------------------------------------------------------------
+// Workload helpers — drive the Java BK client via the sidecar image
+// ---------------------------------------------------------------------------
+
+/// Deterministic payload for a given (label, entry, era). Must match the
+/// Java helper's `payloadFor`.
+#[allow(dead_code)]
+fn payload_for(label: i64, entry_id: i64, era: &str) -> String {
+    format!("ledger_label={label} entry={entry_id} era={era}")
+}
+
+/// Run the Java BkUpgradeHelper in a one-shot sidecar container on the test
+/// network. Returns the combined (stdout, stderr) on success. Bails on
+/// non-zero exit with the helper's stderr in the error message.
+fn run_helper(env: &TestEnv, args: &[&str]) -> Result<(String, String)> {
+    let mut cmd = Command::new("docker");
+    cmd.args(["run", "--rm", "--network", &env.network, HELPER_IMAGE]);
+    cmd.args(args);
+    let out = cmd.output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        anyhow::bail!(
+            "helper failed (args {:?})\nstdout: {}\nstderr: {}",
+            args,
+            stdout,
+            stderr
+        );
+    }
+    Ok((stdout, stderr))
+}
+
+/// Parse a line like "ledger_id=123" out of the helper stdout.
+fn parse_kv(out: &str, key: &str) -> Result<String> {
+    let prefix = format!("{key}=");
+    for line in out.lines() {
+        if let Some(rest) = line.trim().strip_prefix(&prefix) {
+            return Ok(rest.to_string());
+        }
+    }
+    anyhow::bail!("helper stdout did not contain `{key}=<value>`:\n{out}")
+}
+
+/// Create a ledger, write `n_entries` deterministic entries (label=era in
+/// each payload), close it, and return the actual ledger id assigned by ZK.
+fn write_ledger(
+    env: &TestEnv,
+    zk_in_network: &str,
+    label: i64,
+    n_entries: i64,
+    era: &str,
+) -> Result<i64> {
+    let label_s = label.to_string();
+    let n_s = n_entries.to_string();
+    let (stdout, _) = run_helper(
+        env,
+        &[
+            "write",
+            "--zk",
+            zk_in_network,
+            "--label",
+            &label_s,
+            "--entries",
+            &n_s,
+            "--era",
+            era,
+        ],
+    )?;
+    let id: i64 = parse_kv(&stdout, "ledger_id")?.parse()?;
+    info!("Wrote {n_entries} entries to ledger {id} (label={label}, era={era})");
+    Ok(id)
+}
+
+/// Open a ledger, read every entry, verify each payload byte-for-byte
+/// against the deterministic format string. Bails on any mismatch.
+#[allow(dead_code)]
+fn read_ledger(
+    env: &TestEnv,
+    zk_in_network: &str,
+    ledger_id: i64,
+    label: i64,
+    n_entries: i64,
+    era: &str,
+) -> Result<i64> {
+    let id_s = ledger_id.to_string();
+    let label_s = label.to_string();
+    let n_s = n_entries.to_string();
+    let (stdout, _) = run_helper(
+        env,
+        &[
+            "read",
+            "--zk",
+            zk_in_network,
+            "--ledger-id",
+            &id_s,
+            "--label",
+            &label_s,
+            "--entries",
+            &n_s,
+            "--era",
+            era,
+        ],
+    )?;
+    let count: i64 = parse_kv(&stdout, "verified")?.parse()?;
+    info!("Read-verified {count} entries from ledger {ledger_id}");
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------
 // Smoke tests — one per fixture, useful for diagnosing failures of the main
 // test in isolation.
 // ---------------------------------------------------------------------------
@@ -484,6 +599,33 @@ async fn smoke_zk_container() -> Result<()> {
         children.iter().any(|c| c == "zookeeper"),
         "/zookeeper subtree expected"
     );
+
+    env.mark_success();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn smoke_write_ledger() -> Result<()> {
+    init_tracing();
+    check_prerequisites()?;
+    let mut env = TestEnv::new()?;
+    let zk = ZkContainer::start(&env).await?;
+    let zk_in_net = zk.in_network_addr();
+    init_bk_cluster(&env, &zk_in_net).await?;
+
+    let mut slot1 = BookieSlot::new(1, &env);
+    let mut slot2 = BookieSlot::new(2, &env);
+    slot1.start_java(&zk_in_net).await?;
+    slot2.start_java(&zk_in_net).await?;
+    slot1.wait_healthy(Duration::from_secs(180)).await?;
+    slot2.wait_healthy(Duration::from_secs(180)).await?;
+
+    // Sidecar-driven write + read. The helper container joins the test
+    // network so `bk-upgrade-bookie-N-<run-id>:3181` resolves to the right
+    // bookie.
+    let id = write_ledger(&env, &zk_in_net, 100, 5, "smoke")?;
+    read_ledger(&env, &zk_in_net, id, 100, 5, "smoke")?;
 
     env.mark_success();
     Ok(())

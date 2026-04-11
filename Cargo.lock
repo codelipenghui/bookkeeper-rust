@@ -787,6 +787,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bookkeeper-upgrade-test"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "testcontainers",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zookeeper-client",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

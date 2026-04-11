@@ -21,8 +21,5 @@ testcontainers = { workspace = true }
 anyhow = "1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-bookkeeper-client = { workspace = true }
-bookkeeper-protocol = { workspace = true }
 zookeeper-client = { workspace = true }
-bytes = { workspace = true }
 tempfile = { workspace = true }
