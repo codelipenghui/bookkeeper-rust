@@ -5,6 +5,7 @@ use anyhow::Result;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tempfile::TempDir;
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -246,6 +247,38 @@ async fn init_bk_cluster(env: &TestEnv, zk_in_network: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-slot bk_server.conf rendering for the Rust bookie image
+// ---------------------------------------------------------------------------
+
+/// Render a per-slot bk_server.conf into `dir` and return its host path.
+/// The Rust bookie image reads /etc/bookkeeper/bk_server.conf at startup.
+fn render_rust_conf(
+    dir: &std::path::Path,
+    alias: &str,
+    zk_in_network: &str,
+) -> Result<std::path::PathBuf> {
+    let conf = format!(
+        "bookiePort=3181\n\
+         httpServerEnabled=true\n\
+         httpServerPort=8080\n\
+         ledgerDirectories=/bk/data\n\
+         journalDirectory=/bk/journal\n\
+         zkServers={zk}\n\
+         metadataServiceUri=zk://{zk}/ledgers\n\
+         advertisedAddress={alias}\n\
+         useHostNameAsBookieID=true\n\
+         journalSyncData=true\n\
+         journalWriteData=true\n\
+         serverNumIOThreads=4\n",
+        zk = zk_in_network,
+        alias = alias,
+    );
+    let path = dir.join(format!("bk_server-{alias}.conf"));
+    std::fs::write(&path, conf)?;
+    Ok(path)
+}
+
+// ---------------------------------------------------------------------------
 // BookieSlot — per-bookie state, swappable Java/Rust on the same volumes
 // ---------------------------------------------------------------------------
 
@@ -336,6 +369,37 @@ impl BookieSlot {
         Ok(())
     }
 
+    async fn start_rust(&mut self, zk_in_network: &str, conf_dir: &std::path::Path) -> Result<()> {
+        use testcontainers::core::Mount;
+
+        let conf_path = render_rust_conf(conf_dir, &self.alias, zk_in_network)?;
+        let conf_path_str = conf_path.to_string_lossy().to_string();
+
+        let img = GenericImage::new("rust-bookie", "latest")
+            .with_exposed_port(3181.tcp())
+            .with_exposed_port(8080.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("Bookie started at"))
+            .with_startup_timeout(Duration::from_secs(120))
+            .with_network(self.network.clone())
+            .with_container_name(self.alias.clone())
+            .with_mount(Mount::volume_mount(self.data_volume.clone(), "/bk/data"))
+            .with_mount(Mount::volume_mount(
+                self.journal_volume.clone(),
+                "/bk/journal",
+            ))
+            .with_mount(Mount::bind_mount(
+                conf_path_str,
+                "/etc/bookkeeper/bk_server.conf",
+            ));
+        let container = img
+            .start()
+            .await
+            .map_err(|e| anyhow::anyhow!("start rust bookie {}: {e}", self.alias))?;
+        self.container = Some(container);
+        info!("Started Rust bookie {}", self.alias);
+        Ok(())
+    }
+
     async fn wait_healthy(&self, timeout: Duration) -> Result<()> {
         let container = self
             .container
@@ -420,6 +484,25 @@ async fn smoke_zk_container() -> Result<()> {
         children.iter().any(|c| c == "zookeeper"),
         "/zookeeper subtree expected"
     );
+
+    env.mark_success();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn smoke_rust_bookie() -> Result<()> {
+    init_tracing();
+    check_prerequisites()?;
+    let mut env = TestEnv::new()?;
+    let zk = ZkContainer::start(&env).await?;
+    let zk_addr = zk.in_network_addr();
+    init_bk_cluster(&env, &zk_addr).await?;
+
+    let conf_dir = TempDir::new()?;
+    let mut slot = BookieSlot::new(1, &env);
+    slot.start_rust(&zk_addr, conf_dir.path()).await?;
+    slot.wait_healthy(Duration::from_secs(60)).await?;
 
     env.mark_success();
     Ok(())
