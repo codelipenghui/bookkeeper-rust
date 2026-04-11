@@ -56,7 +56,7 @@ The engineer must have these in place on their machine:
 
 ```bash
 docker info > /dev/null              # Docker daemon running
-docker pull apachebookkeeper/bookkeeper:4.18.0
+docker pull apache/bookkeeper:4.17.3
 docker build --target runtime -t rust-bookie:latest .   # in workspace root
 ```
 
@@ -126,7 +126,7 @@ for the full design rationale.
 
 ```bash
 docker info                                                # daemon running
-docker pull apachebookkeeper/bookkeeper:4.18.0
+docker pull apache/bookkeeper:4.17.3
 docker build --target runtime -t rust-bookie:latest .      # in workspace root
 ```
 
@@ -258,7 +258,7 @@ fn init_tracing() {
         .try_init();
 }
 
-const JAVA_BK_IMAGE: &str = "apachebookkeeper/bookkeeper:4.18.0";
+const JAVA_BK_IMAGE: &str = "apache/bookkeeper:4.17.3";
 const RUST_BK_IMAGE: &str = "rust-bookie:latest";
 
 fn check_prerequisites() -> Result<()> {
@@ -325,7 +325,7 @@ Expected (success path, when both images are present):
 ```
 running 1 test
 ✓ Docker daemon reachable
-✓ apachebookkeeper/bookkeeper:4.18.0 present
+✓ apache/bookkeeper:4.17.3 present
 ✓ rust-bookie:latest present
 Prerequisites OK; remainder of test not yet implemented
 test java_to_rust_in_place_upgrade ... ok
@@ -1295,7 +1295,7 @@ Expected: test passes. Output includes:
 - "Swap to Rust complete for bookie-1"
 - "Read-verified 50 entries from ledger N"
 
-If the test fails at the read step, that's a real on-disk format compat bug. The cleanup path leaves the volumes in place; the engineer can `docker run -it --rm -v <vol>:/bk apachebookkeeper/bookkeeper:4.18.0 bash` to inspect the bookie's data dir and figure out which compat surface broke.
+If the test fails at the read step, that's a real on-disk format compat bug. The cleanup path leaves the volumes in place; the engineer can `docker run -it --rm -v <vol>:/bk apache/bookkeeper:4.17.3 bash` to inspect the bookie's data dir and figure out which compat surface broke.
 
 - [ ] **Step 4: Commit**
 
@@ -1377,7 +1377,7 @@ fn parse_cookie(bytes: &[u8]) -> Result<CookieFields> {
 }
 ```
 
-Note: the actual Java cookie file format is a versioned binary format, NOT a plain text k:v format. The parser above is a placeholder that handles the simple text-style cookie that the Rust bookie writes; real Java BK cookies are written by `org.apache.bookkeeper.discover.BookieServiceInfoUtils.parseCookie` and are length-prefixed binary. **Before running this task**, the engineer must inspect a real Java BK cookie by `docker run --rm apachebookkeeper/bookkeeper:4.18.0 bash -c 'cat /bk/data/current/VERSION | xxd | head'` and adapt `parse_cookie` to handle whichever format is on disk. If both Java and Rust write text-format cookies, the placeholder works as-is.
+Note: the actual Java cookie file format is a versioned binary format, NOT a plain text k:v format. The parser above is a placeholder that handles the simple text-style cookie that the Rust bookie writes; real Java BK cookies are written by `org.apache.bookkeeper.discover.BookieServiceInfoUtils.parseCookie` and are length-prefixed binary. **Before running this task**, the engineer must inspect a real Java BK cookie by `docker run --rm apache/bookkeeper:4.17.3 bash -c 'cat /bk/data/current/VERSION | xxd | head'` and adapt `parse_cookie` to handle whichever format is on disk. If both Java and Rust write text-format cookies, the placeholder works as-is.
 
 - [ ] **Step 2: Add `Baseline` and `capture_baseline`**
 
@@ -1771,7 +1771,7 @@ To poke at a volume directly:
 ```bash
 docker run -it --rm \
   -v bk-upgrade-test-<run-id>-bk1-data:/bk/data \
-  apachebookkeeper/bookkeeper:4.18.0 bash
+  apache/bookkeeper:4.17.3 bash
 # Inside:
 ls /bk/data/current/
 cat /bk/data/current/VERSION

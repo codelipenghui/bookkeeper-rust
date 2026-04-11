@@ -70,8 +70,8 @@ A `TestEnv` guard struct manages cleanup. On success, network and volumes are re
 | Slot | Network alias | Volumes | Initial image |
 |---|---|---|---|
 | zk | `zookeeper` | (ephemeral) | `zookeeper:3.8` |
-| bookie 1 | `bookie-1` | `bk1-data → /bk/data`, `bk1-journal → /bk/journal` | `apachebookkeeper/bookkeeper:4.18.0` |
-| bookie 2 | `bookie-2` | `bk2-data → /bk/data`, `bk2-journal → /bk/journal` | `apachebookkeeper/bookkeeper:4.18.0` |
+| bookie 1 | `bookie-1` | `bk1-data → /bk/data`, `bk1-journal → /bk/journal` | `apache/bookkeeper:4.17.3` |
+| bookie 2 | `bookie-2` | `bk2-data → /bk/data`, `bk2-journal → /bk/journal` | `apache/bookkeeper:4.17.3` |
 
 Two bookies, configured for `E=2 W=2 A=2` (matches the existing `docker-compose.yml` topology). Both bookies advertise their network alias as `bookieId`, so the bookieId is stable across image swaps.
 
@@ -231,7 +231,7 @@ The crate is added to the workspace `members` list. It is *not* added to the def
 docker build --target runtime -t rust-bookie:latest .
 
 # 2. Pull the Java BK image (pinned tag)
-docker pull apachebookkeeper/bookkeeper:4.18.0
+docker pull apache/bookkeeper:4.17.3
 
 # 3. Run the test
 cargo test -p bookkeeper-upgrade-test --test upgrade -- --ignored --nocapture
@@ -244,7 +244,7 @@ cargo test -p bookkeeper-upgrade-test --test upgrade -- --ignored --nocapture
 `check_prerequisites()` runs first and fails fast with an actionable message if any prerequisite is missing:
 
 - Docker daemon reachable? (`docker info`)
-- `apachebookkeeper/bookkeeper:4.18.0` image present locally?
+- `apache/bookkeeper:4.17.3` image present locally?
 - `rust-bookie:latest` image present locally?
 - ≥10 GB free in `/var/lib/docker` (best-effort warning, not a hard fail)
 
@@ -263,7 +263,7 @@ TEST FAILED. State preserved for inspection. To clean up:
   docker volume rm bk-upgrade-test-<run-id>-bk{1,2}-{data,journal}
 ```
 
-The user can also `docker run -it --rm -v <vol>:/bk apachebookkeeper/bookkeeper:4.18.0 bash` to poke at any volume directly.
+The user can also `docker run -it --rm -v <vol>:/bk apache/bookkeeper:4.17.3 bash` to poke at any volume directly.
 
 ## Failure modes — what each test failure tells you
 
