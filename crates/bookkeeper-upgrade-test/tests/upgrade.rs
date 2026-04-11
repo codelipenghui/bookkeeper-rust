@@ -3,7 +3,8 @@
 
 use anyhow::Result;
 use std::process::Command;
-use tracing::info;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{info, warn};
 
 const JAVA_BK_IMAGE: &str = "apache/bookkeeper:4.17.3";
 const RUST_BK_IMAGE: &str = "rust-bookie:latest";
@@ -56,6 +57,129 @@ fn require_image(image: &str, fix_cmd: &str) -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// TestEnv — owns Docker network + named volumes for one test run
+// ---------------------------------------------------------------------------
+
+/// On Drop:
+///   - if `succeeded` is true → remove network and volumes
+///   - if `succeeded` is false → leave them and print cleanup commands
+struct TestEnv {
+    run_id: String,
+    network: String,
+    volumes: Vec<String>,
+    succeeded: bool,
+}
+
+impl TestEnv {
+    fn new() -> Result<Self> {
+        // Monotonic + per-process unique run id; avoids collisions on parallel runs.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let run_id = format!("{}-{}", pid, n);
+        let network = format!("bk-upgrade-test-{run_id}");
+        let volumes = vec![
+            format!("bk-upgrade-test-{run_id}-bk1-data"),
+            format!("bk-upgrade-test-{run_id}-bk1-journal"),
+            format!("bk-upgrade-test-{run_id}-bk2-data"),
+            format!("bk-upgrade-test-{run_id}-bk2-journal"),
+        ];
+
+        let out = Command::new("docker")
+            .args(["network", "create", "--driver", "bridge", &network])
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "docker network create failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        info!("Created network {network}");
+
+        for vol in &volumes {
+            let out = Command::new("docker")
+                .args(["volume", "create", vol])
+                .output()?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "docker volume create {vol} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+        info!("Created {} volumes", volumes.len());
+
+        Ok(Self {
+            run_id,
+            network,
+            volumes,
+            succeeded: false,
+        })
+    }
+
+    fn mark_success(&mut self) {
+        self.succeeded = true;
+    }
+}
+
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        if self.succeeded {
+            for vol in &self.volumes {
+                let _ = Command::new("docker")
+                    .args(["volume", "rm", "-f", vol])
+                    .output();
+            }
+            let _ = Command::new("docker")
+                .args(["network", "rm", &self.network])
+                .output();
+            info!("Cleaned up test env (run-id={})", self.run_id);
+        } else {
+            warn!(
+                "TEST FAILED — state preserved for inspection.\n\
+                 To clean up manually:\n  \
+                 docker network rm {}\n  \
+                 docker volume rm -f {}",
+                self.network,
+                self.volumes.join(" ")
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Smoke tests — one per fixture, useful for diagnosing failures of the main
+// test in isolation.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn smoke_test_env() -> Result<()> {
+    init_tracing();
+    check_prerequisites()?;
+    let mut env = TestEnv::new()?;
+
+    let out = Command::new("docker")
+        .args(["network", "inspect", &env.network])
+        .output()?;
+    assert!(out.status.success(), "network not found after create");
+
+    for vol in &env.volumes {
+        let out = Command::new("docker")
+            .args(["volume", "inspect", vol])
+            .output()?;
+        assert!(out.status.success(), "volume {vol} not found after create");
+    }
+
+    env.mark_success();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Main test
+// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
