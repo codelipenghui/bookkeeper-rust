@@ -499,6 +499,219 @@ async fn wait_for_zk_ephemeral_to_clear(
 }
 
 // ---------------------------------------------------------------------------
+// Verification — capture a baseline at the start of the test, re-check
+// against it after every phase to surface drift.
+// ---------------------------------------------------------------------------
+
+/// The cookie fields we compare across swaps. Serialization details may
+/// differ slightly between Java and Rust so we compare parsed fields, not
+/// raw bytes. Note: Java BK's current VERSION file is a text format with
+/// key/value lines prefixed by a layout-version number on line 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CookieFields {
+    bookie_host: String,
+    journal_dir: String,
+    ledger_dirs: String,
+    instance_id: Option<String>,
+    layout_version: String,
+}
+
+fn parse_cookie(bytes: &[u8]) -> Result<CookieFields> {
+    let text = std::str::from_utf8(bytes).map_err(|e| anyhow::anyhow!("cookie not utf8: {e}"))?;
+    let mut lines = text.lines();
+    let layout_version = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty cookie"))?
+        .trim()
+        .to_string();
+    let mut bookie_host = None;
+    let mut journal_dir = None;
+    let mut ledger_dirs = None;
+    let mut instance_id = None;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim();
+            let mut v = v.trim();
+            // Java's cookie file wraps string values in double-quotes.
+            if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+                v = &v[1..v.len() - 1];
+            }
+            let v = v.to_string();
+            match k {
+                "bookieHost" => bookie_host = Some(v),
+                "journalDir" => journal_dir = Some(v),
+                "ledgerDirs" => ledger_dirs = Some(v),
+                "instanceId" => instance_id = Some(v),
+                _ => {}
+            }
+        }
+    }
+    Ok(CookieFields {
+        bookie_host: bookie_host.ok_or_else(|| anyhow::anyhow!("cookie missing bookieHost"))?,
+        journal_dir: journal_dir.ok_or_else(|| anyhow::anyhow!("cookie missing journalDir"))?,
+        ledger_dirs: ledger_dirs.ok_or_else(|| anyhow::anyhow!("cookie missing ledgerDirs"))?,
+        instance_id,
+        layout_version,
+    })
+}
+
+/// Read the cookie file from a running bookie via `docker exec`. The
+/// apache/bookkeeper image has a different data path layout than the rust
+/// image — both drop the cookie at `/bk/data/current/VERSION` because
+/// that's where our configured `ledgerDirectories=/bk/data` puts it.
+fn read_cookie(slot: &BookieSlot) -> Result<Vec<u8>> {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            &slot.alias,
+            "cat",
+            "/bk/data/current/VERSION",
+        ])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "docker exec cat VERSION on {} failed: {}",
+            slot.alias,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// Snapshot taken at the start of P1 and re-checked after every phase.
+#[derive(Debug, Clone)]
+struct Baseline {
+    available_bookies: Vec<String>,
+    instance_id: String,
+    cookies: Vec<(String, CookieFields)>, // (alias, fields)
+}
+
+async fn capture_baseline(
+    zk: &zookeeper_client::Client,
+    bookies: &[&BookieSlot],
+) -> Result<Baseline> {
+    let mut available_bookies: Vec<String> = zk
+        .list_children("/ledgers/available")
+        .await?
+        .into_iter()
+        .filter(|c| !c.starts_with("readonly"))
+        .collect();
+    available_bookies.sort();
+
+    let (id_bytes, _) = zk.get_data("/ledgers/INSTANCEID").await?;
+    let instance_id = String::from_utf8_lossy(&id_bytes).into_owned();
+
+    let mut cookies = Vec::new();
+    for slot in bookies {
+        let raw = read_cookie(slot)?;
+        let fields = parse_cookie(&raw)?;
+        cookies.push((slot.alias.clone(), fields));
+    }
+
+    info!(
+        "Baseline: bookies={available_bookies:?} instance_id={instance_id} cookies_collected={}",
+        cookies.len()
+    );
+    Ok(Baseline {
+        available_bookies,
+        instance_id,
+        cookies,
+    })
+}
+
+/// Run the per-phase assertion bundle. `closed_ledgers` is the list of
+/// `(id, label, count, era)` tuples for ledgers that have been CLOSED so
+/// far in the test; we re-read every entry of every closed ledger as part
+/// of the assertion.
+#[allow(clippy::too_many_arguments)]
+async fn verify_cluster_state(
+    env: &TestEnv,
+    zk_in_network: &str,
+    zk: &zookeeper_client::Client,
+    bookies: &[&BookieSlot],
+    baseline: &Baseline,
+    closed_ledgers: &[(i64, i64, i64, &str)],
+    phase_label: &str,
+) -> Result<()> {
+    info!("=== Verifying cluster state after {phase_label} ===");
+
+    // 1. Both bookies healthy
+    for slot in bookies {
+        slot.wait_healthy(Duration::from_secs(30)).await.map_err(|e| {
+            anyhow::anyhow!("[{phase_label}] bookie {} not healthy: {e}", slot.alias)
+        })?;
+    }
+
+    // 2. Identity continuity — same set of bookieIds in /ledgers/available
+    let mut current: Vec<String> = zk
+        .list_children("/ledgers/available")
+        .await?
+        .into_iter()
+        .filter(|c| !c.starts_with("readonly"))
+        .collect();
+    current.sort();
+    if current != baseline.available_bookies {
+        anyhow::bail!(
+            "[{phase_label}] /ledgers/available drifted from baseline\n  \
+             baseline: {:?}\n  current:  {:?}",
+            baseline.available_bookies,
+            current
+        );
+    }
+
+    // 3. Cluster instance id invariant
+    let (id_bytes, _) = zk.get_data("/ledgers/INSTANCEID").await?;
+    let current_id = String::from_utf8_lossy(&id_bytes).into_owned();
+    if current_id != baseline.instance_id {
+        anyhow::bail!(
+            "[{phase_label}] /ledgers/INSTANCEID changed (rebootstrap?)\n  \
+             baseline: {}\n  current:  {}",
+            baseline.instance_id,
+            current_id
+        );
+    }
+
+    // 4. Cookie field-equal
+    for (alias, baseline_fields) in &baseline.cookies {
+        let slot = bookies
+            .iter()
+            .find(|s| &s.alias == alias)
+            .ok_or_else(|| {
+                anyhow::anyhow!("[{phase_label}] baseline alias {alias} not in current bookies")
+            })?;
+        let raw = read_cookie(slot)?;
+        let now = parse_cookie(&raw)?;
+        if &now != baseline_fields {
+            anyhow::bail!(
+                "[{phase_label}] cookie for {alias} drifted\n  \
+                 baseline: {:?}\n  current:  {:?}",
+                baseline_fields,
+                now
+            );
+        }
+    }
+
+    // 5. No phantom under-replication
+    if let Ok(children) = zk.list_children("/ledgers/underreplication/ledgers").await {
+        if !children.is_empty() {
+            anyhow::bail!(
+                "[{phase_label}] /ledgers/underreplication/ledgers non-empty: {:?}",
+                children
+            );
+        }
+    }
+
+    // 6. All closed ledgers fully readable (via the sidecar workload).
+    for &(id, label, count, era) in closed_ledgers {
+        read_ledger(env, zk_in_network, id, label, count, era)
+            .map_err(|e| anyhow::anyhow!("[{phase_label}] verify ledger {id}: {e}"))?;
+    }
+
+    info!("=== {phase_label} verification PASS ===");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Swap orchestration — stop current bookie, wait for ZK cleanup, start
 // the new image on the same volumes + alias.
 // ---------------------------------------------------------------------------
