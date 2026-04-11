@@ -260,7 +260,7 @@ impl EnsemblePlacementPolicy for RackAwarePlacementPolicy {
         // Matches Java's topology-aware selection with randomization.
         let mut ensemble: Vec<String> = Vec::with_capacity(ensemble_size);
         let mut rack_names: Vec<String> = by_rack.keys().cloned().collect();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         rack_names.shuffle(&mut rng);
 
         // Shuffle bookies within each rack (matching Java's selectRandomFromRack)

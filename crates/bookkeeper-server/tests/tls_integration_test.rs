@@ -20,7 +20,7 @@ use tempfile::TempDir;
 fn generate_self_signed_cert(dir: &std::path::Path) -> (String, String) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
+    let key_pem = cert.signing_key.serialize_pem();
 
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");

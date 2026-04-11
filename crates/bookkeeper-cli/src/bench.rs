@@ -15,9 +15,8 @@ fn parse_digest(s: &str) -> Result<DigestType, Box<dyn std::error::Error>> {
 }
 
 fn random_payload(size: usize) -> Vec<u8> {
-    use rand::Rng;
     let mut buf = vec![0u8; size];
-    rand::thread_rng().fill(&mut buf[..]);
+    rand::fill(&mut buf[..]);
     buf
 }
 
