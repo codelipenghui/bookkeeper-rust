@@ -1048,6 +1048,92 @@ async fn smoke_java_bookie() -> Result<()> {
 async fn java_to_rust_in_place_upgrade() -> Result<()> {
     init_tracing();
     check_prerequisites()?;
-    info!("Prerequisites OK; remainder of test not yet implemented");
+
+    let mut env = TestEnv::new()?;
+    let zk = ZkContainer::start(&env).await?;
+    let zk_in_net = zk.in_network_addr();
+    init_bk_cluster(&env, &zk_in_net).await?;
+    let conf_dir = TempDir::new()?;
+
+    // ----------------------------------------------------------------------
+    // P1 — All-Java cluster + java-era writes
+    // ----------------------------------------------------------------------
+    info!("===== P1: all-Java cluster + java-era writes =====");
+    let mut slot1 = BookieSlot::new(1, &env);
+    let mut slot2 = BookieSlot::new(2, &env);
+    slot1.start_java(&zk_in_net).await?;
+    slot2.start_java(&zk_in_net).await?;
+    slot1.wait_healthy(Duration::from_secs(180)).await?;
+    slot2.wait_healthy(Duration::from_secs(180)).await?;
+
+    let zk_host = zk.host_addr().await?;
+    let zk_client = zookeeper_client::Client::connect(&zk_host).await?;
+
+    let baseline = capture_baseline(&zk_client, &[&slot1, &slot2]).await?;
+
+    let l1 = write_ledger(&env, &zk_in_net, 1, 100, "java-era")?;
+    let l2 = write_ledger(&env, &zk_in_net, 2, 100, "java-era")?;
+    let mut closed: Vec<(i64, i64, i64, &str)> = vec![
+        (l1, 1, 100, "java-era"),
+        (l2, 2, 100, "java-era"),
+    ];
+    verify_cluster_state(
+        &env, &zk_in_net, &zk_client, &[&slot1, &slot2], &baseline, &closed, "P1",
+    ).await?;
+
+    // ----------------------------------------------------------------------
+    // P2 — Rolling Java → Rust, slot by slot
+    // ----------------------------------------------------------------------
+    info!("===== P2: rolling Java → Rust =====");
+    swap_to_rust(&mut slot1, &zk_in_net, &zk_client, conf_dir.path()).await?;
+    verify_cluster_state(
+        &env, &zk_in_net, &zk_client, &[&slot1, &slot2], &baseline, &closed,
+        "P2 after slot1",
+    ).await?;
+
+    swap_to_rust(&mut slot2, &zk_in_net, &zk_client, conf_dir.path()).await?;
+    verify_cluster_state(
+        &env, &zk_in_net, &zk_client, &[&slot1, &slot2], &baseline, &closed,
+        "P2 after slot2",
+    ).await?;
+
+    // ----------------------------------------------------------------------
+    // P3 — All-Rust cluster + rust-era writes
+    // ----------------------------------------------------------------------
+    info!("===== P3: all-Rust cluster + rust-era writes =====");
+    let l3 = write_ledger(&env, &zk_in_net, 3, 100, "rust-era")?;
+    let l4 = write_ledger(&env, &zk_in_net, 4, 100, "rust-era")?;
+    closed.push((l3, 3, 100, "rust-era"));
+    closed.push((l4, 4, 100, "rust-era"));
+    verify_cluster_state(
+        &env, &zk_in_net, &zk_client, &[&slot1, &slot2], &baseline, &closed, "P3",
+    ).await?;
+
+    // ----------------------------------------------------------------------
+    // P4 — Rolling Rust → Java
+    // ----------------------------------------------------------------------
+    info!("===== P4: rolling Rust → Java =====");
+    swap_to_java(&mut slot1, &zk_in_net, &zk_client).await?;
+    verify_cluster_state(
+        &env, &zk_in_net, &zk_client, &[&slot1, &slot2], &baseline, &closed,
+        "P4 after slot1",
+    ).await?;
+
+    swap_to_java(&mut slot2, &zk_in_net, &zk_client).await?;
+    verify_cluster_state(
+        &env, &zk_in_net, &zk_client, &[&slot1, &slot2], &baseline, &closed,
+        "P4 after slot2",
+    ).await?;
+
+    // ----------------------------------------------------------------------
+    // P5 — All-Java again, final read-back of L1..L4
+    // ----------------------------------------------------------------------
+    info!("===== P5: final read-back =====");
+    for &(id, label, count, era) in &closed {
+        read_ledger(&env, &zk_in_net, id, label, count, era)?;
+    }
+
+    env.mark_success();
+    info!("===== java_to_rust_in_place_upgrade ALL PHASES PASS =====");
     Ok(())
 }
