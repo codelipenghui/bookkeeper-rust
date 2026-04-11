@@ -343,6 +343,12 @@ impl BookieSlot {
         // the run_id suffix). Docker will register that name as a DNS alias
         // on the user-defined bridge so other containers can reach this
         // bookie at `<alias>:3181`.
+        //
+        // Both Java and Rust bookies run as root (UID 0) in the test so
+        // that swapping between them doesn't hit UID-mismatch errors on
+        // the shared volumes. Java's image defaults to UID 1000 and the
+        // Rust image to a system user, which would prevent reading each
+        // other's data. This is a test-only override.
         let img = GenericImage::new("apache/bookkeeper", "4.17.3")
             .with_exposed_port(3181.tcp())
             .with_exposed_port(8080.tcp())
@@ -353,6 +359,7 @@ impl BookieSlot {
             .with_wait_for(WaitFor::message_on_stdout("Started component bookie-server."))
             .with_startup_timeout(Duration::from_secs(180))
             .with_network(self.network.clone())
+            .with_user("0:0")
             .with_container_name(self.alias.clone())
             .with_mount(Mount::volume_mount(self.data_volume.clone(), "/bk/data"))
             .with_mount(Mount::volume_mount(
@@ -388,6 +395,7 @@ impl BookieSlot {
             .with_wait_for(WaitFor::message_on_stdout("Bookie started at"))
             .with_startup_timeout(Duration::from_secs(120))
             .with_network(self.network.clone())
+            .with_user("0:0")
             .with_container_name(self.alias.clone())
             .with_mount(Mount::volume_mount(self.data_volume.clone(), "/bk/data"))
             .with_mount(Mount::volume_mount(
@@ -488,6 +496,40 @@ async fn wait_for_zk_ephemeral_to_clear(
             Err(e) => anyhow::bail!("zk check_stat {path}: {e}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Swap orchestration — stop current bookie, wait for ZK cleanup, start
+// the new image on the same volumes + alias.
+// ---------------------------------------------------------------------------
+
+async fn swap_to_rust(
+    slot: &mut BookieSlot,
+    zk_in_network: &str,
+    zk_client: &zookeeper_client::Client,
+    conf_dir: &std::path::Path,
+) -> Result<()> {
+    info!("Swapping {} → Rust", slot.alias);
+    slot.stop().await?;
+    wait_for_zk_ephemeral_to_clear(zk_client, &slot.alias).await?;
+    slot.start_rust(zk_in_network, conf_dir).await?;
+    slot.wait_healthy(Duration::from_secs(120)).await?;
+    info!("Swap to Rust complete for {}", slot.alias);
+    Ok(())
+}
+
+async fn swap_to_java(
+    slot: &mut BookieSlot,
+    zk_in_network: &str,
+    zk_client: &zookeeper_client::Client,
+) -> Result<()> {
+    info!("Swapping {} → Java", slot.alias);
+    slot.stop().await?;
+    wait_for_zk_ephemeral_to_clear(zk_client, &slot.alias).await?;
+    slot.start_java(zk_in_network).await?;
+    slot.wait_healthy(Duration::from_secs(180)).await?;
+    info!("Swap to Java complete for {}", slot.alias);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +747,43 @@ async fn smoke_write_ledger() -> Result<()> {
     // bookie.
     let id = write_ledger(&env, &zk_in_net, 100, 5, "smoke")?;
     read_ledger(&env, &zk_in_net, id, 100, 5, "smoke")?;
+
+    env.mark_success();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn smoke_swap_one_bookie() -> Result<()> {
+    init_tracing();
+    check_prerequisites()?;
+    let mut env = TestEnv::new()?;
+    let zk = ZkContainer::start(&env).await?;
+    let zk_in_net = zk.in_network_addr();
+    init_bk_cluster(&env, &zk_in_net).await?;
+    let conf_dir = TempDir::new()?;
+
+    let mut slot1 = BookieSlot::new(1, &env);
+    let mut slot2 = BookieSlot::new(2, &env);
+    slot1.start_java(&zk_in_net).await?;
+    slot2.start_java(&zk_in_net).await?;
+    slot1.wait_healthy(Duration::from_secs(180)).await?;
+    slot2.wait_healthy(Duration::from_secs(180)).await?;
+
+    // Write a ledger via the all-Java cluster.
+    let id = write_ledger(&env, &zk_in_net, 100, 20, "java-era")?;
+
+    // Swap bookie-1 from Java to Rust on the same volumes. The Rust bookie
+    // has to pick up Java's cookie + RocksDB schemas + entry log format.
+    let zk_host = zk.host_addr().await?;
+    let zk_client = zookeeper_client::Client::connect(&zk_host).await?;
+    swap_to_rust(&mut slot1, &zk_in_net, &zk_client, conf_dir.path()).await?;
+
+    // Read back the Java-written ledger. The Rust bookie is one of two
+    // bookies in the ensemble, so read responses may come from either.
+    // A successful round-trip through the Rust bookie's on-disk path is
+    // the real compat test.
+    read_ledger(&env, &zk_in_net, id, 100, 20, "java-era")?;
 
     env.mark_success();
     Ok(())
