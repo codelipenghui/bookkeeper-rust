@@ -6,9 +6,7 @@ license.workspace = true
 
 [dependencies]
 bookkeeper-proto = { workspace = true }
-bookkeeper-common = { workspace = true }
 prost = { workspace = true }
-bytes = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 zookeeper-client = { workspace = true }
@@ -17,4 +15,4 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-testcontainers = "0.23"
+testcontainers = { workspace = true }

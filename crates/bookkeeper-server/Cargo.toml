@@ -18,7 +18,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true }
 parking_lot = { workspace = true }
-thiserror = { workspace = true }
 prost = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
@@ -29,17 +28,16 @@ lazy_static = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-async-trait = { workspace = true }
-pprof = { version = "0.14", features = ["flamegraph"] }
+pprof = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tempfile = { workspace = true }
+reqwest = { workspace = true }
 bookkeeper-config = { workspace = true }
 bookkeeper-test-utils = { workspace = true }
-rcgen = "0.13"
-testcontainers = "0.23"
+rcgen = { workspace = true }
+testcontainers = { workspace = true }
 uuid = { workspace = true }

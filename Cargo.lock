@@ -513,7 +513,6 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "uuid",
  "zookeeper-client",
@@ -523,7 +522,6 @@ dependencies = [
 name = "bookkeeper-client"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bookkeeper-common",
  "bookkeeper-config",
  "bookkeeper-metadata",
@@ -538,7 +536,6 @@ dependencies = [
  "rand",
  "rustls",
  "rustls-pemfile",
- "sha1",
  "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
@@ -562,7 +559,6 @@ name = "bookkeeper-config"
 version = "0.1.0"
 dependencies = [
  "tempfile",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -570,9 +566,7 @@ name = "bookkeeper-metadata"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bookkeeper-common",
  "bookkeeper-proto",
- "bytes",
  "prost",
  "testcontainers",
  "thiserror 2.0.18",
@@ -593,7 +587,6 @@ dependencies = [
 name = "bookkeeper-protocol"
 version = "0.1.0"
 dependencies = [
- "bookkeeper-common",
  "bookkeeper-proto",
  "bytes",
  "crc32c",
@@ -620,7 +613,6 @@ dependencies = [
  "bookkeeper-server",
  "bookkeeper-test-utils",
  "bytes",
- "prost",
  "tempfile",
  "testcontainers",
  "thiserror 2.0.18",
@@ -634,7 +626,6 @@ dependencies = [
 name = "bookkeeper-server"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "axum",
  "bookkeeper-client",
  "bookkeeper-common",
@@ -660,7 +651,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "testcontainers",
- "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -674,7 +664,6 @@ name = "bookkeeper-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bookkeeper-common",
  "bookkeeper-proto",
  "bookkeeper-protocol",
  "bytes",
@@ -708,7 +697,6 @@ dependencies = [
  "testcontainers",
  "tokio",
  "uuid",
- "zookeeper-client",
 ]
 
 [[package]]

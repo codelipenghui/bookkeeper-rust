@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 bookkeeper-proto = { workspace = true }
-bookkeeper-common = { workspace = true }
 bytes = { workspace = true }
 prost = { workspace = true }
 crc32fast = { workspace = true }
@@ -22,4 +21,4 @@ harness = false
 
 [dev-dependencies]
 tokio = { workspace = true }
-criterion = "0.5"
+criterion = { workspace = true }

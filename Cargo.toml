@@ -48,7 +48,19 @@ crc32fast = "1"
 crc32c = "0.6"
 hmac = "0.12"
 sha1 = "0.10"
-tokio = { version = "1", features = ["full"] }
+# Tokio feature set is narrowed from `full` to only what's actually used
+# across the workspace (verified by grep). Dropping `fs`, `process`, and
+# `io-std` meaningfully shortens cold build time.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+    "parking_lot",
+] }
 tokio-util = { version = "0.7", features = ["codec"] }
 zookeeper-client = { version = "0.11", features = ["tokio"] }
 uuid = { version = "1", features = ["v4"] }
@@ -67,6 +79,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 io-uring = "0.7"
 libc = "0.2"
 pprof = { version = "0.14", features = ["flamegraph"] }
+
+# Test / benchmark tools — shared across multiple crates.
+criterion = "0.5"
+testcontainers = "0.23"
+assert_cmd = "2"
+predicates = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rcgen = "0.13"
 
 # Include debug symbols in release builds for profiling (flamegraphs).
 # This adds ~20% to binary size but doesn't affect runtime performance.

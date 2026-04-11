@@ -16,20 +16,19 @@ bookkeeper-protocol = { workspace = true }
 bookkeeper-config = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 tempfile = { workspace = true }
 hdrhistogram = { workspace = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
-rand = "0.8"
+rand = { workspace = true }
 zookeeper-client = { workspace = true }
 bookkeeper-replication = { workspace = true }
 bookkeeper-storage = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
-testcontainers = "0.23"
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+testcontainers = { workspace = true }
 bookkeeper-test-utils = { workspace = true }
