@@ -147,6 +147,12 @@ docker compose logs -f rust-bookie-1 | grep -i "auditor\|replicat"
 - **Rust bookie config:** `docker/bk_server.conf` (mounted into
   `/etc/bookkeeper/bk_server.conf`). Edit and `docker compose up -d
   rust-bookie --force-recreate` to apply.
+- **RocksDB tuning:** `docker/rocksdb/entry_location_rocksdb.conf` and
+  `docker/rocksdb/ledger_metadata_rocksdb.conf` (mounted into
+  `/etc/bookkeeper/rocksdb/`). Same INI format as Apache BK's
+  `conf/*_rocksdb.conf`; referenced from `bk_server.conf` via
+  `entryLocationRocksdbConf` / `ledgerMetadataRocksdbConf`. Unset
+  either key to fall back to the built-in defaults.
 - **Pulsar broker config:** passed via `PULSAR_PREFIX_*` environment
   variables in `docker-compose.yml`. The Pulsar image's entrypoint
   (`bin/apply-config-from-env.py`) rewrites `conf/broker.conf` at

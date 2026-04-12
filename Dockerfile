@@ -116,8 +116,10 @@ RUN useradd --system --create-home --home-dir /bk --shell /bin/bash bookkeeper
 COPY --from=builder /app/target/release/bk /usr/local/bin/bk
 
 # Default bookie config used by docker-compose. Can be overridden by
-# mounting a different file at the same path.
+# mounting a different file at the same path. The rocksdb subdirectory
+# holds Java BK-style INI tuning files referenced from bk_server.conf.
 COPY docker/bk_server.conf /etc/bookkeeper/bk_server.conf
+COPY docker/rocksdb /etc/bookkeeper/rocksdb
 
 # Data and journal live here — mount volumes for persistence
 RUN mkdir -p /bk/data /bk/journal && chown -R bookkeeper:bookkeeper /bk /etc/bookkeeper
@@ -149,6 +151,7 @@ RUN useradd --system --create-home --home-dir /bk --shell /bin/bash bookkeeper
 
 COPY --from=debug-builder /app/target/release-debug/bk /usr/local/bin/bk
 COPY docker/bk_server.conf /etc/bookkeeper/bk_server.conf
+COPY docker/rocksdb /etc/bookkeeper/rocksdb
 
 RUN mkdir -p /bk/data /bk/journal && chown -R bookkeeper:bookkeeper /bk /etc/bookkeeper
 
