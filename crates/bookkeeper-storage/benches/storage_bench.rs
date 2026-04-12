@@ -379,6 +379,7 @@ fn bench_rocksdb_index(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let index = bookkeeper_storage::index::entry_location::EntryLocationIndex::open(
         &dir.path().join("locations"),
+        None,
     )
     .unwrap();
 

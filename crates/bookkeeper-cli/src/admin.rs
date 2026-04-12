@@ -1039,8 +1039,8 @@ pub async fn cmd_localconsistencycheck(
         return Err(format!("Ledgers index not found at {}", ledgers_path.display()).into());
     }
 
-    let ledger_index = LedgerMetadataIndex::open(&ledgers_path)?;
-    let location_index = EntryLocationIndex::open(&locations_path)?;
+    let ledger_index = LedgerMetadataIndex::open(&ledgers_path, None)?;
+    let location_index = EntryLocationIndex::open(&locations_path, None)?;
 
     let all_ledgers = ledger_index.list_all_ledgers()?;
     println!("Checking {} ledgers in local storage...", all_ledgers.len());

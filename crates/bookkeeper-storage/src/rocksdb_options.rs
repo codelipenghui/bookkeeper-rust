@@ -54,11 +54,19 @@ pub fn load(path: &Path) -> Result<RocksdbOptionsFile, StorageError> {
     parse(&text)
 }
 
+#[derive(Clone, Copy)]
+enum Section {
+    Db,
+    Cf,
+    Table,
+    Ignored,
+}
+
 /// Parse from an already-read string (used by tests; callers should prefer
 /// [`load`]).
 pub fn parse(text: &str) -> Result<RocksdbOptionsFile, StorageError> {
     let mut result = RocksdbOptionsFile::default();
-    let mut current: Option<&'static str> = None;
+    let mut current: Option<Section> = None;
 
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -66,29 +74,26 @@ pub fn parse(text: &str) -> Result<RocksdbOptionsFile, StorageError> {
             continue;
         }
 
-        // Section headers: `[DBOptions]`, `[CFOptions "default"]`,
-        // `[TableOptions/BlockBasedTable "default"]`.
         if let Some(rest) = line.strip_prefix('[') {
             let header = rest
                 .strip_suffix(']')
                 .ok_or_else(|| section_error(lineno, raw))?;
             current = Some(match header {
-                "DBOptions" => "db",
-                s if s.starts_with("CFOptions") => "cf",
-                s if s.starts_with("TableOptions/BlockBasedTable") => "table",
+                "DBOptions" => Section::Db,
+                s if s.starts_with("CFOptions") => Section::Cf,
+                s if s.starts_with("TableOptions/BlockBasedTable") => Section::Table,
                 other => {
                     tracing::warn!(
                         "rocksdb options file line {}: unknown section [{}], skipping",
                         lineno + 1,
                         other
                     );
-                    "ignored"
+                    Section::Ignored
                 }
             });
             continue;
         }
 
-        // key = value
         let Some((k, v)) = line.split_once('=') else {
             return Err(StorageError::RocksDb(format!(
                 "rocksdb options file line {}: expected `key = value`, got {:?}",
@@ -100,19 +105,10 @@ pub fn parse(text: &str) -> Result<RocksdbOptionsFile, StorageError> {
         let value = v.trim().to_string();
 
         match current {
-            Some("db") => {
-                result.db_options.insert(key, value);
-            }
-            Some("cf") => {
-                result.cf_options.insert(key, value);
-            }
-            Some("table") => {
-                result.block_based_table_options.insert(key, value);
-            }
-            Some("ignored") | None => {
-                // Unknown / not-yet-encountered section: skip.
-            }
-            _ => unreachable!(),
+            Some(Section::Db) => { result.db_options.insert(key, value); }
+            Some(Section::Cf) => { result.cf_options.insert(key, value); }
+            Some(Section::Table) => { result.block_based_table_options.insert(key, value); }
+            Some(Section::Ignored) | None => {}
         }
     }
 
@@ -128,11 +124,8 @@ pub fn apply_to_options(
 ) -> Result<(Options, Option<Cache>), StorageError> {
     let mut opts = Options::default();
     let mut block_opts = BlockBasedOptions::default();
-    // Retain the block cache so the caller can hold it alive beyond the
-    // `BlockBasedOptions` struct, which only borrows it.
     let mut block_cache: Option<Cache> = None;
 
-    // ---- [DBOptions] ----
     for (k, v) in &parsed.db_options {
         match k.as_str() {
             "create_if_missing" => opts.create_if_missing(parse_bool(k, v)?),
@@ -152,7 +145,6 @@ pub fn apply_to_options(
         }
     }
 
-    // ---- [CFOptions "default"] ----
     for (k, v) in &parsed.cf_options {
         match k.as_str() {
             "compression" => opts.set_compression_type(parse_compression(v)?),
@@ -173,7 +165,6 @@ pub fn apply_to_options(
         }
     }
 
-    // ---- [TableOptions/BlockBasedTable "default"] ----
     for (k, v) in &parsed.block_based_table_options {
         match k.as_str() {
             "block_size" => block_opts.set_block_size(parse_usize(k, v)?),
@@ -206,98 +197,29 @@ pub fn apply_to_options(
 // Shipped defaults
 // ---------------------------------------------------------------------------
 
-/// Default content for `entry_location_rocksdb.conf` — byte-for-byte match
-/// of Java BK's shipped file (modulo comments). Used when no conf file is
-/// supplied on disk. Tests also use this.
-pub const DEFAULT_ENTRY_LOCATION_CONF: &str = r#"
-[DBOptions]
-create_if_missing=true
-info_log_level=INFO_LEVEL
-keep_log_file_num=30
-log_file_time_to_roll=86400
-max_background_jobs=32
-max_subcompactions=1
-max_total_wal_size=536870912
-max_open_files=-1
-delete_obsolete_files_period_micros=3600000000
+/// Default content for `entry_location_rocksdb.conf`. Single-sourced from
+/// the file shipped under `docker/rocksdb/` so a tuning change in one place
+/// reaches both the in-process fallback and the on-disk default.
+pub const DEFAULT_ENTRY_LOCATION_CONF: &str =
+    include_str!("../../../docker/rocksdb/entry_location_rocksdb.conf");
 
-[CFOptions "default"]
-compression=kLZ4Compression
-write_buffer_size=67108864
-max_write_buffer_number=4
-num_levels=7
-level0_file_num_compaction_trigger=4
-max_bytes_for_level_base=268435456
-target_file_size_base=67108864
-level_compaction_dynamic_level_bytes=true
+/// Default content for `ledger_metadata_rocksdb.conf`. See
+/// [`DEFAULT_ENTRY_LOCATION_CONF`] for single-sourcing rationale.
+pub const DEFAULT_LEDGER_METADATA_CONF: &str =
+    include_str!("../../../docker/rocksdb/ledger_metadata_rocksdb.conf");
 
-[TableOptions/BlockBasedTable "default"]
-block_size=65536
-block_cache=206150041
-format_version=5
-checksum=kxxHash
-filter_policy=rocksdb.BloomFilter:10:false
-cache_index_and_filter_blocks=true
-"#;
-
-/// Default content for `ledger_metadata_rocksdb.conf` — byte-for-byte match
-/// of Java BK's shipped file (modulo comments). The ledger metadata index is
-/// very small, so Java leaves almost everything at rocksdb defaults.
-pub const DEFAULT_LEDGER_METADATA_CONF: &str = r#"
-[DBOptions]
-create_if_missing=true
-info_log_level=INFO_LEVEL
-keep_log_file_num=30
-log_file_time_to_roll=86400
-
-[CFOptions "default"]
-
-[TableOptions/BlockBasedTable "default"]
-format_version=5
-checksum=kxxHash
-"#;
-
-/// Build `(Options, Option<Cache>)` from [`DEFAULT_ENTRY_LOCATION_CONF`].
-/// Panics if the embedded default is malformed (would be a programmer bug
-/// caught by the unit tests below, not runtime input).
-pub fn default_entry_location_options() -> (Options, Option<Cache>) {
-    let parsed = parse(DEFAULT_ENTRY_LOCATION_CONF).expect("embedded default is valid");
-    apply_to_options(&parsed).expect("embedded default applies cleanly")
-}
-
-/// Build `(Options, Option<Cache>)` from [`DEFAULT_LEDGER_METADATA_CONF`].
-pub fn default_ledger_metadata_options() -> (Options, Option<Cache>) {
-    let parsed = parse(DEFAULT_LEDGER_METADATA_CONF).expect("embedded default is valid");
-    apply_to_options(&parsed).expect("embedded default applies cleanly")
-}
-
-/// Load options from `path` if provided, else fall back to the embedded
-/// entry-location defaults. Used by callers that want "conf file if
-/// present, otherwise built-in Java-matching defaults".
-pub fn load_entry_location_or_default(
+/// Load options from `path` if provided, else parse the embedded default.
+/// Typical callers want `load_or_default(cfg_path, DEFAULT_ENTRY_LOCATION_CONF)`
+/// so an unset operator knob falls back to Apache BK's shipped tuning.
+pub fn load_or_default(
     path: Option<&Path>,
+    default: &str,
 ) -> Result<(Options, Option<Cache>), StorageError> {
-    match path {
-        Some(p) => {
-            let parsed = load(p)?;
-            apply_to_options(&parsed)
-        }
-        None => Ok(default_entry_location_options()),
-    }
-}
-
-/// Load options from `path` if provided, else fall back to the embedded
-/// ledger-metadata defaults.
-pub fn load_ledger_metadata_or_default(
-    path: Option<&Path>,
-) -> Result<(Options, Option<Cache>), StorageError> {
-    match path {
-        Some(p) => {
-            let parsed = load(p)?;
-            apply_to_options(&parsed)
-        }
-        None => Ok(default_ledger_metadata_options()),
-    }
+    let parsed = match path {
+        Some(p) => load(p)?,
+        None => parse(default).expect("embedded default is valid"),
+    };
+    apply_to_options(&parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -433,13 +355,13 @@ mod tests {
 
     #[test]
     fn applies_java_entry_location_without_errors() {
-        let (_opts, cache) = default_entry_location_options();
+        let (_opts, cache) = load_or_default(None, DEFAULT_ENTRY_LOCATION_CONF).unwrap();
         assert!(cache.is_some(), "block cache should be set from the file");
     }
 
     #[test]
     fn applies_java_ledger_metadata_without_errors() {
-        let (_opts, cache) = default_ledger_metadata_options();
+        let (_opts, cache) = load_or_default(None, DEFAULT_LEDGER_METADATA_CONF).unwrap();
         assert!(
             cache.is_none(),
             "ledger_metadata_rocksdb.conf has no block_cache — cache should be None"
