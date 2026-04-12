@@ -11,4 +11,5 @@ pub mod db_ledger_storage;
 pub mod lac_watcher;
 pub mod gc;
 pub mod io_engine;
+pub mod rocksdb_options;
 pub mod storage_metrics;
