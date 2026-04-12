@@ -78,7 +78,22 @@ pub struct DbLedgerStorage {
 }
 
 impl DbLedgerStorage {
+    /// Open the storage with built-in rocksdb defaults (match Java BK's
+    /// shipped `entry_location_rocksdb.conf` / `ledger_metadata_rocksdb.conf`).
+    /// Used by tests and by code paths that don't care about operator tuning.
     pub fn open(base_dir: &Path, ledger_io: Arc<dyn crate::io_engine::LedgerIo>) -> Result<Self, StorageError> {
+        Self::open_with_conf(base_dir, ledger_io, None, None)
+    }
+
+    /// Open the storage, optionally loading rocksdb tuning from the two
+    /// Java-BK-style INI files. Passing `None` for either falls back to
+    /// the embedded defaults (`rocksdb_options::DEFAULT_*_CONF`).
+    pub fn open_with_conf(
+        base_dir: &Path,
+        ledger_io: Arc<dyn crate::io_engine::LedgerIo>,
+        entry_location_rocksdb_conf: Option<&Path>,
+        ledger_metadata_rocksdb_conf: Option<&Path>,
+    ) -> Result<Self, StorageError> {
         // All data lives under `<base_dir>/current/`, matching Java's
         // BookieImpl.getCurrentDirectory(dir). Entry log files (.log) sit
         // directly in `current/` alongside the RocksDB subdirectories —
@@ -90,8 +105,14 @@ impl DbLedgerStorage {
         fs::create_dir_all(&locations_dir)?;
         fs::create_dir_all(&ledgers_dir)?;
 
-        let entry_location_index = EntryLocationIndex::open(&locations_dir)?;
-        let ledger_index = LedgerMetadataIndex::open(&ledgers_dir)?;
+        let entry_location_index = match entry_location_rocksdb_conf {
+            Some(p) => EntryLocationIndex::open_with_conf(&locations_dir, p)?,
+            None => EntryLocationIndex::open(&locations_dir)?,
+        };
+        let ledger_index = match ledger_metadata_rocksdb_conf {
+            Some(p) => LedgerMetadataIndex::open_with_conf(&ledgers_dir, p)?,
+            None => LedgerMetadataIndex::open(&ledgers_dir)?,
+        };
 
         // CRITICAL: scan existing entry log files and start writing into a
         // brand-new file (max_existing + 1). Without this we'd reopen

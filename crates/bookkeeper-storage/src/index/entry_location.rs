@@ -1,5 +1,6 @@
 use std::path::Path;
-use rocksdb::{DB, Options, WriteBatch};
+use rocksdb::{Cache, DB, WriteBatch};
+use crate::rocksdb_options;
 use crate::StorageError;
 
 /// RocksDB-backed entry location index.
@@ -7,21 +8,31 @@ use crate::StorageError;
 /// Value: location as 8 bytes big-endian.
 pub struct EntryLocationIndex {
     db: DB,
+    /// The block cache from the loaded options file. rocksdb-rs requires
+    /// the Cache to outlive the DB; we hold it here so it stays alive as
+    /// long as the index.
+    #[allow(dead_code)]
+    block_cache: Option<Cache>,
 }
 
 impl EntryLocationIndex {
+    /// Open the index at `path` using the built-in defaults that match
+    /// Apache BK's shipped `conf/entry_location_rocksdb.conf`. Used by
+    /// tests and by production paths that don't supply a conf file.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_write_buffer_size(64 * 1024 * 1024);
-        opts.set_max_write_buffer_number(4);
-        opts.set_target_file_size_base(64 * 1024 * 1024);
-        opts.set_max_background_jobs(4);
-        let block_opts = rocksdb::BlockBasedOptions::default();
-        opts.set_block_based_table_factory(&block_opts);
+        let (opts, block_cache) = rocksdb_options::default_entry_location_options();
         let db = DB::open(&opts, path).map_err(|e| StorageError::RocksDb(e.to_string()))?;
-        Ok(Self { db })
+        Ok(Self { db, block_cache })
+    }
+
+    /// Open the index at `path`, loading rocksdb options from
+    /// `rocksdb_conf_path` (Java BK-style INI — see [`crate::rocksdb_options`]).
+    /// Production callers use this to honour operator-tuned rocksdb configs.
+    pub fn open_with_conf(path: &Path, rocksdb_conf_path: &Path) -> Result<Self, StorageError> {
+        let parsed = rocksdb_options::load(rocksdb_conf_path)?;
+        let (opts, block_cache) = rocksdb_options::apply_to_options(&parsed)?;
+        let db = DB::open(&opts, path).map_err(|e| StorageError::RocksDb(e.to_string()))?;
+        Ok(Self { db, block_cache })
     }
 
     pub fn put(&self, ledger_id: i64, entry_id: i64, location: u64) -> Result<(), StorageError> {

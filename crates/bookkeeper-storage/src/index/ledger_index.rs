@@ -1,6 +1,7 @@
 use std::path::Path;
 use prost::Message;
-use rocksdb::{DB, Options};
+use rocksdb::{Cache, DB};
+use crate::rocksdb_options;
 use crate::StorageError;
 
 /// Ledger metadata stored in the bookie's RocksDB.
@@ -17,14 +18,28 @@ pub struct LedgerData {
 /// Value: LedgerData protobuf (from DbLedgerStorageDataFormats.proto).
 pub struct LedgerMetadataIndex {
     db: DB,
+    #[allow(dead_code)]
+    block_cache: Option<Cache>,
 }
 
 impl LedgerMetadataIndex {
+    /// Open the index at `path` using the built-in defaults that match
+    /// Apache BK's shipped `conf/ledger_metadata_rocksdb.conf`. Used by
+    /// tests and by production paths that don't supply a conf file.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
+        let (opts, block_cache) = rocksdb_options::default_ledger_metadata_options();
         let db = DB::open(&opts, path).map_err(|e| StorageError::RocksDb(e.to_string()))?;
-        Ok(Self { db })
+        Ok(Self { db, block_cache })
+    }
+
+    /// Open the index at `path`, loading rocksdb options from
+    /// `rocksdb_conf_path` (Java BK-style INI — see [`crate::rocksdb_options`]).
+    /// Production callers use this to honour operator-tuned rocksdb configs.
+    pub fn open_with_conf(path: &Path, rocksdb_conf_path: &Path) -> Result<Self, StorageError> {
+        let parsed = rocksdb_options::load(rocksdb_conf_path)?;
+        let (opts, block_cache) = rocksdb_options::apply_to_options(&parsed)?;
+        let db = DB::open(&opts, path).map_err(|e| StorageError::RocksDb(e.to_string()))?;
+        Ok(Self { db, block_cache })
     }
 
     pub fn set(&self, ledger_id: i64, fenced: bool, master_key: Option<&[u8]>, lac: Option<i64>) -> Result<(), StorageError> {

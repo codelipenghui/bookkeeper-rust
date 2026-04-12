@@ -203,6 +203,104 @@ pub fn apply_to_options(
 }
 
 // ---------------------------------------------------------------------------
+// Shipped defaults
+// ---------------------------------------------------------------------------
+
+/// Default content for `entry_location_rocksdb.conf` — byte-for-byte match
+/// of Java BK's shipped file (modulo comments). Used when no conf file is
+/// supplied on disk. Tests also use this.
+pub const DEFAULT_ENTRY_LOCATION_CONF: &str = r#"
+[DBOptions]
+create_if_missing=true
+info_log_level=INFO_LEVEL
+keep_log_file_num=30
+log_file_time_to_roll=86400
+max_background_jobs=32
+max_subcompactions=1
+max_total_wal_size=536870912
+max_open_files=-1
+delete_obsolete_files_period_micros=3600000000
+
+[CFOptions "default"]
+compression=kLZ4Compression
+write_buffer_size=67108864
+max_write_buffer_number=4
+num_levels=7
+level0_file_num_compaction_trigger=4
+max_bytes_for_level_base=268435456
+target_file_size_base=67108864
+level_compaction_dynamic_level_bytes=true
+
+[TableOptions/BlockBasedTable "default"]
+block_size=65536
+block_cache=206150041
+format_version=5
+checksum=kxxHash
+filter_policy=rocksdb.BloomFilter:10:false
+cache_index_and_filter_blocks=true
+"#;
+
+/// Default content for `ledger_metadata_rocksdb.conf` — byte-for-byte match
+/// of Java BK's shipped file (modulo comments). The ledger metadata index is
+/// very small, so Java leaves almost everything at rocksdb defaults.
+pub const DEFAULT_LEDGER_METADATA_CONF: &str = r#"
+[DBOptions]
+create_if_missing=true
+info_log_level=INFO_LEVEL
+keep_log_file_num=30
+log_file_time_to_roll=86400
+
+[CFOptions "default"]
+
+[TableOptions/BlockBasedTable "default"]
+format_version=5
+checksum=kxxHash
+"#;
+
+/// Build `(Options, Option<Cache>)` from [`DEFAULT_ENTRY_LOCATION_CONF`].
+/// Panics if the embedded default is malformed (would be a programmer bug
+/// caught by the unit tests below, not runtime input).
+pub fn default_entry_location_options() -> (Options, Option<Cache>) {
+    let parsed = parse(DEFAULT_ENTRY_LOCATION_CONF).expect("embedded default is valid");
+    apply_to_options(&parsed).expect("embedded default applies cleanly")
+}
+
+/// Build `(Options, Option<Cache>)` from [`DEFAULT_LEDGER_METADATA_CONF`].
+pub fn default_ledger_metadata_options() -> (Options, Option<Cache>) {
+    let parsed = parse(DEFAULT_LEDGER_METADATA_CONF).expect("embedded default is valid");
+    apply_to_options(&parsed).expect("embedded default applies cleanly")
+}
+
+/// Load options from `path` if provided, else fall back to the embedded
+/// entry-location defaults. Used by callers that want "conf file if
+/// present, otherwise built-in Java-matching defaults".
+pub fn load_entry_location_or_default(
+    path: Option<&Path>,
+) -> Result<(Options, Option<Cache>), StorageError> {
+    match path {
+        Some(p) => {
+            let parsed = load(p)?;
+            apply_to_options(&parsed)
+        }
+        None => Ok(default_entry_location_options()),
+    }
+}
+
+/// Load options from `path` if provided, else fall back to the embedded
+/// ledger-metadata defaults.
+pub fn load_ledger_metadata_or_default(
+    path: Option<&Path>,
+) -> Result<(Options, Option<Cache>), StorageError> {
+    match path {
+        Some(p) => {
+            let parsed = load(p)?;
+            apply_to_options(&parsed)
+        }
+        None => Ok(default_ledger_metadata_options()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Value parsers
 // ---------------------------------------------------------------------------
 
@@ -321,56 +419,9 @@ fn section_error(lineno: usize, raw: &str) -> StorageError {
 mod tests {
     use super::*;
 
-    /// Same content as Java BK's shipped `entry_location_rocksdb.conf.default`.
-    const JAVA_ENTRY_LOCATION: &str = r#"
-[DBOptions]
-create_if_missing=true
-info_log_level=INFO_LEVEL
-keep_log_file_num=30
-log_file_time_to_roll=86400
-max_background_jobs=32
-max_subcompactions=1
-max_total_wal_size=536870912
-max_open_files=-1
-delete_obsolete_files_period_micros=3600000000
-
-[CFOptions "default"]
-compression=kLZ4Compression
-write_buffer_size=67108864
-max_write_buffer_number=4
-num_levels=7
-level0_file_num_compaction_trigger=4
-max_bytes_for_level_base=268435456
-target_file_size_base=67108864
-level_compaction_dynamic_level_bytes=true
-
-[TableOptions/BlockBasedTable "default"]
-block_size=65536
-block_cache=206150041
-format_version=5
-checksum=kxxHash
-filter_policy=rocksdb.BloomFilter:10:false
-cache_index_and_filter_blocks=true
-"#;
-
-    /// Same content as Java BK's shipped `ledger_metadata_rocksdb.conf.default`.
-    const JAVA_LEDGER_METADATA: &str = r#"
-[DBOptions]
-create_if_missing=true
-info_log_level=INFO_LEVEL
-keep_log_file_num=30
-log_file_time_to_roll=86400
-
-[CFOptions "default"]
-
-[TableOptions/BlockBasedTable "default"]
-format_version=5
-checksum=kxxHash
-"#;
-
     #[test]
     fn parses_java_entry_location_file() {
-        let parsed = parse(JAVA_ENTRY_LOCATION).expect("parse");
+        let parsed = parse(DEFAULT_ENTRY_LOCATION_CONF).expect("parse");
         assert_eq!(parsed.db_options.get("create_if_missing"), Some(&"true".into()));
         assert_eq!(parsed.db_options.get("max_background_jobs"), Some(&"32".into()));
         assert_eq!(parsed.cf_options.get("compression"), Some(&"kLZ4Compression".into()));
@@ -382,15 +433,13 @@ checksum=kxxHash
 
     #[test]
     fn applies_java_entry_location_without_errors() {
-        let parsed = parse(JAVA_ENTRY_LOCATION).expect("parse");
-        let (_opts, cache) = apply_to_options(&parsed).expect("apply");
+        let (_opts, cache) = default_entry_location_options();
         assert!(cache.is_some(), "block cache should be set from the file");
     }
 
     #[test]
     fn applies_java_ledger_metadata_without_errors() {
-        let parsed = parse(JAVA_LEDGER_METADATA).expect("parse");
-        let (_opts, cache) = apply_to_options(&parsed).expect("apply");
+        let (_opts, cache) = default_ledger_metadata_options();
         assert!(
             cache.is_none(),
             "ledger_metadata_rocksdb.conf has no block_cache — cache should be None"

@@ -59,7 +59,14 @@ impl BookieServer {
             .first()
             .ok_or("no ledger dirs configured")?;
         let io_engines = bookkeeper_storage::io_engine::select_engine();
-        let mut storage = DbLedgerStorage::open(Path::new(ledger_dir), io_engines.ledger.clone())?;
+        let entry_location_conf = config.entry_location_rocksdb_conf.as_deref().map(Path::new);
+        let ledger_metadata_conf = config.ledger_metadata_rocksdb_conf.as_deref().map(Path::new);
+        let mut storage = DbLedgerStorage::open_with_conf(
+            Path::new(ledger_dir),
+            io_engines.ledger.clone(),
+            entry_location_conf,
+            ledger_metadata_conf,
+        )?;
 
         // Create state manager early so the journal fatal-error callback can
         // reference it. Transition to Running happens after DIRTY file setup.

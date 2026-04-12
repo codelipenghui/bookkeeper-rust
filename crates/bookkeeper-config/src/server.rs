@@ -44,6 +44,14 @@ pub struct ServerConfig {
     pub db_storage_rocksdb_block_size: i32,
     pub db_storage_rocksdb_bloom_filter_bits_per_key: i32,
 
+    /// Path to a Java BK-style `entry_location_rocksdb.conf` (INI). When
+    /// set, its contents override the built-in defaults for the entry
+    /// location index's RocksDB. Config key: `entryLocationRocksdbConf`.
+    pub entry_location_rocksdb_conf: Option<String>,
+    /// Path to a Java BK-style `ledger_metadata_rocksdb.conf`. See
+    /// [`entry_location_rocksdb_conf`]. Config key: `ledgerMetadataRocksdbConf`.
+    pub ledger_metadata_rocksdb_conf: Option<String>,
+
     // Runtime
     /// Number of server I/O threads (tokio workers). Handles TCP connections
     /// and request processing. 0 = 2 × CPU cores (matching Java's default).
@@ -129,6 +137,8 @@ impl Default for ServerConfig {
             db_storage_rocksdb_write_buffer_size_mb: 64,
             db_storage_rocksdb_block_size: 65536,
             db_storage_rocksdb_bloom_filter_bits_per_key: 10,
+            entry_location_rocksdb_conf: None,
+            ledger_metadata_rocksdb_conf: None,
             server_num_io_threads: 0,
             server_tcp_no_delay: true,
             server_sock_keepalive: true,
@@ -197,6 +207,8 @@ impl ServerConfig {
         if let Some(v) = props.get("dbStorage_rocksDB_writeBufferSizeMB") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_write_buffer_size_mb = n; } }
         if let Some(v) = props.get("dbStorage_rocksDB_blockSize") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_block_size = n; } }
         if let Some(v) = props.get("dbStorage_rocksDB_bloomFilterBitsPerKey") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_bloom_filter_bits_per_key = n; } }
+        if let Some(v) = props.get("entryLocationRocksdbConf") { config.entry_location_rocksdb_conf = Some(v.clone()); }
+        if let Some(v) = props.get("ledgerMetadataRocksdbConf") { config.ledger_metadata_rocksdb_conf = Some(v.clone()); }
         if let Some(v) = props.get("serverTcpNoDelay") { config.server_tcp_no_delay = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("serverSockKeepalive") { config.server_sock_keepalive = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("nettyMaxFrameSizeBytes") { if let Ok(n) = v.parse() { config.max_frame_size = n; } }
