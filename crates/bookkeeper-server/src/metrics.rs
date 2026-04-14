@@ -62,6 +62,17 @@ lazy_static! {
         &["success"]
     ).unwrap();
 
+    /// Per-connection response queue wait: time the response sits in the
+    /// per-connection mpsc between "processing task enqueues" and
+    /// "writer task dequeues". Isolates the pipeline-queue stage.
+    /// Rust-only metric (Java uses Netty's event loop and has no equivalent).
+    pub static ref RESPONSE_QUEUE_WAIT: Histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "bookkeeper_server_RESPONSE_QUEUE_WAIT",
+            "Response mpsc queue wait between processor enqueue and writer dequeue"
+        ).buckets(latency_buckets())
+    ).unwrap();
+
     /// ForceLedger request latency. Matches Java's RequestStats.FORCE_LEDGER_REQUEST.
     /// Measures end-to-end time to fsync the journal on a client-initiated force.
     pub static ref FORCE_LEDGER_REQUEST: HistogramVec = HistogramVec::new(
@@ -294,6 +305,7 @@ pub fn register_metrics() {
     reg!(READ_ENTRY_IN_PROGRESS);
     reg!(READ_ENTRY_FENCE_REQUEST);
     reg!(CHANNEL_WRITE);
+    reg!(RESPONSE_QUEUE_WAIT);
     reg!(FORCE_LEDGER_REQUEST);
     reg!(WRITE_LAC_REQUEST);
     reg!(READ_LAC_REQUEST);

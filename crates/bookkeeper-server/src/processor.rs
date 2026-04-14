@@ -25,6 +25,17 @@ const DEFAULT_BACKPRESSURE_TIMEOUT_MS: u64 = 0;
 /// Matches Java's `numHighPriorityWorkerThreads` separate pool concept.
 const DEFAULT_MAX_HIGH_PRIORITY_IN_PROGRESS: usize = 10000;
 
+/// Peek the (ledgerId, entryId) from the first 16 bytes of an AddEntry body.
+/// Returns `(0, 0)` if the body is shorter than the metadata header.
+fn peek_entry_ids(entry_data: &[u8]) -> (i64, i64) {
+    if entry_data.len() < 16 {
+        return (0, 0);
+    }
+    let ledger_id = i64::from_be_bytes(entry_data[0..8].try_into().expect("8 bytes"));
+    let entry_id = i64::from_be_bytes(entry_data[8..16].try_into().expect("8 bytes"));
+    (ledger_id, entry_id)
+}
+
 pub struct RequestProcessor {
     storage: Arc<dyn LedgerStorage>,
     state: Arc<BookieStateManager>,
@@ -105,17 +116,6 @@ impl RequestProcessor {
         self.backpressure_timeout_ms = ms;
     }
 
-    /// Set whether high-priority writes (recovery adds) are allowed in read-only mode.
-    /// Called by the disk monitor based on `minUsableSizeForHighPriorityWrites`.
-    /// Matches Java's `BookieStateManager.setAvailableForHighPriorityWrites()`.
-    pub fn set_available_for_high_priority_writes(&self, available: bool) {
-        self.available_for_high_priority_writes.store(available, Ordering::Release);
-    }
-
-    pub fn is_available_for_high_priority_writes(&self) -> bool {
-        self.available_for_high_priority_writes.load(Ordering::Acquire)
-    }
-
     /// Return a shared reference to the high-priority-writes flag.
     /// Used by the disk monitor to update the flag during state transitions.
     pub fn high_priority_writes_flag(&self) -> Arc<AtomicBool> {
@@ -172,8 +172,7 @@ impl RequestProcessor {
                     Some(p) => p,
                     None => {
                         crate::metrics::ADD_ENTRY_REJECTED.inc();
-                        let ledger_id = if entry_data.len() >= 8 { i64::from_be_bytes(entry_data[0..8].try_into().unwrap()) } else { 0 };
-                        let entry_id = if entry_data.len() >= 16 { i64::from_be_bytes(entry_data[8..16].try_into().unwrap()) } else { 0 };
+                        let (ledger_id, entry_id) = peek_entry_ids(&entry_data);
                         return V2Response::Add { error_code: BKError::TooManyRequests.to_v2_code(), ledger_id, entry_id };
                     }
                 };
@@ -183,9 +182,11 @@ impl RequestProcessor {
                 let resp = self.handle_add_entry(flags, &master_key, entry_data, deferred_sync).await;
                 let elapsed = timer.elapsed().as_secs_f64();
                 crate::metrics::ADD_ENTRY_IN_PROGRESS.dec();
+                // `BOOKIE_*` histograms capture storage processing time.
+                // End-to-end `ADD_ENTRY_REQUEST` is observed by the writer task
+                // once the response is flushed (Java-parity with enqueueNanos).
                 let success = matches!(resp, V2Response::Add { error_code, .. } if error_code == V2_EOK);
                 if success {
-                    crate::metrics::ADD_ENTRY_REQUEST_OK.observe(elapsed);
                     crate::metrics::BOOKIE_ADD_ENTRY_OK.observe(elapsed);
                     if is_recovery {
                         crate::metrics::BOOKIE_RECOVERY_ADD_ENTRY_OK.observe(elapsed);
@@ -193,7 +194,6 @@ impl RequestProcessor {
                     crate::metrics::WRITE_BYTES.inc_by(entry_size as u64);
                     crate::metrics::BOOKIE_ADD_ENTRY_BYTES_OK.observe(entry_size as f64);
                 } else {
-                    crate::metrics::ADD_ENTRY_REQUEST_FAIL.observe(elapsed);
                     crate::metrics::BOOKIE_ADD_ENTRY_FAIL.observe(elapsed);
                     if is_recovery {
                         crate::metrics::BOOKIE_RECOVERY_ADD_ENTRY_FAIL.observe(elapsed);
@@ -227,64 +227,41 @@ impl RequestProcessor {
                 let resp = self.handle_read_entry(flags, ledger_id, entry_id, master_key).await;
                 let elapsed = timer.elapsed().as_secs_f64();
                 crate::metrics::READ_ENTRY_IN_PROGRESS.dec();
+                // End-to-end `READ_ENTRY_REQUEST` / `READ_ENTRY_FENCE_REQUEST`
+                // are recorded by the writer task once the response is flushed.
                 let success = matches!(resp, V2Response::Read { error_code, .. } if error_code == V2_EOK);
                 if success {
-                    crate::metrics::READ_ENTRY_REQUEST_OK.observe(elapsed);
                     crate::metrics::BOOKIE_READ_ENTRY_OK.observe(elapsed);
-                    if is_fence {
-                        crate::metrics::READ_ENTRY_FENCE_REQUEST_OK.observe(elapsed);
-                    }
                     if let V2Response::Read { data: Some(ref d), .. } = resp {
                         let sz = d.len() as u64;
                         crate::metrics::READ_BYTES.inc_by(sz);
                         crate::metrics::BOOKIE_READ_ENTRY_BYTES_OK.observe(sz as f64);
                     }
                 } else {
-                    crate::metrics::READ_ENTRY_REQUEST_FAIL.observe(elapsed);
                     crate::metrics::BOOKIE_READ_ENTRY_FAIL.observe(elapsed);
-                    if is_fence {
-                        crate::metrics::READ_ENTRY_FENCE_REQUEST_FAIL.observe(elapsed);
-                    }
                 }
+                let _ = is_fence;
                 resp
             }
             V2Request::WriteLac { ledger_id, lac, master_key, body } => {
-                let start = std::time::Instant::now();
                 // Validate master key before writing LAC
                 if let Err(e) = self.storage.check_master_key(ledger_id, &master_key) {
-                    crate::metrics::WRITE_LAC_REQUEST_FAIL.observe(start.elapsed().as_secs_f64());
                     return V2Response::WriteLac {
                         error_code: self.storage_error_to_bk(&e).to_v2_code(),
                         ledger_id,
                         entry_id: 0,
                     };
                 }
-                let resp = self.handle_write_lac(ledger_id, lac, body).await;
-                let is_ok = matches!(resp, V2Response::WriteLac { error_code, .. } if error_code == V2_EOK);
-                if is_ok {
-                    crate::metrics::WRITE_LAC_REQUEST_OK.observe(start.elapsed().as_secs_f64());
-                } else {
-                    crate::metrics::WRITE_LAC_REQUEST_FAIL.observe(start.elapsed().as_secs_f64());
-                }
-                resp
+                // End-to-end `WRITE_LAC_REQUEST` recorded by the writer task.
+                self.handle_write_lac(ledger_id, lac, body).await
             }
             V2Request::ReadLac { ledger_id } => {
-                let start = std::time::Instant::now();
-                let resp = self.handle_read_lac(ledger_id).await;
-                let is_ok = matches!(resp, V2Response::ReadLac { error_code, .. } if error_code == V2_EOK);
-                if is_ok {
-                    crate::metrics::READ_LAC_REQUEST_OK.observe(start.elapsed().as_secs_f64());
-                } else {
-                    crate::metrics::READ_LAC_REQUEST_FAIL.observe(start.elapsed().as_secs_f64());
-                }
-                resp
+                // End-to-end `READ_LAC_REQUEST` recorded by the writer task.
+                self.handle_read_lac(ledger_id).await
             }
             V2Request::GetBookieInfo { flags: _, requested } => {
-                let start = std::time::Instant::now();
-                let resp = self.handle_get_bookie_info(requested);
-                // GetBookieInfo never fails at this level; record as success.
-                crate::metrics::GET_BOOKIE_INFO_REQUEST_OK.observe(start.elapsed().as_secs_f64());
-                resp
+                // End-to-end `GET_BOOKIE_INFO_REQUEST` recorded by the writer task.
+                self.handle_get_bookie_info(requested)
             }
             V2Request::Auth { payload: _ } => {
                 // Auth disabled: return success with empty payload.
@@ -326,8 +303,7 @@ impl RequestProcessor {
         if entry_data.len() < 16 {
             return self.add_error_response(BKError::BadRequest, 0, 0);
         }
-        let ledger_id = i64::from_be_bytes(entry_data[0..8].try_into().unwrap());
-        let entry_id = i64::from_be_bytes(entry_data[8..16].try_into().unwrap());
+        let (ledger_id, entry_id) = peek_entry_ids(&entry_data);
         let is_recovery = flags & FLAG_RECOVERY_ADD != 0;
         let is_high_priority = flags & FLAG_HIGH_PRIORITY != 0;
 

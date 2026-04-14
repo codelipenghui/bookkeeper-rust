@@ -3,14 +3,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_util::codec::{Decoder, Encoder};
 
+use bookkeeper_protocol::constants::{FLAG_DO_FENCING, V2_EOK};
 use bookkeeper_protocol::framing::BookieCodec;
 use bookkeeper_protocol::v2::request::{decode_request, V2Request};
-use bookkeeper_protocol::v2::response::encode_response;
+use bookkeeper_protocol::v2::response::{encode_response, V2Response};
 use bookkeeper_storage::db_ledger_storage::{DbLedgerStorage, CURRENT_DIR};
 
 use bookkeeper_metadata::traits::RegistrationManager;
@@ -19,7 +19,7 @@ use bookkeeper_config::server::ServerConfig;
 use crate::http_api;
 use crate::processor::RequestProcessor;
 use crate::state::{BookieState, BookieStateManager};
-use crate::unclean_shutdown::{DIRTY_FILENAME, UncleanShutdownDetection};
+use crate::unclean_shutdown::UncleanShutdownDetection;
 
 pub struct BookieServer {
     local_addr: SocketAddr,
@@ -591,27 +591,6 @@ impl BookieServer {
         self.state.clone()
     }
 
-    /// Update ZK registration when bookie state changes (e.g., to/from read-only).
-    pub async fn update_registration(&self, read_only: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some((ref reg_mgr, ref bookie_id)) = self.zk_reg {
-            use bookkeeper_metadata::traits::RegistrationManager;
-            reg_mgr.unregister_bookie(bookie_id, !read_only).await
-                .map_err(|e| format!("unregister from old path: {e}"))?;
-            // Recover the advertised host from the bookie_id (always of the
-            // form `host:port` per the construction in `start`). Falls back
-            // to the bind address if the id is malformed somehow.
-            let host = bookie_id
-                .rsplit_once(':')
-                .map(|(h, _)| h.to_string())
-                .unwrap_or_else(|| self.local_addr.ip().to_string());
-            let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
-                bookie_id, &host, self.local_addr.port(),
-            );
-            reg_mgr.register_bookie(bookie_id, read_only, &info).await
-                .map_err(|e| format!("register on new path: {e}"))?;
-        }
-        Ok(())
-    }
 
     /// Graceful shutdown matching Java's BookieImpl.shutdown() sequence:
     ///
@@ -1607,6 +1586,120 @@ async fn handle_connection(
     handle_connection_io(reader, writer, processor, max_frame_size).await;
 }
 
+/// End-to-end "request" classification used by the `*_REQUEST` histograms.
+/// Matches Java's `RequestStats` per-op families; timing runs from frame
+/// decode (`enqueued_at`) until the response bytes are flushed on the socket.
+#[derive(Clone, Copy)]
+pub(crate) enum RequestKind {
+    Add,
+    Read,
+    ReadFence,
+    WriteLac,
+    ReadLac,
+    GetBookieInfo,
+    ForceLedger,
+    Other,
+}
+
+/// A response queued for the writer task, carrying the metadata needed to
+/// attribute end-to-end request latency when the socket write completes.
+pub(crate) struct EnqueuedResponse {
+    pub bytes: Bytes,
+    /// Java's `enqueueNanos` — captured when the frame was decoded, used to
+    /// observe end-to-end `*_REQUEST` latency once the response is flushed.
+    pub enqueued_at: std::time::Instant,
+    /// Captured the moment the response was sent into the mpsc channel.
+    /// Used to observe `RESPONSE_QUEUE_WAIT` = writer-dequeue - queued_at.
+    pub queued_at: std::time::Instant,
+    pub kind: RequestKind,
+    pub success: bool,
+}
+
+/// Observe `*_REQUEST` latency (Java `ADD_ENTRY_REQUEST` etc.) once a
+/// response has been flushed on the wire.
+pub(crate) fn observe_request_latency(kind: RequestKind, success: bool, elapsed: f64) {
+    use crate::metrics::*;
+    match kind {
+        RequestKind::Add => {
+            if success { ADD_ENTRY_REQUEST_OK.observe(elapsed); }
+            else       { ADD_ENTRY_REQUEST_FAIL.observe(elapsed); }
+        }
+        RequestKind::Read => {
+            if success { READ_ENTRY_REQUEST_OK.observe(elapsed); }
+            else       { READ_ENTRY_REQUEST_FAIL.observe(elapsed); }
+        }
+        RequestKind::ReadFence => {
+            if success {
+                READ_ENTRY_REQUEST_OK.observe(elapsed);
+                READ_ENTRY_FENCE_REQUEST_OK.observe(elapsed);
+            } else {
+                READ_ENTRY_REQUEST_FAIL.observe(elapsed);
+                READ_ENTRY_FENCE_REQUEST_FAIL.observe(elapsed);
+            }
+        }
+        RequestKind::WriteLac => {
+            if success { WRITE_LAC_REQUEST_OK.observe(elapsed); }
+            else       { WRITE_LAC_REQUEST_FAIL.observe(elapsed); }
+        }
+        RequestKind::ReadLac => {
+            if success { READ_LAC_REQUEST_OK.observe(elapsed); }
+            else       { READ_LAC_REQUEST_FAIL.observe(elapsed); }
+        }
+        RequestKind::GetBookieInfo => {
+            if success { GET_BOOKIE_INFO_REQUEST_OK.observe(elapsed); }
+            else       { GET_BOOKIE_INFO_REQUEST_FAIL.observe(elapsed); }
+        }
+        RequestKind::ForceLedger => {
+            if success { FORCE_LEDGER_REQUEST_OK.observe(elapsed); }
+            else       { FORCE_LEDGER_REQUEST_FAIL.observe(elapsed); }
+        }
+        RequestKind::Other => {}
+    }
+}
+
+/// Map a V2 request to its `RequestKind` + a stable flag indicating whether
+/// the fence flag is set (so a later response we can mark `ReadFence`).
+pub(crate) fn v2_request_kind(req: &V2Request) -> RequestKind {
+    match req {
+        V2Request::AddEntry { .. } => RequestKind::Add,
+        V2Request::ReadEntry { flags, .. } | V2Request::BatchReadEntry { flags, .. } => {
+            if flags & FLAG_DO_FENCING != 0 { RequestKind::ReadFence } else { RequestKind::Read }
+        }
+        V2Request::WriteLac { .. } => RequestKind::WriteLac,
+        V2Request::ReadLac { .. } => RequestKind::ReadLac,
+        V2Request::GetBookieInfo { .. } => RequestKind::GetBookieInfo,
+        V2Request::Auth { .. } => RequestKind::Other,
+    }
+}
+
+/// Extract the EOK/non-EOK status out of a V2 response for request-success
+/// attribution.
+pub(crate) fn v2_response_success(resp: &V2Response) -> bool {
+    match resp {
+        V2Response::Add { error_code, .. }
+        | V2Response::Read { error_code, .. }
+        | V2Response::WriteLac { error_code, .. }
+        | V2Response::ReadLac { error_code, .. }
+        | V2Response::GetBookieInfo { error_code, .. }
+        | V2Response::BatchRead { error_code, .. } => *error_code == V2_EOK,
+        V2Response::Auth { .. } => true,
+    }
+}
+
+/// V3 operation-type → `RequestKind` (without fence detail, which lives
+/// inside the read request body and is handled uniformly in the processor).
+pub(crate) fn v3_request_kind(operation: i32) -> RequestKind {
+    match operation {
+        x if x == bookkeeper_proto::OperationType::AddEntry as i32 => RequestKind::Add,
+        x if x == bookkeeper_proto::OperationType::ReadEntry as i32 => RequestKind::Read,
+        x if x == bookkeeper_proto::OperationType::WriteLac as i32 => RequestKind::WriteLac,
+        x if x == bookkeeper_proto::OperationType::ReadLac as i32 => RequestKind::ReadLac,
+        x if x == bookkeeper_proto::OperationType::GetBookieInfo as i32 => RequestKind::GetBookieInfo,
+        x if x == bookkeeper_proto::OperationType::ForceLedger as i32 => RequestKind::ForceLedger,
+        _ => RequestKind::Other,
+    }
+}
+
 /// Pipelined connection handler: reads frames concurrently with request
 /// processing. Each request is dispatched as a separate tokio task so
 /// journal writes from multiple in-flight requests can batch naturally.
@@ -1633,7 +1726,7 @@ where
     // write buffer. The bounded variant was ~6% of hot-path CPU because every
     // send/recv acquired a batch_semaphore permit — unbounded is a simple
     // atomic linked-list push/pop.
-    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<EnqueuedResponse>();
 
     // Writer task: sends framed responses to the socket.
     // Matches Java's closeChannelOnResponseTimeout: if a write takes longer
@@ -1642,9 +1735,13 @@ where
     let writer_handle = tokio::spawn(async move {
         let mut codec = BookieCodec::new(max_frame_size);
         let mut out = BytesMut::with_capacity(256);
-        while let Some(response_bytes) = resp_rx.recv().await {
+        while let Some(enq) = resp_rx.recv().await {
+            // Observe mpsc queue wait: how long the response sat between
+            // the processor enqueue and the writer dequeue. If this shows
+            // the tail, the response pipeline is the bottleneck.
+            crate::metrics::RESPONSE_QUEUE_WAIT.observe(enq.queued_at.elapsed().as_secs_f64());
             out.clear();
-            if codec.encode(response_bytes, &mut out).is_err() {
+            if codec.encode(enq.bytes, &mut out).is_err() {
                 break;
             }
             let write_start = std::time::Instant::now();
@@ -1652,19 +1749,25 @@ where
                 write_timeout,
                 writer.write_all(&out),
             ).await;
-            let elapsed = write_start.elapsed().as_secs_f64();
+            let write_elapsed = write_start.elapsed().as_secs_f64();
+            // End-to-end "request" latency = time from frame decode to response flushed.
+            // Matches Java's RequestStats `*_REQUEST` family (see PacketProcessorBaseV3).
+            let request_elapsed = enq.enqueued_at.elapsed().as_secs_f64();
             match write_result {
                 Ok(Ok(())) => {
-                    crate::metrics::CHANNEL_WRITE_OK.observe(elapsed);
+                    crate::metrics::CHANNEL_WRITE_OK.observe(write_elapsed);
+                    observe_request_latency(enq.kind, enq.success, request_elapsed);
                 }
                 Ok(Err(_)) => {
-                    crate::metrics::CHANNEL_WRITE_FAIL.observe(elapsed);
+                    crate::metrics::CHANNEL_WRITE_FAIL.observe(write_elapsed);
+                    observe_request_latency(enq.kind, false, request_elapsed);
                     break;
                 }
                 Err(_) => {
                     // Write timeout — slow client. Close connection.
-                    tracing::warn!("Closing slow client: write timed out after {:.1}s", elapsed);
-                    crate::metrics::CHANNEL_WRITE_FAIL.observe(elapsed);
+                    tracing::warn!("Closing slow client: write timed out after {:.1}s", write_elapsed);
+                    crate::metrics::CHANNEL_WRITE_FAIL.observe(write_elapsed);
+                    observe_request_latency(enq.kind, false, request_elapsed);
                     break;
                 }
             }
@@ -1684,34 +1787,54 @@ where
         match codec.decode(&mut buf) {
             Ok(Some(frame)) => {
                 let frame_bytes = frame.freeze();
+                // Java's `enqueueNanos` — start of the end-to-end `*_REQUEST` timer.
+                let enqueued_at = std::time::Instant::now();
 
-                let use_v3 = is_v3.unwrap_or_else(|| {
-                    crate::v3_processor::try_decode_v3(&frame_bytes).is_some()
-                });
+                let decoded_v3 = match is_v3 {
+                    Some(true) => crate::v3_processor::try_decode_v3(&frame_bytes),
+                    Some(false) => None,
+                    None => crate::v3_processor::try_decode_v3(&frame_bytes),
+                };
+                let use_v3 = decoded_v3.is_some() || is_v3 == Some(true);
 
                 if use_v3 {
                     is_v3 = Some(true);
-                    if let Some(v3_req) = crate::v3_processor::try_decode_v3(&frame_bytes) {
+                    if let Some(v3_req) = decoded_v3 {
                         // Allow AUTH requests through even if not yet authenticated.
                         let is_auth_op = v3_req.header.operation == bookkeeper_proto::OperationType::Auth as i32;
                         if !authenticated && !is_auth_op {
                             let txn_id = v3_req.header.txn_id as u64;
                             let operation = v3_req.header.operation;
+                            let kind = v3_request_kind(operation);
                             let resp = crate::v3_processor::build_v3_error_response(
                                 txn_id, operation,
                                 bookkeeper_common::error::BKError::Unauthorized,
                             );
-                            let _ = resp_tx.send(Bytes::from(resp));
+                            let _ = resp_tx.send(EnqueuedResponse {
+                                bytes: Bytes::from(resp),
+                                enqueued_at,
+                                queued_at: std::time::Instant::now(),
+                                kind,
+                                success: false,
+                            });
                             continue;
                         }
                         if is_auth_op {
                             authenticated = true;
                         }
+                        let kind = v3_request_kind(v3_req.header.operation);
                         let proc = processor.clone();
                         let tx = resp_tx.clone();
                         tokio::spawn(async move {
-                            let resp = crate::v3_processor::process_v3_request(&proc, v3_req).await;
-                            let _ = tx.send(Bytes::from(resp));
+                            let (resp_bytes, success) =
+                                crate::v3_processor::process_v3_request(&proc, v3_req).await;
+                            let _ = tx.send(EnqueuedResponse {
+                                bytes: Bytes::from(resp_bytes),
+                                enqueued_at,
+                                queued_at: std::time::Instant::now(),
+                                kind,
+                                success,
+                            });
                         });
                     } else {
                         break;
@@ -1733,19 +1856,33 @@ where
                                     }).await;
                                     // Send an unauthorized error. For simplicity, we send
                                     // the auth-disabled response — the client will see EUA.
-                                    let _ = tx.send(encode_response(&resp).freeze());
+                                    let _ = tx.send(EnqueuedResponse {
+                                        bytes: encode_response(&resp).freeze(),
+                                        enqueued_at,
+                                        queued_at: std::time::Instant::now(),
+                                        kind: RequestKind::Other,
+                                        success: false,
+                                    });
                                 });
                                 continue;
                             }
                             if is_auth_req {
                                 authenticated = true;
                             }
+                            let kind = v2_request_kind(&req);
                             let proc = processor.clone();
                             let tx = resp_tx.clone();
                             tokio::spawn(async move {
                                 let resp = proc.process_request(req).await;
+                                let success = v2_response_success(&resp);
                                 let resp_encoded = encode_response(&resp);
-                                let _ = tx.send(resp_encoded.freeze());
+                                let _ = tx.send(EnqueuedResponse {
+                                    bytes: resp_encoded.freeze(),
+                                    enqueued_at,
+                                    queued_at: std::time::Instant::now(),
+                                    kind,
+                                    success,
+                                });
                             });
                         }
                         Err(_) => {

@@ -15,10 +15,12 @@ pub fn try_decode_v3(data: &[u8]) -> Option<bookkeeper_proto::Request> {
 
 /// Process a V3 protobuf request by converting to V2 internal representation,
 /// running through the same handler, and converting the response back to V3 protobuf.
+/// Returns the encoded response bytes plus a success flag (status == EOK) used
+/// by the writer task to attribute the end-to-end `*_REQUEST` latency.
 pub async fn process_v3_request(
     processor: &RequestProcessor,
     req: bookkeeper_proto::Request,
-) -> Vec<u8> {
+) -> (Vec<u8>, bool) {
     let header = &req.header;
     let txn_id = header.txn_id;
     let operation = header.operation;
@@ -58,7 +60,7 @@ pub async fn process_v3_request(
                 };
                 processor.process_request(v2_req).await
             } else {
-                return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+                return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
             }
         }
         op if op == bookkeeper_proto::OperationType::ReadEntry as i32 => {
@@ -140,7 +142,7 @@ pub async fn process_v3_request(
                     processor.process_request(v2_req).await
                 }
             } else {
-                return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+                return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
             }
         }
         op if op == bookkeeper_proto::OperationType::WriteLac as i32 => {
@@ -156,7 +158,7 @@ pub async fn process_v3_request(
                 };
                 processor.process_request(v2_req).await
             } else {
-                return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+                return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
             }
         }
         op if op == bookkeeper_proto::OperationType::ReadLac as i32 => {
@@ -164,7 +166,7 @@ pub async fn process_v3_request(
                 let v2_req = V2Request::ReadLac { ledger_id: rl.ledger_id };
                 processor.process_request(v2_req).await
             } else {
-                return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+                return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
             }
         }
         op if op == bookkeeper_proto::OperationType::GetBookieInfo as i32 => {
@@ -174,22 +176,19 @@ pub async fn process_v3_request(
         }
         op if op == bookkeeper_proto::OperationType::ForceLedger as i32 => {
             if let Some(fl) = req.force_ledger_request {
-                // Observe latency to match Java's RequestStats.FORCE_LEDGER_REQUEST.
-                let start = std::time::Instant::now();
-                let result = processor.force_journal_sync().await;
-                let latency = start.elapsed().as_secs_f64();
-                match result {
+                // `FORCE_LEDGER_REQUEST` is recorded end-to-end by the writer task
+                // once the response is flushed (matches Java's
+                // PacketProcessorBaseV3.sendResponse → enqueueNanos semantics).
+                match processor.force_journal_sync().await {
                     Ok(_) => {
-                        crate::metrics::FORCE_LEDGER_REQUEST_OK.observe(latency);
-                        return build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Ok);
+                        return (build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Ok), true);
                     }
                     Err(_) => {
-                        crate::metrics::FORCE_LEDGER_REQUEST_FAIL.observe(latency);
-                        return build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Io);
+                        return (build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Io), false);
                     }
                 }
             } else {
-                return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+                return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
             }
         }
         op if op == bookkeeper_proto::OperationType::Auth as i32 => {
@@ -204,7 +203,7 @@ pub async fn process_v3_request(
                 }),
                 ..Default::default()
             };
-            return resp.encode_to_vec();
+            return (resp.encode_to_vec(), true);
         }
         op if op == bookkeeper_proto::OperationType::StartTls as i32 => {
             // START_TLS is handled at the connection level in handle_starttls_connection.
@@ -214,7 +213,7 @@ pub async fn process_v3_request(
             // 2. The connection is already TLS-upgraded → START_TLS mid-stream is invalid
             //
             // In both cases, return EBADREQ matching Java's behavior.
-            return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+            return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
         }
         op if op == bookkeeper_proto::OperationType::GetListOfEntriesOfLedger as i32 => {
             if let Some(req) = req.get_list_of_entries_of_ledger_request {
@@ -243,23 +242,26 @@ pub async fn process_v3_request(
                             ),
                             ..Default::default()
                         };
-                        return resp.encode_to_vec();
+                        return (resp.encode_to_vec(), true);
                     }
                     Err(_) => {
-                        return build_v3_error_response(txn_id, operation, BKError::NoLedger);
+                        return (build_v3_error_response(txn_id, operation, BKError::NoLedger), false);
                     }
                 }
             } else {
-                return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+                return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
             }
         }
         _ => {
-            return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+            return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
         }
     };
 
-    // Convert V2 response to V3 protobuf
-    v2_response_to_v3(txn_id, operation, v2_response)
+    // Convert V2 response to V3 protobuf. Success flag derives from the V2
+    // response's error_code (EOK == success) so the writer task can attribute
+    // end-to-end `*_REQUEST` latency to the OK/FAIL histogram.
+    let success = crate::server::v2_response_success(&v2_response);
+    (v2_response_to_v3(txn_id, operation, v2_response), success)
 }
 
 fn v2_response_to_v3(txn_id: u64, operation: i32, v2_resp: V2Response) -> Vec<u8> {
