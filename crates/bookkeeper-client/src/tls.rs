@@ -56,8 +56,19 @@ pub fn build_tls_connector(cfg: &ClientTlsConfig) -> Result<TlsConnector, Box<dy
     ensure_crypto_provider();
 
     if !cfg.keystore_type.eq_ignore_ascii_case("PEM") {
+        // rustls can't read JKS keystores; give the operator the
+        // exact conversion command rather than a generic "unsupported"
+        // message. Java defaults to JKS so config files arriving from
+        // a Java bookie deployment hit this path first.
+        let hint = if cfg.keystore_type.eq_ignore_ascii_case("JKS") {
+            " (convert with `keytool -importkeystore -srckeystore client.jks \
+              -destkeystore client.p12 -deststoretype PKCS12` then split to \
+              PEM via openssl)"
+        } else {
+            " (convert with openssl)"
+        };
         return Err(format!(
-            "tlsKeyStoreType={} is not supported (only PEM); convert with openssl",
+            "tlsKeyStoreType={} is not supported by the client (only PEM){hint}",
             cfg.keystore_type
         ).into());
     }

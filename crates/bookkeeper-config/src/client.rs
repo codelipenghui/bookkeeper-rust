@@ -250,7 +250,11 @@ impl Default for ClientConfig {
             task_execution_warn_time_micros: 1000000,
             client_tcp_user_timeout_millis: -1,
             tls_provider_factory_class: None,
-            tls_keystore_type: "PEM".to_string(),
+            // Matches Java's `tlsKeyStoreType=JKS` default so config
+            // files are portable; the TLS builder rejects JKS at runtime
+            // with a clear openssl-conversion message since rustls can't
+            // load JKS directly.
+            tls_keystore_type: "JKS".to_string(),
             tls_certificate_path: None,
             tls_key_path: None,
             tls_trust_store_path: None,

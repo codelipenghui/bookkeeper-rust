@@ -158,8 +158,9 @@ fn server_config_new_fields_defaults() {
     assert_eq!(config.rw_rereplicate_backoff_ms, 5000);
     assert_eq!(config.open_ledger_rereplication_grace_period, 30000);
     assert_eq!(config.lock_release_of_failed_ledger_grace_period, 300000);
-    // ZK retry
-    assert_eq!(config.zk_retry_backoff_start_ms, 1000);
+    // ZK retry: Java default is zkTimeout (10_000ms); 1000ms would
+    // retry aggressively and turn a ZK hiccup into a retry storm.
+    assert_eq!(config.zk_retry_backoff_start_ms, 10000);
     // HTTP
     assert_eq!(config.http_server_host, "0.0.0.0");
     assert!(!config.http_server_tls_enable);
@@ -728,6 +729,30 @@ fn env_overrides_apply_on_top_of_file() {
     assert_eq!(config.advertised_address.as_deref(), Some("10.0.0.5"));
     // File value that was NOT overridden should be untouched.
     assert_eq!(config.journal_directory, "/data/journal");
+}
+
+#[test]
+fn defaults_match_java_for_zk_scrub_and_tls_keystore() {
+    // D3 + D4 + D5: three defaults that previously drifted from Java.
+    // Lock them down so operators loading a Java-shaped config get the
+    // same behaviour out of the box.
+    let config = ServerConfig::default();
+    assert_eq!(
+        config.zk_retry_backoff_start_ms, 10_000,
+        "zkRetryBackoffStartMs must match Java (= zkTimeout 10_000ms)"
+    );
+    assert_eq!(
+        config.local_scrub_rate_limit, 60,
+        "localScrubRateLimit must match Java default of 60 entries/sec"
+    );
+    assert_eq!(
+        config.tls_keystore_type, "JKS",
+        "tlsKeyStoreType default must match Java's JKS"
+    );
+
+    // Client parity too — JKS default so Java config files are portable.
+    let client = ClientConfig::default();
+    assert_eq!(client.tls_keystore_type, "JKS");
 }
 
 #[test]

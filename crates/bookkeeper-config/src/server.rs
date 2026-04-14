@@ -422,7 +422,12 @@ impl Default for ServerConfig {
             tls_key_path: None,
             tls_trust_store_path: None,
             tls_client_authentication: false,
-            tls_keystore_type: "PEM".to_string(),
+            // Java defaults `tlsKeyStoreType` to "JKS". Aligning here so
+            // a Java-shaped config file loaded without an explicit type
+            // behaves the same way. The TLS builder surfaces a clear
+            // "convert via openssl/keytool" error when JKS is actually
+            // used at runtime, since rustls does not support JKS natively.
+            tls_keystore_type: "JKS".to_string(),
             tls_enabled_cipher_suites: None,
             tls_enabled_protocols: None,
             tls_cert_refresh_seconds: 0,
@@ -497,13 +502,21 @@ impl Default for ServerConfig {
             zk_servers: None,
             zk_ledger_root: "/ledgers".to_string(),
             zk_timeout: 10000,
-            zk_retry_backoff_start_ms: 1000,
+            // Java defaults `zkRetryBackoffStartMs` to `zkTimeout` (10_000ms).
+            // 1_000ms is too aggressive — a ZK hiccup turns into a retry
+            // storm that extends the outage instead of waiting a realistic
+            // recovery window. Aligning with Java.
+            zk_retry_backoff_start_ms: 10000,
             zk_retry_backoff_max_ms: 10000,
             http_server_enabled: false,
             http_server_port: 8080,
             http_server_host: "0.0.0.0".to_string(),
             local_scrub_interval: 0,
-            local_scrub_rate_limit: 0,
+            // Java defaults `localScrubRateLimit` to 60 entries/sec. Leaving
+            // it unlimited risks saturating a production bookie's IO when
+            // the scrubber is later wired up. Match Java to cap the
+            // verification cost at ~60 reads/sec per bookie.
+            local_scrub_rate_limit: 60,
             local_consistency_check_on_startup: false,
             data_integrity_checking: false,
             data_integrity_stamp_missing_cookies: false,

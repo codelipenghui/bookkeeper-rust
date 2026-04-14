@@ -40,6 +40,16 @@ pub fn build_tls_acceptor(cfg: &TlsConfig) -> Result<TlsAcceptor, Box<dyn std::e
     let (certs, key) = match cfg.keystore_type.to_uppercase().as_str() {
         "PEM" => load_pem(&cfg.cert_path, &cfg.key_path)?,
         "PKCS12" | "P12" | "PFX" => load_pkcs12(&cfg.key_path)?,
+        // rustls can't parse Java-style JKS keystores natively. We still
+        // accept the Java default value so config files stay portable,
+        // but surface a clear conversion path rather than a generic
+        // "unsupported" error.
+        "JKS" => return Err(
+            "tlsKeyStoreType=JKS is not supported by rustls — convert the \
+             keystore to PKCS12 with `keytool -importkeystore -srckeystore \
+             bookie.jks -destkeystore bookie.p12 -deststoretype PKCS12` \
+             and set tlsKeyStoreType=PKCS12 (or split to PEM via openssl)".into()
+        ),
         other => return Err(format!("unsupported tlsKeyStoreType: {other} (supported: PEM, PKCS12)").into()),
     };
 
