@@ -616,6 +616,9 @@ impl RequestProcessor {
             bookkeeper_storage::StorageError::Fenced(_) => BKError::Fenced,
             bookkeeper_storage::StorageError::StorageFull => BKError::ReadOnly,
             bookkeeper_storage::StorageError::Unauthorized(_) => BKError::Unauthorized,
+            // Matches Java's `OperationRejectedException` → ETOOMANYREQUESTS.
+            // Signals the client to back off / retry on another bookie.
+            bookkeeper_storage::StorageError::OperationRejected => BKError::TooManyRequests,
             _ => BKError::Io,
         }
     }

@@ -190,6 +190,128 @@ async fn journal_rollover_replays_across_multiple_files() {
 }
 
 #[tokio::test]
+async fn current_mark_advances_after_synced_writes() {
+    // Issue #33: Checkpoint offset must track the durable journal position,
+    // not stay at 0. After a synced write, current_mark() should return a
+    // non-zero offset matching the bytes written (+ header).
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = make_config(tmp.path().to_path_buf());
+    let journal = Journal::start(cfg, default_journal_io(), None);
+
+    // No writes yet → no mark.
+    assert!(journal.current_mark().is_none());
+
+    // Write one entry and wait for fsync ack.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&1i64.to_be_bytes());
+    buf.extend_from_slice(&0i64.to_be_bytes());
+    buf.extend_from_slice(&(-1i64).to_be_bytes());
+    buf.extend_from_slice(&100i64.to_be_bytes());
+    buf.extend_from_slice(b"first-entry");
+    journal.log_add_entry(&buf).await.unwrap();
+
+    let (log_id, offset) = journal.current_mark().expect("mark should advance after synced write");
+    assert!(log_id > 0, "log_id must be non-zero after first write");
+    // Expect at least: header (8 bytes v6) + 4-byte len + payload.
+    // The exact offset depends on padding, but must be well past 0.
+    assert!(offset > buf.len() as u64, "offset {offset} must be past the first entry");
+
+    // Additional writes should only advance the mark monotonically.
+    let prev_offset = offset;
+    for i in 1..5 {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1i64.to_be_bytes());
+        b.extend_from_slice(&(i as i64).to_be_bytes());
+        b.extend_from_slice(&((i - 1) as i64).to_be_bytes());
+        b.extend_from_slice(&100i64.to_be_bytes());
+        b.extend_from_slice(b"more-data");
+        journal.log_add_entry(&b).await.unwrap();
+    }
+    let (_, new_offset) = journal.current_mark().unwrap();
+    assert!(new_offset > prev_offset, "mark must advance monotonically");
+}
+
+#[tokio::test]
+async fn replay_respects_checkpoint_offset() {
+    // Issue #33: If lastMark records a non-zero offset, replay must skip
+    // data already covered by the checkpoint. Otherwise crash recovery
+    // re-scans the whole journal file.
+    use bookkeeper_storage::journal::format::LastMark;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = make_config(tmp.path().to_path_buf());
+    let journal = Journal::start(cfg, default_journal_io(), None);
+
+    // Write 5 entries, take the mark, then write 5 more.
+    for i in 0..5i64 {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1i64.to_be_bytes());
+        b.extend_from_slice(&i.to_be_bytes());
+        b.extend_from_slice(&(i - 1).to_be_bytes());
+        b.extend_from_slice(&100i64.to_be_bytes());
+        b.extend_from_slice(format!("entry-{i}").as_bytes());
+        journal.log_add_entry(&b).await.unwrap();
+    }
+    let (mark_log_id, mark_offset) = journal.current_mark().unwrap();
+
+    for i in 5..10i64 {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1i64.to_be_bytes());
+        b.extend_from_slice(&i.to_be_bytes());
+        b.extend_from_slice(&(i - 1).to_be_bytes());
+        b.extend_from_slice(&100i64.to_be_bytes());
+        b.extend_from_slice(format!("entry-{i}").as_bytes());
+        journal.log_add_entry(&b).await.unwrap();
+    }
+
+    drop(journal);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Replay without mark → all 10 entries.
+    let mut all_count = 0;
+    replay_journal(tmp.path(), None, |_| all_count += 1).unwrap();
+    assert_eq!(all_count, 10);
+
+    // Replay with the mark taken after 5 entries → only the latter 5.
+    let mark = LastMark::new(mark_log_id as i64, mark_offset as i64);
+    let mut post_mark_count = 0;
+    let mut ids: Vec<i64> = Vec::new();
+    replay_journal(tmp.path(), Some(mark), |data| {
+        post_mark_count += 1;
+        if data.len() >= 16 {
+            ids.push(i64::from_be_bytes(data[8..16].try_into().unwrap()));
+        }
+    }).unwrap();
+    assert_eq!(post_mark_count, 5, "replay should skip entries already covered by mark");
+    assert_eq!(ids, vec![5, 6, 7, 8, 9]);
+}
+
+#[tokio::test]
+async fn current_mark_advances_in_no_sync_mode() {
+    // Mode 3 (no sync): mark advances after write_all since that's the
+    // strongest durability we have. Still non-zero so recovery can skip.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = make_config(tmp.path().to_path_buf());
+    cfg.sync_data = false;
+    let journal = Journal::start(cfg, default_journal_io(), None);
+
+    for i in 0..5i64 {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1i64.to_be_bytes());
+        b.extend_from_slice(&i.to_be_bytes());
+        b.extend_from_slice(&(i - 1).to_be_bytes());
+        b.extend_from_slice(&100i64.to_be_bytes());
+        b.extend_from_slice(b"payload");
+        journal.log_add_entry(&b).await.unwrap();
+    }
+
+    let (log_id, offset) = journal.current_mark()
+        .expect("mark should advance in no-sync mode after writes");
+    assert!(log_id > 0);
+    assert!(offset > 0);
+}
+
+#[tokio::test]
 async fn sync_data_false_still_replays() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = make_config(tmp.path().to_path_buf());

@@ -54,7 +54,16 @@ pub struct StorageConfig {
     pub max_entry_log_size: u64,
     pub read_ahead_batch_size: usize,
     pub read_ahead_max_bytes: usize,
+    /// Max time a single `add_entry` caller will wait for a write-cache
+    /// flush before rejecting with `OperationRejected`. Mirrors Java's
+    /// `dbStorage_maxThrottleTimeMs`, used by `triggerFlushAndAddEntry`
+    /// to bound backpressure instead of blocking Bookie IO threads
+    /// indefinitely.
+    pub max_throttle_time_ms: u64,
 }
+
+/// Matches Java's `DbLedgerStorage.MAX_THROTTLE_TIME_MILLIS` default (10s).
+const DEFAULT_MAX_THROTTLE_TIME_MS: u64 = 10_000;
 
 impl Default for StorageConfig {
     fn default() -> Self {
@@ -64,6 +73,7 @@ impl Default for StorageConfig {
             max_entry_log_size: DEFAULT_MAX_ENTRY_LOG_SIZE,
             read_ahead_batch_size: DEFAULT_READ_AHEAD_BATCH_SIZE,
             read_ahead_max_bytes: DEFAULT_READ_AHEAD_MAX_BYTES,
+            max_throttle_time_ms: DEFAULT_MAX_THROTTLE_TIME_MS,
         }
     }
 }
@@ -89,6 +99,11 @@ impl StorageConfig {
             } else {
                 DEFAULT_READ_AHEAD_MAX_BYTES
             },
+            max_throttle_time_ms: if cfg.db_storage_max_throttle_time_ms > 0 {
+                cfg.db_storage_max_throttle_time_ms as u64
+            } else {
+                DEFAULT_MAX_THROTTLE_TIME_MS
+            },
         }
     }
 }
@@ -99,6 +114,11 @@ struct EntryLogState {
     /// Persistent file handle for the current entry log. Avoids open/close per write.
     /// Writes go through `LedgerIo::write_batch` using the raw fd from this handle.
     file: Option<fs::File>,
+    /// Per-ledger bytes written into the current (still-open) entry log file.
+    /// Drives the ledgers map that is appended at end-of-file on rotation,
+    /// matching Java's `BufferedLogChannel.ledgersMap` maintained for
+    /// `appendLedgersMap()`. Reset whenever a new log file is opened.
+    current_log_ledger_sizes: std::collections::HashMap<i64, u64>,
 }
 
 /// In-memory snapshot of a ledger's metadata (master key + fenced flag).
@@ -209,6 +229,7 @@ impl DbLedgerStorage {
                 log_id: initial_log_id,
                 offset: LOGFILE_HEADER_SIZE as u64,
                 file: None,
+                current_log_ledger_sizes: std::collections::HashMap::new(),
             }),
             flush_mutex: tokio::sync::Mutex::new(()),
             ledger_io,
@@ -371,6 +392,70 @@ impl DbLedgerStorage {
         Ok(())
     }
 
+    /// Append the ledgers map to a rotated entry-log file and patch the
+    /// header so GC (and any other metadata consumer) can enumerate the
+    /// ledgers in this file in O(num_ledgers) instead of O(file_size).
+    ///
+    /// On-disk layout (matches Java's `DefaultEntryLogger`):
+    /// ```text
+    ///   [ 1024-byte header  ][ user entries ... ][ ledgers map batches ]
+    ///                                            ^ map_offset (u64 big-endian at byte 8)
+    ///                                              + num_ledgers (i32 big-endian at byte 16)
+    /// ```
+    /// Each batch is `encode_ledger_map_batch()`:
+    /// `[contentSize:4][INVALID_LID:8][LEDGERS_MAP_ENTRY_ID:8][count:4][(ledgerId,size)...]`
+    /// with at most `LEDGERS_MAP_MAX_BATCH_SIZE` ledgers per batch to bound
+    /// per-batch memory, matching Java's 10 000-ledger batch cap.
+    fn append_ledgers_map(
+        file: &mut fs::File,
+        ledger_sizes: &std::collections::HashMap<i64, u64>,
+    ) -> Result<(), StorageError> {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::FileExt;
+
+        let num_ledgers = ledger_sizes.len();
+        if num_ledgers == 0 {
+            return Ok(());
+        }
+
+        // Start writing at the current end-of-file.
+        let map_offset = file.seek(SeekFrom::End(0))?;
+
+        // Collect + sort entries so the on-disk layout is deterministic
+        // (makes byte-for-byte reproducibility easier and matches Java's
+        // iteration order for ledger maps via ConcurrentLongLongHashMap.forEach).
+        let mut entries: Vec<elf::LedgerMapEntry> = ledger_sizes.iter()
+            .map(|(&ledger_id, &size)| elf::LedgerMapEntry {
+                ledger_id,
+                size: size as i64,
+            })
+            .collect();
+        entries.sort_by_key(|e| e.ledger_id);
+
+        // Write in batches of at most LEDGERS_MAP_MAX_BATCH_SIZE ledgers.
+        for chunk in entries.chunks(elf::LEDGERS_MAP_MAX_BATCH_SIZE) {
+            let batch = elf::encode_ledger_map_batch(chunk);
+            file.write_all(&batch)?;
+        }
+        // Flush map contents to the FS before we publish the pointer in
+        // the header — otherwise a crash could leave a header pointing at
+        // unwritten / partial map data. Mirrors Java's `super.flush();`
+        // call in `appendLedgersMap` before the header patch.
+        file.sync_data()?;
+
+        // Patch the header in place: map_offset (8 bytes) + num_ledgers (4 bytes).
+        // Offsets inside the header: magic(4) + version(4) = 8, then
+        // ledgers_map_offset(8) + ledgers_count(4). Same layout as
+        // `EntryLogHeader::to_bytes` above.
+        let mut patch = [0u8; 12];
+        patch[0..8].copy_from_slice(&(map_offset as i64).to_be_bytes());
+        patch[8..12].copy_from_slice(&(num_ledgers as i32).to_be_bytes());
+        file.write_all_at(&patch, 8)?;
+        file.sync_data()?;
+
+        Ok(())
+    }
+
     async fn read_entry_from_log(&self, location: u64) -> Result<Vec<u8>, StorageError> {
         let loc = EntryLocation::from_u64(location);
         let pos = loc.position() as u64;
@@ -437,15 +522,62 @@ impl LedgerStorage for DbLedgerStorage {
                 return Ok(());
             }
         }
-        // Cache full — flush and retry (throttled write)
+        // Cache full — flush and retry with a bounded throttle window.
+        //
+        // Matches Java's `triggerFlushAndAddEntry`: rather than blocking
+        // the caller indefinitely on a slow flush, we enforce a total
+        // `max_throttle_time_ms` budget. If we can't make room in that
+        // window, the request is rejected with `OperationRejected` so the
+        // client retries or fails fast instead of piling up stalled tasks.
         storage_metrics::THROTTLED_WRITE_REQUESTS.inc();
         let throttle_start = Instant::now();
-        self.flush().await?;
-        storage_metrics::THROTTLED_WRITE.observe(throttle_start.elapsed().as_secs_f64());
-        let cache = self.write_cache.read();
-        let result = cache.put(ledger_id, entry_id, entry);
-        storage_metrics::ADD_ENTRY.observe(add_start.elapsed().as_secs_f64());
-        result
+        let max_throttle = std::time::Duration::from_millis(
+            self.storage_config.max_throttle_time_ms,
+        );
+
+        // Inner retry loop: re-try the cache put between flushes in case
+        // a concurrent flush rotated the cache while we were waiting.
+        // Java's version also loops on `writeCache.put()` with a sleep.
+        loop {
+            // Quick re-check: a concurrent flush may have rotated the
+            // cache already, so try the put again before starting work.
+            {
+                let cache = self.write_cache.read();
+                if cache.put(ledger_id, entry_id, entry).is_ok() {
+                    storage_metrics::THROTTLED_WRITE.observe(throttle_start.elapsed().as_secs_f64());
+                    storage_metrics::ADD_ENTRY.observe(add_start.elapsed().as_secs_f64());
+                    return Ok(());
+                }
+            }
+
+            let remaining = max_throttle.saturating_sub(throttle_start.elapsed());
+            if remaining.is_zero() {
+                storage_metrics::REJECTED_WRITE_REQUESTS.inc();
+                return Err(StorageError::OperationRejected);
+            }
+
+            // Call flush with a remaining-time deadline. If a peer flush
+            // is in progress holding `flush_mutex`, the timeout covers the
+            // mutex wait too — so a single slow flush can no longer stall
+            // every in-flight add_entry for unbounded time.
+            //
+            // Cancelling an in-flight flush is safe here: the cache swap
+            // is atomic under a parking_lot write lock, and all
+            // write_cache_being_flushed mutations are re-done idempotently
+            // by a subsequent flush (entries stay in being_flushed until a
+            // successful flush clears them — see the bottom of flush()).
+            match tokio::time::timeout(remaining, self.flush()).await {
+                Ok(Ok(())) => {
+                    // Flush succeeded — one more put attempt in next loop iter.
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    // Timed out — reject so the client can retry/failover.
+                    storage_metrics::REJECTED_WRITE_REQUESTS.inc();
+                    return Err(StorageError::OperationRejected);
+                }
+            }
+        }
     }
 
     async fn get_entry(&self, ledger_id: i64, entry_id: i64) -> Result<Bytes, StorageError> {
@@ -807,7 +939,18 @@ impl LedgerStorage for DbLedgerStorage {
             framed_entries: Vec<Vec<u8>>,
             locations: Vec<(i64, i64, u32, u64)>, // (ledger_id, entry_id, log_id, position)
         }
+        /// A log file that was rotated away mid-flush. Carries the ledger→bytes
+        /// map built while the file was active, so Phase 2 can append the
+        /// self-describing ledgers map (matching Java's `appendLedgersMap()`
+        /// in `DefaultEntryLogger.BufferedLogChannel`). Without this, GC has
+        /// to scan the whole log body to discover which ledgers it contains.
+        struct RotatedLog {
+            log_id: u32,
+            file: fs::File,
+            ledger_sizes: std::collections::HashMap<i64, u64>,
+        }
         let segments: Vec<FlushSegment>;
+        let rotated_logs: Vec<RotatedLog>;
         let entry_count: usize;
         let total_bytes: u64;
 
@@ -825,6 +968,7 @@ impl LedgerStorage for DbLedgerStorage {
             let flushing_data = flushing.data();
 
             let mut segs: Vec<FlushSegment> = Vec::new();
+            let mut rotated: Vec<RotatedLog> = Vec::new();
             let mut flush_bytes: u64 = 0;
 
             {
@@ -857,8 +1001,21 @@ impl LedgerStorage for DbLedgerStorage {
                             segs.push(current);
                         }
 
-                        // Rotate: close current, open new
-                        log_state.file = None;
+                        // Rotate: hand off the old file + ledger-size map
+                        // to Phase 2 so it can write the ledgers map after
+                        // the entry writes land. This mirrors Java's
+                        // `EntryLogManagerBase.createNewLog` which calls
+                        // `logChannel.appendLedgersMap()` before swapping
+                        // in a fresh log channel.
+                        let old_log_id = log_state.log_id;
+                        let old_file = log_state.file.take().unwrap();
+                        let old_sizes = std::mem::take(&mut log_state.current_log_ledger_sizes);
+                        rotated.push(RotatedLog {
+                            log_id: old_log_id,
+                            file: old_file,
+                            ledger_sizes: old_sizes,
+                        });
+
                         log_state.log_id += 1;
                         log_state.offset = LOGFILE_HEADER_SIZE as u64;
                         self.ensure_entry_log_exists(log_state.log_id)?;
@@ -881,6 +1038,10 @@ impl LedgerStorage for DbLedgerStorage {
                     current.locations.push((ledger_id, entry_id, log_state.log_id, position));
                     current.framed_entries.push(framed);
                     log_state.offset += encoded_size;
+                    // Track per-ledger bytes for the currently-open log so
+                    // its ledgers map is accurate at rotation time.
+                    *log_state.current_log_ledger_sizes
+                        .entry(ledger_id).or_insert(0) += encoded_size;
                     flush_bytes += encoded_size;
                 }
 
@@ -890,6 +1051,7 @@ impl LedgerStorage for DbLedgerStorage {
             } // log_state MutexGuard dropped
 
             segments = segs;
+            rotated_logs = rotated;
             total_bytes = flush_bytes;
         } // flushing RwLockReadGuard dropped
 
@@ -917,6 +1079,21 @@ impl LedgerStorage for DbLedgerStorage {
         for guard in &file_guards {
             guard.sync_data()?;
         }
+
+        // Append the ledgers map to every log file that rotated during this
+        // flush. This makes rotated log files self-describing so GC can
+        // enumerate their ledgers without scanning the whole body.
+        // Matches Java's `DefaultEntryLogger.BufferedLogChannel.appendLedgersMap()`,
+        // invoked from `EntryLogManagerBase.createNewLog` before rolling
+        // over to a new log file.
+        for mut rl in rotated_logs {
+            if let Err(e) = Self::append_ledgers_map(&mut rl.file, &rl.ledger_sizes) {
+                // Non-fatal: the file is still readable, GC just falls back
+                // to scanning the body as it does for pre-existing files.
+                tracing::warn!("failed to append ledgers map for log {:x}: {e}", rl.log_id);
+            }
+        }
+
         storage_metrics::FLUSH_ENTRYLOG.observe(entrylog_start.elapsed().as_secs_f64());
 
         if !batch.is_empty() {
@@ -955,11 +1132,16 @@ impl LedgerStorage for DbLedgerStorage {
         //
         // If the flush fails at any point, lastMark stays at the
         // previous safe position — crash recovery replays from there.
-        let cp = if let Some(log_id) = self.journal.as_ref().and_then(|j| j.current_log_id()) {
-            Some(crate::checkpoint::Checkpoint::new(log_id as i64, 0))
-        } else {
-            None
-        };
+        // Snapshot the durable (log_id, offset) mark — Java's
+        // `Journal.newCheckpoint()` / `LastLogMark.markLog()`. Using the
+        // actual synced offset (not 0) means crash recovery replays only
+        // entries written after this point instead of rescanning the whole
+        // journal file.
+        let cp = self.journal.as_ref()
+            .and_then(|j| j.current_mark())
+            .map(|(log_id, offset)| {
+                crate::checkpoint::Checkpoint::new(log_id as i64, offset as i64)
+            });
 
         // Phase 2: Flush everything
         self.flush().await?;

@@ -19,9 +19,7 @@ use bookkeeper_config::server::ServerConfig;
 use crate::http_api;
 use crate::processor::RequestProcessor;
 use crate::state::{BookieState, BookieStateManager};
-
-/// Filename for unclean shutdown detection, matching Java's UncleanShutdownDetectionImpl.
-const DIRTY_FILENAME: &str = "DIRTY";
+use crate::unclean_shutdown::{DIRTY_FILENAME, UncleanShutdownDetection};
 
 pub struct BookieServer {
     local_addr: SocketAddr,
@@ -113,6 +111,23 @@ impl BookieServer {
             Arc::new(BookieStateManager::new())
         };
 
+        // Unclean-shutdown detection must happen BEFORE journal replay so
+        // the replay can opt in to lenient scanning (skip_invalid_record)
+        // when we know the last shutdown was abrupt. Matches Java where
+        // `UncleanShutdownDetection` is checked at boot and informs the
+        // operator / drives the optional integrity scan below.
+        let unclean_detection = UncleanShutdownDetection::new(&config.ledger_directories);
+        let was_unclean = unclean_detection.last_shutdown_was_unclean();
+        if was_unclean {
+            crate::metrics::BOOKIE_UNCLEAN_SHUTDOWN_DETECTED.set(1);
+            tracing::warn!(
+                "Unclean shutdown detected — forcing skip_invalid_record=true for journal replay \
+                 and scheduling a post-replay integrity scan (if enabled)."
+            );
+        } else {
+            crate::metrics::BOOKIE_UNCLEAN_SHUTDOWN_DETECTED.set(0);
+        }
+
         // Initialize journal for write-ahead logging (crash recovery).
         // Controlled by `journalWriteData` (default true). When false, the
         // journal is skipped entirely — writes go directly to the write cache
@@ -144,12 +159,16 @@ impl BookieServer {
                     crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
                 });
 
+            // On unclean shutdown, tolerate torn records at the tail of the
+            // journal — they correspond to entries that were mid-write when
+            // the process died. Clean shutdowns keep strict parsing.
+            let skip_invalid = config.skip_replay_journal_invalid_record || was_unclean;
             let replayed = storage.init_journal(
                 &journal_current,
                 journal_config,
                 io_engines.journal,
                 Some(on_journal_fatal),
-                config.skip_replay_journal_invalid_record,
+                skip_invalid,
             ).await?;
             if replayed > 0 {
                 tracing::info!("Journal recovery: replayed {replayed} entries");
@@ -158,37 +177,39 @@ impl BookieServer {
             tracing::info!("Journal disabled (journalWriteData=false)");
         }
 
-        // Check for unclean shutdown (DIRTY file in any ledger directory).
-        // Java defaults to unclean=true on any I/O error (fail-safe).
-        let was_unclean = config.ledger_directories.iter().any(|dir| {
-            let dirty_path = Path::new(dir).join(CURRENT_DIR).join(DIRTY_FILENAME);
-            match dirty_path.try_exists() {
-                Ok(exists) => exists,
-                Err(e) => {
-                    tracing::error!("Failed to check DIRTY file in {dir}: {e} — assuming unclean");
-                    true // fail-safe: assume unclean
-                }
-            }
-        });
-        if was_unclean {
-            tracing::info!("Unclean shutdown detected (DIRTY file present). Journal replay completed.");
-        }
-
         let storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage> =
             Arc::new(storage);
+
+        // Post-crash integrity scan — walks the entry_location_index and
+        // verifies each entry can be read from its recorded entry log
+        // position, catching torn writes / half-applied flushes that the
+        // journal replay alone cannot detect. Gated on config so operators
+        // can skip it when they have external tooling.
+        if was_unclean && config.verify_storage_on_unclean_shutdown {
+            let scan_start = std::time::Instant::now();
+            match storage.local_consistency_check(0).await {
+                Ok(errors) => {
+                    crate::metrics::BOOKIE_UNCLEAN_RECOVERY_ERRORS.set(errors as i64);
+                    tracing::info!(
+                        "Post-crash integrity scan completed in {:?} — {} mismatches",
+                        scan_start.elapsed(), errors
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Post-crash integrity scan failed after {:?}: {e}",
+                        scan_start.elapsed()
+                    );
+                }
+            }
+        }
 
         // Create DIRTY file in each ledger directory — signals unclean shutdown
         // if the process crashes before clean shutdown removes it.
         // Matches Java: written AFTER bookie.start() succeeds, BEFORE accepting connections.
         // Java aborts startup if DIRTY creation fails (re-throws IOException).
-        for dir in &config.ledger_directories {
-            let current = Path::new(dir).join(CURRENT_DIR);
-            std::fs::create_dir_all(&current)
-                .map_err(|e| format!("Failed to create {}/current: {e}", dir))?;
-            let dirty_path = current.join(DIRTY_FILENAME);
-            std::fs::File::create(&dirty_path)
-                .map_err(|e| format!("Failed to create DIRTY file in {dir}: {e}"))?;
-        }
+        unclean_detection.register_startup()
+            .map_err(|e| format!("Failed to register startup (DIRTY file): {e}"))?;
 
         // Transition to Running or ReadOnly based on config.
         if config.force_read_only_bookie {
@@ -649,14 +670,7 @@ impl BookieServer {
 
         // Step 6: Remove DIRTY files — clean shutdown confirmed.
         // Matches Java: deleted AFTER bookie.shutdown() completes (all flushed).
-        for dir in &self.ledger_directories {
-            let dirty_path = Path::new(dir).join(CURRENT_DIR).join(DIRTY_FILENAME);
-            if dirty_path.exists() {
-                if let Err(e) = std::fs::remove_file(&dirty_path) {
-                    tracing::warn!("Failed to remove DIRTY file in {dir}: {e}");
-                }
-            }
-        }
+        UncleanShutdownDetection::new(&self.ledger_directories).register_clean_shutdown();
 
         // Step 7: Transition to ShuttingDown
         self.state.transition_to(BookieState::ShuttingDown);

@@ -138,6 +138,12 @@ pub struct ServerConfig {
     // Journal (extended)
     /// Skip invalid records during journal replay instead of aborting.
     pub skip_replay_journal_invalid_record: bool,
+    /// After an unclean shutdown (DIRTY file present), scan the entry
+    /// location index and verify each entry is readable at its recorded
+    /// offset. Catches torn writes / half-applied flushes that journal
+    /// replay alone cannot detect. Default: false (matches Java, which
+    /// only surfaces the unclean flag but doesn't automatically scan).
+    pub verify_storage_on_unclean_shutdown: bool,
     /// Pre-allocate journal files (MB). 0 = no pre-allocation.
     pub journal_pre_alloc_size_mb: i32,
     /// Journal write buffer size (KB).
@@ -188,6 +194,11 @@ pub struct ServerConfig {
     pub db_storage_read_ahead_cache_batch_size: i32,
     /// Read-ahead max bytes per batch.
     pub db_storage_read_ahead_cache_batch_bytes_size: i32,
+    /// Max time an add_entry request waits for a write-cache flush before
+    /// being rejected with `OperationRejected`. Matches Java's
+    /// `dbStorage_maxThrottleTimeMs` — prevents slow flushes from blocking
+    /// all write processing indefinitely. 0 → default (10 000 ms).
+    pub db_storage_max_throttle_time_ms: i64,
     /// Max batch read size in bytes. Matches Java's `maxBatchReadSize` semantic.
     /// Default 5MB (5242880). Config key: `maxBatchReadSize`.
     pub max_batch_read_size_bytes: i64,
@@ -430,6 +441,7 @@ impl Default for ServerConfig {
             max_connections: 0,
             close_channel_on_response_timeout_ms: 0,
             skip_replay_journal_invalid_record: false,
+            verify_storage_on_unclean_shutdown: false,
             journal_pre_alloc_size_mb: 16,
             journal_write_buffer_size_kb: 64,
             journal_reuse_files: false,
@@ -451,6 +463,7 @@ impl Default for ServerConfig {
             num_high_priority_worker_threads: 8,
             db_storage_read_ahead_cache_batch_size: 100,
             db_storage_read_ahead_cache_batch_bytes_size: -1,
+            db_storage_max_throttle_time_ms: 10_000,
             max_batch_read_size_bytes: 5 * 1024 * 1024, // 5MB, matching Java
             max_batch_read_count: 10_000,
             auto_recovery_daemon_enabled: false,
@@ -700,6 +713,7 @@ impl ServerConfig {
         if let Some(v) = props.get("closeChannelOnResponseTimeout") { if let Ok(n) = v.parse() { config.close_channel_on_response_timeout_ms = n; } }
         // Journal extended
         if let Some(v) = props.get("skipReplayJournalInvalidRecord") { config.skip_replay_journal_invalid_record = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("verifyStorageOnUncleanShutdown") { config.verify_storage_on_unclean_shutdown = v.eq_ignore_ascii_case("true"); }
         if let Some(v) = props.get("journalPreAllocSizeMB") { if let Ok(n) = v.parse() { config.journal_pre_alloc_size_mb = n; } }
         if let Some(v) = props.get("journalWriteBufferSizeKB") { if let Ok(n) = v.parse() { config.journal_write_buffer_size_kb = n; } }
         if let Some(v) = props.get("journalReuseFiles") { config.journal_reuse_files = v.eq_ignore_ascii_case("true"); }
@@ -722,6 +736,7 @@ impl ServerConfig {
         // DbLedgerStorage extended
         if let Some(v) = props.get("dbStorage_readAheadCacheBatchSize") { if let Ok(n) = v.parse() { config.db_storage_read_ahead_cache_batch_size = n; } }
         if let Some(v) = props.get("dbStorage_readAheadCacheBatchBytesSize") { if let Ok(n) = v.parse() { config.db_storage_read_ahead_cache_batch_bytes_size = n; } }
+        if let Some(v) = props.get("dbStorage_maxThrottleTimeMs") { if let Ok(n) = v.parse() { config.db_storage_max_throttle_time_ms = n; } }
         if let Some(v) = props.get("maxBatchReadSize") { if let Ok(n) = v.parse() { config.max_batch_read_size_bytes = n; } }
         if let Some(v) = props.get("maxBatchReadCount") { if let Ok(n) = v.parse() { config.max_batch_read_count = n; } }
         // Replication / Auditor

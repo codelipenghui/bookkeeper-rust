@@ -81,6 +81,16 @@ pub struct Journal {
     _threads: Vec<std::thread::JoinHandle<()>>,
     master_key_cache: std::sync::Mutex<HashSet<i64>>,
     current_log_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Last durably-synced (log_id, byte_offset) pair.
+    /// Updated atomically after fsync succeeds. `offset` is the position in
+    /// the journal file — including the header — immediately after the last
+    /// fsync'd byte. Matches Java's `LastLogMark.curMark` (log_id, offset),
+    /// which is advanced in `Journal.ForceWriteThread.syncJournal` via
+    /// `lastLogMark.setCurLogMark(logId, lastFlushedPosition)`.
+    ///
+    /// Used by `newCheckpoint()` so crash-recovery replay skips data already
+    /// known to be durable, instead of rescanning the whole journal file.
+    last_log_mark: Arc<std::sync::Mutex<(u64, u64)>>,
 }
 
 impl Journal {
@@ -99,6 +109,8 @@ impl Journal {
 
         let current_log_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let shared_log_id = current_log_id.clone();
+        let last_log_mark = Arc::new(std::sync::Mutex::new((0u64, 0u64)));
+        let shared_last_mark = last_log_mark.clone();
 
         let mut threads = Vec::new();
 
@@ -115,7 +127,7 @@ impl Journal {
                 let t = std::thread::Builder::new()
                     .name("journal-uring".into())
                     .spawn(move || {
-                        journal_uring_loop(uring_config, rx, on_fatal_error, shared_log_id)
+                        journal_uring_loop(uring_config, rx, on_fatal_error, shared_log_id, shared_last_mark)
                     })
                     .expect("failed to spawn journal-uring thread");
                 threads.push(t);
@@ -130,10 +142,11 @@ impl Journal {
             let shared_cb: Option<Arc<dyn Fn(io::Error) + Send + Sync>> =
                 on_fatal_error.map(|cb| Arc::from(cb) as Arc<dyn Fn(io::Error) + Send + Sync>);
             let fw_cb = shared_cb.clone();
+            let fw_last_mark = shared_last_mark.clone();
 
             let sync_thread = std::thread::Builder::new()
                 .name("journal-sync".into())
-                .spawn(move || force_write_loop(fw_rx, fw_cb))
+                .spawn(move || force_write_loop(fw_rx, fw_cb, fw_last_mark))
                 .expect("failed to spawn journal-sync thread");
             threads.push(sync_thread);
 
@@ -141,7 +154,11 @@ impl Journal {
             let writer_thread = std::thread::Builder::new()
                 .name("journal-writer".into())
                 .spawn(move || {
-                    journal_writer_loop(writer_config, rx, Some(fw_tx), shared_cb, shared_log_id)
+                    // Mode 2: writer hands off to force-write; mark is
+                    // updated there (after fsync). Pass a dummy Arc
+                    // that will never be touched.
+                    journal_writer_loop(writer_config, rx, Some(fw_tx), shared_cb, shared_log_id,
+                        Arc::new(std::sync::Mutex::new((0u64, 0u64))))
                 })
                 .expect("failed to spawn journal-writer thread");
             threads.push(writer_thread);
@@ -153,7 +170,9 @@ impl Journal {
             let writer_thread = std::thread::Builder::new()
                 .name("journal-writer".into())
                 .spawn(move || {
-                    journal_writer_loop(writer_config, rx, None, cb, shared_log_id)
+                    // Mode 3 (no-sync): advance mark after write_all since
+                    // that's the strongest durability we have.
+                    journal_writer_loop(writer_config, rx, None, cb, shared_log_id, shared_last_mark)
                 })
                 .expect("failed to spawn journal-writer thread");
             threads.push(writer_thread);
@@ -164,6 +183,7 @@ impl Journal {
             _threads: threads,
             master_key_cache: std::sync::Mutex::new(HashSet::new()),
             current_log_id,
+            last_log_mark,
         }
     }
 
@@ -318,6 +338,18 @@ impl Journal {
         let id = self.current_log_id.load(std::sync::atomic::Ordering::Relaxed);
         if id == 0 { None } else { Some(id) }
     }
+
+    /// Snapshot the last durably-synced `(log_id, offset)` for use as a
+    /// checkpoint. Matches Java's `Journal.newCheckpoint()` →
+    /// `lastLogMark.markLog()` which reads `curMark` (updated in
+    /// `ForceWriteThread.syncJournal` after each fsync).
+    ///
+    /// Returns `None` if no data has ever been durably synced yet.
+    pub fn current_mark(&self) -> Option<(u64, u64)> {
+        let guard = self.last_log_mark.lock().unwrap_or_else(|p| p.into_inner());
+        let (log_id, offset) = *guard;
+        if log_id == 0 { None } else { Some((log_id, offset)) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +361,13 @@ struct ForceWriteRequest {
     acks: Vec<tokio::sync::oneshot::Sender<()>>,
     /// Earliest enqueue time among entries in this batch (for e2e latency).
     oldest_enqueue_time: Instant,
+    /// Journal file log_id for this batch — advances the durable lastMark
+    /// after fsync. Matches Java's `ForceWriteRequest.logId`.
+    log_id: u64,
+    /// Journal file position immediately after the bytes just written —
+    /// becomes `lastLogMark.offset` after the fsync succeeds.
+    /// Matches Java's `ForceWriteRequest.lastFlushedPosition`.
+    last_flushed_position: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +380,7 @@ fn journal_uring_loop(
     rx: mpsc::Receiver<JournalEntry>,
     on_fatal_error: Option<OnFatalError>,
     shared_log_id: Arc<std::sync::atomic::AtomicU64>,
+    shared_last_mark: Arc<std::sync::Mutex<(u64, u64)>>,
 ) {
     use io_uring::{opcode, types, IoUring};
 
@@ -355,6 +395,8 @@ fn journal_uring_loop(
         fsync_start: &mut Option<Instant>,
         fsync_in_flight: &mut bool,
         on_fatal_error: &Option<OnFatalError>,
+        syncing_mark: &mut Option<(u64, u64)>,
+        shared_last_mark: &Arc<std::sync::Mutex<(u64, u64)>>,
     ) -> bool {
         if let Some(cqe) = ring.completion().next() {
             // Record JOURNAL_SYNC latency
@@ -368,7 +410,19 @@ fn journal_uring_loop(
                     cb(io::Error::from_raw_os_error(-cqe.result()));
                 }
                 syncing_acks.clear();
+                *syncing_mark = None;
             } else {
+                // fsync succeeded: advance the durable lastMark to the
+                // (log_id, position) captured when this fsync was submitted.
+                if let Some((log_id, offset)) = syncing_mark.take() {
+                    let mut guard = shared_last_mark.lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    // Only advance forward: a rotation + out-of-order CQE
+                    // must not rewind the mark.
+                    if (log_id, offset) > *guard {
+                        *guard = (log_id, offset);
+                    }
+                }
                 // Record JOURNAL_ADD_ENTRY (e2e) for all acked entries
                 if let Some(oldest) = syncing_oldest_enqueue.take() {
                     metrics::JOURNAL_ADD_ENTRY.observe(oldest.elapsed().as_secs_f64());
@@ -415,6 +469,9 @@ fn journal_uring_loop(
     let mut syncing_fw_count: u64 = 0; // force-write requests grouped in current fsync
     let mut fsync_in_flight = false;
     let mut fsync_start: Option<Instant> = None;
+    // Durable (log_id, offset) snapshot captured when the in-flight fsync
+    // was submitted. Applied to shared_last_mark only on CQE success.
+    let mut syncing_mark: Option<(u64, u64)> = None;
 
     loop {
         // If fsync is in flight, don't block -- poll for entries and CQE.
@@ -428,6 +485,7 @@ fn journal_uring_loop(
                         &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
                         &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
                         &on_fatal_error,
+                        &mut syncing_mark, &shared_last_mark,
                     );
                     // If fsync still in flight and no entries, do a short wait
                     if fsync_in_flight {
@@ -439,6 +497,7 @@ fn journal_uring_loop(
                                     &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
                                     &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
                                     &on_fatal_error,
+                                    &mut syncing_mark, &shared_last_mark,
                                 );
                                 continue;
                             }
@@ -455,6 +514,7 @@ fn journal_uring_loop(
                             &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
                             &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
                             &on_fatal_error,
+                            &mut syncing_mark, &shared_last_mark,
                         );
                     }
                     break;
@@ -628,6 +688,7 @@ fn journal_uring_loop(
                         &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
                         &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
                         &on_fatal_error,
+                        &mut syncing_mark, &shared_last_mark,
                     );
                 }
 
@@ -666,6 +727,9 @@ fn journal_uring_loop(
                     }
                     fsync_in_flight = true;
                     fsync_start = Some(Instant::now());
+                    // Capture the durable position at fsync submission time;
+                    // applied to shared_last_mark once the CQE reports success.
+                    syncing_mark = Some((state.log_id, state.position));
                 }
             }
             Err(e) => {
@@ -692,6 +756,7 @@ fn journal_writer_loop(
     fw_tx: Option<mpsc::Sender<ForceWriteRequest>>,
     on_fatal_error: Option<Arc<dyn Fn(io::Error) + Send + Sync>>,
     shared_log_id: Arc<std::sync::atomic::AtomicU64>,
+    shared_last_mark: Arc<std::sync::Mutex<(u64, u64)>>,
 ) {
     fs::create_dir_all(&config.journal_dir).ok();
 
@@ -714,6 +779,7 @@ fn journal_writer_loop(
                         &config, &mut state, &mut write_buf, &mut pending_acks,
                         &mut pending_oldest_enqueue,
                         &fw_tx, &on_fatal_error, &shared_log_id,
+                        &shared_last_mark,
                         FlushTrigger::EmptyQueue,
                     );
                 }
@@ -819,6 +885,7 @@ fn journal_writer_loop(
             &config, &mut state, &mut write_buf, &mut pending_acks,
             &mut pending_oldest_enqueue,
             &fw_tx, &on_fatal_error, &shared_log_id,
+            &shared_last_mark,
             flush_trigger,
         );
         pending_bytes = 0;
@@ -849,6 +916,7 @@ fn flush_write_buf(
     fw_tx: &Option<mpsc::Sender<ForceWriteRequest>>,
     on_fatal_error: &Option<Arc<dyn Fn(io::Error) + Send + Sync>>,
     shared_log_id: &Arc<std::sync::atomic::AtomicU64>,
+    shared_last_mark: &Arc<std::sync::Mutex<(u64, u64)>>,
     flush_trigger: FlushTrigger,
 ) {
     if write_buf.is_empty() {
@@ -937,12 +1005,24 @@ fn flush_write_buf(
                     fd,
                     acks,
                     oldest_enqueue_time: oldest_enqueue,
+                    log_id: state.log_id,
+                    last_flushed_position: state.position,
                 }).is_err() {
                     tracing::error!("Force-write thread gone");
                     metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
                 }
             } else {
-                // Mode 3: no sync -- ACK immediately, record e2e latency
+                // Mode 3: no sync -- ACK immediately, record e2e latency.
+                // Advance lastMark to match the newly-written position.
+                // This is the strongest durability point available in no-sync mode.
+                {
+                    let mut guard = shared_last_mark.lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let new_mark = (state.log_id, state.position);
+                    if new_mark > *guard {
+                        *guard = new_mark;
+                    }
+                }
                 metrics::JOURNAL_ADD_ENTRY.observe(oldest_enqueue.elapsed().as_secs_f64());
                 for ack in acks {
                     let _ = ack.send(());
@@ -968,6 +1048,7 @@ fn flush_write_buf(
 fn force_write_loop(
     rx: mpsc::Receiver<ForceWriteRequest>,
     on_fatal_error: Option<Arc<dyn Fn(io::Error) + Send + Sync>>,
+    shared_last_mark: Arc<std::sync::Mutex<(u64, u64)>>,
 ) {
     loop {
         let first = match rx.recv() {
@@ -980,6 +1061,9 @@ fn force_write_loop(
         let mut last_fd = first.fd;
         let mut oldest_enqueue = first.oldest_enqueue_time;
         let mut grouped_count: u64 = 1; // count of ForceWriteRequests grouped
+        // Track the last (log_id, position) across grouped requests.
+        let mut last_log_id = first.log_id;
+        let mut last_position = first.last_flushed_position;
 
         while let Ok(req) = rx.try_recv() {
             metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
@@ -989,6 +1073,10 @@ fn force_write_loop(
             if req.oldest_enqueue_time < oldest_enqueue {
                 oldest_enqueue = req.oldest_enqueue_time;
             }
+            // The last-grouped request carries the furthest write position.
+            // Matches Java's `ForceWriteThread.syncJournal(lastRequest)`.
+            last_log_id = req.log_id;
+            last_position = req.last_flushed_position;
             grouped_count += 1;
         }
 
@@ -1004,6 +1092,18 @@ fn force_write_loop(
             continue;
         }
         let sync_elapsed = sync_start.elapsed();
+
+        // fsync succeeded: advance the durable lastMark.
+        // Matches Java's `lastLogMark.setCurLogMark(lastRequest.logId,
+        // lastRequest.lastFlushedPosition)` in `ForceWriteThread.syncJournal`.
+        {
+            let mut guard = shared_last_mark.lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let new_mark = (last_log_id, last_position);
+            if new_mark > *guard {
+                *guard = new_mark;
+            }
+        }
 
         // Record metrics
         metrics::JOURNAL_SYNC.observe(sync_elapsed.as_secs_f64());

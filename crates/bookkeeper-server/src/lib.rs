@@ -7,3 +7,4 @@ pub mod metrics;
 pub mod tls;
 pub mod auth;
 pub mod scrubber;
+pub mod unclean_shutdown;

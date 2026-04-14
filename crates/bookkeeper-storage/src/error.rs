@@ -18,4 +18,9 @@ pub enum StorageError {
     RocksDb(String),
     #[error("unauthorized access to ledger {0}")]
     Unauthorized(i64),
+    /// Write cache full and the bounded throttle period elapsed without
+    /// completing a flush. Matches Java's `OperationRejectedException`
+    /// returned from `triggerFlushAndAddEntry()` after `maxThrottleTimeNanos`.
+    #[error("operation rejected: write cache full, flush throttle timeout")]
+    OperationRejected,
 }

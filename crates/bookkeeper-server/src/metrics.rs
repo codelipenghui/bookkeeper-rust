@@ -217,6 +217,22 @@ lazy_static! {
         "bookie_scrub_errors_total", "Total entry errors found by local consistency checker"
     ).unwrap();
 
+    /// Whether the last shutdown was unclean (DIRTY file found at boot).
+    /// Mirrors Java's UncleanShutdownDetectionImpl result — surfaced as a
+    /// metric so operators can alert on unclean restarts.
+    pub static ref BOOKIE_UNCLEAN_SHUTDOWN_DETECTED: IntGauge = IntGauge::new(
+        "bookie_unclean_shutdown_detected",
+        "1 if the previous bookie process exited uncleanly (DIRTY file present), else 0"
+    ).unwrap();
+
+    /// Entry mismatches found by the post-crash integrity scan. Only set
+    /// when an unclean shutdown is detected AND
+    /// `verify_storage_on_unclean_shutdown` is enabled.
+    pub static ref BOOKIE_UNCLEAN_RECOVERY_ERRORS: IntGauge = IntGauge::new(
+        "bookie_unclean_recovery_errors",
+        "Number of entry mismatches found during the post-crash integrity scan"
+    ).unwrap();
+
     // -----------------------------------------------------------------------
     // Pre-resolved Histogram handles for the hot path.
     //
@@ -309,6 +325,8 @@ pub fn register_metrics() {
     // Server
     reg!(BOOKIE_STATE);
     reg!(SCRUB_ERRORS);
+    reg!(BOOKIE_UNCLEAN_SHUTDOWN_DETECTED);
+    reg!(BOOKIE_UNCLEAN_RECOVERY_ERRORS);
     // Journal (defined in bookkeeper-storage crate)
     bookkeeper_storage::journal::metrics::register_journal_metrics(&REGISTRY);
     // Storage (defined in bookkeeper-storage crate)
