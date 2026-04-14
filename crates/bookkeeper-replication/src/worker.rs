@@ -22,12 +22,26 @@ use crate::ReplicationError;
 /// - Closed ledgers: copy entries from good replicas to replacement bookies (no fencing)
 /// - Open ledgers with missing bookies in last segment: fence + recovery
 /// - Updates ensemble metadata per-fragment with old→new bookie mapping
+/// Max size of the failed-ledger cache matching Java's REPLICATED_FAILED_LEDGERS_MAXSIZE.
+const FAILED_LEDGER_CACHE_MAX: usize = 2000;
+/// Max exponential backoff retries before capping, matching Java's NUM_OF_EXPONENTIAL_BACKOFF_RETRIALS.
+const MAX_BACKOFF_RETRIES: u32 = 5;
+
 pub struct ReplicationWorker {
     ur_manager: Arc<ZkUnderreplicationManager>,
     ledger_manager: Arc<dyn LedgerManager>,
     bookie_id: String,
-    backoff_ms: u64,
+    base_backoff_ms: u64,
     shutdown_rx: watch::Receiver<bool>,
+    /// Consecutive failure count for exponential backoff.
+    consecutive_failures: u32,
+    /// Recently-failed ledger IDs to avoid re-attempting immediately.
+    /// Matches Java's `replicatedFailedLedgers` LoadingCache.
+    failed_ledger_cache: std::collections::VecDeque<i64>,
+    /// Grace period (ms) before fencing an open ledger.
+    /// Gives the writing client time to handle bookie failure itself.
+    /// 0 = immediate fencing. Matches Java's `openLedgerRereplicationGracePeriod`.
+    open_ledger_grace_period_ms: u64,
 }
 
 impl ReplicationWorker {
@@ -42,9 +56,41 @@ impl ReplicationWorker {
             ur_manager,
             ledger_manager,
             bookie_id,
-            backoff_ms,
+            base_backoff_ms: backoff_ms,
             shutdown_rx,
+            consecutive_failures: 0,
+            failed_ledger_cache: std::collections::VecDeque::new(),
+            open_ledger_grace_period_ms: 30_000, // default 30s matching Java
         }
+    }
+
+    /// Set the grace period before fencing open ledgers (ms).
+    /// 0 = immediate. Matches Java's `openLedgerRereplicationGracePeriod`.
+    pub fn set_open_ledger_grace_period_ms(&mut self, ms: u64) {
+        self.open_ledger_grace_period_ms = ms;
+    }
+
+    fn current_backoff_ms(&self) -> u64 {
+        let exponent = self.consecutive_failures.min(MAX_BACKOFF_RETRIES);
+        self.base_backoff_ms * 2u64.pow(exponent)
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    fn record_failure(&mut self, ledger_id: i64) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if !self.failed_ledger_cache.contains(&ledger_id) {
+            if self.failed_ledger_cache.len() >= FAILED_LEDGER_CACHE_MAX {
+                self.failed_ledger_cache.pop_front();
+            }
+            self.failed_ledger_cache.push_back(ledger_id);
+        }
+    }
+
+    fn is_recently_failed(&self, ledger_id: i64) -> bool {
+        self.failed_ledger_cache.contains(&ledger_id)
     }
 
     /// Run the replication worker main loop.
@@ -60,8 +106,11 @@ impl ReplicationWorker {
             let result = self.try_rereplicate().await;
 
             match result {
-                Ok(true) => {}
+                Ok(true) => {
+                    self.record_success();
+                }
                 Ok(false) => {
+                    let backoff = self.current_backoff_ms();
                     tokio::select! {
                         _ = self.shutdown_rx.changed() => {
                             if *self.shutdown_rx.borrow() {
@@ -69,11 +118,13 @@ impl ReplicationWorker {
                                 break;
                             }
                         }
-                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(self.backoff_ms)) => {}
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(backoff)) => {}
                     }
                 }
                 Err(e) => {
                     tracing::warn!("ReplicationWorker error: {e}");
+                    self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                    let backoff = self.current_backoff_ms();
                     tokio::select! {
                         _ = self.shutdown_rx.changed() => {
                             if *self.shutdown_rx.borrow() {
@@ -81,7 +132,7 @@ impl ReplicationWorker {
                                 break;
                             }
                         }
-                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(self.backoff_ms)) => {}
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(backoff)) => {}
                     }
                 }
             }
@@ -89,7 +140,7 @@ impl ReplicationWorker {
         Ok(())
     }
 
-    async fn try_rereplicate(&self) -> Result<bool, ReplicationError> {
+    async fn try_rereplicate(&mut self) -> Result<bool, ReplicationError> {
         if !self.ur_manager.is_replication_enabled().await? {
             return Ok(false);
         }
@@ -98,6 +149,14 @@ impl ReplicationWorker {
             Some(lid) => lid,
             None => return Ok(false),
         };
+
+        // Skip recently-failed ledgers to avoid repeated failures.
+        // Matches Java's replicatedFailedLedgers cache check.
+        if self.is_recently_failed(ledger_id) {
+            tracing::debug!("ReplicationWorker: skipping recently-failed ledger {ledger_id}");
+            self.ur_manager.release_lock(ledger_id).await?;
+            return Ok(false);
+        }
 
         tracing::info!("ReplicationWorker: claimed ledger {ledger_id} for replication");
 
@@ -109,6 +168,7 @@ impl ReplicationWorker {
             }
             Err(e) => {
                 tracing::warn!("ReplicationWorker: failed to replicate ledger {ledger_id}: {e}");
+                self.record_failure(ledger_id);
                 self.ur_manager.release_lock(ledger_id).await?;
                 Ok(false)
             }
@@ -197,17 +257,19 @@ impl ReplicationWorker {
         let available = self.get_available_bookies().await?;
 
         for (seg_start, seg_end, ensemble) in &segments {
-            // Detect bad bookies in this segment by probing sample entries
-            let bad_indices = self
+            // Detect bad bookies by verifying ALL entries per bookie.
+            // Returns a map: bad_bookie_index -> set of missing entry IDs.
+            let bad_bookies = self
                 .detect_bad_bookies(
                     ledger_id, *seg_start, *seg_end, ensemble, schedule, &master_key,
                 )
                 .await?;
 
-            if bad_indices.is_empty() {
+            if bad_bookies.is_empty() {
                 continue; // this segment is fine
             }
 
+            let bad_indices: Vec<usize> = bad_bookies.keys().copied().collect();
             tracing::info!(
                 "ReplicationWorker: ledger {ledger_id} segment [{seg_start}..{seg_end}] has bad bookies at indices {:?}",
                 bad_indices
@@ -243,11 +305,22 @@ impl ReplicationWorker {
                 }
             }
 
-            // Copy entries from good replicas to replacement bookies
-            for entry_id in *seg_start..=*seg_end {
+            // Collect all entry IDs that need to be copied (union of all
+            // missing entries across all bad bookies). Using a set avoids
+            // reading the same entry twice when multiple bookies are missing it.
+            let mut entries_to_copy: HashSet<i64> = HashSet::new();
+            for missing in bad_bookies.values() {
+                entries_to_copy.extend(missing);
+            }
+            let mut sorted_entries: Vec<i64> = entries_to_copy.into_iter().collect();
+            sorted_entries.sort_unstable();
+
+            // Copy only the actually-missing entries to replacement bookies
+            for entry_id in sorted_entries {
                 let write_set = schedule.write_set(entry_id);
 
-                // Read from a good replica
+                // Read from a good replica (any bookie NOT in bad_indices that
+                // has this entry in its write set)
                 let entry_data = self
                     .read_entry_from_good_replica(
                         ledger_id,
@@ -260,10 +333,12 @@ impl ReplicationWorker {
                     )
                     .await?;
 
-                // Write to each replacement bookie
+                // Write to each replacement bookie that is missing this entry
                 for (&bad_idx, replacement_addr) in &replacements {
-                    if !write_set.contains(&bad_idx) {
-                        continue; // this entry wasn't on the bad bookie
+                    let is_missing = bad_bookies.get(&bad_idx)
+                        .map_or(false, |missing| missing.contains(&entry_id));
+                    if !is_missing {
+                        continue; // this entry is NOT missing on this bookie
                     }
                     if let Some(conn) = conns.get(replacement_addr) {
                         let resp = conn
@@ -318,6 +393,40 @@ impl ReplicationWorker {
         dm: DigestManager,
         master_key: [u8; MASTER_KEY_LENGTH],
     ) -> Result<(), ReplicationError> {
+        // Grace period: wait before fencing to let the writing client handle
+        // the failure itself. Matches Java's openLedgerRereplicationGracePeriod.
+        if self.open_ledger_grace_period_ms > 0 {
+            tracing::info!(
+                "Waiting {:.1}s grace period before fencing open ledger {ledger_id}",
+                self.open_ledger_grace_period_ms as f64 / 1000.0
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                self.open_ledger_grace_period_ms,
+            ))
+            .await;
+
+            // Re-check if the ledger was closed during the grace period
+            let versioned = self
+                .ledger_manager
+                .read_ledger_metadata(ledger_id)
+                .await
+                .map_err(|e| ReplicationError::Failed(format!("re-read after grace: {e}")))?;
+            if versioned.value().state() == LedgerState::Closed {
+                tracing::info!(
+                    "Ledger {ledger_id} was closed during grace period, treating as closed"
+                );
+                return self
+                    .replicate_closed_ledger(
+                        ledger_id,
+                        versioned.value(),
+                        schedule,
+                        &dm,
+                        master_key,
+                    )
+                    .await;
+            }
+        }
+
         let ensembles = md.all_ensembles();
         let (last_segment_entry, ensemble) = ensembles
             .iter()
@@ -378,12 +487,15 @@ impl ReplicationWorker {
         Ok(())
     }
 
-    /// Detect bad bookies in a segment by probing sample entries per bookie.
+    /// Detect bad bookies in a segment by verifying ALL entries per bookie.
     ///
     /// Matches Java's LedgerChecker.verifyLedgerFragment():
     /// - For each bookie in the ensemble, find entries that SHOULD be on it (via write_set)
-    /// - Sample first + last + a few in between
-    /// - If any sample read fails, bookie is marked bad
+    /// - Verify every entry exists on the bookie
+    /// - Returns a map of bad_bookie_index -> set of missing entry IDs
+    ///
+    /// Unlike the previous sampling approach, this checks every entry so it
+    /// cannot produce false negatives (missing gaps in between samples).
     async fn detect_bad_bookies(
         &self,
         ledger_id: i64,
@@ -392,69 +504,43 @@ impl ReplicationWorker {
         ensemble: &[String],
         schedule: &RoundRobinDistributionSchedule,
         master_key: &[u8; MASTER_KEY_LENGTH],
-    ) -> Result<Vec<usize>, ReplicationError> {
-        let mut bad = Vec::new();
+    ) -> Result<HashMap<usize, HashSet<i64>>, ReplicationError> {
+        let mut bad: HashMap<usize, HashSet<i64>> = HashMap::new();
 
         for (idx, addr) in ensemble.iter().enumerate() {
             let conn = match connect_to_bookie(addr).await {
                 Ok(c) => c,
                 Err(_) => {
-                    bad.push(idx);
+                    // Bookie unreachable: mark ALL entries on this bookie as missing
+                    let missing: HashSet<i64> = (first_entry_id..=last_entry_id)
+                        .filter(|eid| schedule.write_set(*eid).contains(&idx))
+                        .collect();
+                    if !missing.is_empty() {
+                        bad.insert(idx, missing);
+                    }
                     continue;
                 }
             };
 
-            // Find entries in this segment that should be on this bookie
-            // (i.e., entries where idx is in the write_set)
-            let mut entries_on_bookie: Vec<i64> = Vec::new();
+            let mut missing_entries: HashSet<i64> = HashSet::new();
+
             for eid in first_entry_id..=last_entry_id {
-                if schedule.write_set(eid).contains(&idx) {
-                    entries_on_bookie.push(eid);
+                if !schedule.write_set(eid).contains(&idx) {
+                    continue; // this entry is not on this bookie
                 }
-                // Limit scan for large segments — collect enough to sample
-                if entries_on_bookie.len() > 1000 {
-                    break;
-                }
-            }
-
-            if entries_on_bookie.is_empty() {
-                continue; // this bookie has no entries in this segment
-            }
-
-            // Sample: first, last, and up to 3 evenly spaced entries
-            let mut samples: Vec<i64> = Vec::new();
-            samples.push(entries_on_bookie[0]); // first
-            if entries_on_bookie.len() > 1 {
-                samples.push(*entries_on_bookie.last().unwrap()); // last
-            }
-            // Add evenly spaced samples
-            let count = entries_on_bookie.len();
-            if count > 2 {
-                for i in 1..=std::cmp::min(3, count - 2) {
-                    let pos = i * count / (std::cmp::min(3, count - 2) + 1);
-                    let eid = entries_on_bookie[pos];
-                    if !samples.contains(&eid) {
-                        samples.push(eid);
-                    }
-                }
-            }
-
-            // Probe each sample entry
-            let mut is_bad = false;
-            for &eid in &samples {
                 match conn
                     .send_read_entry(0, ledger_id, eid, Some(*master_key))
                     .await
                 {
                     Ok(V2Response::Read { error_code, .. }) if error_code == V2_EOK => {}
                     _ => {
-                        is_bad = true;
-                        break;
+                        missing_entries.insert(eid);
                     }
                 }
             }
-            if is_bad {
-                bad.push(idx);
+
+            if !missing_entries.is_empty() {
+                bad.insert(idx, missing_entries);
             }
         }
         Ok(bad)

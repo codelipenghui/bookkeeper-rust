@@ -30,7 +30,7 @@ fn add_entry_request_layout() {
     let req = V2Request::AddEntry {
         flags: FLAG_RECOVERY_ADD,
         master_key,
-        entry_data: entry_data.clone(),
+        entry_data: entry_data.clone(), deferred_sync: false,
     };
 
     let buf = encode_request(&req);
@@ -110,7 +110,7 @@ fn full_stack_add_entry() {
     let req = V2Request::AddEntry {
         flags: 0,
         master_key: [0u8; 20],
-        entry_data: entry_bytes.freeze(),
+        entry_data: entry_bytes.freeze(), deferred_sync: false,
     };
     let req_bytes = encode_request(&req);
 

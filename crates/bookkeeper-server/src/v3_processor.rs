@@ -22,6 +22,10 @@ pub async fn process_v3_request(
     let header = &req.header;
     let txn_id = header.txn_id;
     let operation = header.operation;
+    // Java's RequestUtils.isHighPriority(request): header.getPriority() > 0.
+    // High-priority requests are routed to the high-priority thread pool so
+    // recovery and fencing ops make progress even when normal pools are saturated.
+    let header_high_priority = header.priority.unwrap_or(0) > 0;
 
     // Convert V3 request to V2 internal request and process
     let v2_response = match operation {
@@ -31,16 +35,26 @@ pub async fn process_v3_request(
                 let key_len = add.master_key.len().min(MASTER_KEY_LENGTH);
                 master_key[..key_len].copy_from_slice(&add.master_key[..key_len]);
 
-                let flags = if add.flag == Some(bookkeeper_proto::add_request::Flag::RecoveryAdd as i32) {
-                    FLAG_RECOVERY_ADD
-                } else {
-                    0
-                };
+                let mut flags: u16 = 0;
+                if add.flag == Some(bookkeeper_proto::add_request::Flag::RecoveryAdd as i32) {
+                    flags |= FLAG_RECOVERY_ADD;
+                }
+                // Propagate header-level priority to the internal flag.
+                // Matches Java's WriteEntryProcessorV3 which routes through
+                // the high-priority thread pool when isHighPriority(request).
+                if header_high_priority {
+                    flags |= FLAG_HIGH_PRIORITY;
+                }
+
+                // Parse DEFERRED_SYNC from V3 writeFlags field.
+                // Matches Java's WriteEntryProcessorV3: ackBeforeSync = writeFlags.contains(DEFERRED_SYNC)
+                let deferred_sync = add.write_flags.unwrap_or(0) & WRITE_FLAG_DEFERRED_SYNC != 0;
 
                 let v2_req = V2Request::AddEntry {
                     flags,
                     master_key,
                     entry_data: Bytes::from(add.body),
+                    deferred_sync,
                 };
                 processor.process_request(v2_req).await
             } else {
@@ -65,6 +79,14 @@ pub async fn process_v3_request(
                         master_key_opt = Some(key);
                     }
                 }
+                // Propagate header-level priority.  Matches Java's
+                // BookieRequestProcessor which routes isHighPriority reads to
+                // highPriorityThreadPool.  FENCE_LEDGER is already high-priority
+                // via FLAG_DO_FENCING, so this covers the remaining case of
+                // header.priority > 0 on a non-fencing read.
+                if header_high_priority {
+                    flags |= FLAG_HIGH_PRIORITY;
+                }
 
                 if is_long_poll {
                     // Long poll read matching Java's LongPollReadEntryProcessorV3.
@@ -76,14 +98,16 @@ pub async fn process_v3_request(
                     let current_lac = processor.storage().get_last_add_confirmed(ledger_id)
                         .unwrap_or(-1);
 
-                    // Determine the effective LAC (may wait for update)
+                    // Determine the effective LAC (may wait for update).
+                    // Uses async watchers — no OS thread per long poll.
+                    // Matches Java's LongPollReadEntryProcessorV3 which uses a
+                    // non-blocking Watcher + HashedWheelTimer for timeout.
                     let effective_lac = if current_lac > previous_lac {
                         current_lac // already advanced
                     } else if let Some(watchers) = processor.storage().lac_watchers() {
-                        if let Some(rx) = watchers.watch(ledger_id, previous_lac, current_lac) {
-                            // Wait using spawn_blocking for the sync recv_timeout call
+                        if let Some(rx) = watchers.watch_async(ledger_id, previous_lac, current_lac) {
                             let timeout = std::time::Duration::from_millis(timeout_ms);
-                            match tokio::task::spawn_blocking(move || rx.recv_timeout(timeout)).await {
+                            match tokio::time::timeout(timeout, rx).await {
                                 Ok(Ok(new_lac)) => new_lac,
                                 _ => current_lac,
                             }
@@ -150,8 +174,20 @@ pub async fn process_v3_request(
         }
         op if op == bookkeeper_proto::OperationType::ForceLedger as i32 => {
             if let Some(fl) = req.force_ledger_request {
-                let _ = processor.force_flush().await;
-                return build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Ok);
+                // Observe latency to match Java's RequestStats.FORCE_LEDGER_REQUEST.
+                let start = std::time::Instant::now();
+                let result = processor.force_journal_sync().await;
+                let latency = start.elapsed().as_secs_f64();
+                match result {
+                    Ok(_) => {
+                        crate::metrics::FORCE_LEDGER_REQUEST_OK.observe(latency);
+                        return build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Ok);
+                    }
+                    Err(_) => {
+                        crate::metrics::FORCE_LEDGER_REQUEST_FAIL.observe(latency);
+                        return build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Io);
+                    }
+                }
             } else {
                 return build_v3_error_response(txn_id, operation, BKError::BadRequest);
             }
@@ -169,6 +205,53 @@ pub async fn process_v3_request(
                 ..Default::default()
             };
             return resp.encode_to_vec();
+        }
+        op if op == bookkeeper_proto::OperationType::StartTls as i32 => {
+            // START_TLS is handled at the connection level in handle_starttls_connection.
+            // If the request reaches the V3 processor, it means either:
+            // 1. TLS is not configured on this bookie → return EBADREQ (matches Java
+            //    BookieRequestProcessor.processStartTLSRequestV3 when shFactory == null)
+            // 2. The connection is already TLS-upgraded → START_TLS mid-stream is invalid
+            //
+            // In both cases, return EBADREQ matching Java's behavior.
+            return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+        }
+        op if op == bookkeeper_proto::OperationType::GetListOfEntriesOfLedger as i32 => {
+            if let Some(req) = req.get_list_of_entries_of_ledger_request {
+                let ledger_id = req.ledger_id;
+                match processor.storage().get_entries_of_ledger(ledger_id) {
+                    Ok(entries) => {
+                        // Encode as Java's AvailabilityOfEntriesOfLedger format:
+                        // A sequence of (firstEntry:i64, lastEntry:i64) pairs representing
+                        // contiguous ranges, preceded by a header long = number of ranges.
+                        let ranges = entries_to_ranges(&entries);
+                        let mut buf = Vec::with_capacity(8 + ranges.len() * 16);
+                        buf.extend_from_slice(&(ranges.len() as i64).to_be_bytes());
+                        for (first, last) in &ranges {
+                            buf.extend_from_slice(&first.to_be_bytes());
+                            buf.extend_from_slice(&last.to_be_bytes());
+                        }
+                        let resp = bookkeeper_proto::Response {
+                            header: make_v3_header(txn_id, operation),
+                            status: bookkeeper_proto::StatusCode::Eok as i32,
+                            get_list_of_entries_of_ledger_response: Some(
+                                bookkeeper_proto::GetListOfEntriesOfLedgerResponse {
+                                    status: bookkeeper_proto::StatusCode::Eok as i32,
+                                    ledger_id,
+                                    availability_of_entries_of_ledger: Some(buf),
+                                },
+                            ),
+                            ..Default::default()
+                        };
+                        return resp.encode_to_vec();
+                    }
+                    Err(_) => {
+                        return build_v3_error_response(txn_id, operation, BKError::NoLedger);
+                    }
+                }
+            } else {
+                return build_v3_error_response(txn_id, operation, BKError::BadRequest);
+            }
         }
         _ => {
             return build_v3_error_response(txn_id, operation, BKError::BadRequest);
@@ -283,13 +366,34 @@ fn v2_to_v3_status(v2_code: i32) -> i32 {
     BKError::from_v2_code(v2_code).to_v3_code()
 }
 
-fn build_v3_error_response(txn_id: u64, operation: i32, err: BKError) -> Vec<u8> {
+pub fn build_v3_error_response(txn_id: u64, operation: i32, err: BKError) -> Vec<u8> {
     let resp = bookkeeper_proto::Response {
         header: make_v3_header(txn_id, operation),
         status: err.to_v3_code(),
         ..Default::default()
     };
     resp.encode_to_vec()
+}
+
+/// Convert a sorted list of entry IDs into contiguous (first, last) ranges.
+fn entries_to_ranges(entries: &[i64]) -> Vec<(i64, i64)> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut first = entries[0];
+    let mut last = entries[0];
+    for &eid in &entries[1..] {
+        if eid == last + 1 {
+            last = eid;
+        } else {
+            ranges.push((first, last));
+            first = eid;
+            last = eid;
+        }
+    }
+    ranges.push((first, last));
+    ranges
 }
 
 fn build_v3_force_ledger_response(txn_id: u64, ledger_id: i64, err: BKError) -> Vec<u8> {

@@ -179,10 +179,15 @@ pub async fn spawn_bookie(connect: &str, root: &str) -> (BookieServer, TempDir) 
 
 /// Spawn a single in-process bookie with the HTTP admin API enabled on an
 /// OS-assigned port. Use [`BookieServer::http_addr`] to get the address.
+/// Also enables the auto-recovery daemon so the auditor/worker threads
+/// create the `underreplication` ZK subtree — the HTTP admin endpoints
+/// for autorecovery (status, lostBookieRecoveryDelay, triggerAudit) all
+/// operate on that subtree.
 pub async fn spawn_bookie_with_http(connect: &str, root: &str) -> (BookieServer, TempDir) {
     let (server, dir) = spawn_bookie_raw(connect, root, |config| {
         config.http_server_enabled = true;
         config.http_server_port = 0;
+        config.auto_recovery_daemon_enabled = true;
     })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -214,8 +219,14 @@ pub async fn spawn_bookies(
     let mut bookies = Vec::with_capacity(n);
     let mut dirs = Vec::with_capacity(n);
     let mut addrs = Vec::with_capacity(n);
+    // Enable auto-recovery so the auditor/worker threads create the
+    // `underreplication` ZK subtree that CLI and HTTP admin tests depend on.
+    // Without this, autorecovery-related endpoints fail with "node not exists".
+    let customize = |config: &mut ServerConfig| {
+        config.auto_recovery_daemon_enabled = true;
+    };
     for _ in 0..n {
-        let (server, dir) = spawn_bookie_raw(connect, root, |_| {}).await;
+        let (server, dir) = spawn_bookie_raw(connect, root, customize).await;
         addrs.push(server.local_addr().to_string());
         bookies.push(server);
         dirs.push(dir);

@@ -6,8 +6,62 @@ use crate::journal::format::LastMark;
 /// Matches Java's `LAST_MARK_DEFAULT_NAME = "lastMark"` (no dot prefix).
 const LAST_MARK_FILENAME: &str = "lastMark";
 
+/// A checkpoint token representing a snapshot of the journal position.
+/// Matches Java's `CheckpointSource.Checkpoint` interface.
+///
+/// Two-phase protocol:
+/// 1. `new_checkpoint(journal)` → captures current journal position
+/// 2. Caller performs storage flush
+/// 3. `complete(dirs)` → persists lastMark only after flush succeeds
+///
+/// If the flush fails, the token is dropped without persisting, and
+/// lastMark stays at the previous safe position.
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    mark: LastMark,
+}
+
+impl Checkpoint {
+    /// Create a new checkpoint by snapshotting the current journal position.
+    /// Matches Java's `Journal.newCheckpoint()`.
+    pub fn new(log_id: i64, offset: i64) -> Self {
+        Self { mark: LastMark::new(log_id, offset) }
+    }
+
+    /// Create from an existing LastMark.
+    pub fn from_mark(mark: LastMark) -> Self {
+        Self { mark }
+    }
+
+    /// The captured LastMark.
+    pub fn mark(&self) -> &LastMark {
+        &self.mark
+    }
+
+    /// Complete the checkpoint by persisting lastMark to the given directory.
+    /// Only call this AFTER the storage flush succeeds.
+    /// Matches Java's `journal.checkpointComplete(cp, true)`.
+    pub fn complete(&self, base_dir: &Path) -> Result<(), StorageError> {
+        let mark_path = base_dir.join("current").join(LAST_MARK_FILENAME);
+        write_last_mark(&mark_path, &self.mark)
+    }
+
+    /// Complete the checkpoint by persisting lastMark to multiple directories.
+    pub fn complete_multi(&self, dirs: &[PathBuf]) -> Result<(), StorageError> {
+        for dir in dirs {
+            let mark_path = dir.join(LAST_MARK_FILENAME);
+            write_last_mark(&mark_path, &self.mark)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn write_last_mark(path: &Path, mark: &LastMark) -> Result<(), StorageError> {
-    fs::write(path, &mark.to_bytes())?;
+    use std::io::Write;
+    let data = mark.to_bytes();
+    let mut file = fs::File::create(path)?;
+    file.write_all(&data)?;
+    file.sync_data()?;
     Ok(())
 }
 

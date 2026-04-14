@@ -125,7 +125,7 @@ fn bench_frame_codec(c: &mut Criterion) {
         let req = V2Request::AddEntry {
             flags: 0,
             master_key,
-            entry_data: entry_bytes.clone(),
+            entry_data: entry_bytes.clone(), deferred_sync: false,
         };
         let req_bytes = encode_request(&req).freeze();
 

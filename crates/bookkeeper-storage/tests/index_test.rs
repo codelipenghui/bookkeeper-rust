@@ -82,3 +82,51 @@ fn ledger_index_delete() {
     index.delete(1).unwrap();
     assert!(index.get(1).unwrap().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// ST2: getLastEntryInLedger floor scan
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_last_entry_in_ledger_returns_max_entry() {
+    let dir = TempDir::new().unwrap();
+    let index = EntryLocationIndex::open(dir.path(), None).unwrap();
+    // Insert entries 0, 5, 10 for ledger 1
+    index.put(1, 0, 100).unwrap();
+    index.put(1, 5, 200).unwrap();
+    index.put(1, 10, 300).unwrap();
+    index.flush().unwrap();
+
+    let last = index.get_last_entry_in_ledger(1).unwrap();
+    assert_eq!(last, Some(10), "should return the highest entry ID");
+}
+
+#[test]
+fn get_last_entry_in_ledger_empty_returns_none() {
+    let dir = TempDir::new().unwrap();
+    let index = EntryLocationIndex::open(dir.path(), None).unwrap();
+    let last = index.get_last_entry_in_ledger(999).unwrap();
+    assert_eq!(last, None, "should return None for non-existent ledger");
+}
+
+#[test]
+fn get_last_entry_in_ledger_does_not_cross_ledger_boundary() {
+    let dir = TempDir::new().unwrap();
+    let index = EntryLocationIndex::open(dir.path(), None).unwrap();
+    // Ledger 1 has entries 0, 1
+    index.put(1, 0, 100).unwrap();
+    index.put(1, 1, 200).unwrap();
+    // Ledger 2 has entry 0
+    index.put(2, 0, 300).unwrap();
+    index.flush().unwrap();
+
+    let last1 = index.get_last_entry_in_ledger(1).unwrap();
+    assert_eq!(last1, Some(1), "ledger 1 last entry should be 1");
+
+    let last2 = index.get_last_entry_in_ledger(2).unwrap();
+    assert_eq!(last2, Some(0), "ledger 2 last entry should be 0");
+
+    // Ledger 3 has no entries
+    let last3 = index.get_last_entry_in_ledger(3).unwrap();
+    assert_eq!(last3, None);
+}

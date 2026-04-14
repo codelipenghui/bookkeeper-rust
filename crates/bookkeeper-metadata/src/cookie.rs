@@ -35,22 +35,27 @@ impl Cookie {
     pub fn index_dirs(&self) -> Option<&str> { self.index_dirs.as_deref() }
 
     /// Serialize to the v5 cookie format: version line + protobuf text format.
-    /// FIX 4: use write! to avoid format! temporaries
+    ///
+    /// String values are escaped to match Java's `TextFormat.printToString()`:
+    /// tab → `\t`, backslash → `\\`, double-quote → `\"`, newline → `\n`.
+    /// This is critical because `ledger_dirs` and `index_dirs` use tab characters
+    /// as separators (via `encode_dir_paths`), and Java's protobuf TextFormat
+    /// escapes them on write and unescapes them on read.
     pub fn serialize(&self) -> String {
         use std::fmt::Write;
         let mut s = String::with_capacity(256);
         writeln!(s, "{}", CURRENT_COOKIE_LAYOUT_VERSION).unwrap();
-        writeln!(s, "bookieHost: \"{}\"", self.bookie_id).unwrap();
-        writeln!(s, "journalDir: \"{}\"", self.journal_dirs).unwrap();
-        writeln!(s, "ledgerDirs: \"{}\"", self.ledger_dirs).unwrap();
+        writeln!(s, "bookieHost: \"{}\"", proto_text_escape(&self.bookie_id)).unwrap();
+        writeln!(s, "journalDir: \"{}\"", proto_text_escape(&self.journal_dirs)).unwrap();
+        writeln!(s, "ledgerDirs: \"{}\"", proto_text_escape(&self.ledger_dirs)).unwrap();
         if let Some(ref id) = self.instance_id {
             if !id.is_empty() {
-                writeln!(s, "instanceId: \"{}\"", id).unwrap();
+                writeln!(s, "instanceId: \"{}\"", proto_text_escape(id)).unwrap();
             }
         }
         if let Some(ref dirs) = self.index_dirs {
             if !dirs.is_empty() {
-                writeln!(s, "indexDirs: \"{}\"", dirs).unwrap();
+                writeln!(s, "indexDirs: \"{}\"", proto_text_escape(dirs)).unwrap();
             }
         }
         s
@@ -149,17 +154,16 @@ fn parse_proto_text_cookie(text: &str) -> Result<Cookie, MetadataError> {
 
     for line in text.lines() {
         let line = line.trim();
-        // FIX 3: use extract_proto_text_field returning &str, call .to_string() only on success
         if let Some(val) = extract_proto_text_field(line, "bookieHost") {
-            bookie_id = val.to_string();
+            bookie_id = val;
         } else if let Some(val) = extract_proto_text_field(line, "journalDir") {
-            journal_dirs = val.to_string();
+            journal_dirs = val;
         } else if let Some(val) = extract_proto_text_field(line, "ledgerDirs") {
-            ledger_dirs = val.to_string();
+            ledger_dirs = val;
         } else if let Some(val) = extract_proto_text_field(line, "instanceId") {
-            if !val.is_empty() { instance_id = Some(val.to_string()); }
+            if !val.is_empty() { instance_id = Some(val); }
         } else if let Some(val) = extract_proto_text_field(line, "indexDirs") {
-            if !val.is_empty() { index_dirs = Some(val.to_string()); }
+            if !val.is_empty() { index_dirs = Some(val); }
         }
     }
 
@@ -170,9 +174,53 @@ fn parse_proto_text_cookie(text: &str) -> Result<Cookie, MetadataError> {
     Ok(Cookie { bookie_id, journal_dirs, ledger_dirs, instance_id, index_dirs })
 }
 
-// FIX 3: zero-alloc field extraction — return &str slice into the input line
-fn extract_proto_text_field<'a>(line: &'a str, field_name: &str) -> Option<&'a str> {
+/// Extract a field value from a protobuf text format line.
+/// Returns the unescaped string value.
+fn extract_proto_text_field(line: &str, field_name: &str) -> Option<String> {
     let rest = line.strip_prefix(field_name)?;
     let rest = rest.strip_prefix(": \"")?;
-    rest.strip_suffix('"')
+    let raw = rest.strip_suffix('"')?;
+    Some(proto_text_unescape(raw))
+}
+
+/// Escape a string value for protobuf text format output.
+/// Matches Java's `TextFormat.escapeBytes()` / `TextFormat.escapeText()` for
+/// the characters that appear in BookKeeper cookie values.
+fn proto_text_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Unescape a protobuf text format string value.
+/// Matches Java's `TextFormat.unescapeText()` for the escape sequences that
+/// appear in BookKeeper cookie values.
+fn proto_text_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some(other) => { out.push('\\'); out.push(other); }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }

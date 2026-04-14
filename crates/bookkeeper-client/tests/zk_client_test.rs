@@ -184,3 +184,97 @@ async fn zk_password_mismatch() {
     bk.delete_ledger(ledger_id).await.unwrap();
     server.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Fix #27: digest type mismatch rejection on open_ledger
+// ---------------------------------------------------------------------------
+
+/// Opening a ledger with a digest type different from the one in the
+/// metadata must return a clear `DigestTypeMismatch` error up front
+/// (not silently succeed and fail later with a confusing digest mismatch).
+/// Matches Java's `DigestManager.instantiate` behavior.
+#[tokio::test]
+async fn open_ledger_rejects_wrong_digest_type() {
+    let Some(connect) = shared_zk().await else { return; };
+    let root = "/test-digest-mismatch";
+    bootstrap_cluster(&connect, root).await;
+    let (server, _dir) = spawn_bookie(&connect, root).await;
+
+    let mut bk = ZkBookKeeper::new(&connect, root).await.unwrap();
+
+    let password = b"pwd";
+    let (mut wh, _conns) = bk
+        .create_ledger(1, 1, 1, DigestType::Crc32c, password)
+        .await
+        .unwrap();
+    let ledger_id = wh.ledger_id();
+    bk.close_ledger(&wh).await.unwrap();
+    let _ = wh; // silence "unused" if any
+
+    // Open with the WRONG digest type (HmacSha1 instead of Crc32c).
+    let result = bk
+        .open_ledger(ledger_id, DigestType::HmacSha1, password)
+        .await;
+    match result {
+        Ok(_) => panic!("expected digest-type mismatch error, got Ok"),
+        Err(bookkeeper_client::bookie_connection::ClientError::DigestTypeMismatch {
+            expected,
+            actual,
+        }) => {
+            assert!(expected.contains("Crc32c"), "expected={expected}");
+            assert!(actual.contains("HmacSha1"), "actual={actual}");
+        }
+        Err(other) => panic!("expected DigestTypeMismatch, got {other:?}"),
+    }
+
+    // Open with the CORRECT digest type should still work.
+    let (_rh, _conns) = bk
+        .open_ledger(ledger_id, DigestType::Crc32c, password)
+        .await
+        .expect("correct digest type must succeed");
+
+    bk.delete_ledger(ledger_id).await.unwrap();
+    server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Fix #28: list_ledgers API
+// ---------------------------------------------------------------------------
+
+/// `list_ledgers` enumerates all ledger IDs created through this client.
+#[tokio::test]
+async fn list_ledgers_returns_created_ledger_ids() {
+    let Some(connect) = shared_zk().await else { return; };
+    let root = "/test-list-ledgers";
+    bootstrap_cluster(&connect, root).await;
+    let (server, _dir) = spawn_bookie(&connect, root).await;
+
+    let mut bk = ZkBookKeeper::new(&connect, root).await.unwrap();
+
+    let password = b"pwd";
+    let mut expected_ids: Vec<i64> = Vec::new();
+    for _ in 0..3 {
+        let (wh, _) = bk
+            .create_ledger(1, 1, 1, DigestType::Crc32c, password)
+            .await
+            .unwrap();
+        expected_ids.push(wh.ledger_id());
+        bk.close_ledger(&wh).await.unwrap();
+    }
+
+    let mut listed = bk.list_ledgers().await.unwrap();
+    listed.sort();
+    expected_ids.sort();
+    for id in &expected_ids {
+        assert!(
+            listed.contains(id),
+            "expected ledger {id} in list; got {listed:?}"
+        );
+    }
+
+    // Cleanup.
+    for id in &expected_ids {
+        let _ = bk.delete_ledger(*id).await;
+    }
+    server.shutdown().await;
+}

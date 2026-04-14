@@ -99,6 +99,39 @@ impl EntryLocationIndex {
         Ok(results)
     }
 
+    /// Get the last entry ID stored for a ledger by doing a floor scan.
+    /// Seeks to `(ledgerId, MAX)` and scans backward to find the largest
+    /// entry ID. Returns `None` if no entries exist for the ledger.
+    /// Matches Java's `EntryLocationIndex.getLastEntryInLedger()` which uses
+    /// `locationsDb.getFloor(maxEntryId)`.
+    pub fn get_last_entry_in_ledger(&self, ledger_id: i64) -> Result<Option<i64>, StorageError> {
+        // Seek to (ledgerId, MAX_VALUE) — the largest possible key for this ledger.
+        let seek_key = encode_location_key(ledger_id, i64::MAX);
+        // The exclusive lower bound for this ledger.
+        let lower = encode_location_key(ledger_id, 0);
+
+        let iter = self.db.iterator(
+            rocksdb::IteratorMode::From(&seek_key, rocksdb::Direction::Reverse),
+        );
+        for item in iter {
+            let (key, _value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            if key.len() != 16 {
+                break;
+            }
+            // Check that this key still belongs to our ledger
+            let key_ledger = i64::from_be_bytes(key[0..8].try_into().unwrap());
+            if key_ledger != ledger_id {
+                break;
+            }
+            if &key[..] < &lower[..] {
+                break;
+            }
+            let entry_id = i64::from_be_bytes(key[8..16].try_into().unwrap());
+            return Ok(Some(entry_id));
+        }
+        Ok(None)
+    }
+
     /// Trigger RocksDB compaction to reclaim space after ledger deletions.
     /// Matches Java's DbLedgerStorage.entryLocationCompact().
     pub fn compact(&self) -> Result<(), StorageError> {

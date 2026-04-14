@@ -138,6 +138,39 @@ impl DigestManager {
         output
     }
 
+    /// Compute digest for WriteLac body: 16-byte metadata `[ledgerId:8][lac:8]`.
+    /// Matches Java's `DigestManager.computeDigestAndPackageForSendingLac()`
+    /// which uses `LAC_METADATA_LENGTH = 16` (not the full 32-byte entry header).
+    pub fn compute_lac(&self, lac_metadata: &[u8; 16]) -> DigestOutput {
+        let mut output = DigestOutput { buf: [0u8; 20], len: 0 };
+        match self.digest_type {
+            DigestType::Crc32 => {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(lac_metadata);
+                let bytes = (hasher.finalize() as i64).to_be_bytes();
+                output.buf[..8].copy_from_slice(&bytes);
+                output.len = 8;
+            }
+            DigestType::Crc32c => {
+                let crc = crc32c::crc32c(lac_metadata);
+                let bytes = (crc as i32).to_be_bytes();
+                output.buf[..4].copy_from_slice(&bytes);
+                output.len = 4;
+            }
+            DigestType::HmacSha1 => {
+                type HmacSha1 = Hmac<Sha1>;
+                let mut mac = HmacSha1::new_from_slice(self.derived_key())
+                    .expect("HMAC accepts any key length");
+                mac.update(lac_metadata);
+                let result = mac.finalize().into_bytes();
+                output.buf.copy_from_slice(&result);
+                output.len = 20;
+            }
+            DigestType::Dummy => {}
+        }
+        output
+    }
+
     pub fn verify(&self, metadata: &[u8; 32], payload: &[u8], expected: &[u8]) -> bool {
         if self.digest_type == DigestType::Dummy {
             return true;

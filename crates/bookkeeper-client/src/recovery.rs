@@ -92,34 +92,36 @@ impl RecoveryHandle {
 
         let responses = join_all(futures).await;
 
-        let no_entry_code = BKError::NoEntry.to_v2_code();
-
         let mut max_lac: i64 = -1;
         let mut success_count = 0;
 
         for result in responses {
             match result {
                 Ok(V2Response::Read { error_code, entry_id, data, .. }) => {
-                    if error_code == V2_EOK || error_code == no_entry_code {
-                        success_count += 1;
-                        // entry_id contains the LAC for LAST_ADD_CONFIRMED reads
-                        if entry_id > max_lac {
-                            max_lac = entry_id;
-                        }
-                        // Extract total_length from the last confirmed entry data
-                        if error_code == V2_EOK {
-                            if let Some(entry_data) = data {
-                                if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
-                                    if entry.length > self.total_length {
-                                        self.total_length = entry.length;
+                    let bk_err = BKError::from_v2_code(error_code);
+                    match bk_err {
+                        BKError::Ok | BKError::NoEntry => {
+                            success_count += 1;
+                            if entry_id > max_lac {
+                                max_lac = entry_id;
+                            }
+                            if bk_err == BKError::Ok {
+                                if let Some(entry_data) = data {
+                                    if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
+                                        if entry.length > self.total_length {
+                                            self.total_length = entry.length;
+                                        }
                                     }
                                 }
                             }
                         }
+                        _ => {
+                            // Fencing failed on this bookie — continue, need write quorum
+                        }
                     }
                 }
                 _ => {
-                    // Fencing failed on this bookie — continue, need write quorum
+                    // Connection/transport error — continue, need write quorum
                 }
             }
         }
@@ -223,52 +225,24 @@ impl RecoveryHandle {
             .build()
             .freeze();
 
-        let write_set = self.schedule.write_set(entry_id);
-        let mut ack_set = self.schedule.new_ack_set();
-
-        let mk = self.master_key;
-        let valid_indices: Vec<usize> = write_set.iter()
-            .filter(|&&idx| idx < conns.len())
-            .copied()
-            .collect();
-
-        let futures: Vec<_> = valid_indices.iter().map(|&bookie_idx| {
-            let conn = &*conns[bookie_idx];
-            let entry = entry_bytes.clone();
-            async move { conn.send_add_entry(FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY, mk, entry).await }
-        }).collect();
-
-        let results = join_all(futures).await;
-
-        for (i, result) in results.into_iter().enumerate() {
-            let bookie_idx = valid_indices[i];
-            match result {
-                Ok(V2Response::Add { error_code, .. }) => {
-                    if error_code == V2_EOK {
-                        if ack_set.complete_bookie(bookie_idx) {
-                            return Ok(entry_id);
-                        }
-                    } else {
-                        ack_set.fail_bookie(bookie_idx);
-                    }
-                }
-                _ => {
-                    ack_set.fail_bookie(bookie_idx);
-                }
-            }
-        }
-
-        if ack_set.is_quorum_reached() {
-            Ok(entry_id)
-        } else {
-            Err(ClientError::Protocol("recovery add quorum not reached".into()))
-        }
+        self.scatter_recovery_add(conns, entry_id, entry_bytes).await?;
+        Ok(entry_id)
     }
 
     /// Re-replicate an existing entry (raw bytes) with FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY.
     /// Unlike `recovery_add_entry`, this sends the original entry bytes verbatim,
     /// preserving the cumulative `length` field already embedded in the entry.
     async fn recovery_add_raw(
+        &self,
+        conns: &[Arc<BookieConnection>],
+        entry_id: i64,
+        entry_data: Bytes,
+    ) -> Result<(), ClientError> {
+        self.scatter_recovery_add(conns, entry_id, entry_data).await
+    }
+
+    /// Send a recovery add to the write set and wait for ack quorum.
+    async fn scatter_recovery_add(
         &self,
         conns: &[Arc<BookieConnection>],
         entry_id: i64,
@@ -295,12 +269,19 @@ impl RecoveryHandle {
             let bookie_idx = valid_indices[i];
             match result {
                 Ok(V2Response::Add { error_code, .. }) => {
-                    if error_code == V2_EOK {
-                        if ack_set.complete_bookie(bookie_idx) {
-                            return Ok(());
+                    let bk_err = BKError::from_v2_code(error_code);
+                    match bk_err {
+                        BKError::Ok => {
+                            if ack_set.complete_bookie(bookie_idx) {
+                                return Ok(());
+                            }
                         }
-                    } else {
-                        ack_set.fail_bookie(bookie_idx);
+                        BKError::Fenced | BKError::Unauthorized => {
+                            return Err(ClientError::BookieError { error: bk_err });
+                        }
+                        _ => {
+                            ack_set.fail_bookie(bookie_idx);
+                        }
                     }
                 }
                 _ => {

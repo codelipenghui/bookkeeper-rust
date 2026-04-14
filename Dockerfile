@@ -61,6 +61,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json -p bookkeeper-cli
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY docker ./docker
 RUN cargo build --release -p bookkeeper-cli
 
 # ----------------------------------------------------------------------------
@@ -76,6 +77,7 @@ RUN cargo chef cook \
         -p bookkeeper-cli
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY docker ./docker
 RUN cargo build \
         --profile release-debug \
         --features profiling \
@@ -89,6 +91,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --recipe-path recipe.json -p bookkeeper-cli
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY docker ./docker
 RUN cargo build -p bookkeeper-cli
 
 # ----------------------------------------------------------------------------

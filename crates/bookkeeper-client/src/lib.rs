@@ -6,4 +6,6 @@ pub mod client;
 pub mod recovery;
 pub mod zk_client;
 pub mod placement;
+pub mod bookie_info_reader;
 pub mod tls;
+pub mod client_metrics;

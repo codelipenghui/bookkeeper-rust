@@ -6,6 +6,45 @@ use serde::{Deserialize, Serialize};
 use bookkeeper_storage::db_ledger_storage::CURRENT_DIR;
 use crate::state::{BookieState, BookieStateManager};
 
+/// Shared GC status for the gc_details HTTP endpoint.
+/// Updated by the GC thread, read by the HTTP handler.
+/// Matches Java's GarbageCollectionStatus fields.
+///
+/// Wrapped in a single `Arc` (one heap allocation) rather than per-field
+/// `Arc<AtomicXxx>` (seven allocations). All fields are plain atomics —
+/// safe for concurrent access through the shared `Arc`.
+#[derive(Clone)]
+pub struct GcStatus(Arc<GcStatusInner>);
+
+pub struct GcStatusInner {
+    pub force_compacting: std::sync::atomic::AtomicBool,
+    pub major_compacting: std::sync::atomic::AtomicBool,
+    pub minor_compacting: std::sync::atomic::AtomicBool,
+    pub last_major_compaction_time: std::sync::atomic::AtomicI64,
+    pub last_minor_compaction_time: std::sync::atomic::AtomicI64,
+    pub major_compaction_counter: std::sync::atomic::AtomicI64,
+    pub minor_compaction_counter: std::sync::atomic::AtomicI64,
+}
+
+impl Default for GcStatus {
+    fn default() -> Self {
+        Self(Arc::new(GcStatusInner {
+            force_compacting: std::sync::atomic::AtomicBool::new(false),
+            major_compacting: std::sync::atomic::AtomicBool::new(false),
+            minor_compacting: std::sync::atomic::AtomicBool::new(false),
+            last_major_compaction_time: std::sync::atomic::AtomicI64::new(0),
+            last_minor_compaction_time: std::sync::atomic::AtomicI64::new(0),
+            major_compaction_counter: std::sync::atomic::AtomicI64::new(0),
+            minor_compaction_counter: std::sync::atomic::AtomicI64::new(0),
+        }))
+    }
+}
+
+impl std::ops::Deref for GcStatus {
+    type Target = GcStatusInner;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
 #[derive(Clone)]
 pub struct HttpState {
     pub state_manager: Arc<BookieStateManager>,
@@ -21,6 +60,8 @@ pub struct HttpState {
     /// Shared GC force flags — set to true to trigger immediate GC on next loop iteration.
     pub gc_force_major: Arc<std::sync::atomic::AtomicBool>,
     pub gc_force_minor: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared GC status for the gc_details endpoint.
+    pub gc_status: GcStatus,
 }
 
 pub fn create_router(http_state: HttpState) -> Router {
@@ -160,9 +201,17 @@ async fn set_readonly(
     Json(body): Json<ReadOnlyRequest>,
 ) -> impl IntoResponse {
     if body.read_only {
-        state.state_manager.transition_to(BookieState::ReadOnly);
+        // Manual read-only: set the flag so the disk monitor won't auto-recover
+        // while the operator intends the bookie to stay read-only.
+        // Matches Java's BookieImpl.doTransitionToReadOnlyMode(forceReadOnly=true).
+        state.state_manager.transition_to_read_only(true);
         (StatusCode::OK, Json(serde_json::json!({"readOnly": true})))
     } else {
+        // Clearing manual read-only: also clear the manually_read_only flag so
+        // the disk monitor can resume auto-recovery behavior on disk space events.
+        // Matches Java's BookieStateManager where setReadOnly(false) clears
+        // forceReadOnly and allows LedgerDirsMonitor to manage state again.
+        state.state_manager.clear_manual_read_only();
         state.state_manager.transition_to(BookieState::Running);
         (StatusCode::OK, Json(serde_json::json!({"readOnly": false})))
     }
@@ -423,16 +472,17 @@ async fn bookie_sanity(State(state): State<HttpState>) -> impl IntoResponse {
 // Matches Java's GCDetailsService
 // ---------------------------------------------------------------------------
 
-async fn gc_details(State(_state): State<HttpState>) -> Json<serde_json::Value> {
-    // TODO: track GC metrics in storage layer for full parity with Java
+async fn gc_details(State(state): State<HttpState>) -> Json<serde_json::Value> {
+    use std::sync::atomic::Ordering;
+    let gs = &state.gc_status;
     Json(serde_json::json!([{
-        "forceCompacting": false,
-        "majorCompacting": false,
-        "minorCompacting": false,
-        "lastMajorCompactionTime": 0,
-        "lastMinorCompactionTime": 0,
-        "majorCompactionCounter": 0,
-        "minorCompactionCounter": 0,
+        "forceCompacting": gs.force_compacting.load(Ordering::Relaxed),
+        "majorCompacting": gs.major_compacting.load(Ordering::Relaxed),
+        "minorCompacting": gs.minor_compacting.load(Ordering::Relaxed),
+        "lastMajorCompactionTime": gs.last_major_compaction_time.load(Ordering::Relaxed),
+        "lastMinorCompactionTime": gs.last_minor_compaction_time.load(Ordering::Relaxed),
+        "majorCompactionCounter": gs.major_compaction_counter.load(Ordering::Relaxed),
+        "minorCompactionCounter": gs.minor_compaction_counter.load(Ordering::Relaxed),
     }]))
 }
 

@@ -98,21 +98,52 @@ fn on_protocol_upgrade_does_not_panic() {
 
 #[test]
 fn create_factory_with_no_class_returns_disabled() {
-    let factory = create_auth_factory(None);
+    let factory = create_auth_factory(None, false).unwrap();
     assert_eq!(factory.plugin_name(), "AUTHENTICATION_DISABLED");
 }
 
 #[test]
 fn create_factory_with_empty_class_returns_disabled() {
-    let factory = create_auth_factory(Some(""));
+    let factory = create_auth_factory(Some(""), false).unwrap();
     assert_eq!(factory.plugin_name(), "AUTHENTICATION_DISABLED");
 }
 
 #[test]
-fn create_factory_with_unknown_class_falls_back_to_disabled() {
-    let factory = create_auth_factory(Some("org.example.MyAuthProvider"));
-    // Falls back to disabled with a warning logged
+fn create_factory_with_unknown_class_is_hard_error() {
+    // Critical security fix: unknown auth plugin must be a hard error rather
+    // than a silent fallback to disabled auth, so an operator typo cannot
+    // accidentally turn off authentication.  Matches the spirit of Java's
+    // AuthProviderFactoryFactory which raises ClassNotFoundException.
+    match create_auth_factory(Some("org.example.MyAuthProvider"), false) {
+        Ok(_) => panic!("expected UnsupportedPlugin error, got Ok"),
+        Err(AuthFactoryError::UnsupportedPlugin { class }) => {
+            assert_eq!(class, "org.example.MyAuthProvider");
+        }
+    }
+}
+
+#[test]
+fn create_factory_with_tls_class_returns_tls_factory() {
+    let factory = create_auth_factory(Some("my.auth.TLSAuthProviderFactory"), false).unwrap();
+    assert_eq!(factory.plugin_name(), "TLS_AUTH");
+}
+
+#[test]
+fn create_factory_with_authentication_disabled_class_is_ok() {
+    // Java's `AuthenticationDisabledAuthProviderFactory` must still map to
+    // disabled auth without triggering the hard-error guard.
+    let factory = create_auth_factory(
+        Some("org.apache.bookkeeper.auth.AuthenticationDisabledAuthProviderFactory"),
+        false,
+    ).unwrap();
     assert_eq!(factory.plugin_name(), "AUTHENTICATION_DISABLED");
+}
+
+#[test]
+fn create_factory_with_tls_client_auth_enabled_returns_tls_factory() {
+    // If tlsClientAuthentication=true, TLS factory is used regardless of class.
+    let factory = create_auth_factory(None, true).unwrap();
+    assert_eq!(factory.plugin_name(), "TLS_AUTH");
 }
 
 // ---------------------------------------------------------------------------

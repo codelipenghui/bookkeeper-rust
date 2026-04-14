@@ -37,7 +37,7 @@ async fn write_entries(storage: &dyn LedgerStorage, ledger_id: i64, count: i64) 
 #[tokio::test]
 async fn gc_deletes_local_ledger_not_in_metadata() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     write_entries(&*storage, 1, 5).await;
     write_entries(&*storage, 2, 5).await;
@@ -51,8 +51,8 @@ async fn gc_deletes_local_ledger_not_in_metadata() {
     let mut active = HashSet::new();
     active.insert(2i64);
 
-    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
-    gc.gc(&active).await.unwrap();
+    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
+    gc.gc(&active, false).await.unwrap();
 
     // After GC, ledgers 1 and 3 should be gone locally
     let local = storage.get_active_ledgers().unwrap();
@@ -63,7 +63,7 @@ async fn gc_deletes_local_ledger_not_in_metadata() {
 #[tokio::test]
 async fn gc_keeps_all_when_metadata_matches_local() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     write_entries(&*storage, 10, 3).await;
     write_entries(&*storage, 20, 3).await;
@@ -72,8 +72,8 @@ async fn gc_keeps_all_when_metadata_matches_local() {
     active.insert(10i64);
     active.insert(20i64);
 
-    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
-    gc.gc(&active).await.unwrap();
+    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
+    gc.gc(&active, false).await.unwrap();
 
     let local = storage.get_active_ledgers().unwrap();
     assert_eq!(local.len(), 2);
@@ -82,14 +82,14 @@ async fn gc_keeps_all_when_metadata_matches_local() {
 #[tokio::test]
 async fn gc_with_empty_metadata_deletes_all_local() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     write_entries(&*storage, 100, 5).await;
     write_entries(&*storage, 200, 5).await;
 
     let active: HashSet<i64> = HashSet::new();
-    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
-    gc.gc(&active).await.unwrap();
+    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
+    gc.gc(&active, false).await.unwrap();
 
     let local = storage.get_active_ledgers().unwrap();
     assert!(local.is_empty(), "expected all ledgers deleted, got {local:?}");
@@ -98,7 +98,7 @@ async fn gc_with_empty_metadata_deletes_all_local() {
 #[tokio::test]
 async fn gc_idempotent_when_run_twice() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     write_entries(&*storage, 1, 3).await;
     write_entries(&*storage, 2, 3).await;
@@ -106,9 +106,9 @@ async fn gc_idempotent_when_run_twice() {
     let mut active = HashSet::new();
     active.insert(1i64);
 
-    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
-    gc.gc(&active).await.unwrap();
-    gc.gc(&active).await.unwrap(); // second run should be no-op
+    let gc = GarbageCollector::new(storage.clone(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
+    gc.gc(&active, false).await.unwrap();
+    gc.gc(&active, false).await.unwrap(); // second run should be no-op
 
     let local = storage.get_active_ledgers().unwrap();
     assert_eq!(local.len(), 1);
@@ -117,9 +117,9 @@ async fn gc_idempotent_when_run_twice() {
 #[tokio::test]
 async fn gc_with_no_local_ledgers_succeeds() {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
+    let storage = Arc::new(DbLedgerStorage::open(dir.path(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap()) as Arc<dyn LedgerStorage>;
 
     let active: HashSet<i64> = HashSet::new();
-    let gc = GarbageCollector::new(storage, Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
-    gc.gc(&active).await.unwrap();
+    let gc = GarbageCollector::new(storage, Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
+    gc.gc(&active, false).await.unwrap();
 }

@@ -62,6 +62,35 @@ lazy_static! {
         &["success"]
     ).unwrap();
 
+    /// ForceLedger request latency. Matches Java's RequestStats.FORCE_LEDGER_REQUEST.
+    /// Measures end-to-end time to fsync the journal on a client-initiated force.
+    pub static ref FORCE_LEDGER_REQUEST: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("bookkeeper_server_FORCE_LEDGER_REQUEST", "ForceLedger request latency")
+            .buckets(latency_buckets()),
+        &["success"]
+    ).unwrap();
+
+    /// WriteLac request latency. Matches Java's RequestStats.WRITE_LAC_REQUEST.
+    pub static ref WRITE_LAC_REQUEST: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("bookkeeper_server_WRITE_LAC_REQUEST", "WriteLac request latency")
+            .buckets(latency_buckets()),
+        &["success"]
+    ).unwrap();
+
+    /// ReadLac request latency. Matches Java's RequestStats.READ_LAC_REQUEST.
+    pub static ref READ_LAC_REQUEST: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("bookkeeper_server_READ_LAC_REQUEST", "ReadLac request latency")
+            .buckets(latency_buckets()),
+        &["success"]
+    ).unwrap();
+
+    /// GetBookieInfo request latency. Matches Java's RequestStats.GET_BOOKIE_INFO_REQUEST.
+    pub static ref GET_BOOKIE_INFO_REQUEST: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("bookkeeper_server_GET_BOOKIE_INFO_REQUEST", "GetBookieInfo request latency")
+            .buckets(latency_buckets()),
+        &["success"]
+    ).unwrap();
+
     // -----------------------------------------------------------------------
     // Bookie storage metrics (scope: bookie)
     // Matches Java's BookieStats.java
@@ -183,6 +212,11 @@ lazy_static! {
         "bookie_SERVER_STATUS", "Bookie server status (1=writable, 2=readonly, 0=other)"
     ).unwrap();
 
+    /// Cumulative scrub errors found by the local consistency checker.
+    pub static ref SCRUB_ERRORS: IntCounter = IntCounter::new(
+        "bookie_scrub_errors_total", "Total entry errors found by local consistency checker"
+    ).unwrap();
+
     // -----------------------------------------------------------------------
     // Pre-resolved Histogram handles for the hot path.
     //
@@ -204,6 +238,18 @@ lazy_static! {
 
     pub static ref CHANNEL_WRITE_OK: Histogram = CHANNEL_WRITE.with_label_values(&["true"]);
     pub static ref CHANNEL_WRITE_FAIL: Histogram = CHANNEL_WRITE.with_label_values(&["false"]);
+
+    pub static ref FORCE_LEDGER_REQUEST_OK: Histogram = FORCE_LEDGER_REQUEST.with_label_values(&["true"]);
+    pub static ref FORCE_LEDGER_REQUEST_FAIL: Histogram = FORCE_LEDGER_REQUEST.with_label_values(&["false"]);
+
+    pub static ref WRITE_LAC_REQUEST_OK: Histogram = WRITE_LAC_REQUEST.with_label_values(&["true"]);
+    pub static ref WRITE_LAC_REQUEST_FAIL: Histogram = WRITE_LAC_REQUEST.with_label_values(&["false"]);
+
+    pub static ref READ_LAC_REQUEST_OK: Histogram = READ_LAC_REQUEST.with_label_values(&["true"]);
+    pub static ref READ_LAC_REQUEST_FAIL: Histogram = READ_LAC_REQUEST.with_label_values(&["false"]);
+
+    pub static ref GET_BOOKIE_INFO_REQUEST_OK: Histogram = GET_BOOKIE_INFO_REQUEST.with_label_values(&["true"]);
+    pub static ref GET_BOOKIE_INFO_REQUEST_FAIL: Histogram = GET_BOOKIE_INFO_REQUEST.with_label_values(&["false"]);
 
     pub static ref BOOKIE_ADD_ENTRY_OK: Histogram = BOOKIE_ADD_ENTRY.with_label_values(&["true"]);
     pub static ref BOOKIE_ADD_ENTRY_FAIL: Histogram = BOOKIE_ADD_ENTRY.with_label_values(&["false"]);
@@ -232,6 +278,10 @@ pub fn register_metrics() {
     reg!(READ_ENTRY_IN_PROGRESS);
     reg!(READ_ENTRY_FENCE_REQUEST);
     reg!(CHANNEL_WRITE);
+    reg!(FORCE_LEDGER_REQUEST);
+    reg!(WRITE_LAC_REQUEST);
+    reg!(READ_LAC_REQUEST);
+    reg!(GET_BOOKIE_INFO_REQUEST);
     // Bookie storage
     reg!(WRITE_BYTES);
     reg!(READ_BYTES);
@@ -258,6 +308,7 @@ pub fn register_metrics() {
     reg!(ELECTION_ATTEMPTS);
     // Server
     reg!(BOOKIE_STATE);
+    reg!(SCRUB_ERRORS);
     // Journal (defined in bookkeeper-storage crate)
     bookkeeper_storage::journal::metrics::register_journal_metrics(&REGISTRY);
     // Storage (defined in bookkeeper-storage crate)

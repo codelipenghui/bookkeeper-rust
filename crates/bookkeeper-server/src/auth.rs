@@ -119,19 +119,95 @@ impl ConnectionAuthState {
 // Factory selection from config
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Built-in: TLS/mTLS-based auth (client certificate authentication)
+// ---------------------------------------------------------------------------
+
+/// TLS auth provider — authenticates connections based on client certificate
+/// verification during the TLS handshake. When `tlsClientAuthentication=true`,
+/// the TLS acceptor already validates the client cert; this provider marks the
+/// connection as authenticated when it receives the `on_protocol_upgrade` callback.
+///
+/// Matches Java's pattern where TLS client auth is enforced at the transport layer
+/// and the auth provider simply records that the TLS handshake succeeded.
+pub struct TlsAuthProvider {
+    tls_authenticated: bool,
+}
+
+impl BookieAuthProvider for TlsAuthProvider {
+    fn process(&mut self, _plugin_name: &str, _payload: &[u8]) -> Result<AuthResult, AuthError> {
+        // If TLS auth is enabled, the TLS handshake already validated the cert.
+        // Any explicit AUTH request just confirms completion.
+        if self.tls_authenticated {
+            Ok(AuthResult::Complete)
+        } else {
+            Err(AuthError::Unauthorized("TLS client auth required but not completed".into()))
+        }
+    }
+
+    fn on_protocol_upgrade(&mut self) {
+        // Called after successful TLS handshake with client cert verification.
+        self.tls_authenticated = true;
+    }
+}
+
+pub struct TlsAuthProviderFactory;
+
+impl BookieAuthProviderFactory for TlsAuthProviderFactory {
+    fn plugin_name(&self) -> &str {
+        "TLS_AUTH"
+    }
+    fn new_provider(&self) -> Box<dyn BookieAuthProvider> {
+        Box::new(TlsAuthProvider { tls_authenticated: false })
+    }
+}
+
+/// Error type for auth factory configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthFactoryError {
+    #[error(
+        "unsupported bookieAuthProviderFactoryClass '{class}': only TLS-based auth plugins are \
+        currently supported in the Rust implementation. Setting an unknown plugin would silently \
+        disable authentication (security regression). If you need SASL/Kerberos/custom auth, \
+        either remove the config (disables auth) or use a supported TLS-based plugin."
+    )]
+    UnsupportedPlugin { class: String },
+}
+
 /// Create an auth provider factory from config.
 /// Matches Java's bookieAuthProviderFactoryClass config.
+///
+/// Returns an error when the configured factory class is not recognized,
+/// rather than silently falling back to disabled auth. This prevents the
+/// security regression of an operator typo or a missing plugin silently
+/// turning authentication off.
 pub fn create_auth_factory(
     factory_class: Option<&str>,
-) -> Box<dyn BookieAuthProviderFactory> {
+    tls_client_auth_enabled: bool,
+) -> Result<Box<dyn BookieAuthProviderFactory>, AuthFactoryError> {
+    // If TLS client auth is enabled, use TLS auth provider
+    if tls_client_auth_enabled {
+        tracing::info!("Auth: using TLS client certificate authentication");
+        return Ok(Box::new(TlsAuthProviderFactory));
+    }
     match factory_class {
         None | Some("") => {
-            // Default: auth disabled
-            Box::new(DisabledAuthProviderFactory)
+            Ok(Box::new(DisabledAuthProviderFactory))
+        }
+        Some(class) if class.trim().is_empty() => {
+            Ok(Box::new(DisabledAuthProviderFactory))
+        }
+        Some(class)
+            if class.contains("AuthenticationDisabled")
+                || class.contains("authentication_disabled") =>
+        {
+            Ok(Box::new(DisabledAuthProviderFactory))
+        }
+        Some(class) if class.contains("TLS") || class.contains("tls") => {
+            Ok(Box::new(TlsAuthProviderFactory))
         }
         Some(class) => {
-            tracing::warn!("Auth: unknown factory class '{class}', using disabled auth");
-            Box::new(DisabledAuthProviderFactory)
+            Err(AuthFactoryError::UnsupportedPlugin { class: class.to_string() })
         }
     }
 }

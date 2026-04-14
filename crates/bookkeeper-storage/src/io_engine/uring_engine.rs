@@ -27,14 +27,14 @@ impl UringEngine {
             Ok(j) => Arc::new(j),
             Err(e) => {
                 tracing::warn!("uring journal init failed, falling back to std: {e}");
-                Arc::new(StdEngine)
+                Arc::new(StdEngine::new())
             }
         };
         let ledger: Arc<dyn LedgerIo> = match UringLedgerIo::new() {
             Ok(l) => Arc::new(l),
             Err(e) => {
                 tracing::warn!("uring ledger init failed, falling back to std: {e}");
-                Arc::new(StdEngine)
+                Arc::new(StdEngine::new())
             }
         };
         Self { journal, ledger }

@@ -177,6 +177,41 @@ async fn readonly_get_and_put() {
     server.shutdown().await;
 }
 
+/// Setting readOnly=true via HTTP should set the manual flag so the disk
+/// monitor cannot auto-recover. Setting readOnly=false must clear the manual
+/// flag so the disk monitor can resume auto-recovery behavior.
+/// Matches Java's BookieStateManager where setReadOnly(false) clears
+/// forceReadOnly.
+#[tokio::test]
+async fn readonly_put_false_clears_manual_flag() {
+    let dir = TempDir::new().unwrap();
+    let server = BookieServer::start(test_config(&dir)).await.unwrap();
+    let http_addr = server.http_addr().unwrap();
+    let client = reqwest::Client::new();
+
+    // 1. PUT readOnly=true — bookie goes read-only WITH manual flag set.
+    client.put(format!("http://{}/api/v1/bookie/state/readonly", http_addr))
+        .json(&serde_json::json!({"readOnly": true}))
+        .send().await.unwrap();
+    assert!(server.state_manager().is_manually_read_only(),
+        "manual flag should be set after explicit PUT readOnly=true");
+
+    // 2. PUT readOnly=false — must clear the manual flag so the disk monitor
+    //    can auto-recover. Without this fix the flag would remain true and
+    //    try_recover_to_running() would refuse to transition the bookie.
+    client.put(format!("http://{}/api/v1/bookie/state/readonly", http_addr))
+        .json(&serde_json::json!({"readOnly": false}))
+        .send().await.unwrap();
+    assert!(!server.state_manager().is_manually_read_only(),
+        "manual flag must be cleared after explicit PUT readOnly=false");
+    // And try_recover_to_running should now succeed (simulating disk monitor).
+    assert!(server.state_manager().try_recover_to_running()
+            || server.state_manager().state() == bookkeeper_server::state::BookieState::Running,
+        "disk monitor should be able to recover to Running after manual clear");
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn list_ledgers_local_empty() {
     let dir = TempDir::new().unwrap();

@@ -156,3 +156,51 @@ fn cookie_validate_self_is_ok() {
     let c = Cookie::new("b:3181", "/j", &["/l"], Some("id"), None);
     assert!(c.validate_against(&c).is_ok());
 }
+
+#[test]
+fn cookie_java_format_with_escaped_tabs_parses() {
+    // Java's TextFormat.printToString() escapes tab characters as \t in the
+    // quoted string values. This test verifies the Rust parser correctly
+    // unescapes them, matching Java's TextFormat.merge() behavior.
+    let java_cookie = "5\n\
+        bookieHost: \"bookie1:3181\"\n\
+        journalDir: \"/data/journal\"\n\
+        ledgerDirs: \"1\\t/data/ledgers\"\n\
+        instanceId: \"test-id\"\n";
+    let parsed = Cookie::deserialize(java_cookie).unwrap();
+    assert_eq!(parsed.bookie_id(), "bookie1:3181");
+    assert_eq!(parsed.journal_dirs(), "/data/journal");
+    // After unescaping, the tab byte should be present
+    assert_eq!(parsed.ledger_dirs(), "1\t/data/ledgers");
+    assert_eq!(parsed.instance_id(), Some("test-id"));
+}
+
+#[test]
+fn cookie_serialize_escapes_tabs() {
+    // Verify that serialization escapes tab characters in ledger_dirs
+    // to match Java's TextFormat output format.
+    let cookie = Cookie::new("b:3181", "/j", &["/l1", "/l2"], None, None);
+    let serialized = cookie.serialize();
+    // The ledger_dirs "2\t/l1\t/l2" should be escaped as "2\\t/l1\\t/l2"
+    assert!(serialized.contains("ledgerDirs: \"2\\t/l1\\t/l2\""),
+        "serialized cookie should contain escaped tabs: {serialized}");
+}
+
+#[test]
+fn cookie_java_multi_dir_round_trip() {
+    // Simulate a Java-written cookie with multiple ledger dirs (escaped tabs)
+    // and verify it round-trips correctly through Rust.
+    let java_cookie = "5\n\
+        bookieHost: \"host:3181\"\n\
+        journalDir: \"/journal\"\n\
+        ledgerDirs: \"3\\t/l1\\t/l2\\t/l3\"\n\
+        instanceId: \"uuid-123\"\n\
+        indexDirs: \"2\\t/idx1\\t/idx2\"\n";
+    let parsed = Cookie::deserialize(java_cookie).unwrap();
+    assert_eq!(parsed.ledger_dirs(), "3\t/l1\t/l2\t/l3");
+    assert_eq!(parsed.index_dirs(), Some("2\t/idx1\t/idx2"));
+    // Re-serialize and verify it produces the same escaped format
+    let reserialized = parsed.serialize();
+    assert!(reserialized.contains("ledgerDirs: \"3\\t/l1\\t/l2\\t/l3\""));
+    assert!(reserialized.contains("indexDirs: \"2\\t/idx1\\t/idx2\""));
+}

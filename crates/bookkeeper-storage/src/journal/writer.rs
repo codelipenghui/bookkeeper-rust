@@ -14,9 +14,13 @@ use crate::StorageError;
 
 /// Meta-entry ID for master key journaling.
 pub const METAENTRY_ID_LEDGER_KEY: i64 = -0x1000;
+/// Meta-entry ID for fence journaling. Matches Java's `METAENTRY_ID_FENCE_KEY`.
+pub const METAENTRY_ID_FENCE_KEY: i64 = -0x2000;
+/// Meta-entry ID for explicit LAC journaling. Matches Java's `METAENTRY_ID_LEDGER_EXPLICITLAC`.
+pub const METAENTRY_ID_LEDGER_EXPLICITLAC: i64 = -0x8000;
 
-/// Maximum journal queue memory in bytes (default 32MB, matching Java).
-const MAX_QUEUE_MEMORY: usize = 32 * 1024 * 1024;
+/// Default journal queue memory in bytes (32MB, matching Java).
+const DEFAULT_MAX_QUEUE_MEMORY: usize = 32 * 1024 * 1024;
 
 /// A journal entry to be written.
 struct JournalEntry {
@@ -36,6 +40,22 @@ pub struct JournalConfig {
     pub buffered_entries_threshold: usize,
     pub alignment_size: usize,
     pub format_version: i32,
+    /// Max journal queue memory in bytes. 0 = use default (32MB).
+    /// Matches Java's `journalMaxMemorySizeMb`.
+    pub max_queue_memory: usize,
+    /// When true, flush immediately when the queue is empty after draining
+    /// (reduces latency at low throughput). Matches Java's `journalFlushWhenQueueEmpty`.
+    pub flush_when_queue_empty: bool,
+    /// When true, call posix_fadvise(DONTNEED) after journal writes to evict
+    /// written pages from OS page cache. Linux-only. Matches Java's `journalRemoveFromPageCache`.
+    pub remove_from_page_cache: bool,
+    /// When true, old journal files are renamed and reused instead of deleted
+    /// and recreated. Avoids filesystem metadata overhead on rotation.
+    /// Matches Java's `journalReuseFiles`.
+    pub reuse_files: bool,
+    /// Max number of old journal files to keep in the reuse pool.
+    /// Matches Java's `maxBackupJournals`.
+    pub max_backup_journals: usize,
 }
 
 /// The journal — write-ahead log for crash recovery.
@@ -54,7 +74,7 @@ pub struct JournalConfig {
 ///
 /// 3. **No sync** (any engine): Single writer thread. ACKs immediately
 ///    after `write_all`. No force-write thread.
-pub type OnFatalError = Box<dyn Fn(io::Error) + Send + 'static>;
+pub type OnFatalError = Box<dyn Fn(io::Error) + Send + Sync + 'static>;
 
 pub struct Journal {
     tx: mpsc::Sender<JournalEntry>,
@@ -69,7 +89,12 @@ impl Journal {
         _journal_io: std::sync::Arc<dyn crate::io_engine::JournalIo>,
         on_fatal_error: Option<OnFatalError>,
     ) -> Self {
-        let bound = MAX_QUEUE_MEMORY / 1024;
+        let queue_mem = if config.max_queue_memory > 0 {
+            config.max_queue_memory
+        } else {
+            DEFAULT_MAX_QUEUE_MEMORY
+        };
+        let bound = queue_mem / 1024;
         let (tx, rx) = mpsc::bounded(bound);
 
         let current_log_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -99,9 +124,16 @@ impl Journal {
             // Mode 2: two threads (writer + blocking force-write)
             let (fw_tx, fw_rx) = mpsc::unbounded::<ForceWriteRequest>();
 
+            // Share the fatal-error callback between both threads so that
+            // an fsync failure in the force-write thread also triggers the
+            // bookie's transition to read-only mode.
+            let shared_cb: Option<Arc<dyn Fn(io::Error) + Send + Sync>> =
+                on_fatal_error.map(|cb| Arc::from(cb) as Arc<dyn Fn(io::Error) + Send + Sync>);
+            let fw_cb = shared_cb.clone();
+
             let sync_thread = std::thread::Builder::new()
                 .name("journal-sync".into())
-                .spawn(move || force_write_loop(fw_rx))
+                .spawn(move || force_write_loop(fw_rx, fw_cb))
                 .expect("failed to spawn journal-sync thread");
             threads.push(sync_thread);
 
@@ -109,17 +141,19 @@ impl Journal {
             let writer_thread = std::thread::Builder::new()
                 .name("journal-writer".into())
                 .spawn(move || {
-                    journal_writer_loop(writer_config, rx, Some(fw_tx), on_fatal_error, shared_log_id)
+                    journal_writer_loop(writer_config, rx, Some(fw_tx), shared_cb, shared_log_id)
                 })
                 .expect("failed to spawn journal-writer thread");
             threads.push(writer_thread);
         } else {
             // Mode 3: single writer thread, no sync
             let writer_config = config.clone();
+            let cb: Option<Arc<dyn Fn(io::Error) + Send + Sync>> =
+                on_fatal_error.map(|cb| Arc::from(cb) as Arc<dyn Fn(io::Error) + Send + Sync>);
             let writer_thread = std::thread::Builder::new()
                 .name("journal-writer".into())
                 .spawn(move || {
-                    journal_writer_loop(writer_config, rx, None, on_fatal_error, shared_log_id)
+                    journal_writer_loop(writer_config, rx, None, cb, shared_log_id)
                 })
                 .expect("failed to spawn journal-writer thread");
             threads.push(writer_thread);
@@ -137,21 +171,88 @@ impl Journal {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let enqueue_time = Instant::now();
         metrics::JOURNAL_QUEUE_SIZE.inc();
-        self.tx
-            .send(JournalEntry {
-                data: data.to_vec(),
-                ack_tx: Some(ack_tx),
-                enqueue_time,
-            })
-            .map_err(|_| {
+        let entry = JournalEntry {
+            data: data.to_vec(),
+            ack_tx: Some(ack_tx),
+            enqueue_time,
+        };
+        // Fast path: try_send is non-blocking and avoids spawn_blocking overhead.
+        // This succeeds >99% of the time since the journal queue rarely fills up.
+        // Only fall back to spawn_blocking when the queue is actually full,
+        // providing backpressure without stalling the Tokio runtime.
+        match self.tx.try_send(entry) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(entry)) => {
+                // Queue full — use spawn_blocking for backpressure
+                let tx = self.tx.clone();
+                tokio::task::spawn_blocking(move || tx.send(entry))
+                    .await
+                    .map_err(|_| {
+                        metrics::JOURNAL_QUEUE_SIZE.dec();
+                        StorageError::Io(io::Error::new(
+                            io::ErrorKind::BrokenPipe, "journal spawn_blocking failed",
+                        ))
+                    })?
+                    .map_err(|_| {
+                        metrics::JOURNAL_QUEUE_SIZE.dec();
+                        StorageError::Io(io::Error::new(
+                            io::ErrorKind::BrokenPipe, "journal writer closed",
+                        ))
+                    })?;
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
                 metrics::JOURNAL_QUEUE_SIZE.dec();
-                StorageError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe, "journal writer closed",
-                ))
-            })?;
-        ack_rx.await.map_err(|_| StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe, "journal ack lost",
+                return Err(StorageError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe, "journal writer closed",
+                )));
+            }
+        }
+        ack_rx.await.map_err(|_| StorageError::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe, "journal ack lost",
         )))
+    }
+
+    /// Force the journal to fsync all previously written data.
+    /// Used by ForceLedger to ensure deferred-sync entries reach disk.
+    /// Enqueues a zero-length barrier entry with an ack; when the ack
+    /// returns, all preceding entries have been durably synced.
+    pub async fn force_sync(&self) -> Result<(), StorageError> {
+        // Re-use the same path as log_add_entry: enqueue with an ack
+        // and wait for it. The journal thread will write+sync this
+        // (empty) entry along with anything queued before it.
+        self.log_add_entry(&[]).await
+    }
+
+    /// Enqueue an entry to the journal without waiting for fsync.
+    /// Used for DEFERRED_SYNC writes where the client will call ForceLedger
+    /// later to ensure durability. Matches Java's `ackBeforeSync` behavior.
+    ///
+    /// Returns an error if the journal queue is full or the writer thread
+    /// has shut down, so the caller can reject the write with backpressure
+    /// instead of silently losing data.
+    pub fn log_add_entry_deferred(&self, data: &[u8]) -> Result<(), StorageError> {
+        metrics::JOURNAL_QUEUE_SIZE.inc();
+        match self.tx.try_send(JournalEntry {
+            data: data.to_vec(),
+            ack_tx: None,
+            enqueue_time: Instant::now(),
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                metrics::JOURNAL_QUEUE_SIZE.dec();
+                Err(StorageError::Io(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "journal queue full, cannot accept deferred-sync entry",
+                )))
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                metrics::JOURNAL_QUEUE_SIZE.dec();
+                Err(StorageError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "journal writer closed",
+                )))
+            }
+        }
     }
 
     pub fn maybe_journal_master_key(
@@ -159,7 +260,8 @@ impl Journal {
         ledger_id: i64,
         master_key: &[u8],
     ) -> Result<(), StorageError> {
-        let mut cache = self.master_key_cache.lock().unwrap();
+        let mut cache = self.master_key_cache.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if cache.contains(&ledger_id) {
             return Ok(());
         }
@@ -181,6 +283,35 @@ impl Journal {
         });
 
         Ok(())
+    }
+
+    /// Journal a fence operation for `ledger_id`. The entry is written to the
+    /// journal and the method returns only after fsync completes.
+    /// Matches Java's `fenceAndLogInJournal()` which writes a
+    /// `METAENTRY_ID_FENCE_KEY` entry before responding to the client.
+    pub async fn journal_fence(&self, ledger_id: i64) -> Result<(), StorageError> {
+        // Fence journal entry: [ledger_id:8][METAENTRY_ID_FENCE_KEY:8]
+        let mut entry = Vec::with_capacity(16);
+        entry.extend_from_slice(&ledger_id.to_be_bytes());
+        entry.extend_from_slice(&METAENTRY_ID_FENCE_KEY.to_be_bytes());
+        self.log_add_entry(&entry).await
+    }
+
+    /// Journal an explicit LAC write. The entry is written to the journal
+    /// and the method returns only after fsync completes.
+    /// Matches Java's `setExplicitLac()` which journals a
+    /// `METAENTRY_ID_LEDGER_EXPLICITLAC` entry for crash recovery.
+    pub async fn journal_explicit_lac(
+        &self,
+        ledger_id: i64,
+        lac_body: &[u8],
+    ) -> Result<(), StorageError> {
+        // LAC journal entry: [ledger_id:8][METAENTRY_ID_LEDGER_EXPLICITLAC:8][body...]
+        let mut entry = Vec::with_capacity(16 + lac_body.len());
+        entry.extend_from_slice(&ledger_id.to_be_bytes());
+        entry.extend_from_slice(&METAENTRY_ID_LEDGER_EXPLICITLAC.to_be_bytes());
+        entry.extend_from_slice(lac_body);
+        self.log_add_entry(&entry).await
     }
 
     pub fn current_log_id(&self) -> Option<u64> {
@@ -480,10 +611,16 @@ fn journal_uring_loop(
                 metrics::JOURNAL_FORCE_WRITE_BATCH_BYTES.observe(batch_bytes as f64);
                 metrics::JOURNAL_WRITE_BYTES.inc_by(batch_bytes);
 
+                let write_start_pos = state.position;
                 if let Some(ref pad) = padding {
                     state.position += pad.len() as u64;
                 }
                 state.position += batch_bytes;
+
+                if config.remove_from_page_cache {
+                    let written_len = state.position - write_start_pos;
+                    advise_dontneed(file.as_raw_fd(), write_start_pos as i64, written_len as i64);
+                }
 
                 // If a previous fsync completed, check CQE
                 if fsync_in_flight {
@@ -553,7 +690,7 @@ fn journal_writer_loop(
     config: JournalConfig,
     rx: mpsc::Receiver<JournalEntry>,
     fw_tx: Option<mpsc::Sender<ForceWriteRequest>>,
-    on_fatal_error: Option<OnFatalError>,
+    on_fatal_error: Option<Arc<dyn Fn(io::Error) + Send + Sync>>,
     shared_log_id: Arc<std::sync::atomic::AtomicU64>,
 ) {
     fs::create_dir_all(&config.journal_dir).ok();
@@ -616,8 +753,10 @@ fn journal_writer_loop(
         let bytes_threshold_met = buffered_writes_threshold > 0
             && pending_bytes >= buffered_writes_threshold;
 
+        let queue_empty_after_drain = pending_acks.len() <= 1;
         let should_wait = if fw_tx.is_some() {
             !entries_threshold_met && !bytes_threshold_met
+                && !(config.flush_when_queue_empty && queue_empty_after_drain)
         } else {
             pending_acks.len() > 1 && !entries_threshold_met && !bytes_threshold_met
         };
@@ -708,7 +847,7 @@ fn flush_write_buf(
     pending_acks: &mut Vec<tokio::sync::oneshot::Sender<()>>,
     pending_oldest_enqueue: &mut Option<Instant>,
     fw_tx: &Option<mpsc::Sender<ForceWriteRequest>>,
-    on_fatal_error: &Option<OnFatalError>,
+    on_fatal_error: &Option<Arc<dyn Fn(io::Error) + Send + Sync>>,
     shared_log_id: &Arc<std::sync::atomic::AtomicU64>,
     flush_trigger: FlushTrigger,
 ) {
@@ -770,12 +909,21 @@ fn flush_write_buf(
             metrics::JOURNAL_FORCE_WRITE_BATCH_BYTES.observe(batch_bytes as f64);
             metrics::JOURNAL_WRITE_BYTES.inc_by(batch_bytes);
 
+            let write_start_pos = state.position;
             if let Some(ref pad) = padding {
                 state.position += pad.len() as u64;
             }
             state.position += batch_bytes;
 
             let fd = file.as_raw_fd();
+
+            // Evict written pages from OS page cache to avoid pollution.
+            // Matches Java's journalRemoveFromPageCache.
+            if config.remove_from_page_cache {
+                let written_len = state.position - write_start_pos;
+                advise_dontneed(fd, write_start_pos as i64, written_len as i64);
+            }
+
             let acks = std::mem::take(pending_acks);
             let oldest_enqueue = pending_oldest_enqueue.take().unwrap_or_else(Instant::now);
 
@@ -817,7 +965,10 @@ fn flush_write_buf(
 // Force-write thread (StdEngine only)
 // ---------------------------------------------------------------------------
 
-fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
+fn force_write_loop(
+    rx: mpsc::Receiver<ForceWriteRequest>,
+    on_fatal_error: Option<Arc<dyn Fn(io::Error) + Send + Sync>>,
+) {
     loop {
         let first = match rx.recv() {
             Ok(req) => req,
@@ -844,6 +995,12 @@ fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
         let sync_start = Instant::now();
         if let Err(e) = sync_fd(last_fd) {
             tracing::error!("FATAL: journal fsync failed: {e}");
+            if let Some(ref cb) = on_fatal_error {
+                cb(io::Error::new(e.kind(), format!("journal fsync: {e}")));
+            }
+            // Drop all pending acks without sending — callers will get
+            // a RecvError ("journal ack lost") which surfaces as an I/O
+            // error. Do NOT ack entries that were not durably synced.
             continue;
         }
         let sync_elapsed = sync_start.elapsed();
@@ -856,6 +1013,20 @@ fn force_write_loop(rx: mpsc::Receiver<ForceWriteRequest>) {
         for ack in all_acks {
             let _ = ack.send(());
         }
+    }
+}
+
+/// Advise the OS to evict the given range from the page cache.
+/// No-op on non-Linux platforms.
+fn advise_dontneed(fd: RawFd, offset: i64, len: i64) {
+    #[cfg(target_os = "linux")]
+    {
+        // POSIX_FADV_DONTNEED = 4
+        unsafe { libc::posix_fadvise(fd, offset, len, libc::POSIX_FADV_DONTNEED); }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, offset, len);
     }
 }
 
@@ -885,24 +1056,34 @@ struct JournalFileState {
 
 impl JournalFileState {
     fn new(config: &JournalConfig) -> Self {
-        let log_id = Self::find_next_log_id(&config.journal_dir);
+        let log_id = Self::next_timestamp_log_id(&config.journal_dir);
         Self { log_id, file: None, position: 0 }
     }
 
-    fn find_next_log_id(dir: &Path) -> u64 {
-        let mut max_id = 0u64;
+    /// Generate the next journal log ID using wall-clock time.
+    /// Matches Java's `Journal.getTimestamp()` which uses `System.currentTimeMillis()`.
+    /// If an existing file already uses the same timestamp, increment until unique.
+    fn next_timestamp_log_id(dir: &Path) -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut max_existing = 0u64;
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.ends_with(".txn") {
                     if let Ok(id) = u64::from_str_radix(name.trim_end_matches(".txn"), 16) {
-                        if id > max_id { max_id = id; }
+                        if id > max_existing { max_existing = id; }
                     }
                 }
             }
         }
-        max_id + 1
+        // Ensure monotonically increasing: max(now, max_existing + 1)
+        std::cmp::max(now, max_existing + 1)
     }
 
     fn ensure_open(&mut self, config: &JournalConfig) -> Result<(), StorageError> {
@@ -929,10 +1110,62 @@ impl JournalFileState {
 
     fn rotate(&mut self, config: &JournalConfig) -> Result<(), StorageError> {
         self.file = None;
-        self.log_id += 1;
+        // Use wall-clock timestamp for the new journal file, matching Java's
+        // Journal.getTimestamp(). Ensure it's strictly greater than the current ID.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let new_id = std::cmp::max(now, self.log_id + 1);
+
+        // Journal file reuse: if enabled, try to rename an old journal file
+        // instead of creating a new one. Avoids filesystem metadata overhead.
+        // Matches Java's Journal.journalReuseFiles behavior.
+        if config.reuse_files {
+            if let Some(old_path) = find_reusable_journal(&config.journal_dir, new_id) {
+                let new_path = config.journal_dir.join(format!("{:x}.txn", new_id));
+                if fs::rename(&old_path, &new_path).is_ok() {
+                    // Truncate the file — ensure_open will write the header
+                    let _ = fs::OpenOptions::new().write(true).truncate(true).open(&new_path);
+                }
+            }
+        }
+
+        self.log_id = new_id;
         self.position = 0;
         self.ensure_open(config)
     }
+}
+
+/// Find the oldest journal file that can be reused.
+/// Matches Java's Journal.journalReuseFiles: picks the oldest .txn file
+/// that is not the current one.
+fn find_reusable_journal(dir: &Path, current_id: u64) -> Option<PathBuf> {
+    let mut oldest: Option<(u64, PathBuf)> = None;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(stem) = name.strip_suffix(".txn") {
+                if let Ok(id) = u64::from_str_radix(stem, 16) {
+                    if id == current_id {
+                        continue;
+                    }
+                    match &oldest {
+                        Some((old_id, _)) if id < *old_id => {
+                            oldest = Some((id, entry.path()));
+                        }
+                        None => {
+                            oldest = Some((id, entry.path()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    oldest.map(|(_, path)| path)
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +1176,22 @@ pub fn replay_journal<F>(
     journal_dir: &Path,
     last_mark: Option<format::LastMark>,
     mut callback: F,
+) -> Result<usize, StorageError>
+where
+    F: FnMut(&[u8]),
+{
+    replay_journal_opt(journal_dir, last_mark, false, &mut callback)
+}
+
+/// Replay journal entries from disk, optionally skipping corrupt records.
+/// When `skip_invalid_record` is true, scanning continues past corrupt
+/// entries instead of stopping — matching Java's `Journal.scanJournal()`
+/// with `skipInvalidRecord=true`.
+pub fn replay_journal_opt<F>(
+    journal_dir: &Path,
+    last_mark: Option<format::LastMark>,
+    skip_invalid_record: bool,
+    callback: &mut F,
 ) -> Result<usize, StorageError>
 where
     F: FnMut(&[u8]),
@@ -985,11 +1234,11 @@ where
             0
         };
 
-        let scan_data = &data[header_size..];
-        let entries = format::scan_journal_entries(scan_data, header.version());
-        for (idx, entry_data) in entries.iter().enumerate() {
-            let _ = start_offset;
-            let _ = idx;
+        // Skip past entries already covered by the lastMark checkpoint.
+        // start_offset is a byte offset into the post-header scan region.
+        let scan_data = &data[header_size + start_offset..];
+        let entries = format::scan_journal_entries_opt(scan_data, header.version(), skip_invalid_record);
+        for entry_data in &entries {
             callback(entry_data);
             total_replayed += 1;
         }

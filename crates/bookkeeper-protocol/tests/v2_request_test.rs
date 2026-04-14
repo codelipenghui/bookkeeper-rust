@@ -15,7 +15,7 @@ fn add_entry_round_trip() {
     let req = V2Request::AddEntry {
         flags: 0,
         master_key: [0u8; 20],
-        entry_data: entry_data.clone(),
+        entry_data: entry_data.clone(), deferred_sync: false,
     };
 
     let encoded = encode_request(&req);
@@ -70,15 +70,77 @@ fn batch_read_round_trip() {
         request_id: 12345,
         max_count: 100,
         max_size: 1048576,
+        master_key: None,
     };
     let encoded = encode_request(&req);
     let decoded = decode_request(encoded.freeze()).unwrap();
     match decoded {
-        V2Request::BatchReadEntry { ledger_id, request_id, max_count, .. } => {
+        V2Request::BatchReadEntry { ledger_id, request_id, max_count, master_key, .. } => {
             assert_eq!(ledger_id, 1);
             assert_eq!(request_id, 12345);
             assert_eq!(max_count, 100);
+            assert!(master_key.is_none(), "no fencing flag ⇒ no masterKey");
         }
         _ => panic!("expected BatchReadEntry"),
+    }
+}
+
+#[test]
+fn batch_read_with_fencing_round_trips_master_key() {
+    use bookkeeper_protocol::constants::{FLAG_DO_FENCING, MASTER_KEY_LENGTH};
+    let mk = [42u8; MASTER_KEY_LENGTH];
+    let req = V2Request::BatchReadEntry {
+        flags: FLAG_DO_FENCING,
+        ledger_id: 7,
+        start_entry_id: 3,
+        request_id: 99,
+        max_count: 10,
+        max_size: 65536,
+        master_key: Some(mk),
+    };
+    let encoded = encode_request(&req);
+    let decoded = decode_request(encoded.freeze()).unwrap();
+    match decoded {
+        V2Request::BatchReadEntry { flags, master_key, .. } => {
+            assert_eq!(flags & FLAG_DO_FENCING, FLAG_DO_FENCING);
+            assert_eq!(master_key, Some(mk),
+                "fenced batch-read must carry the 20-byte masterKey through the wire");
+        }
+        _ => panic!("expected BatchReadEntry"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V2 Auth protobuf AuthMessage wire format (P2)
+// ---------------------------------------------------------------------------
+
+/// V2 Auth request encodes payload as protobuf AuthMessage.
+/// Matches Java's BookieProtoEncoding.RequestEnDeCoderPreV3 for AUTH.
+#[test]
+fn auth_request_encodes_as_protobuf_auth_message() {
+    let req = V2Request::Auth { payload: Bytes::from_static(b"my-token") };
+    let encoded = encode_request(&req);
+    let decoded = decode_request(encoded.freeze()).unwrap();
+    match decoded {
+        V2Request::Auth { payload } => {
+            assert_eq!(payload.as_ref(), b"my-token");
+        }
+        _ => panic!("expected Auth"),
+    }
+}
+
+/// V2 Auth response encodes payload as protobuf AuthMessage (not standard header).
+/// Matches Java's BookieProtoEncoding.ResponseEnDeCoderPreV3.
+#[test]
+fn auth_response_java_compatible_format() {
+    use bookkeeper_protocol::v2::response::{V2Response, encode_response, decode_response};
+    let resp = V2Response::Auth { error_code: 0, payload: Bytes::from_static(b"auth-reply") };
+    let encoded = encode_response(&resp);
+    let decoded = decode_response(encoded.freeze()).unwrap();
+    match decoded {
+        V2Response::Auth { payload, .. } => {
+            assert_eq!(payload.as_ref(), b"auth-reply");
+        }
+        _ => panic!("expected Auth response"),
     }
 }

@@ -62,6 +62,8 @@ async fn spawn_elector(
                 auditor_zk,
                 paths,
                 0, // lost_bookie_recovery_delay_secs
+                0, // auditor_periodic_check_interval_secs (disabled)
+                0, // auditor_periodic_placement_check_interval_secs (disabled)
                 shutdown_rx,
             )
             .await;

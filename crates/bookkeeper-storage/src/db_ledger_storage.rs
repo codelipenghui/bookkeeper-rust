@@ -17,6 +17,18 @@ use crate::StorageError;
 use crate::ledger_storage::LedgerStorage;
 use crate::storage_metrics;
 
+/// Constant-time byte comparison to prevent timing attacks on master key checks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Subdirectory under each ledger/journal base dir where all data lives.
 /// Matches Java's `BookKeeperConstants.CURRENT_DIR = "current"`.
 pub const CURRENT_DIR: &str = "current";
@@ -24,8 +36,62 @@ pub const CURRENT_DIR: &str = "current";
 const DEFAULT_WRITE_CACHE_SIZE: usize = 256 * 1024 * 1024; // 256MB
 const DEFAULT_READ_CACHE_SIZE: usize = 64 * 1024 * 1024;  // 64MB
 const READ_CACHE_SEGMENTS: usize = 4;
-const MAX_ENTRY_LOG_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
+const DEFAULT_MAX_ENTRY_LOG_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
 const MAX_ENTRY_SIZE: usize = 100 * 1024 * 1024; // 100MB sanity limit
+/// Number of consecutive entries to read ahead on a cache miss.
+/// Matches Java's `dbStorage_readAheadCacheBatchSize` (default 100).
+const DEFAULT_READ_AHEAD_BATCH_SIZE: usize = 100;
+/// Max bytes to read ahead per cache miss.
+/// Matches Java's `dbStorage_readAheadCacheBatchBytesSize` (default 256KB).
+const DEFAULT_READ_AHEAD_MAX_BYTES: usize = 256 * 1024;
+
+/// Configurable storage parameters. Bridges `ServerConfig` fields to
+/// the storage layer so they aren't hardcoded constants.
+#[derive(Clone)]
+pub struct StorageConfig {
+    pub write_cache_max_size: usize,
+    pub read_cache_max_size: usize,
+    pub max_entry_log_size: u64,
+    pub read_ahead_batch_size: usize,
+    pub read_ahead_max_bytes: usize,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            write_cache_max_size: DEFAULT_WRITE_CACHE_SIZE,
+            read_cache_max_size: DEFAULT_READ_CACHE_SIZE,
+            max_entry_log_size: DEFAULT_MAX_ENTRY_LOG_SIZE,
+            read_ahead_batch_size: DEFAULT_READ_AHEAD_BATCH_SIZE,
+            read_ahead_max_bytes: DEFAULT_READ_AHEAD_MAX_BYTES,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Build from a `ServerConfig`, mapping the relevant fields.
+    pub fn from_server_config(cfg: &bookkeeper_config::server::ServerConfig) -> Self {
+        Self {
+            write_cache_max_size: (cfg.db_storage_write_cache_max_size_mb as usize) * 1024 * 1024,
+            read_cache_max_size: (cfg.db_storage_read_cache_max_size_mb as usize) * 1024 * 1024,
+            max_entry_log_size: if cfg.log_size_limit > 0 {
+                cfg.log_size_limit as u64
+            } else {
+                DEFAULT_MAX_ENTRY_LOG_SIZE
+            },
+            read_ahead_batch_size: if cfg.db_storage_read_ahead_cache_batch_size > 0 {
+                cfg.db_storage_read_ahead_cache_batch_size as usize
+            } else {
+                DEFAULT_READ_AHEAD_BATCH_SIZE
+            },
+            read_ahead_max_bytes: if cfg.db_storage_read_ahead_cache_batch_bytes_size > 0 {
+                cfg.db_storage_read_ahead_cache_batch_bytes_size as usize
+            } else {
+                DEFAULT_READ_AHEAD_MAX_BYTES
+            },
+        }
+    }
+}
 
 struct EntryLogState {
     log_id: u32,
@@ -50,7 +116,7 @@ pub struct DbLedgerStorage {
     base_dir: PathBuf,
     write_cache: RwLock<WriteCache>,
     write_cache_being_flushed: RwLock<WriteCache>,
-    read_cache: ReadCache,
+    read_cache: Arc<ReadCache>,
     entry_location_index: EntryLocationIndex,
     ledger_index: LedgerMetadataIndex,
     entry_log_dir: PathBuf,
@@ -62,6 +128,8 @@ pub struct DbLedgerStorage {
     journal: Option<crate::journal::writer::Journal>,
     /// Journal directory path (for cleanup after checkpoint).
     journal_dir: Option<PathBuf>,
+    /// Max old journal files to keep after checkpoint. Matches Java's `maxBackupJournals`.
+    max_backup_journals: usize,
     /// In-memory LAC cache. Updated on every add_entry (in-memory only).
     /// Persisted to RocksDB during flush/checkpoint. Matches Java's
     /// TransientLedgerInfo which keeps LAC in memory and only writes to
@@ -75,6 +143,8 @@ pub struct DbLedgerStorage {
     meta_cache: dashmap::DashMap<i64, Arc<LedgerMetaCacheEntry>>,
     /// LAC watcher registry for long poll reads.
     lac_watchers: crate::lac_watcher::LacWatcherRegistry,
+    /// Configurable storage parameters (cache sizes, read-ahead, log size).
+    storage_config: StorageConfig,
 }
 
 impl DbLedgerStorage {
@@ -90,6 +160,17 @@ impl DbLedgerStorage {
         ledger_io: Arc<dyn crate::io_engine::LedgerIo>,
         entry_location_rocksdb_conf: Option<&Path>,
         ledger_metadata_rocksdb_conf: Option<&Path>,
+    ) -> Result<Self, StorageError> {
+        Self::open_full(base_dir, ledger_io, entry_location_rocksdb_conf, ledger_metadata_rocksdb_conf, StorageConfig::default())
+    }
+
+    /// Full constructor with all configuration options.
+    pub fn open_full(
+        base_dir: &Path,
+        ledger_io: Arc<dyn crate::io_engine::LedgerIo>,
+        entry_location_rocksdb_conf: Option<&Path>,
+        ledger_metadata_rocksdb_conf: Option<&Path>,
+        storage_config: StorageConfig,
     ) -> Result<Self, StorageError> {
         // All data lives under `<base_dir>/current/`, matching Java's
         // BookieImpl.getCurrentDirectory(dir). Entry log files (.log) sit
@@ -118,9 +199,9 @@ impl DbLedgerStorage {
 
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
-            write_cache: RwLock::new(WriteCache::new(DEFAULT_WRITE_CACHE_SIZE)),
-            write_cache_being_flushed: RwLock::new(WriteCache::new(DEFAULT_WRITE_CACHE_SIZE)),
-            read_cache: ReadCache::new(DEFAULT_READ_CACHE_SIZE, READ_CACHE_SEGMENTS),
+            write_cache: RwLock::new(WriteCache::new(storage_config.write_cache_max_size)),
+            write_cache_being_flushed: RwLock::new(WriteCache::new(storage_config.write_cache_max_size)),
+            read_cache: Arc::new(ReadCache::new(storage_config.read_cache_max_size, READ_CACHE_SEGMENTS)),
             entry_location_index,
             ledger_index,
             entry_log_dir,
@@ -133,10 +214,12 @@ impl DbLedgerStorage {
             ledger_io,
             journal: None,
             journal_dir: None,
+            max_backup_journals: 5,
             lac_cache: dashmap::DashMap::new(),
             explicit_lac_cache: dashmap::DashMap::new(),
             meta_cache: dashmap::DashMap::new(),
             lac_watchers: crate::lac_watcher::LacWatcherRegistry::new(),
+            storage_config,
         })
     }
 
@@ -170,6 +253,8 @@ impl DbLedgerStorage {
         config: crate::journal::writer::JournalConfig,
         journal_io: std::sync::Arc<dyn crate::io_engine::JournalIo>,
         on_fatal_error: Option<crate::journal::writer::OnFatalError>,
+        #[allow(unused_variables)]
+        skip_invalid_record: bool,
     ) -> Result<usize, StorageError> {
         // Read lastMark from the ledger directory. This tells us where
         // the last successful checkpoint was, so we only replay journal
@@ -178,7 +263,7 @@ impl DbLedgerStorage {
         let last_mark = crate::checkpoint::read_last_mark(&mark_path).ok();
 
         // Replay existing journal entries (crash recovery)
-        let replayed = crate::journal::writer::replay_journal(journal_dir, last_mark, |entry_data| {
+        let replayed = crate::journal::writer::replay_journal_opt(journal_dir, last_mark, skip_invalid_record, &mut |entry_data| {
             if entry_data.len() >= 32 {
                 // Replay into write cache (same as add_entry, but without re-journaling)
                 let ledger_id = Self::extract_ledger_id(entry_data);
@@ -215,12 +300,16 @@ impl DbLedgerStorage {
     /// are preserved because they may contain entries not yet flushed
     /// to entry logs. This matches Java's SyncThread cleanup which
     /// only removes journals older than the lastMark.
+    /// Remove old journal files after checkpoint, keeping `max_backup_journals`
+    /// files before the current one. Matches Java's `Journal.checkpointComplete()`
+    /// which uses `maxBackupJournals` to retain a safety margin of old journals.
     fn cleanup_journals(&self) {
         let current_id = self.journal.as_ref()
             .and_then(|j| j.current_log_id());
         let Some(current_id) = current_id else { return; };
 
         if let Some(ref journal_dir) = self.journal_dir {
+            let mut old_journals: Vec<(u64, std::path::PathBuf)> = Vec::new();
             if let Ok(entries) = fs::read_dir(journal_dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
@@ -230,13 +319,23 @@ impl DbLedgerStorage {
                             name.trim_end_matches(".txn"), 16,
                         ) {
                             if id < current_id {
-                                let _ = fs::remove_file(entry.path());
+                                old_journals.push((id, entry.path()));
                             }
                         }
                     }
                 }
             }
+            // Sort descending so we keep the most recent N
+            old_journals.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_id, path) in old_journals.iter().skip(self.max_backup_journals) {
+                let _ = fs::remove_file(path);
+            }
         }
+    }
+
+    /// Set the max number of old journal files to retain after checkpoint.
+    pub fn set_max_backup_journals(&mut self, n: usize) {
+        self.max_backup_journals = n;
     }
 
     /// Frame an entry for the entry log: `[size(4 BE)][payload]`.
@@ -322,9 +421,17 @@ impl LedgerStorage for DbLedgerStorage {
             self.lac_watchers.notify_lac_advance(ledger_id, lac);
         }
 
-        // Try write cache
+        // Try write cache. Use try_read() first to detect lock contention
+        // from concurrent flush cache swap (write lock).
         {
-            let cache = self.write_cache.read();
+            let cache = match self.write_cache.try_read() {
+                Some(guard) => guard,
+                None => {
+                    // Read lock blocked — a flush cache swap is in progress.
+                    storage_metrics::ADD_ENTRY_BLOCKED_BY_FLUSH.inc();
+                    self.write_cache.read()
+                }
+            };
             if cache.put(ledger_id, entry_id, entry).is_ok() {
                 storage_metrics::ADD_ENTRY.observe(add_start.elapsed().as_secs_f64());
                 return Ok(());
@@ -369,6 +476,58 @@ impl LedgerStorage for DbLedgerStorage {
             storage_metrics::READ_ENTRYLOG_TIME.inc_by(entrylog_start.elapsed().as_nanos() as u64);
 
             self.read_cache.put(ledger_id, entry_id, &data);
+
+            // Read-ahead: collect index locations synchronously (fast RocksDB
+            // point reads), then spawn the entry log I/O as a background task
+            // so the caller gets their entry immediately.
+            // Matches Java's DbLedgerStorage readAheadCacheBatchSize behavior.
+            let mut ahead_locs: Vec<(i64, u64)> = Vec::new();
+            let mut ahead_bytes = data.len();
+            let ra_batch = self.storage_config.read_ahead_batch_size;
+            let ra_max_bytes = self.storage_config.read_ahead_max_bytes;
+            for ahead_eid in (entry_id + 1)..(entry_id + 1 + ra_batch as i64) {
+                if ahead_bytes >= ra_max_bytes {
+                    break;
+                }
+                if self.read_cache.get(ledger_id, ahead_eid).is_some() {
+                    continue;
+                }
+                match self.entry_location_index.get(ledger_id, ahead_eid) {
+                    Ok(Some(loc)) => {
+                        ahead_locs.push((ahead_eid, loc));
+                        // Estimate ~4KB per entry for the byte budget
+                        ahead_bytes += 4096;
+                    }
+                    _ => break,
+                }
+            }
+
+            if !ahead_locs.is_empty() {
+                let cache = Arc::clone(&self.read_cache);
+                let io = Arc::clone(&self.ledger_io);
+                let dir = self.entry_log_dir.clone();
+                tokio::spawn(async move {
+                    let mut total = 0usize;
+                    for (eid, loc_u64) in ahead_locs {
+                        if total >= ra_max_bytes {
+                            break;
+                        }
+                        let loc = EntryLocation::from_u64(loc_u64);
+                        let pos = loc.position() as u64;
+                        if pos < 4 {
+                            break;
+                        }
+                        match io.read_framed_entry(&dir, loc.log_id(), pos - 4, MAX_ENTRY_SIZE).await {
+                            Ok(ahead_data) => {
+                                total += ahead_data.len();
+                                cache.put(ledger_id, eid, &ahead_data);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+
             storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
             return Ok(Bytes::from(data));
         }
@@ -384,9 +543,12 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn set_fenced(&self, ledger_id: i64) -> Result<bool, StorageError> {
-        self.ledger_index.set_fenced(ledger_id)?;
-        // Mirror the fenced bit into the cache so validate_for_write sees it
-        // without going back to RocksDB. Preserve master_key if already cached.
+        // Update the in-memory cache BEFORE persisting to RocksDB so that
+        // concurrent validate_for_write calls see the fenced bit immediately.
+        // A brief false-positive fence (cache says fenced, RocksDB write
+        // hasn't completed yet) is safe — it just rejects a write that would
+        // have been rejected moments later anyway. The alternative (RocksDB
+        // first) leaves a window where writes succeed on a fencing ledger.
         let master_key = self
             .meta_cache
             .get(&ledger_id)
@@ -395,6 +557,7 @@ impl LedgerStorage for DbLedgerStorage {
             ledger_id,
             Arc::new(LedgerMetaCacheEntry { fenced: true, master_key }),
         );
+        self.ledger_index.set_fenced(ledger_id)?;
         Ok(true)
     }
 
@@ -425,7 +588,7 @@ impl LedgerStorage for DbLedgerStorage {
         // Fast path: cached ledger with a master key already set.
         if let Some(meta) = self.meta_cache.get(&ledger_id) {
             if let Some(stored) = &meta.master_key {
-                if stored.as_slice() != master_key {
+                if !constant_time_eq(stored.as_slice(), master_key) {
                     return Err(StorageError::Unauthorized(ledger_id));
                 }
                 return Ok(());
@@ -435,7 +598,7 @@ impl LedgerStorage for DbLedgerStorage {
         match self.ledger_index.get(ledger_id)? {
             Some(data) => {
                 if let Some(stored_key) = &data.master_key {
-                    if stored_key != master_key {
+                    if !constant_time_eq(stored_key, master_key) {
                         return Err(StorageError::Unauthorized(ledger_id));
                     }
                     self.meta_cache.insert(
@@ -536,11 +699,16 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     async fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError> {
-        let (fd, offset, log_id) = {
+        let encoded_size = (4 + entry.len()) as u64;
+
+        // Reserve offset atomically under the lock. The offset is advanced
+        // *before* the I/O so that a concurrent caller gets a distinct
+        // position. If the write fails we accept a gap in the log — this
+        // is the same trade-off Java makes in SingleDirectoryDbLedgerStorage.
+        let (fd, write_offset, log_id, _file_guard) = {
             let mut log_state = self.log_state.lock().unwrap();
 
-            let encoded_size = (4 + entry.len()) as u64;
-            if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
+            if log_state.offset + encoded_size > self.storage_config.max_entry_log_size {
                 log_state.file = None;
                 log_state.log_id += 1;
                 log_state.offset = LOGFILE_HEADER_SIZE as u64;
@@ -554,20 +722,21 @@ impl LedgerStorage for DbLedgerStorage {
             }
 
             let fd = log_state.file.as_ref().unwrap().as_raw_fd();
-            let offset = log_state.offset;
+            // Clone to keep the fd valid through the async write phase
+            let file_guard = log_state.file.as_ref().unwrap().try_clone()?;
+            let write_offset = log_state.offset;
             let log_id = log_state.log_id;
-            (fd, offset, log_id)
+
+            // Reserve the space atomically before releasing the lock
+            log_state.offset += encoded_size;
+
+            (fd, write_offset, log_id, file_guard)
         };
 
         let framed = Self::frame_entry(entry);
-        let encoded_size = framed.len() as u64;
-        self.ledger_io.write_batch(fd, offset, vec![framed]).await?;
+        self.ledger_io.write_batch(fd, write_offset, vec![framed]).await?;
 
-        // Advance offset only after successful write
-        let mut log_state = self.log_state.lock().unwrap();
-        log_state.offset = offset + encoded_size;
-
-        let position = offset + 4;
+        let position = write_offset + 4;
         let location = EntryLocation::new(log_id, position as u32).to_u64();
         Ok(location)
     }
@@ -575,6 +744,19 @@ impl LedgerStorage for DbLedgerStorage {
     fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError> {
         // No per-entry flush needed — write_batch already wrote to disk.
         // Just update the RocksDB index.
+        self.entry_location_index.put_batch(batch)?;
+        self.entry_location_index.flush()
+    }
+
+    async fn update_entry_locations_with_flush_lock(
+        &self,
+        batch: &[(i64, i64, u64)],
+    ) -> Result<(), StorageError> {
+        // Acquire the flush mutex to prevent a concurrent flush from writing
+        // stale pre-compaction locations to the index.
+        // Matches Java's SingleDirectoryDbLedgerStorage.updateEntriesLocations()
+        // which acquires flushMutex before calling entryLocationIndex.updateLocations().
+        let _lock = self.flush_mutex.lock().await;
         self.entry_location_index.put_batch(batch)?;
         self.entry_location_index.flush()
     }
@@ -590,15 +772,25 @@ impl LedgerStorage for DbLedgerStorage {
         Ok(())
     }
 
+    async fn force_journal_sync(&self) -> Result<(), StorageError> {
+        if let Some(journal) = self.journal.as_ref() {
+            journal.force_sync().await?;
+        }
+        Ok(())
+    }
+
     async fn flush(&self) -> Result<(), StorageError> {
         let flush_start = Instant::now();
         let _lock = self.flush_mutex.lock().await;
 
-        // Swap: active → being_flushed, being_flushed (cleared) → active
+        // Swap: active → being_flushed, being_flushed (cleared) → active.
+        // The write lock briefly blocks all concurrent add_entry() read-lock attempts.
         {
+            let swap_start = Instant::now();
             let mut active = self.write_cache.write();
             let mut flushing = self.write_cache_being_flushed.write();
             std::mem::swap(&mut *active, &mut *flushing);
+            storage_metrics::FLUSH_CACHE_SWAP.observe(swap_start.elapsed().as_secs_f64());
         }
 
         // Phase 1: Under log_state mutex, collect all framed entries and metadata.
@@ -607,6 +799,10 @@ impl LedgerStorage for DbLedgerStorage {
         // and drop all guards before the async I/O phase.
         struct FlushSegment {
             fd: RawFd,
+            /// Keeps the file handle alive so `fd` remains valid through the
+            /// async write phase. Without this, log rotation drops the File
+            /// and invalidates the fd (bad file descriptor).
+            _file_guard: fs::File,
             write_offset: u64,
             framed_entries: Vec<Vec<u8>>,
             locations: Vec<(i64, i64, u32, u64)>, // (ledger_id, entry_id, log_id, position)
@@ -642,8 +838,10 @@ impl LedgerStorage for DbLedgerStorage {
                     log_state.file = Some(file);
                 }
 
+                let file_ref = log_state.file.as_ref().unwrap();
                 let mut current = FlushSegment {
-                    fd: log_state.file.as_ref().unwrap().as_raw_fd(),
+                    fd: file_ref.as_raw_fd(),
+                    _file_guard: file_ref.try_clone()?,
                     write_offset: log_state.offset,
                     framed_entries: Vec::new(),
                     locations: Vec::new(),
@@ -653,7 +851,7 @@ impl LedgerStorage for DbLedgerStorage {
                     let entry_data = &flushing_data[offset..offset + size];
                     let encoded_size = (4 + entry_data.len()) as u64;
 
-                    if log_state.offset + encoded_size > MAX_ENTRY_LOG_SIZE {
+                    if log_state.offset + encoded_size > self.storage_config.max_entry_log_size {
                         // Push the current segment if it has entries
                         if !current.framed_entries.is_empty() {
                             segs.push(current);
@@ -668,8 +866,10 @@ impl LedgerStorage for DbLedgerStorage {
                         let file = fs::OpenOptions::new().read(true).write(true).open(&new_path)?;
                         log_state.file = Some(file);
 
+                        let new_file_ref = log_state.file.as_ref().unwrap();
                         current = FlushSegment {
-                            fd: log_state.file.as_ref().unwrap().as_raw_fd(),
+                            fd: new_file_ref.as_raw_fd(),
+                            _file_guard: new_file_ref.try_clone()?,
                             write_offset: log_state.offset,
                             framed_entries: Vec::new(),
                             locations: Vec::new(),
@@ -696,6 +896,7 @@ impl LedgerStorage for DbLedgerStorage {
         // Phase 2: Async I/O (no non-Send guards held)
         let entrylog_start = Instant::now();
         let mut batch = Vec::with_capacity(entry_count);
+        let mut file_guards: Vec<fs::File> = Vec::new();
         for segment in segments {
             self.ledger_io.write_batch(
                 segment.fd,
@@ -706,6 +907,15 @@ impl LedgerStorage for DbLedgerStorage {
                 batch.push((ledger_id, entry_id,
                     EntryLocation::new(log_id, position as u32).to_u64()));
             }
+            file_guards.push(segment._file_guard);
+        }
+
+        // Fsync all entry log files BEFORE updating the RocksDB index.
+        // Without this, a crash after the index update but before the
+        // entry log data reaches disk would leave the index pointing
+        // to unwritten/partial data — corrupting reads after recovery.
+        for guard in &file_guards {
+            guard.sync_data()?;
         }
         storage_metrics::FLUSH_ENTRYLOG.observe(entrylog_start.elapsed().as_secs_f64());
 
@@ -738,20 +948,26 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     async fn checkpoint(&self) -> Result<(), StorageError> {
+        // Two-phase checkpoint protocol matching Java's CheckpointSource:
+        // 1. Snapshot journal position BEFORE flush
+        // 2. Flush write cache + entry logs + indexes
+        // 3. Only persist lastMark AFTER flush succeeds
+        //
+        // If the flush fails at any point, lastMark stays at the
+        // previous safe position — crash recovery replays from there.
+        let cp = if let Some(log_id) = self.journal.as_ref().and_then(|j| j.current_log_id()) {
+            Some(crate::checkpoint::Checkpoint::new(log_id as i64, 0))
+        } else {
+            None
+        };
+
+        // Phase 2: Flush everything
         self.flush().await?;
 
-        // Write lastMark to each ledger directory. This records the
-        // current journal position so that:
-        // 1. Crash recovery knows where to start replaying
-        // 2. cleanup_journals knows which files are safe to delete
-        // 3. A Java bookie restarting on this data dir finds a valid mark
-        // Matches Java's checkpointComplete → rollLog → writeLogMark flow.
-        if let Some(log_id) = self.journal.as_ref().and_then(|j| j.current_log_id()) {
-            let mark = crate::journal::format::LastMark::new(log_id as i64, 0);
-            // Write to the ledger directory's current/ subdir.
-            // Java writes to ALL ledger dirs; we have one (base_dir).
-            let mark_path = self.base_dir.join(CURRENT_DIR).join("lastMark");
-            if let Err(e) = crate::checkpoint::write_last_mark(&mark_path, &mark) {
+        // Phase 3: Persist lastMark only after successful flush.
+        // Matches Java's `journal.checkpointComplete(cp, true)`.
+        if let Some(cp) = cp {
+            if let Err(e) = cp.complete(&self.base_dir) {
                 tracing::warn!("Failed to write lastMark: {e}");
             }
         }
@@ -778,7 +994,7 @@ impl LedgerStorage for DbLedgerStorage {
         match self.ledger_index.get(ledger_id)? {
             Some(data) => {
                 if let Some(stored_key) = &data.master_key {
-                    if stored_key != master_key {
+                    if !constant_time_eq(stored_key, master_key) {
                         return Err(StorageError::Unauthorized(ledger_id));
                     }
                     self.meta_cache.insert(
@@ -814,5 +1030,87 @@ impl LedgerStorage for DbLedgerStorage {
                 Ok(false)
             }
         }
+    }
+
+    fn get_entries_of_ledger(&self, ledger_id: i64) -> Result<Vec<i64>, StorageError> {
+        let entries = self.entry_location_index.iter_ledger_entries(ledger_id)?;
+        Ok(entries.into_iter().map(|(eid, _)| eid).collect())
+    }
+
+    async fn local_consistency_check(&self, rate_limit: u64) -> Result<usize, StorageError> {
+        let ledgers = self.ledger_index.list_all_ledgers()?;
+        let mut errors = 0usize;
+        let mut checked = 0u64;
+        let rate_interval = if rate_limit > 0 {
+            Some(std::time::Duration::from_secs_f64(1.0 / rate_limit as f64))
+        } else {
+            None
+        };
+        let mut last_check = std::time::Instant::now();
+
+        for ledger_id in &ledgers {
+            let entries = match self.entry_location_index.iter_ledger_entries(*ledger_id) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("scrub: failed to iterate entries for ledger {ledger_id}: {e}");
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            for (entry_id, location) in &entries {
+                // Rate limiting
+                if let Some(interval) = rate_interval {
+                    let elapsed = last_check.elapsed();
+                    if elapsed < interval {
+                        tokio::time::sleep(interval - elapsed).await;
+                    }
+                    last_check = std::time::Instant::now();
+                }
+
+                let loc = elf::EntryLocation::from_u64(*location);
+                let log_id = loc.log_id();
+                // Position in the entry log (location points to the entry data,
+                // which starts 4 bytes after the size prefix)
+                let pos = loc.position() as u64;
+                let read_offset = pos - 4; // include the size prefix
+
+                match self.ledger_io.read_framed_entry(
+                    &self.entry_log_dir, log_id, read_offset, MAX_ENTRY_SIZE,
+                ).await {
+                    Ok(data) => {
+                        // Verify ledger_id and entry_id in the entry header
+                        if data.len() < 16 {
+                            tracing::warn!(
+                                "scrub: entry too short: ledger={ledger_id}, entry={entry_id}, \
+                                 log={log_id}, size={}",
+                                data.len()
+                            );
+                            errors += 1;
+                            continue;
+                        }
+                        let stored_lid = i64::from_be_bytes(data[0..8].try_into().unwrap());
+                        let stored_eid = i64::from_be_bytes(data[8..16].try_into().unwrap());
+                        if stored_lid != *ledger_id || stored_eid != *entry_id {
+                            tracing::warn!(
+                                "scrub: ID mismatch at log={log_id} pos={pos}: \
+                                 expected ({ledger_id},{entry_id}), found ({stored_lid},{stored_eid})"
+                            );
+                            errors += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "scrub: failed to read entry: ledger={ledger_id}, entry={entry_id}, \
+                             log={log_id}, pos={pos}: {e}"
+                        );
+                        errors += 1;
+                    }
+                }
+                checked += 1;
+            }
+        }
+        tracing::info!("scrub: checked {checked} entries across {} ledgers, {errors} errors", ledgers.len());
+        Ok(errors)
     }
 }

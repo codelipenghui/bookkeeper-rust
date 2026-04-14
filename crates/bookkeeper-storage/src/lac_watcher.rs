@@ -1,24 +1,65 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Trait abstracting over sync and async sender types for the drain helper.
+trait WatcherSender: Send {
+    fn fire(self, value: i64);
+}
+impl WatcherSender for std::sync::mpsc::Sender<i64> {
+    fn fire(self, v: i64) { let _ = self.send(v); }
+}
+impl WatcherSender for tokio::sync::oneshot::Sender<i64> {
+    fn fire(self, v: i64) { let _ = self.send(v); }
+}
+
+/// Drain watchers from a map entry where the predicate matches, returning
+/// senders to fire. Keeps non-matching watchers in the list.
+fn drain_matching<S: WatcherSender>(
+    map: &mut HashMap<i64, Vec<(i64, S)>>,
+    ledger_id: i64,
+    predicate: impl Fn(i64) -> bool,
+) -> Vec<S> {
+    let Some(list) = map.get_mut(&ledger_id) else { return Vec::new() };
+    let mut remaining = Vec::new();
+    let mut notify = Vec::new();
+    for (prev, tx) in list.drain(..) {
+        if predicate(prev) {
+            notify.push(tx);
+        } else {
+            remaining.push((prev, tx));
+        }
+    }
+    *list = remaining;
+    notify
+}
+
+/// Remove all watchers for a ledger and return senders to fire.
+fn remove_all<S: WatcherSender>(
+    map: &mut HashMap<i64, Vec<(i64, S)>>,
+    ledger_id: i64,
+) -> Vec<S> {
+    map.remove(&ledger_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, tx)| tx)
+        .collect()
+}
+
 /// Per-ledger LAC watcher registry for long poll reads.
-///
-/// Uses std::sync channels (not tokio) so watchers work from sync context
-/// (spawn_blocking). Matches Java's TransientLedgerInfo watcher mechanism.
 pub struct LacWatcherRegistry {
     watchers: Mutex<HashMap<i64, Vec<(i64, std::sync::mpsc::Sender<i64>)>>>,
+    async_watchers: Mutex<HashMap<i64, Vec<(i64, tokio::sync::oneshot::Sender<i64>)>>>,
 }
 
 impl LacWatcherRegistry {
     pub fn new() -> Self {
         Self {
             watchers: Mutex::new(HashMap::new()),
+            async_watchers: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Register a watcher that fires when LAC advances past `previous_lac`.
-    /// Returns a sync receiver that blocks until notified or timeout.
-    /// If current LAC already > previous_lac, returns None (read immediately).
+    /// Register a sync watcher. Returns None if LAC already advanced.
     pub fn watch(
         &self,
         ledger_id: i64,
@@ -26,61 +67,55 @@ impl LacWatcherRegistry {
         current_lac: i64,
     ) -> Option<std::sync::mpsc::Receiver<i64>> {
         if current_lac > previous_lac {
-            return None; // already advanced
+            return None;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut watchers = self.watchers.lock().unwrap();
-        watchers.entry(ledger_id).or_default().push((previous_lac, tx));
+        self.watchers.lock().unwrap().entry(ledger_id).or_default().push((previous_lac, tx));
+        Some(rx)
+    }
+
+    /// Register an async watcher. Returns None if LAC already advanced.
+    pub fn watch_async(
+        &self,
+        ledger_id: i64,
+        previous_lac: i64,
+        current_lac: i64,
+    ) -> Option<tokio::sync::oneshot::Receiver<i64>> {
+        if current_lac > previous_lac {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.async_watchers.lock().unwrap().entry(ledger_id).or_default().push((previous_lac, tx));
         Some(rx)
     }
 
     /// Notify all watchers for a ledger that LAC has advanced.
-    /// Releases the lock before sending to avoid serializing under concurrent load.
     pub fn notify_lac_advance(&self, ledger_id: i64, new_lac: i64) {
-        let to_notify: Vec<std::sync::mpsc::Sender<i64>> = {
-            let mut watchers = self.watchers.lock().unwrap();
-            if let Some(list) = watchers.get_mut(&ledger_id) {
-                let mut remaining = Vec::new();
-                let mut notify = Vec::new();
-                for (prev, tx) in list.drain(..) {
-                    if new_lac > prev {
-                        notify.push(tx);
-                    } else {
-                        remaining.push((prev, tx));
-                    }
-                }
-                *list = remaining;
-                notify
-            } else {
-                Vec::new()
-            }
-        }; // lock released
-        for tx in to_notify {
-            let _ = tx.send(new_lac);
-        }
+        let sync = drain_matching(&mut self.watchers.lock().unwrap(), ledger_id, |prev| new_lac > prev);
+        for tx in sync { tx.fire(new_lac); }
+
+        let async_ = drain_matching(&mut self.async_watchers.lock().unwrap(), ledger_id, |prev| new_lac > prev);
+        for tx in async_ { tx.fire(new_lac); }
     }
 
     /// Fire all watchers for a ledger (e.g., ledger closed).
-    /// Matches Java's TransientLedgerInfo notifyWatchers(Long.MAX_VALUE) on close.
     pub fn notify_ledger_closed(&self, ledger_id: i64) {
-        let mut watchers = self.watchers.lock().unwrap();
-        if let Some(list) = watchers.remove(&ledger_id) {
-            for (_, tx) in list {
-                let _ = tx.send(i64::MAX);
-            }
-        }
+        let sync = remove_all(&mut self.watchers.lock().unwrap(), ledger_id);
+        for tx in sync { tx.fire(i64::MAX); }
+
+        let async_ = remove_all(&mut self.async_watchers.lock().unwrap(), ledger_id);
+        for tx in async_ { tx.fire(i64::MAX); }
     }
 
     /// Remove all watchers for a ledger.
     pub fn cancel_watchers(&self, ledger_id: i64) {
-        let mut watchers = self.watchers.lock().unwrap();
-        watchers.remove(&ledger_id);
+        self.watchers.lock().unwrap().remove(&ledger_id);
+        self.async_watchers.lock().unwrap().remove(&ledger_id);
     }
 
     /// Clean up watchers for ledgers that no longer exist.
-    /// Call periodically to prevent memory leaks from abandoned watchers.
     pub fn cleanup_stale(&self, active_ledgers: &std::collections::HashSet<i64>) {
-        let mut watchers = self.watchers.lock().unwrap();
-        watchers.retain(|lid, _| active_ledgers.contains(lid));
+        self.watchers.lock().unwrap().retain(|lid, _| active_ledgers.contains(lid));
+        self.async_watchers.lock().unwrap().retain(|lid, _| active_ledgers.contains(lid));
     }
 }

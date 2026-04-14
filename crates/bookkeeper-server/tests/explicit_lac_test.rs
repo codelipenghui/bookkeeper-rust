@@ -14,7 +14,7 @@ use tempfile::TempDir;
 
 fn setup() -> (RequestProcessor, TempDir) {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
     let state = BookieStateManager::new();
     state.transition_to(BookieState::Running);
     let processor = RequestProcessor::new(Arc::new(storage), Arc::new(state));
@@ -41,7 +41,7 @@ async fn write_lac_and_read_lac_round_trip() {
     let req = V2Request::AddEntry {
         flags: 0,
         master_key,
-        entry_data: Bytes::from(make_entry(ledger_id, 0, -1, b"hello")),
+        entry_data: Bytes::from(make_entry(ledger_id, 0, -1, b"hello")), deferred_sync: false,
     };
     let resp = processor.process_request(req).await;
     assert!(matches!(resp, V2Response::Add { error_code: V2_EOK, .. }));
@@ -101,7 +101,7 @@ async fn batch_read_returns_multiple_entries() {
         let req = V2Request::AddEntry {
             flags: 0,
             master_key,
-            entry_data: Bytes::from(make_entry(ledger_id, i, i - 1, payload.as_bytes())),
+            entry_data: Bytes::from(make_entry(ledger_id, i, i - 1, payload.as_bytes())), deferred_sync: false,
         };
         processor.process_request(req).await;
     }
@@ -114,6 +114,7 @@ async fn batch_read_returns_multiple_entries() {
         request_id: 1,
         max_count: 5,
         max_size: 1024 * 1024,
+        master_key: None,
     };
     let resp = processor.process_request(req).await;
     match resp {
@@ -136,7 +137,7 @@ async fn batch_read_respects_max_count() {
         let req = V2Request::AddEntry {
             flags: 0,
             master_key,
-            entry_data: Bytes::from(make_entry(ledger_id, i, i - 1, b"data")),
+            entry_data: Bytes::from(make_entry(ledger_id, i, i - 1, b"data")), deferred_sync: false,
         };
         processor.process_request(req).await;
     }
@@ -149,6 +150,7 @@ async fn batch_read_respects_max_count() {
         request_id: 99,
         max_count: 3,
         max_size: 1024 * 1024,
+        master_key: None,
     };
     let resp = processor.process_request(req).await;
     match resp {
@@ -170,7 +172,7 @@ async fn write_lac_with_wrong_master_key_rejected() {
     let req = V2Request::AddEntry {
         flags: 0,
         master_key,
-        entry_data: Bytes::from(make_entry(ledger_id, 0, -1, b"x")),
+        entry_data: Bytes::from(make_entry(ledger_id, 0, -1, b"x")), deferred_sync: false,
     };
     processor.process_request(req).await;
 

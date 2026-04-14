@@ -71,8 +71,27 @@ pub trait LedgerStorage: Send + Sync {
     /// Update a batch of entry locations in the index.
     fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError>;
 
+    /// Update entry locations while holding the flush lock.
+    /// Ensures no concurrent flush can overwrite the compaction's index updates.
+    /// Matches Java's `updateEntriesLocations` which acquires flushMutex before
+    /// updating the entry location index, preventing a race where a concurrent
+    /// flush writes stale pre-compaction locations.
+    async fn update_entry_locations_with_flush_lock(
+        &self,
+        batch: &[(i64, i64, u64)],
+    ) -> Result<(), StorageError> {
+        // Default: no lock, just delegate. DbLedgerStorage overrides.
+        self.update_entry_locations(batch)
+    }
+
     /// Get the LAC watcher registry for long poll reads.
     fn lac_watchers(&self) -> Option<&crate::lac_watcher::LacWatcherRegistry>;
+
+    /// Force the journal to fsync all pending data.
+    /// Used by ForceLedger — lighter than a full flush since it only
+    /// ensures journal durability without flushing the write cache or
+    /// updating the RocksDB index.
+    async fn force_journal_sync(&self) -> Result<(), StorageError>;
 
     /// Flush all pending data to persistent storage.
     async fn flush(&self) -> Result<(), StorageError>;
@@ -80,7 +99,21 @@ pub trait LedgerStorage: Send + Sync {
     /// Perform a checkpoint: flush and return completion.
     async fn checkpoint(&self) -> Result<(), StorageError>;
 
+    /// Run a local consistency check on all stored entries.
+    /// Verifies that for each entry in the location index, the entry log
+    /// contains the correct `ledgerId` and `entryId` at the indexed position.
+    /// Matches Java's `InterleavedLedgerStorage.localConsistencyCheck()`.
+    ///
+    /// `rate_limit` controls max entries/second to check (0 = unlimited).
+    /// Returns the number of errors found.
+    async fn local_consistency_check(&self, rate_limit: u64) -> Result<usize, StorageError>;
+
     /// Validate a ledger for writing: check existence, fencing, and master key in one operation.
     /// Creates the ledger if it doesn't exist. Returns true if the ledger is fenced.
     fn validate_for_write(&self, ledger_id: i64, master_key: &[u8]) -> Result<bool, StorageError>;
+
+    /// Get the list of entry IDs stored for a ledger. Used by GetListOfEntriesOfLedger
+    /// operation and admin tooling. Returns a sorted Vec of entry IDs.
+    /// Matches Java's `Bookie.getListOfEntriesOfLedger()`.
+    fn get_entries_of_ledger(&self, ledger_id: i64) -> Result<Vec<i64>, StorageError>;
 }

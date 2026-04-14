@@ -9,7 +9,7 @@ fn std_journal_write_and_sync_persists_entries() {
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
     let fd = tmp.as_raw_fd();
 
-    let engine = StdEngine;
+    let engine = StdEngine::new();
     let entry_a = b"hello";
     let entry_b = b"world";
     engine
@@ -31,7 +31,7 @@ async fn std_ledger_write_batch_returns_correct_offsets() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let fd = tmp.as_raw_fd();
 
-    let engine = StdEngine;
+    let engine = StdEngine::new();
     let entry_a = b"aaaa"; // 4 bytes
     let entry_b = b"bbbbbb"; // 6 bytes
 
@@ -52,7 +52,7 @@ async fn std_ledger_read_at_returns_exact_bytes() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let fd = tmp.as_raw_fd();
 
-    let engine = StdEngine;
+    let engine = StdEngine::new();
 
     // Write known data: "AABBBBCC"
     let data_a = b"AA";
@@ -81,7 +81,7 @@ async fn std_ledger_write_batch_at_nonzero_offset() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let fd = tmp.as_raw_fd();
 
-    let engine = StdEngine;
+    let engine = StdEngine::new();
 
     // Write initial data at offset 0.
     engine.write_batch(fd, 0, vec![b"HEAD".to_vec()]).await.unwrap();
@@ -105,7 +105,7 @@ async fn test_std_read_framed_entry() {
     use bookkeeper_storage::io_engine::std_engine::StdEngine;
 
     let dir = tempfile::tempdir().unwrap();
-    let engine = StdEngine;
+    let engine = StdEngine::new();
 
     // Create "0.log" with a framed entry: [size(4 BE)][data]
     let log_path = dir.path().join("0.log");
@@ -126,7 +126,7 @@ async fn test_std_read_framed_entry_rejects_oversized() {
     use bookkeeper_storage::io_engine::std_engine::StdEngine;
 
     let dir = tempfile::tempdir().unwrap();
-    let engine = StdEngine;
+    let engine = StdEngine::new();
 
     let log_path = dir.path().join("0.log");
     let size = (1000i32).to_be_bytes();

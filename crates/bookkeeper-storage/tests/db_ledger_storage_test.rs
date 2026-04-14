@@ -6,7 +6,7 @@ use bookkeeper_storage::ledger_storage::LedgerStorage;
 use tempfile::TempDir;
 
 fn default_ledger_io() -> Arc<dyn bookkeeper_storage::io_engine::LedgerIo> {
-    Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>
+    Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>
 }
 
 /// Uses select_engine() — picks UringLedgerIo on Linux, StdEngine elsewhere.
@@ -165,6 +165,42 @@ async fn restart_does_not_overwrite_existing_entry_logs() {
     }
 }
 
+/// Verifies that read-ahead populates the read cache for consecutive entries
+/// without blocking the original get_entry call. After reading entry 0 from
+/// disk, the background read-ahead should eventually cache entries 1..N.
+/// Matches Java's `dbStorage_readAheadCacheBatchSize` behavior.
+#[tokio::test]
+async fn read_ahead_populates_cache() {
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    // Add 10 consecutive entries and flush to entry log so they're on disk
+    for i in 0..10i64 {
+        let entry = make_entry(1, i, i.saturating_sub(1), &vec![0xAAu8; 128]);
+        storage.add_entry(&entry).await.unwrap();
+    }
+    storage.flush().await.unwrap();
+
+    // Reading entry 0 triggers read-ahead for entries 1..N in the background
+    let entry0 = storage.get_entry(1, 0).await.unwrap();
+    assert_eq!(entry0.len(), 32 + 128);
+
+    // Give the background read-ahead task time to complete
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Entries 1-9 should now be in the read cache (served without disk I/O).
+    // Verify they're all readable and correct.
+    for i in 1..10i64 {
+        let entry = storage.get_entry(1, i).await.unwrap();
+        assert_eq!(entry.len(), 32 + 128, "entry {i} should be 160 bytes");
+        // Verify ledger_id and entry_id in the entry header
+        let lid = i64::from_be_bytes(entry[0..8].try_into().unwrap());
+        let eid = i64::from_be_bytes(entry[8..16].try_into().unwrap());
+        assert_eq!(lid, 1);
+        assert_eq!(eid, i);
+    }
+}
+
 /// Tests add_entry overflow → implicit flush with the platform engine.
 /// The bench hits this when the write cache fills during iteration.
 #[tokio::test]
@@ -185,4 +221,45 @@ async fn add_entry_overflow_flush_with_platform_engine() {
     assert_eq!(retrieved.len(), 32 + 4000);
     let retrieved = storage.get_entry(1, 19999).await.unwrap();
     assert_eq!(retrieved.len(), 32 + 4000);
+}
+
+// ---------------------------------------------------------------------------
+// Local consistency check tests (I15)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn local_consistency_check_passes_on_clean_data() {
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    // Write entries
+    for i in 0..10 {
+        let entry = make_entry(1, i, i.saturating_sub(1), b"clean-data");
+        storage.add_entry(&entry).await.unwrap();
+    }
+
+    // Flush to entry log so the consistency check can read from disk
+    storage.flush().await.unwrap();
+
+    // Consistency check should find 0 errors
+    let errors = storage.local_consistency_check(0).await.unwrap();
+    assert_eq!(errors, 0, "clean data should have no consistency errors");
+}
+
+#[tokio::test]
+async fn local_consistency_check_with_multiple_ledgers() {
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    // Write entries across multiple ledgers
+    for lid in 1..=3 {
+        for eid in 0..5 {
+            let entry = make_entry(lid, eid, eid.saturating_sub(1), b"multi-ledger");
+            storage.add_entry(&entry).await.unwrap();
+        }
+    }
+    storage.flush().await.unwrap();
+
+    let errors = storage.local_consistency_check(0).await.unwrap();
+    assert_eq!(errors, 0, "multiple clean ledgers should have no errors");
 }

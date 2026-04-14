@@ -19,8 +19,18 @@ pub const FLAG_HIGH_PRIORITY: u16 = 0x0004;
 // Write flags (v3)
 pub const WRITE_FLAG_DEFERRED_SYNC: i32 = 0x1;
 
-// Pre-v3 error codes
+// Pre-v3 error codes — must match Java's BookieProtocol constants
 pub const V2_EOK: i32 = 0;
+pub const V2_ENOLEDGER: i32 = 1;
+pub const V2_ENOENTRY: i32 = 2;
+pub const V2_EBADREQ: i32 = 100;
+pub const V2_EIO: i32 = 101;
+pub const V2_EUA: i32 = 102;
+pub const V2_EBADVERSION: i32 = 103;
+pub const V2_EFENCED: i32 = 104;
+pub const V2_EREADONLY: i32 = 105;
+pub const V2_ETOOMANYREQUESTS: i32 = 106;
+pub const V2_EUNKNOWNLEDGERSTATE: i32 = 107;
 
 // Master key
 pub const MASTER_KEY_LENGTH: usize = 20;

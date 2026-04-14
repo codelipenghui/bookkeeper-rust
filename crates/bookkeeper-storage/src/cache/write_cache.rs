@@ -37,11 +37,27 @@ impl WriteCache {
 
     pub fn put(&self, ledger_id: i64, entry_id: i64, entry: &[u8]) -> Result<(), StorageError> {
         let aligned_size = align64(entry.len());
-        let offset = self.offset.fetch_add(aligned_size, Ordering::SeqCst);
-        if offset + aligned_size > self.max_size {
-            self.offset.fetch_sub(aligned_size, Ordering::SeqCst);
+        if aligned_size > self.max_size {
             return Err(StorageError::StorageFull);
         }
+        // Reserve space atomically via CAS loop. This avoids the
+        // fetch_add/fetch_sub race where two concurrent overflows
+        // could corrupt the offset counter.
+        let offset = loop {
+            let current = self.offset.load(Ordering::SeqCst);
+            if current + aligned_size > self.max_size {
+                return Err(StorageError::StorageFull);
+            }
+            if self.offset.compare_exchange(
+                current,
+                current + aligned_size,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ).is_ok() {
+                break current;
+            }
+            // CAS failed — another thread won, retry
+        };
         unsafe {
             let data = &mut *self.data.get();
             data[offset..offset + entry.len()].copy_from_slice(entry);
@@ -78,6 +94,10 @@ impl WriteCache {
     }
 
     /// Return all entries sorted by (ledgerId, entryId) for flushing.
+    /// Note: this collects from DashMap into a Vec then sorts, causing a
+    /// transient memory spike proportional to entry count. This is inherent
+    /// to DashMap's iterator model and is the same cost Java's ConcurrentMap
+    /// pays during flush. The spike is short-lived (freed after flush).
     pub fn sorted_entries(&self) -> Vec<(i64, i64, usize, usize)> {
         let mut entries: Vec<(i64, i64, usize, usize)> = self.index.iter().map(|e| {
             let (ledger_id, entry_id) = *e.key();

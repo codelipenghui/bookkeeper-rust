@@ -75,7 +75,16 @@ pub fn calculate_padding(current_pos: u64, alignment: u64) -> Vec<u8> {
 
 /// Scan journal entry payloads from a byte buffer (after the header).
 /// Handles padding blocks (V5+) by skipping them.
+///
+/// When `skip_invalid_record` is true, corrupt entries (negative length, etc.)
+/// are skipped and scanning continues — matching Java's `Journal.scanJournal()`
+/// with `skipInvalidRecord=true`. When false, scanning stops at the first
+/// corrupt entry (legacy behavior, safe for clean journals).
 pub fn scan_journal_entries(data: &[u8], version: i32) -> Vec<&[u8]> {
+    scan_journal_entries_opt(data, version, false)
+}
+
+pub fn scan_journal_entries_opt(data: &[u8], version: i32, skip_invalid_record: bool) -> Vec<&[u8]> {
     let mut entries = Vec::new();
     let mut pos = 0;
     while pos + 4 <= data.len() {
@@ -87,19 +96,27 @@ pub fn scan_journal_entries(data: &[u8], version: i32) -> Vec<&[u8]> {
             if pos + 8 > data.len() {
                 break;
             }
-            // pad_len is the zero-fill byte count (Java format); total block = 8 + pad_len
             let zero_fill_len = i32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
             pos += 8 + zero_fill_len;
             continue;
         }
         if size < 0 {
-            break; // corrupt entry — negative length
+            if skip_invalid_record {
+                tracing::warn!("journal: skipping invalid record at offset {pos} (size={size})");
+                pos += 4;
+                continue;
+            }
+            break;
         }
         let entry_size = size as usize;
         let entry_start = pos + 4;
         let entry_end = entry_start + entry_size;
         if entry_end > data.len() {
-            break; // truncated entry
+            if skip_invalid_record {
+                tracing::warn!("journal: skipping truncated record at offset {pos} (size={entry_size}, remaining={})", data.len() - entry_start);
+                break;
+            }
+            break;
         }
         entries.push(&data[entry_start..entry_end]);
         pos = entry_end;

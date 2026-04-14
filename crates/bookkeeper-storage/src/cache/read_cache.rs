@@ -32,11 +32,24 @@ impl CacheSegment {
     }
 
     fn put(&self, ledger_id: i64, entry_id: i64, entry: &[u8]) -> bool {
-        let offset = self.offset.fetch_add(entry.len(), Ordering::SeqCst);
-        if offset + entry.len() > self.max_size {
-            self.offset.fetch_sub(entry.len(), Ordering::SeqCst);
+        if entry.len() > self.max_size {
             return false;
         }
+        // Reserve space atomically via CAS loop (same fix as WriteCache).
+        let offset = loop {
+            let current = self.offset.load(Ordering::SeqCst);
+            if current + entry.len() > self.max_size {
+                return false;
+            }
+            if self.offset.compare_exchange(
+                current,
+                current + entry.len(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ).is_ok() {
+                break current;
+            }
+        };
         unsafe {
             let data = &mut *self.data.get();
             data[offset..offset + entry.len()].copy_from_slice(entry);
@@ -56,6 +69,11 @@ impl CacheSegment {
     }
 
     fn clear(&self) {
+        // Clear the index BEFORE resetting offset. If a concurrent get()
+        // looks up an entry after the offset is zeroed but before the
+        // index is cleared, it could read from a region being overwritten
+        // by a new put(). Clearing the index first ensures get() returns
+        // None for any stale entries before new writes begin.
         self.index.clear();
         self.offset.store(0, Ordering::SeqCst);
     }
@@ -74,6 +92,9 @@ impl ReadCache {
     }
 
     pub fn put(&self, ledger_id: i64, entry_id: i64, entry: &[u8]) {
+        if self.num_segments == 0 || entry.len() > self.segments[0].max_size {
+            return;
+        }
         let idx = self.current_idx.load(Ordering::SeqCst);
         if !self.segments[idx].put(ledger_id, entry_id, entry) {
             let next = (idx + 1) % self.num_segments;

@@ -114,7 +114,7 @@ pub fn select_engine() -> EngineSet {
     match override_val.as_str() {
         "std" => {
             tracing::info!("BOOKKEEPER_IO_ENGINE=std — forcing StdEngine");
-            let engine = Arc::new(std_engine::StdEngine);
+            let engine = Arc::new(std_engine::StdEngine::new());
             return EngineSet {
                 journal: engine.clone() as Arc<dyn JournalIo>,
                 ledger: engine as Arc<dyn LedgerIo>,
@@ -133,7 +133,7 @@ pub fn select_engine() -> EngineSet {
             #[cfg(not(target_os = "linux"))]
             {
                 tracing::warn!("BOOKKEEPER_IO_ENGINE=uring but not on Linux — using StdEngine");
-                let engine = Arc::new(std_engine::StdEngine);
+                let engine = Arc::new(std_engine::StdEngine::new());
                 return EngineSet {
                     journal: engine.clone() as Arc<dyn JournalIo>,
                     ledger: engine as Arc<dyn LedgerIo>,
@@ -156,7 +156,7 @@ pub fn select_engine() -> EngineSet {
         }
     }
     tracing::info!("Using StdEngine (standard blocking I/O)");
-    let engine = Arc::new(std_engine::StdEngine);
+    let engine = Arc::new(std_engine::StdEngine::new());
     EngineSet {
         journal: engine.clone() as Arc<dyn JournalIo>,
         ledger: engine as Arc<dyn LedgerIo>,

@@ -45,6 +45,8 @@ impl AuditorElector {
         zk_for_auditor: zk::Client,
         paths: ZkPaths,
         lost_bookie_recovery_delay_secs: u64,
+        auditor_periodic_check_interval_secs: u64,
+        auditor_periodic_placement_check_interval_secs: u64,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<(), ReplicationError> {
         // Ensure election path exists
@@ -82,11 +84,19 @@ impl AuditorElector {
                         lost_bookie_recovery_delay_secs,
                         auditor_shutdown,
                     );
+                    auditor.set_all_ledgers_check_interval(auditor_periodic_check_interval_secs);
+                    auditor.set_placement_check_interval(auditor_periodic_placement_check_interval_secs);
                     if let Err(e) = auditor.run().await {
                         tracing::warn!("Auditor exited: {e}");
                     }
-                    // If auditor exits (shutdown or error), break
-                    break;
+                    // If auditor exits due to error (e.g., ZK session expiry),
+                    // re-enter the election loop. If shutdown was signaled, the
+                    // check at the top of the loop will break.
+                    // Matches Java's AutoRecoveryMain which re-enters election
+                    // on session loss rather than stopping silently.
+                    tracing::info!("Re-entering auditor election");
+                    self.my_vote = None; // force new vote creation
+                    continue;
                 }
                 ElectionResult::Waiting(predecessor) => {
                     // Watch predecessor — wait for deletion or shutdown
@@ -193,14 +203,15 @@ impl AuditorElector {
     }
 
     async fn wait_for_deletion(&self, path: &str) {
-        // Poll for deletion (zookeeper-client doesn't expose a simple exists-watch API directly).
-        // We check every second until the znode disappears.
-        loop {
-            match self.client.check_stat(path).await {
-                Ok(Some(_)) => {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                }
-                _ => return, // gone or error — re-enter election
+        // Use ZK watch instead of polling for efficient predecessor monitoring.
+        // Matches Java's AuditorElector which watches the predecessor znode.
+        match self.client.check_and_watch_stat(path).await {
+            Ok((Some(_stat), watcher)) => {
+                // Node exists — wait for the watch to fire (deletion or any change)
+                let _ = watcher.changed().await;
+            }
+            _ => {
+                // Node already gone or error — re-enter election immediately
             }
         }
     }

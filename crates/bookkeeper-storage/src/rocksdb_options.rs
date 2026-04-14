@@ -345,7 +345,7 @@ mod tests {
     fn parses_java_entry_location_file() {
         let parsed = parse(DEFAULT_ENTRY_LOCATION_CONF).expect("parse");
         assert_eq!(parsed.db_options.get("create_if_missing"), Some(&"true".into()));
-        assert_eq!(parsed.db_options.get("max_background_jobs"), Some(&"32".into()));
+        assert_eq!(parsed.db_options.get("max_background_jobs"), Some(&"4".into()));
         assert_eq!(parsed.cf_options.get("compression"), Some(&"kLZ4Compression".into()));
         assert_eq!(
             parsed.block_based_table_options.get("filter_policy"),

@@ -222,10 +222,8 @@ impl ZkUnderreplicationManager {
 
     /// Mark a ledger as replicated (done). Deletes the marker and lock.
     pub async fn mark_ledger_replicated(&self, ledger_id: i64) -> Result<(), ReplicationError> {
-        let ur_path = underreplication_ledger_path(
-            &format!("{}/ledgers", self.paths.underreplication()),
-            ledger_id,
-        );
+        let base = format!("{}/ledgers", self.paths.underreplication());
+        let ur_path = underreplication_ledger_path(&base, ledger_id);
         let lock_path = underreplication_lock_path(
             &format!("{}/locks", self.paths.underreplication()),
             ledger_id,
@@ -238,9 +236,41 @@ impl ZkUnderreplicationManager {
             Err(zk::Error::BadVersion) => {} // leave it, someone re-marked
             Err(e) => return Err(ReplicationError::Zk(format!("delete marker: {e}"))),
         }
+
+        // Clean up empty parent directories in the hierarchy.
+        // Matches Java's ZkLedgerUnderreplicationManager which walks up the
+        // 4-level hex hierarchy and deletes empty parent znodes.
+        self.cleanup_hierarchy(&ur_path, &base).await;
+
         // Release lock
         let _ = self.client.delete(&lock_path, None).await;
         Ok(())
+    }
+
+    /// Walk up the hierarchy from `znode_path` to `stop_at_prefix` and delete
+    /// empty intermediate directories. Ignores errors since other workers may
+    /// be concurrently creating/deleting in the same hierarchy.
+    async fn cleanup_hierarchy(&self, znode_path: &str, stop_at_prefix: &str) {
+        let mut path = znode_path.to_string();
+        loop {
+            // Move up to parent
+            if let Some(slash_pos) = path.rfind('/') {
+                path.truncate(slash_pos);
+            } else {
+                break;
+            }
+            // Don't go above the base directory
+            if path.len() <= stop_at_prefix.len() {
+                break;
+            }
+            // Try to delete — only succeeds if empty (ZK enforces this)
+            match self.client.delete(&path, None).await {
+                Ok(()) => {} // deleted empty dir, continue up
+                Err(zk::Error::NoNode) => {} // already deleted by another worker
+                Err(zk::Error::NotEmpty) => break, // has other children, stop
+                Err(_) => break, // any other error, stop
+            }
+        }
     }
 
     /// Release lock without deleting marker (for retry).
@@ -276,6 +306,38 @@ impl ZkUnderreplicationManager {
     /// Get the ZK paths.
     pub fn paths(&self) -> &ZkPaths {
         &self.paths
+    }
+
+    /// Get the lost bookie recovery delay from ZK (seconds).
+    /// Returns the default if not set. Matches Java's
+    /// `ZkLedgerUnderreplicationManager.getLostBookieRecoveryDelay()`.
+    pub async fn get_lost_bookie_recovery_delay(&self, default_secs: u64) -> Result<u64, ReplicationError> {
+        let delay_path = format!("{}/lostBookieRecoveryDelay", self.paths.underreplication());
+        match self.client.get_data(&delay_path).await {
+            Ok((data, _stat)) => {
+                let s = String::from_utf8_lossy(&data);
+                Ok(s.trim().parse::<u64>().unwrap_or(default_secs))
+            }
+            Err(zk::Error::NoNode) => Ok(default_secs),
+            Err(e) => Err(ReplicationError::Zk(format!("read delay: {e}"))),
+        }
+    }
+
+    /// Set the lost bookie recovery delay in ZK (seconds).
+    /// Matches Java's `ZkLedgerUnderreplicationManager.setLostBookieRecoveryDelay()`.
+    pub async fn set_lost_bookie_recovery_delay(&self, secs: u64) -> Result<(), ReplicationError> {
+        let delay_path = format!("{}/lostBookieRecoveryDelay", self.paths.underreplication());
+        let data = secs.to_string().into_bytes();
+        match self.client.set_data(&delay_path, &data, None).await {
+            Ok(_) => Ok(()),
+            Err(zk::Error::NoNode) => {
+                let opts = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
+                self.client.create(&delay_path, &data, &opts).await
+                    .map(|_| ())
+                    .map_err(|e| ReplicationError::Zk(format!("create delay znode: {e}")))
+            }
+            Err(e) => Err(ReplicationError::Zk(format!("set delay: {e}"))),
+        }
     }
 
     fn find_underreplicated_in_tree<'a>(

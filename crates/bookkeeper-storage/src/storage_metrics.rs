@@ -137,6 +137,29 @@ lazy_static! {
     .unwrap();
 
     // -----------------------------------------------------------------------
+    // Flush lock contention metrics (Rust-specific, not in Java)
+    // -----------------------------------------------------------------------
+
+    /// Time the write-lock is held during write cache swap in flush().
+    /// This exclusive lock blocks all concurrent add_entry read-lock attempts.
+    pub static ref FLUSH_CACHE_SWAP: Histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "bookie_flush_cache_swap",
+            "latency of the exclusive write-lock during write cache swap in flush",
+        )
+        .buckets(latency_buckets()),
+    )
+    .unwrap();
+
+    /// Number of add_entry calls that had to wait for the flush cache swap lock.
+    /// Non-zero values indicate write-path stalls caused by flush contention.
+    pub static ref ADD_ENTRY_BLOCKED_BY_FLUSH: IntCounter = IntCounter::new(
+        "bookie_add_entry_blocked_by_flush",
+        "number of add_entry calls blocked waiting for the write cache flush swap lock",
+    )
+    .unwrap();
+
+    // -----------------------------------------------------------------------
     // Cache metrics (moved from bookkeeper-server metrics.rs)
     // Matches Java's DbLedgerStorageStats.java cache counters/gauges
     // -----------------------------------------------------------------------
@@ -180,6 +203,51 @@ lazy_static! {
     pub static ref READ_CACHE_COUNT: IntGauge = IntGauge::new(
         "bookie_read_cache_count", "Read cache current entry count"
     ).unwrap();
+
+    // -----------------------------------------------------------------------
+    // GC metrics. Matches Java's GarbageCollectorStats.
+    // -----------------------------------------------------------------------
+
+    /// Number of ledgers deleted by GC. Matches Java's `gc-deleted-ledgers`.
+    pub static ref GC_DELETED_LEDGERS: IntCounter = IntCounter::new(
+        "bookie_gc_deleted_ledgers", "Number of ledgers deleted by GC"
+    ).unwrap();
+
+    /// Number of entry log files deleted (all entries dead). Matches Java's `gc-deleted-entry-logs`.
+    pub static ref GC_DELETED_ENTRY_LOGS: IntCounter = IntCounter::new(
+        "bookie_gc_deleted_entry_logs", "Number of entry log files deleted by GC"
+    ).unwrap();
+
+    /// Number of entry log files compacted. Matches Java's `gc-compacted-entry-logs`.
+    pub static ref GC_COMPACTED_ENTRY_LOGS: IntCounter = IntCounter::new(
+        "bookie_gc_compacted_entry_logs", "Number of entry log files compacted by GC"
+    ).unwrap();
+
+    /// Number of entries moved during compaction. Matches Java's `compaction-entries-count`.
+    pub static ref GC_COMPACTED_ENTRIES: IntCounter = IntCounter::new(
+        "bookie_gc_compacted_entries", "Number of entries relocated during compaction"
+    ).unwrap();
+
+    /// Total bytes written during compaction. Matches Java's `compaction-bytes-count`.
+    pub static ref GC_COMPACTED_BYTES: IntCounter = IntCounter::new(
+        "bookie_gc_compacted_bytes", "Total bytes written during compaction"
+    ).unwrap();
+
+    /// Compaction duration histogram (per-file). Matches Java's `compaction-time`.
+    pub static ref GC_COMPACTION_DURATION: Histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "bookie_gc_compaction_duration",
+            "Time spent compacting individual entry log files",
+        ).buckets(latency_buckets()),
+    ).unwrap();
+
+    /// Total GC cycle duration. Matches Java's `gc-time`.
+    pub static ref GC_RUN_DURATION: Histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "bookie_gc_run_duration",
+            "Time spent in a full GC cycle",
+        ).buckets(latency_buckets()),
+    ).unwrap();
 }
 
 /// Register all storage metrics with the given prometheus Registry.
@@ -203,6 +271,9 @@ pub fn register_storage_metrics(registry: &prometheus::Registry) {
     reg!(READ_ENTRYLOG_TIME);
     reg!(THROTTLED_WRITE_REQUESTS);
     reg!(REJECTED_WRITE_REQUESTS);
+    // Flush lock contention
+    reg!(FLUSH_CACHE_SWAP);
+    reg!(ADD_ENTRY_BLOCKED_BY_FLUSH);
     // Cache
     reg!(WRITE_CACHE_HITS);
     reg!(WRITE_CACHE_MISSES);
@@ -212,6 +283,15 @@ pub fn register_storage_metrics(registry: &prometheus::Registry) {
     reg!(WRITE_CACHE_COUNT);
     reg!(READ_CACHE_SIZE);
     reg!(READ_CACHE_COUNT);
+
+    // GC metrics
+    reg!(GC_DELETED_LEDGERS);
+    reg!(GC_DELETED_ENTRY_LOGS);
+    reg!(GC_COMPACTED_ENTRY_LOGS);
+    reg!(GC_COMPACTED_ENTRIES);
+    reg!(GC_COMPACTED_BYTES);
+    reg!(GC_COMPACTION_DURATION);
+    reg!(GC_RUN_DURATION);
 }
 
 /// Latency histogram buckets (seconds).

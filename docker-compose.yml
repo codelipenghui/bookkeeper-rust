@@ -34,6 +34,11 @@ services:
     environment:
       ZOO_4LW_COMMANDS_WHITELIST: "ruok,stat,mntr,conf,srvr"
       ZOO_STANDALONE_ENABLED: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
     healthcheck:
       test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
       interval: 3s
@@ -91,10 +96,6 @@ services:
         condition: service_healthy
       bk-init:
         condition: service_completed_successfully
-    # Only the HTTP admin port is exposed on the host. The BK wire
-    # protocol (3181) stays internal — only the Pulsar broker on this
-    # compose network speaks it, and host-side tools have no reason
-    # to open raw connections.
     ports:
       - "8081:8080"
     environment:
@@ -104,6 +105,11 @@ services:
     volumes:
       - bk1_data:/bk/data
       - bk1_journal:/bk/journal
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
       interval: 5s
@@ -132,6 +138,11 @@ services:
     volumes:
       - bk2_data:/bk/data
       - bk2_journal:/bk/journal
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
       interval: 5s
@@ -211,6 +222,11 @@ services:
       PULSAR_PREFIX_bookkeeperClientExposeStatsToPrometheus: "true"
       # Keep memory usage reasonable for a laptop
       PULSAR_MEM: "-Xms512m -Xmx1g -XX:MaxDirectMemorySize=512m"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
     command: >
       /bin/bash -c "
       bin/apply-config-from-env.py conf/broker.conf &&

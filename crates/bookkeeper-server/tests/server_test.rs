@@ -63,6 +63,7 @@ async fn server_add_and_read_entry() {
         flags: 0,
         master_key: [0u8; 20],
         entry_data,
+        deferred_sync: false,
     };
 
     // Encode request into a framed wire message

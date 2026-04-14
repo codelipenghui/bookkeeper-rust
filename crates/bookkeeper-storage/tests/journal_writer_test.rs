@@ -10,7 +10,7 @@ use bookkeeper_storage::io_engine::JournalIo;
 use bookkeeper_storage::journal::writer::{Journal, JournalConfig, replay_journal};
 
 fn default_journal_io() -> Arc<dyn JournalIo> {
-    Arc::new(StdEngine)
+    Arc::new(StdEngine::new())
 }
 
 fn make_config(dir: PathBuf) -> JournalConfig {
@@ -23,6 +23,11 @@ fn make_config(dir: PathBuf) -> JournalConfig {
         buffered_entries_threshold: 1000,
         alignment_size: 4096,
         format_version: 6,
+        max_queue_memory: 0,
+        flush_when_queue_empty: false,
+        remove_from_page_cache: false,
+        reuse_files: false,
+        max_backup_journals: 5,
     }
 }
 

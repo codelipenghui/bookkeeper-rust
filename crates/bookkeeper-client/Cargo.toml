@@ -21,12 +21,16 @@ zookeeper-client = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+socket2 = { workspace = true }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
+parking_lot = { workspace = true }
+bookkeeper-config = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 bookkeeper-storage = { workspace = true }
 bookkeeper-server = { workspace = true }
-bookkeeper-config = { workspace = true }
 bookkeeper-test-utils = { workspace = true }
 uuid = { workspace = true }
 testcontainers = { workspace = true }

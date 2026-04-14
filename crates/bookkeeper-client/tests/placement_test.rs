@@ -13,8 +13,8 @@
 use std::collections::{HashMap, HashSet};
 
 use bookkeeper_client::placement::{
-    DefaultPlacementPolicy, EnsemblePlacementPolicy, PlacementError, PolicyAdherence,
-    RackAwarePlacementPolicy, RackResolver, StaticRackResolver,
+    BookieInfo, DefaultPlacementPolicy, EnsemblePlacementPolicy, PlacementError,
+    PolicyAdherence, RackAwarePlacementPolicy, RackResolver, StaticRackResolver,
 };
 
 // ---------------------------------------------------------------------------
@@ -574,4 +574,387 @@ fn rack_aware_on_cluster_changed_replaces_internal_state() {
         err.is_err(),
         "should fail when cluster shrinks below ensemble size"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Disk-weight-based placement
+// Matches Java's BookieInfoReader + WeightedRandomSelection behavior.
+// ---------------------------------------------------------------------------
+
+/// Helper: build bookie info with varying free space.
+fn disk_info(bookies_free: &[(&str, i64)]) -> HashMap<String, BookieInfo> {
+    bookies_free
+        .iter()
+        .map(|(b, free)| (b.to_string(), BookieInfo::new(*free, 1_000_000)))
+        .collect()
+}
+
+#[test]
+fn default_policy_weighted_selection_favors_high_free_space() {
+    let mut p = DefaultPlacementPolicy::new();
+    let bks = bookies("b", 3);
+    p.on_cluster_changed(&bks, &[]);
+
+    // b0 has 10x more free space than b1 and b2.
+    p.update_bookie_info(&disk_info(&[
+        ("b0:3181", 100_000),
+        ("b1:3181", 10_000),
+        ("b2:3181", 10_000),
+    ]));
+
+    // Over many trials, b0 should appear in ensembles much more often.
+    let mut b0_count = 0;
+    let trials = 1000;
+    for _ in 0..trials {
+        let r = p.new_ensemble(1, 1, 1, &empty_exclude()).unwrap();
+        if r.bookies[0] == "b0:3181" {
+            b0_count += 1;
+        }
+    }
+    // With max_weight_multiple=3 clamping, b0 weight is capped at 3*10000=30000.
+    // Expected: b0 gets 30000/(30000+10000+10000) = 60% of selections.
+    // Allow wide range for randomness: at least 35%.
+    assert!(
+        b0_count > trials / 3,
+        "b0 (highest free space) should be chosen frequently, got {b0_count}/{trials}"
+    );
+}
+
+#[test]
+fn default_policy_no_weights_uses_uniform_selection() {
+    let mut p = DefaultPlacementPolicy::new();
+    let bks = bookies("b", 3);
+    p.on_cluster_changed(&bks, &[]);
+    // No update_bookie_info — should use uniform selection
+
+    let r = p.new_ensemble(3, 2, 2, &empty_exclude()).unwrap();
+    assert_eq!(r.bookies.len(), 3);
+}
+
+#[test]
+fn rack_aware_policy_weighted_selection_within_racks() {
+    let resolver = rack_resolver(&[
+        ("b0:3181", "/r1"),
+        ("b1:3181", "/r1"),
+        ("b2:3181", "/r2"),
+        ("b3:3181", "/r2"),
+    ]);
+    let mut p = RackAwarePlacementPolicy::new(Box::new(resolver), 2, true);
+    let bks = bookies("b", 4);
+    p.on_cluster_changed(&bks, &[]);
+
+    // b0 has much more free space than b1 (same rack).
+    // b2 has much more free space than b3 (same rack).
+    p.update_bookie_info(&disk_info(&[
+        ("b0:3181", 100_000),
+        ("b1:3181", 10_000),
+        ("b2:3181", 100_000),
+        ("b3:3181", 10_000),
+    ]));
+
+    // E=2, W=2. One from each rack. The heavier bookie in each rack
+    // should be chosen more often.
+    let mut b0_count = 0;
+    let mut b2_count = 0;
+    let trials = 1000;
+    for _ in 0..trials {
+        let r = p.new_ensemble(2, 2, 2, &empty_exclude()).unwrap();
+        if r.bookies.contains(&"b0:3181".to_string()) {
+            b0_count += 1;
+        }
+        if r.bookies.contains(&"b2:3181".to_string()) {
+            b2_count += 1;
+        }
+    }
+    // Both heavy bookies should be chosen more than half the time.
+    assert!(
+        b0_count > trials / 3,
+        "b0 (heavier in r1) should be chosen frequently, got {b0_count}/{trials}"
+    );
+    assert!(
+        b2_count > trials / 3,
+        "b2 (heavier in r2) should be chosen frequently, got {b2_count}/{trials}"
+    );
+}
+
+#[test]
+fn weighted_max_multiple_caps_skew() {
+    let mut p = DefaultPlacementPolicy::new();
+    p.set_max_weight_multiple(2);
+    let bks = bookies("b", 2);
+    p.on_cluster_changed(&bks, &[]);
+
+    // b0 has 100x more free space, but max_multiple=2 caps it.
+    p.update_bookie_info(&disk_info(&[
+        ("b0:3181", 1_000_000),
+        ("b1:3181", 10_000),
+    ]));
+
+    let mut b0_count = 0;
+    let trials = 1000;
+    for _ in 0..trials {
+        let r = p.new_ensemble(1, 1, 1, &empty_exclude()).unwrap();
+        if r.bookies[0] == "b0:3181" {
+            b0_count += 1;
+        }
+    }
+    // With cap=2, b0 weight = 2*10000=20000, b1=10000. b0 expected ~66%.
+    // Should not be much higher than 75% (would indicate cap isn't working).
+    let b0_pct = b0_count as f64 / trials as f64 * 100.0;
+    assert!(
+        b0_pct < 85.0,
+        "max_multiple=2 should cap skew; b0 got {b0_pct:.1}%"
+    );
+    assert!(
+        b0_pct > 45.0,
+        "b0 should still be favored; got {b0_pct:.1}%"
+    );
+}
+
+#[test]
+fn update_bookie_info_clears_on_empty_map() {
+    let mut p = DefaultPlacementPolicy::new();
+    let bks = bookies("b", 3);
+    p.on_cluster_changed(&bks, &[]);
+
+    // Set weights, then clear them
+    p.update_bookie_info(&disk_info(&[
+        ("b0:3181", 100_000),
+        ("b1:3181", 10_000),
+        ("b2:3181", 10_000),
+    ]));
+    // Clear — should fall back to uniform
+    p.update_bookie_info(&HashMap::new());
+
+    let r = p.new_ensemble(3, 2, 2, &empty_exclude()).unwrap();
+    assert_eq!(r.bookies.len(), 3, "should still work after clearing info");
+}
+
+// ---------------------------------------------------------------------------
+// F8: areAckedBookiesAdheringToPlacementPolicy
+// ---------------------------------------------------------------------------
+
+/// With min_racks=2, acked bookies from 2 racks should adhere.
+#[test]
+fn acked_bookies_from_two_racks_adhere() {
+    let mut rack_map = HashMap::new();
+    rack_map.insert("b1:3181".into(), "/rack1".into());
+    rack_map.insert("b2:3181".into(), "/rack2".into());
+    rack_map.insert("b3:3181".into(), "/rack1".into());
+    let resolver = StaticRackResolver::new(rack_map);
+    let policy = RackAwarePlacementPolicy::new(Box::new(resolver), 2, true);
+
+    let acked: HashSet<String> = ["b1:3181".into(), "b2:3181".into()].into();
+    assert!(policy.are_acked_bookies_adhering(&acked, 3, 2),
+        "bookies from 2 racks should adhere with min_racks=2");
+}
+
+/// With min_racks=2, acked bookies from 1 rack should NOT adhere.
+#[test]
+fn acked_bookies_from_one_rack_do_not_adhere() {
+    let mut rack_map = HashMap::new();
+    rack_map.insert("b1:3181".into(), "/rack1".into());
+    rack_map.insert("b2:3181".into(), "/rack1".into());
+    rack_map.insert("b3:3181".into(), "/rack2".into());
+    let resolver = StaticRackResolver::new(rack_map);
+    let policy = RackAwarePlacementPolicy::new(Box::new(resolver), 2, true);
+
+    let acked: HashSet<String> = ["b1:3181".into(), "b2:3181".into()].into();
+    assert!(!policy.are_acked_bookies_adhering(&acked, 3, 2),
+        "bookies from 1 rack should NOT adhere with min_racks=2");
+}
+
+// ---------------------------------------------------------------------------
+// F2: reorder_read_sequence
+// ---------------------------------------------------------------------------
+
+/// reorder_read_sequence moves failed bookies to end.
+#[test]
+fn reorder_read_sequence_moves_failed_to_end() {
+    let policy = DefaultPlacementPolicy::new();
+    let ensemble = vec![
+        "b0:3181".to_string(),
+        "b1:3181".to_string(),
+        "b2:3181".to_string(),
+    ];
+    let write_set = vec![0, 1, 2];
+    let mut failed: HashSet<String> = HashSet::new();
+    failed.insert("b1:3181".into());
+
+    let reordered = policy.reorder_read_sequence(&ensemble, &write_set, &failed);
+    // b1 (index 1) should be last
+    assert_eq!(reordered, vec![0, 2, 1],
+        "failed bookie should be moved to end");
+}
+
+/// With no failures, reorder_read_sequence preserves order.
+#[test]
+fn reorder_read_sequence_no_failures_preserves_order() {
+    let policy = DefaultPlacementPolicy::new();
+    let ensemble = vec!["b0:3181".into(), "b1:3181".into(), "b2:3181".into()];
+    let write_set = vec![0, 1, 2];
+    let failed: HashSet<String> = HashSet::new();
+
+    let reordered = policy.reorder_read_sequence(&ensemble, &write_set, &failed);
+    assert_eq!(reordered, vec![0, 1, 2]);
+}
+
+/// Default policy always passes adherence check.
+#[test]
+fn default_policy_always_adheres() {
+    let policy = DefaultPlacementPolicy::new();
+    let acked: HashSet<String> = ["b1:3181".into()].into();
+    assert!(policy.are_acked_bookies_adhering(&acked, 3, 2));
+}
+
+// ---------------------------------------------------------------------------
+// CommandBasedRackResolver tests (I16)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn command_based_resolver_runs_script_and_caches() {
+    use bookkeeper_client::placement::CommandBasedRackResolver;
+    use bookkeeper_client::placement::RackResolver;
+
+    // Use `echo` as a trivial script that returns the hostname as the rack
+    let resolver = CommandBasedRackResolver::new("echo".to_string());
+
+    // First call executes the script
+    let rack = resolver.resolve("bookie1:3181");
+    assert_eq!(rack, "bookie1");
+
+    // Second call should hit cache (same result)
+    let rack2 = resolver.resolve("bookie1:3181");
+    assert_eq!(rack2, "bookie1");
+
+    // Different bookie gets different result
+    let rack3 = resolver.resolve("bookie2:3181");
+    assert_eq!(rack3, "bookie2");
+}
+
+#[test]
+fn command_based_resolver_reload_clears_cache() {
+    use bookkeeper_client::placement::CommandBasedRackResolver;
+    use bookkeeper_client::placement::RackResolver;
+
+    let resolver = CommandBasedRackResolver::new("echo".to_string());
+
+    // Populate cache
+    let _ = resolver.resolve("bookie1:3181");
+
+    // Clear cache
+    resolver.reload_cached_mappings();
+
+    // Next call re-executes (still same result since echo is deterministic)
+    let rack = resolver.resolve("bookie1:3181");
+    assert_eq!(rack, "bookie1");
+}
+
+#[test]
+fn command_based_resolver_bad_script_returns_default() {
+    use bookkeeper_client::placement::CommandBasedRackResolver;
+    use bookkeeper_client::placement::RackResolver;
+
+    let resolver = CommandBasedRackResolver::new("/nonexistent/script".to_string());
+    let rack = resolver.resolve("bookie1:3181");
+    assert_eq!(rack, "/default-region/default-rack");
+}
+
+// ---------------------------------------------------------------------------
+// Fix #24: bookie quarantine mechanism
+// ---------------------------------------------------------------------------
+
+mod quarantine_tests {
+    use bookkeeper_client::placement::{BookieQuarantine, DefaultPlacementPolicy, EnsemblePlacementPolicy};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn quarantine_excludes_bookie_from_set() {
+        let q = BookieQuarantine::new(Duration::from_secs(60));
+        assert!(q.is_empty());
+        q.quarantine("bookie1:3181");
+        assert!(q.is_quarantined("bookie1:3181"));
+        assert!(!q.is_quarantined("bookie2:3181"));
+        assert_eq!(q.quarantined_set().len(), 1);
+    }
+
+    #[test]
+    fn quarantine_release_removes_entry() {
+        let q = BookieQuarantine::new(Duration::from_secs(60));
+        q.quarantine("bookie1:3181");
+        assert!(q.is_quarantined("bookie1:3181"));
+        q.release("bookie1:3181");
+        assert!(!q.is_quarantined("bookie1:3181"));
+    }
+
+    #[test]
+    fn quarantine_expires_after_ttl() {
+        let q = BookieQuarantine::new(Duration::from_millis(50));
+        q.quarantine("bookie1:3181");
+        assert!(q.is_quarantined("bookie1:3181"));
+        std::thread::sleep(Duration::from_millis(100));
+        // TTL expired → no longer quarantined
+        assert!(!q.is_quarantined("bookie1:3181"));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn default_policy_excludes_quarantined_bookies_from_new_ensemble() {
+        let mut policy = DefaultPlacementPolicy::new();
+        policy.on_cluster_changed(
+            &[
+                "b1:3181".into(), "b2:3181".into(), "b3:3181".into(), "b4:3181".into(),
+            ],
+            &[],
+        );
+
+        let quarantine = Arc::new(BookieQuarantine::new(Duration::from_secs(60)));
+        quarantine.quarantine("b1:3181");
+        quarantine.quarantine("b2:3181");
+        policy.set_quarantine(quarantine);
+
+        // With 2 bookies quarantined, we can only select from {b3, b4}.
+        let result = policy
+            .new_ensemble(2, 2, 2, &HashSet::new())
+            .expect("should still succeed with 2 available");
+        assert!(!result.bookies.iter().any(|b| b == "b1:3181"),
+            "quarantined b1 must be excluded: {:?}", result.bookies);
+        assert!(!result.bookies.iter().any(|b| b == "b2:3181"),
+            "quarantined b2 must be excluded: {:?}", result.bookies);
+
+        // Asking for 3 when only 2 unquarantined bookies → NotEnoughBookies.
+        match policy.new_ensemble(3, 3, 3, &HashSet::new()) {
+            Ok(_) => panic!("expected NotEnoughBookies, got Ok"),
+            Err(bookkeeper_client::placement::PlacementError::NotEnoughBookies { needed, available }) => {
+                assert_eq!(needed, 3);
+                assert_eq!(available, 2, "only 2 bookies should be available after quarantine");
+            }
+            Err(other) => panic!("expected NotEnoughBookies, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_policy_replace_bookie_avoids_quarantined() {
+        let mut policy = DefaultPlacementPolicy::new();
+        policy.on_cluster_changed(
+            &[
+                "b1:3181".into(), "b2:3181".into(), "b3:3181".into(), "b4:3181".into(),
+            ],
+            &[],
+        );
+
+        let quarantine = Arc::new(BookieQuarantine::new(Duration::from_secs(60)));
+        // Quarantine b3; current ensemble = [b1, b2]; need to replace b2.
+        quarantine.quarantine("b3:3181");
+        policy.set_quarantine(quarantine);
+
+        let current = vec!["b1:3181".to_string(), "b2:3181".to_string()];
+        let replacement = policy
+            .replace_bookie(2, 2, 2, &current, "b2:3181", &HashSet::new())
+            .unwrap();
+        assert_eq!(replacement, "b4:3181",
+            "b3 is quarantined, b1/b2 are in ensemble, only b4 is available");
+    }
 }

@@ -110,22 +110,28 @@ impl LedgerMetadataIndex {
         Ok(ledgers)
     }
 
-    /// Store the raw explicit LAC body (from WriteLac) to RocksDB.
-    /// Uses a separate key prefix "lac:" to avoid conflicting with ledger metadata.
+    /// Store the raw explicit LAC body (from WriteLac) in the LedgerData protobuf.
+    /// Matches Java's `LedgerMetadataIndex.setExplicitLac()` which stores the
+    /// raw LAC body (with digest) in the `explicitLac` field of `LedgerData`.
     pub fn set_explicit_lac_body(&self, ledger_id: i64, body: &[u8]) -> Result<(), StorageError> {
-        let mut key = Vec::with_capacity(12);
-        key.extend_from_slice(b"lac:");
-        key.extend_from_slice(&ledger_id.to_be_bytes());
-        self.db.put(&key, body).map_err(|e| StorageError::RocksDb(e.to_string()))
+        let key = ledger_id.to_be_bytes();
+        let mut proto = self.get_raw(ledger_id)?.unwrap_or_else(|| bookkeeper_proto::LedgerData {
+            exists: true,
+            fenced: false,
+            master_key: Vec::new(),
+            explicit_lac: None,
+            limbo: None,
+        });
+        proto.explicit_lac = Some(body.to_vec());
+        let value = proto.encode_to_vec();
+        self.db.put(&key, &value).map_err(|e| StorageError::RocksDb(e.to_string()))
     }
 
-    /// Get the raw explicit LAC body from RocksDB.
+    /// Get the raw explicit LAC body from the LedgerData protobuf.
+    /// Matches Java's `LedgerMetadataIndex.getExplicitLac()`.
     pub fn get_explicit_lac_body(&self, ledger_id: i64) -> Result<Option<Vec<u8>>, StorageError> {
-        let mut key = Vec::with_capacity(12);
-        key.extend_from_slice(b"lac:");
-        key.extend_from_slice(&ledger_id.to_be_bytes());
-        match self.db.get(&key).map_err(|e| StorageError::RocksDb(e.to_string()))? {
-            Some(v) => Ok(Some(v)),
+        match self.get_raw(ledger_id)? {
+            Some(proto) => Ok(proto.explicit_lac),
             None => Ok(None),
         }
     }

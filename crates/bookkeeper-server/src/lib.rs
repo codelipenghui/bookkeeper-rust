@@ -6,3 +6,4 @@ pub mod v3_processor;
 pub mod metrics;
 pub mod tls;
 pub mod auth;
+pub mod scrubber;

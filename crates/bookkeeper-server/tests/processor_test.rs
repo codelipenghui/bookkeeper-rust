@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 fn setup() -> (RequestProcessor, TempDir) {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
     let state = BookieStateManager::new();
     state.transition_to(bookkeeper_server::state::BookieState::Running);
     let processor = RequestProcessor::new(Arc::new(storage), Arc::new(state));
@@ -35,7 +35,7 @@ async fn add_entry_success() {
     let req = V2Request::AddEntry {
         flags: 0,
         master_key: [0u8; 20],
-        entry_data: Bytes::from(entry_data),
+        entry_data: Bytes::from(entry_data), deferred_sync: false,
     };
     let resp = processor.process_request(req).await;
     match resp {
@@ -55,7 +55,7 @@ async fn read_entry_success() {
     let entry_data = make_entry(1, 0, -1, b"hello");
     let req = V2Request::AddEntry {
         flags: 0, master_key: [0u8; 20],
-        entry_data: Bytes::from(entry_data),
+        entry_data: Bytes::from(entry_data), deferred_sync: false,
     };
     processor.process_request(req).await;
     // Now read it
@@ -92,7 +92,7 @@ async fn read_entry_not_found() {
 #[tokio::test]
 async fn add_entry_rejected_when_read_only() {
     let dir = TempDir::new().unwrap();
-    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>).unwrap();
     let state = BookieStateManager::new();
     state.transition_to(bookkeeper_server::state::BookieState::Running);
     state.transition_to(bookkeeper_server::state::BookieState::ReadOnly);
@@ -101,7 +101,7 @@ async fn add_entry_rejected_when_read_only() {
     let entry_data = make_entry(1, 0, -1, b"hello");
     let req = V2Request::AddEntry {
         flags: 0, master_key: [0u8; 20],
-        entry_data: Bytes::from(entry_data),
+        entry_data: Bytes::from(entry_data), deferred_sync: false,
     };
     let resp = processor.process_request(req).await;
     match resp {
@@ -119,7 +119,7 @@ async fn fencing_blocks_subsequent_writes() {
     let entry_data = make_entry(1, 0, -1, b"hello");
     processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [0u8; 20],
-        entry_data: Bytes::from(entry_data),
+        entry_data: Bytes::from(entry_data), deferred_sync: false,
     }).await;
     // Fence via read with FLAG_DO_FENCING
     processor.process_request(V2Request::ReadEntry {
@@ -130,7 +130,7 @@ async fn fencing_blocks_subsequent_writes() {
     let entry_data2 = make_entry(1, 1, 0, b"world");
     let resp = processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [0u8; 20],
-        entry_data: Bytes::from(entry_data2),
+        entry_data: Bytes::from(entry_data2), deferred_sync: false,
     }).await;
     match resp {
         V2Response::Add { error_code, .. } => {
@@ -147,7 +147,7 @@ async fn recovery_add_bypasses_fence() {
     let entry_data = make_entry(1, 0, -1, b"hello");
     processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [0u8; 20],
-        entry_data: Bytes::from(entry_data),
+        entry_data: Bytes::from(entry_data), deferred_sync: false,
     }).await;
     processor.process_request(V2Request::ReadEntry {
         flags: FLAG_DO_FENCING, ledger_id: 1, entry_id: 0,
@@ -157,7 +157,7 @@ async fn recovery_add_bypasses_fence() {
     let entry_data2 = make_entry(1, 1, 0, b"recovery");
     let resp = processor.process_request(V2Request::AddEntry {
         flags: FLAG_RECOVERY_ADD, master_key: [0u8; 20],
-        entry_data: Bytes::from(entry_data2),
+        entry_data: Bytes::from(entry_data2), deferred_sync: false,
     }).await;
     match resp {
         V2Response::Add { error_code, .. } => {
@@ -188,13 +188,13 @@ async fn master_key_mismatch_rejected() {
     let entry_data = make_entry(1, 0, -1, b"hello");
     processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [1u8; 20],
-        entry_data: Bytes::from(entry_data),
+        entry_data: Bytes::from(entry_data), deferred_sync: false,
     }).await;
     // Write with key B — should be rejected
     let entry_data2 = make_entry(1, 1, 0, b"world");
     let resp = processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [2u8; 20],
-        entry_data: Bytes::from(entry_data2),
+        entry_data: Bytes::from(entry_data2), deferred_sync: false,
     }).await;
     match resp {
         V2Response::Add { error_code, .. } => {
@@ -211,7 +211,7 @@ async fn fencing_with_wrong_key_rejected() {
     let entry_data = make_entry(1, 0, -1, b"hello");
     processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [1u8; 20],
-        entry_data: Bytes::from(entry_data),
+        entry_data: Bytes::from(entry_data), deferred_sync: false,
     }).await;
     // Try to fence with key B — should fail
     let resp = processor.process_request(V2Request::ReadEntry {
@@ -228,7 +228,7 @@ async fn fencing_with_wrong_key_rejected() {
     let entry_data3 = make_entry(1, 1, 0, b"still works");
     let resp2 = processor.process_request(V2Request::AddEntry {
         flags: 0, master_key: [1u8; 20],
-        entry_data: Bytes::from(entry_data3),
+        entry_data: Bytes::from(entry_data3), deferred_sync: false,
     }).await;
     match resp2 {
         V2Response::Add { error_code, .. } => {

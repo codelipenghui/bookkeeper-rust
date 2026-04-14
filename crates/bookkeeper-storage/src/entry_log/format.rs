@@ -93,6 +93,10 @@ pub struct EntryLocation {
 
 impl EntryLocation {
     pub fn new(log_id: u32, position: u32) -> Self {
+        debug_assert!(
+            (position as u64) < u32::MAX as u64,
+            "entry log position {position} exceeds u32::MAX — increase MAX_ENTRY_LOG_SIZE guard"
+        );
         Self { log_id, position }
     }
 

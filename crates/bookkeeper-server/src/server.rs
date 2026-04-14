@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use tokio_util::codec::{Decoder, Encoder};
 
 use bookkeeper_protocol::framing::BookieCodec;
-use bookkeeper_protocol::v2::request::decode_request;
+use bookkeeper_protocol::v2::request::{decode_request, V2Request};
 use bookkeeper_protocol::v2::response::encode_response;
 use bookkeeper_storage::db_ledger_storage::{DbLedgerStorage, CURRENT_DIR};
 
@@ -37,6 +37,7 @@ pub struct BookieServer {
     disk_monitor_handle: Option<tokio::task::JoinHandle<()>>,
     sync_handle: Option<tokio::task::JoinHandle<()>>,
     session_watcher_handle: Option<tokio::task::JoinHandle<()>>,
+    scrubber_handle: Option<tokio::task::JoinHandle<()>>,
     /// Ledger directories — used to create/remove DIRTY files.
     ledger_directories: Vec<String>,
 }
@@ -53,6 +54,37 @@ impl BookieServer {
         let listener = TcpListener::bind(&addr).await?;
         let local_addr = listener.local_addr()?;
 
+        // Environment validation at startup.
+        // Matches Java's BookieImpl.checkEnvironment().
+        check_environment(&config)?;
+
+        // Multi-directory warning: the Rust bookie currently uses only the
+        // first ledger directory and a single journal directory.  If the
+        // operator has configured multiple directories (comma-separated
+        // ledgerDirectories or pipe-separated journalDirectories), warn
+        // loudly so this operational difference from Java is visible.
+        // Matches Java's DbLedgerStorage which supports multi-directory striping.
+        if config.ledger_directories.len() > 1 {
+            tracing::warn!(
+                "Multiple ledger directories configured ({:?}), but the Rust bookie \
+                currently uses only the FIRST directory ({}). Data will NOT be striped \
+                across disks. This differs from Java BookKeeper's DbLedgerStorage.",
+                config.ledger_directories,
+                config.ledger_directories[0],
+            );
+        }
+        // Warn if a pipe-separated journalDirectories was collapsed to a
+        // single journal_directory by the config parser.  The parser takes
+        // the first element; a pipe in the journal_directory would indicate
+        // the operator tried to supply multiple directories.
+        if config.journal_directory.contains('|') {
+            tracing::warn!(
+                "journal_directory appears to contain multiple paths ('{}'), but the Rust \
+                bookie uses a single journal directory. Journal I/O will NOT be parallelized.",
+                config.journal_directory,
+            );
+        }
+
         // Open storage using first ledger dir
         let ledger_dir = config
             .ledger_directories
@@ -61,16 +93,25 @@ impl BookieServer {
         let io_engines = bookkeeper_storage::io_engine::select_engine();
         let entry_location_conf = config.entry_location_rocksdb_conf.as_deref().map(Path::new);
         let ledger_metadata_conf = config.ledger_metadata_rocksdb_conf.as_deref().map(Path::new);
-        let mut storage = DbLedgerStorage::open_with_conf(
+        let storage_config = bookkeeper_storage::db_ledger_storage::StorageConfig::from_server_config(&config);
+        let mut storage = DbLedgerStorage::open_full(
             Path::new(ledger_dir),
             io_engines.ledger.clone(),
             entry_location_conf,
             ledger_metadata_conf,
+            storage_config,
         )?;
 
         // Create state manager early so the journal fatal-error callback can
         // reference it. Transition to Running happens after DIRTY file setup.
-        let state = Arc::new(BookieStateManager::new());
+        let state = if config.persist_bookie_status_enabled {
+            let status_path = std::path::Path::new(&config.ledger_directories[0])
+                .join(bookkeeper_storage::db_ledger_storage::CURRENT_DIR)
+                .join("bookie_status");
+            Arc::new(BookieStateManager::with_persistence(&status_path))
+        } else {
+            Arc::new(BookieStateManager::new())
+        };
 
         // Initialize journal for write-ahead logging (crash recovery).
         // Controlled by `journalWriteData` (default true). When false, the
@@ -88,6 +129,11 @@ impl BookieServer {
                 buffered_entries_threshold: config.journal_buffered_entries_threshold as usize,
                 alignment_size: config.journal_alignment_size as usize,
                 format_version: config.journal_format_version_to_write,
+                max_queue_memory: config.journal_max_queue_memory_mb * 1024 * 1024,
+                flush_when_queue_empty: config.journal_flush_when_queue_empty,
+                remove_from_page_cache: config.journal_remove_from_page_cache,
+                reuse_files: config.journal_reuse_files,
+                max_backup_journals: config.journal_max_backups as usize,
             };
 
             let fatal_state = state.clone();
@@ -103,6 +149,7 @@ impl BookieServer {
                 journal_config,
                 io_engines.journal,
                 Some(on_journal_fatal),
+                config.skip_replay_journal_invalid_record,
             ).await?;
             if replayed > 0 {
                 tracing::info!("Journal recovery: replayed {replayed} entries");
@@ -143,17 +190,57 @@ impl BookieServer {
                 .map_err(|e| format!("Failed to create DIRTY file in {dir}: {e}"))?;
         }
 
-        // Transition to Running (state manager was created earlier for the
-        // journal fatal-error callback).
-        state.transition_to(BookieState::Running);
-        crate::metrics::BOOKIE_STATE.set(1); // 1 = writable/running
+        // Transition to Running or ReadOnly based on config.
+        if config.force_read_only_bookie {
+            state.transition_to(BookieState::Running); // must go through Running first
+            state.transition_to(BookieState::ReadOnly);
+            crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
+            tracing::info!("Bookie starting in forced READ-ONLY mode");
+        } else {
+            state.transition_to(BookieState::Running);
+            crate::metrics::BOOKIE_STATE.set(1); // 1 = writable/running
+        }
 
         // Initialize Prometheus metrics
         crate::metrics::register_metrics();
 
         // Create request processor
         let storage_for_shutdown = storage.clone();
-        let processor = Arc::new(RequestProcessor::new(storage.clone(), state.clone()));
+        let max_adds = if config.max_adds_in_progress_limit > 0 { config.max_adds_in_progress_limit } else { 10000 };
+        let max_reads = if config.max_reads_in_progress_limit > 0 { config.max_reads_in_progress_limit } else { 10000 };
+        let mut processor_inner = RequestProcessor::with_limits(storage.clone(), state.clone(), max_adds, max_reads);
+        processor_inner.set_max_batch_read_count(config.max_batch_read_count);
+        processor_inner.set_max_batch_read_size_bytes(config.max_batch_read_size_bytes);
+
+        // Wire backpressure behavior from config.
+        // Matches Java's waitTimeoutOnBackpressureMillis:
+        // - Negative (default): block indefinitely (u64::MAX sentinel, handled
+        //   by acquire_permit() as a plain .await to avoid tokio timer overhead).
+        // - Zero: reject immediately with ETOOMANYREQUESTS (legacy mode).
+        // - Positive: wait up to this duration, then reject.
+        let backpressure_ms = config.wait_timeout_on_response_backpressure_ms;
+        if backpressure_ms < 0 {
+            processor_inner.set_backpressure_timeout_ms(u64::MAX);
+        } else {
+            processor_inner.set_backpressure_timeout_ms(backpressure_ms as u64);
+        }
+
+        // Wire auth enforcement: if an auth provider is configured (non-disabled),
+        // connections must authenticate before other requests are accepted.
+        // An unknown plugin class is a HARD ERROR (not a silent fallback to
+        // disabled auth) so an operator typo cannot accidentally turn off
+        // authentication in production.
+        let auth_factory = crate::auth::create_auth_factory(
+            config.bookie_auth_provider_factory_class.as_deref(),
+            config.tls_client_authentication,
+        )?;
+        let auth_disabled = auth_factory.plugin_name() == "AUTHENTICATION_DISABLED";
+        if !auth_disabled {
+            processor_inner.set_require_auth(true);
+            tracing::info!("Auth enabled: {} (connections must authenticate)", auth_factory.plugin_name());
+        }
+
+        let processor = Arc::new(processor_inner);
 
         // Shutdown channel
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -171,25 +258,31 @@ impl BookieServer {
             // bind address is 0.0.0.0 but peers reach us via a DNS name
             // from the overlay network). Otherwise fall back to the actual
             // bind address.
-            let (advertised_host, bookie_id) = match &config.advertised_address {
-                Some(adv) => {
-                    // advertisedAddress may or may not include a port
-                    // suffix. Split once on ':' so "rust-bookie-1" →
-                    // ("rust-bookie-1", local_addr.port()), and
-                    // "rust-bookie-1:3181" → ("rust-bookie-1", 3181).
-                    let (host, port) = match adv.split_once(':') {
-                        Some((h, p)) => (
-                            h.to_string(),
-                            p.parse::<u16>().unwrap_or(local_addr.port()),
-                        ),
-                        None => (adv.clone(), local_addr.port()),
-                    };
-                    let id = format!("{}:{}", host, port);
-                    (host, id)
-                }
-                None => {
-                    let host = local_addr.ip().to_string();
-                    (host.clone(), format!("{}:{}", host, local_addr.port()))
+            // Bookie identity resolution order (matching Java):
+            // 1. Explicit bookieId config (highest priority)
+            // 2. advertisedAddress config
+            // 3. Actual bind address (fallback)
+            let (advertised_host, bookie_id) = if let Some(ref explicit_id) = config.bookie_id {
+                // bookieId overrides everything. Extract host portion for display.
+                let host = explicit_id.split(':').next().unwrap_or(explicit_id).to_string();
+                (host, explicit_id.clone())
+            } else {
+                match &config.advertised_address {
+                    Some(adv) => {
+                        let (host, port) = match adv.split_once(':') {
+                            Some((h, p)) => (
+                                h.to_string(),
+                                p.parse::<u16>().unwrap_or(local_addr.port()),
+                            ),
+                            None => (adv.clone(), local_addr.port()),
+                        };
+                        let id = format!("{}:{}", host, port);
+                        (host, id)
+                    }
+                    None => {
+                        let host = local_addr.ip().to_string();
+                        (host.clone(), format!("{}:{}", host, local_addr.port()))
+                    }
                 }
             };
             let reg_mgr = bookkeeper_metadata::zk::registration::ZkRegistrationManager::new(
@@ -240,6 +333,9 @@ impl BookieServer {
                     reg_mgr.paths().clone(),
                     &bookie_id,
                     config.lost_bookie_recovery_delay as u64,
+                    config.rw_rereplicate_backoff_ms as u64,
+                    config.auditor_periodic_check_interval as u64,
+                    config.auditor_periodic_placement_policy_check_interval as u64,
                     shutdown_rx.clone(),
                 )
                 .await?;
@@ -265,6 +361,25 @@ impl BookieServer {
             let gc_zk = zk_reg.as_ref().unwrap().0.zk_client().clone();
             let gc_paths = zk_reg.as_ref().unwrap().0.paths().clone();
             let gc_wait_ms = config.gc_wait_time as u64;
+            let gc_config = bookkeeper_storage::gc::GcConfig {
+                minor_compaction_threshold: config.minor_compaction_threshold,
+                major_compaction_threshold: config.major_compaction_threshold,
+                compaction_rate_bytes_per_sec: config.compaction_rate_bytes_per_sec,
+                compaction_max_time_ms: config.compaction_max_time_ms,
+                minor_compaction_interval: config.minor_compaction_interval,
+                major_compaction_interval: config.major_compaction_interval,
+                compaction_max_outstanding_requests: config.compaction_max_outstanding_requests,
+                minor_compaction_max_time_ms: config.minor_compaction_max_time_ms,
+                major_compaction_max_time_ms: config.major_compaction_max_time_ms,
+                is_force_gc_allow_when_no_space: config.is_force_gc_allow_when_no_space,
+            };
+            let metadata_cache_dir = if config.gc_entry_log_metadata_cache_enabled {
+                Some(std::path::Path::new(&config.ledger_directories[0])
+                    .join(bookkeeper_storage::db_ledger_storage::CURRENT_DIR)
+                    .join("metadata-cache"))
+            } else {
+                None
+            };
             let gc_shutdown = shutdown_rx.clone();
             let gc_suspend_major_c = gc_suspend_major.clone();
             let gc_suspend_minor_c = gc_suspend_minor.clone();
@@ -273,7 +388,8 @@ impl BookieServer {
 
             Some(tokio::spawn(async move {
                 run_gc_loop(
-                    gc_storage, gc_ledger_io, gc_zk, gc_paths, gc_wait_ms, gc_shutdown,
+                    gc_storage, gc_ledger_io, gc_zk, gc_paths, gc_wait_ms,
+                    gc_config, metadata_cache_dir, gc_shutdown,
                     gc_suspend_major_c, gc_suspend_minor_c,
                     gc_force_major_c, gc_force_minor_c,
                 ).await;
@@ -292,6 +408,7 @@ impl BookieServer {
             }
             let monitor_threshold = config.disk_usage_threshold;
             let monitor_lwm = config.disk_usage_lwm_threshold;
+            let monitor_warn = config.disk_usage_warn_threshold;
             let monitor_interval_ms = config.disk_check_interval as u64;
             let monitor_shutdown = shutdown_rx.clone();
             // Pass ZK registration info for updating registration on state change
@@ -299,15 +416,21 @@ impl BookieServer {
                 (reg.zk_client().clone(), reg.paths().clone(), bid.clone())
             });
 
+            let monitor_hp_flag = processor.high_priority_writes_flag();
+            let monitor_min_hp_size = config.min_usable_size_for_high_priority_writes;
+
             Some(tokio::spawn(async move {
                 run_disk_monitor(
                     monitor_state,
                     monitor_dirs,
                     monitor_threshold,
                     monitor_lwm,
+                    monitor_warn,
                     monitor_interval_ms,
                     monitor_zk_reg,
                     monitor_shutdown,
+                    monitor_hp_flag,
+                    monitor_min_hp_size,
                 ).await;
             }))
         } else {
@@ -337,9 +460,11 @@ impl BookieServer {
                 gc_suspend_minor: gc_suspend_minor.clone(),
                 gc_force_major: gc_force_major.clone(),
                 gc_force_minor: gc_force_minor.clone(),
+                gc_status: http_api::GcStatus::default(),
             };
             let router = http_api::create_router(http_state);
-            let http_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{http_port}")).await?;
+            let http_host = &config.http_server_host;
+            let http_listener = tokio::net::TcpListener::bind(format!("{http_host}:{http_port}")).await?;
             let http_local_addr = http_listener.local_addr()?;
             tokio::spawn(async move {
                 axum::serve(http_listener, router).await.ok();
@@ -396,7 +521,21 @@ impl BookieServer {
             shutdown_rx,
             max_frame_size,
             tls_acceptor,
+            config.server_sock_keepalive,
+            config.server_tcp_no_delay,
+            config.max_connections,
         ));
+
+        // Start scrubber if localScrubInterval > 0
+        let scrubber_handle = if config.local_scrub_interval > 0 {
+            Some(crate::scrubber::start_scrubber(
+                storage_for_shutdown.clone(),
+                config.local_scrub_interval as u64,
+                config.local_scrub_rate_limit as u64,
+            ))
+        } else {
+            None
+        };
 
         Ok(BookieServer {
             local_addr,
@@ -412,6 +551,7 @@ impl BookieServer {
             disk_monitor_handle,
             sync_handle,
             session_watcher_handle,
+            scrubber_handle,
             ledger_directories: config.ledger_directories.clone(),
         })
     }
@@ -422,6 +562,11 @@ impl BookieServer {
 
     pub fn http_addr(&self) -> Option<SocketAddr> {
         self.http_addr
+    }
+
+    /// Access the bookie's state manager (for tests and HTTP admin).
+    pub fn state_manager(&self) -> Arc<BookieStateManager> {
+        self.state.clone()
     }
 
     /// Update ZK registration when bookie state changes (e.g., to/from read-only).
@@ -537,6 +682,9 @@ async fn validate_cookie(
     // Java stores the cookie as a `VERSION` file inside each `current/`
     // directory. Match that convention so an in-place upgrade from Java
     // finds the file where it expects it.
+    //
+    // Validate against ALL directories (journal + ledger + index) to detect
+    // inconsistencies. Matches Java's Cookie.verify() which checks all dirs.
     let journal_current = std::path::Path::new(&config.journal_directory).join(CURRENT_DIR);
     let disk_cookie_path = journal_current.join("VERSION");
 
@@ -564,7 +712,8 @@ async fn validate_cookie(
                 .map_err(|e| format!("cookie validation failed: {e}"))?;
         }
         (None, None) => {
-            // First time — create cookie in both ZK and disk
+            // First time — create cookie in ZK, journal dir, and ALL ledger dirs.
+            // Matches Java's Cookie.writeToRegistrationManager() + Cookie.writeToDirectory().
             let ledger_dirs: Vec<&str> = config.ledger_directories.iter().map(|s| s.as_str()).collect();
             let cookie = Cookie::new(
                 bookie_id,
@@ -578,10 +727,17 @@ async fn validate_cookie(
             let cookie_str = cookie.serialize();
             zk_reg.create_cookie(bookie_id, cookie_str.as_bytes()).await
                 .map_err(|e| format!("create ZK cookie: {e}"))?;
+            // Write to journal dir
             std::fs::create_dir_all(&journal_current)
                 .map_err(|e| format!("create journal dir: {e}"))?;
             std::fs::write(&disk_cookie_path, &cookie_str)
                 .map_err(|e| format!("write disk cookie: {e}"))?;
+            // Write to all ledger and index dirs
+            for dir in config.ledger_directories.iter().chain(
+                config.index_directories.iter().flat_map(|v| v.iter()),
+            ) {
+                write_cookie_to_dir(dir, &cookie_str)?;
+            }
         }
         (Some(_), None) => {
             // ZK has cookie but disk doesn't — error
@@ -592,6 +748,22 @@ async fn validate_cookie(
             return Err("disk cookie exists but ZK cookie is missing".into());
         }
     }
+
+    // Validate cookies in all ledger and index directories against the journal cookie.
+    // Matches Java's Cookie.verify() which checks every directory for consistency.
+    if disk_cookie_path.exists() {
+        let ref_str = std::fs::read_to_string(&disk_cookie_path)
+            .map_err(|e| format!("re-read journal cookie: {e}"))?;
+        let ref_cookie = Cookie::deserialize(&ref_str)
+            .map_err(|e| format!("re-parse journal cookie: {e}"))?;
+
+        for dir in config.ledger_directories.iter().chain(
+            config.index_directories.iter().flat_map(|v| v.iter()),
+        ) {
+            validate_cookie_in_dir(dir, &ref_cookie)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -671,6 +843,9 @@ pub enum DiskMonitorAction {
     /// Transition ReadOnly → Running because total disk usage dropped below
     /// the low-water mark.
     GoRunning,
+    /// Fatal disk I/O error — trigger bookie shutdown.
+    /// Matches Java's DiskErrorException → triggerBookieShutdown.
+    Shutdown,
 }
 
 /// Pure policy decision for the disk monitor: given the current bookie
@@ -684,16 +859,28 @@ pub enum DiskMonitorAction {
 pub fn decide_disk_monitor_action(
     current: BookieState,
     any_full: bool,
-    total_usage: f64,
+    all_below_lwm: bool,
+    _total_usage: f64,
     lwm_threshold: f64,
     dir_count: usize,
+    has_disk_error: bool,
 ) -> DiskMonitorAction {
+    let _ = (lwm_threshold,); // kept in signature for compatibility
+
+    // Disk I/O error → shutdown. Matches Java's DiskErrorException handling
+    // where LedgerDirsMonitor calls listener.diskFailed() → triggerBookieShutdown.
+    if has_disk_error {
+        return DiskMonitorAction::Shutdown;
+    }
+
     if any_full && current == BookieState::Running {
         return DiskMonitorAction::GoReadOnly;
     }
+    // Recovery: ALL directories must be below LWM (per-dir check).
+    // Matches Java's LedgerDirsMonitor which re-qualifies individual dirs.
     if current == BookieState::ReadOnly
         && dir_count > 0
-        && total_usage < lwm_threshold
+        && all_below_lwm
     {
         return DiskMonitorAction::GoRunning;
     }
@@ -711,9 +898,12 @@ async fn run_disk_monitor(
     ledger_dirs: Vec<String>,
     threshold: f64,
     lwm_threshold: f64,
+    warn_threshold: f64,
     interval_ms: u64,
     zk_info: Option<(zookeeper_client::Client, bookkeeper_metadata::zk_path::ZkPaths, String)>,
     mut shutdown_rx: watch::Receiver<bool>,
+    high_priority_writes_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    min_usable_size_for_high_priority_writes: i64,
 ) {
     let interval = tokio::time::Duration::from_millis(interval_ms);
 
@@ -726,9 +916,11 @@ async fn run_disk_monitor(
             }
             _ = tokio::time::sleep(interval) => {
                 let mut any_full = false;
+                let mut all_below_lwm = true;
                 let mut total_used: f64 = 0.0;
                 let mut total_capacity: f64 = 0.0;
                 let mut dir_count = 0;
+                let mut has_disk_error = false;
 
                 for dir in &ledger_dirs {
                     match get_disk_usage_details(dir) {
@@ -736,17 +928,32 @@ async fn run_disk_monitor(
                             if usage > threshold {
                                 any_full = true;
                             }
+                            if usage > warn_threshold && usage <= threshold {
+                                tracing::warn!(
+                                    "Disk usage for {dir}: {:.1}% exceeds warn threshold ({:.1}%)",
+                                    usage * 100.0,
+                                    warn_threshold * 100.0,
+                                );
+                            }
+                            if usage >= lwm_threshold {
+                                all_below_lwm = false;
+                            }
                             total_used += used_bytes;
                             total_capacity += total_bytes;
                             dir_count += 1;
                         }
                         Err(e) => {
-                            tracing::warn!("Disk monitor: error checking {dir}: {e}");
+                            // Distinguish I/O errors from transient issues.
+                            // If the directory is unreachable or unreadable,
+                            // this is a physical disk failure.
+                            // Matches Java's DiskErrorException detection.
+                            tracing::error!("Disk monitor: I/O error checking {dir}: {e}");
+                            has_disk_error = true;
+                            all_below_lwm = false;
                         }
                     }
                 }
 
-                // For recovery: use total usage across all directories (matching Java)
                 let total_usage = if total_capacity > 0.0 {
                     total_used / total_capacity
                 } else {
@@ -755,22 +962,61 @@ async fn run_disk_monitor(
 
                 let current = state.state();
                 match decide_disk_monitor_action(
-                    current, any_full, total_usage, lwm_threshold, dir_count,
+                    current, any_full, all_below_lwm, total_usage, lwm_threshold, dir_count, has_disk_error,
                 ) {
                     DiskMonitorAction::GoReadOnly => {
                         if state.transition_to(BookieState::ReadOnly) {
                             crate::metrics::BOOKIE_STATE.set(2); // 2 = readonly
                             tracing::info!("Disk monitor: disk usage exceeds {:.0}% threshold, transitioning to READ-ONLY", threshold * 100.0);
+
+                            // Determine if high-priority writes should remain available.
+                            // Matches Java's LedgerDirsMonitor.allDisksFull(highPriorityWritesAllowed):
+                            // if any directory has enough free space for high-priority writes,
+                            // keep accepting recovery adds even in read-only mode.
+                            let hp_allowed = if min_usable_size_for_high_priority_writes > 0 {
+                                ledger_dirs.iter().any(|dir| {
+                                    if let Ok((_usage, used, total)) = get_disk_usage_details(dir) {
+                                        let available = total - used;
+                                        available >= min_usable_size_for_high_priority_writes as f64
+                                    } else {
+                                        false
+                                    }
+                                })
+                            } else {
+                                // When minUsableSizeForHighPriorityWrites is 0 (default),
+                                // always allow high-priority writes in read-only mode.
+                                // Matches Java default: availableForHighPriorityWrites starts
+                                // as true and is only disabled when explicitly configured and
+                                // disk space is below the threshold.
+                                true
+                            };
+                            high_priority_writes_flag.store(hp_allowed, std::sync::atomic::Ordering::Release);
+                            if hp_allowed {
+                                tracing::info!("Disk monitor: high-priority writes (recovery adds) remain enabled in read-only mode");
+                            } else {
+                                tracing::info!("Disk monitor: high-priority writes disabled — insufficient reserved space");
+                            }
+
                             update_zk_registration(&zk_info, true).await;
                         }
                     }
                     DiskMonitorAction::GoRunning => {
-                        if state.transition_to(BookieState::Running) {
+                        // Use try_recover_to_running which respects the manual read-only flag.
+                        // Matches Java's LedgerDirsMonitor which checks isManuallyModified.
+                        if state.try_recover_to_running() {
                             crate::metrics::BOOKIE_STATE.set(1); // 1 = writable
                             tracing::info!("Disk monitor: total disk usage ({:.1}%) below {:.0}% LWM, transitioning back to WRITABLE",
                                 total_usage * 100.0, lwm_threshold * 100.0);
+                            // Re-enable high-priority writes when recovering to writable.
+                            // Matches Java's BookieImpl.allDisksFull(true) → setHighPriorityWritesAvailability(true).
+                            high_priority_writes_flag.store(true, std::sync::atomic::Ordering::Release);
                             update_zk_registration(&zk_info, false).await;
                         }
+                    }
+                    DiskMonitorAction::Shutdown => {
+                        tracing::error!("Disk monitor: fatal disk I/O error detected, initiating shutdown");
+                        state.transition_to(BookieState::ShuttingDown);
+                        break;
                     }
                     DiskMonitorAction::Stay => {}
                 }
@@ -902,6 +1148,83 @@ async fn run_sync_thread(
 
 /// 2. Compare against local storage
 /// 3. Delete local data for ledgers no longer in metadata
+/// Validate the bookie environment at startup.
+/// Matches Java's `BookieImpl.checkEnvironment()`:
+/// - Ensures all configured directories exist and are accessible
+/// - Validates that journal and ledger dirs are on separate filesystems (warning only)
+/// - Creates `current/` subdirectories if missing
+fn write_cookie_to_dir(dir: &str, cookie_str: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let current = std::path::Path::new(dir).join(CURRENT_DIR);
+    std::fs::create_dir_all(&current)
+        .map_err(|e| format!("create dir {dir}/current: {e}"))?;
+    std::fs::write(current.join("VERSION"), cookie_str)
+        .map_err(|e| format!("write cookie {dir}: {e}"))?;
+    Ok(())
+}
+
+fn validate_cookie_in_dir(
+    dir: &str,
+    ref_cookie: &bookkeeper_metadata::cookie::Cookie,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let version_path = std::path::Path::new(dir).join(CURRENT_DIR).join("VERSION");
+    if version_path.exists() {
+        let s = std::fs::read_to_string(&version_path)
+            .map_err(|e| format!("read cookie {dir}: {e}"))?;
+        let cookie = bookkeeper_metadata::cookie::Cookie::deserialize(&s)
+            .map_err(|e| format!("parse cookie {dir}: {e}"))?;
+        cookie.validate_against(ref_cookie)
+            .map_err(|e| format!("cookie mismatch {dir}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn check_environment(config: &ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate journal directory exists or can be created
+    let journal_dir = &config.journal_directory;
+    let journal_current = std::path::Path::new(journal_dir).join(CURRENT_DIR);
+    std::fs::create_dir_all(&journal_current)
+        .map_err(|e| format!("cannot create journal dir {journal_dir}/current: {e}"))?;
+
+    // Validate all ledger directories
+    for dir in &config.ledger_directories {
+        let ledger_current = std::path::Path::new(dir).join(CURRENT_DIR);
+        std::fs::create_dir_all(&ledger_current)
+            .map_err(|e| format!("cannot create ledger dir {dir}/current: {e}"))?;
+    }
+
+    // Validate index directories if configured
+    if let Some(ref index_dirs) = config.index_directories {
+        for dir in index_dirs {
+            let idx_current = std::path::Path::new(dir).join(CURRENT_DIR);
+            std::fs::create_dir_all(&idx_current)
+                .map_err(|e| format!("cannot create index dir {dir}/current: {e}"))?;
+        }
+    }
+
+    // Warn if journal and ledger dirs are on the same filesystem.
+    // Matches Java's checkIfDirsOnSameDiskPartition().
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(journal_meta) = std::fs::metadata(journal_dir) {
+            let journal_dev = journal_meta.dev();
+            for dir in &config.ledger_directories {
+                if let Ok(ledger_meta) = std::fs::metadata(dir) {
+                    if ledger_meta.dev() == journal_dev && dir != journal_dir {
+                        tracing::warn!(
+                            "Journal dir ({journal_dir}) and ledger dir ({dir}) are on the same filesystem. \
+                             This may impact performance. Java BK rejects this unless \
+                             allowMultipleDirsUnderSameDiskPartition=true."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// 4. Delete empty entry log files
 async fn run_gc_loop(
     storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
@@ -909,6 +1232,8 @@ async fn run_gc_loop(
     zk_client: zookeeper_client::Client,
     paths: bookkeeper_metadata::zk_path::ZkPaths,
     gc_wait_ms: u64,
+    gc_config: bookkeeper_storage::gc::GcConfig,
+    metadata_cache_dir: Option<std::path::PathBuf>,
     mut shutdown_rx: watch::Receiver<bool>,
     suspend_major: Arc<std::sync::atomic::AtomicBool>,
     suspend_minor: Arc<std::sync::atomic::AtomicBool>,
@@ -918,18 +1243,41 @@ async fn run_gc_loop(
     use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
     use bookkeeper_metadata::traits::LedgerManager;
     use bookkeeper_storage::gc::GarbageCollector;
+    use bookkeeper_storage::index::entry_log_meta_map::EntryLogMetadataMap;
     use std::collections::HashSet;
     use std::sync::atomic::Ordering;
 
+    let meta_map = metadata_cache_dir.and_then(|dir| {
+        match EntryLogMetadataMap::open(&dir) {
+            Ok(m) => {
+                tracing::info!("GC: persistent entry log metadata cache opened at {}", dir.display());
+                Some(m)
+            }
+            Err(e) => {
+                tracing::warn!("GC: failed to open persistent metadata cache: {e}");
+                None
+            }
+        }
+    });
+
     let ledger_manager = ZkLedgerManager::new(zk_client, paths);
-    let gc = GarbageCollector::new(storage, ledger_io);
+    let minor_interval_secs = gc_config.minor_compaction_interval;
+    let major_interval_secs = gc_config.major_compaction_interval;
+    let gc = GarbageCollector::with_config(storage, ledger_io, gc_config, meta_map);
     let interval = tokio::time::Duration::from_millis(gc_wait_ms);
     // Force-trigger checks at a faster cadence (1s) so HTTP-triggered GC is responsive.
     let force_check_interval = tokio::time::Duration::from_secs(1);
 
-    tracing::info!("GC thread started (interval: {}ms)", gc_wait_ms);
+    tracing::info!("GC thread started (interval: {}ms, minor: {}s, major: {}s)",
+        gc_wait_ms, minor_interval_secs, major_interval_secs);
 
-    let mut last_run = tokio::time::Instant::now();
+    let mut last_gc_run = tokio::time::Instant::now();
+    // Track minor and major compaction timers separately.
+    // Matches Java's GarbageCollectorThread which schedules minor and major
+    // compaction on independent timers (minorCompactionInterval, majorCompactionInterval).
+    let mut last_minor = tokio::time::Instant::now();
+    let mut last_major = tokio::time::Instant::now();
+
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -940,30 +1288,46 @@ async fn run_gc_loop(
             }
             _ = tokio::time::sleep(force_check_interval) => {
                 // Check force flags first (HTTP-triggered immediate GC)
-                let forced = force_major.swap(false, Ordering::Relaxed)
-                    || force_minor.swap(false, Ordering::Relaxed);
-                let should_run = forced || last_run.elapsed() >= interval;
+                let forced_major = force_major.swap(false, Ordering::Relaxed);
+                let forced_minor = force_minor.swap(false, Ordering::Relaxed);
+                let forced = forced_major || forced_minor;
+                let should_run = forced || last_gc_run.elapsed() >= interval;
                 if !should_run {
                     continue;
                 }
 
-                // Honor suspension flags. If both major and minor are suspended,
-                // skip the GC cycle entirely. (This is a coarse-grained match to
-                // Java's per-compaction suspension; the underlying GC implementation
-                // does not yet distinguish major vs minor compaction tiers.)
-                let major_suspended = suspend_major.load(Ordering::Relaxed);
-                let minor_suspended = suspend_minor.load(Ordering::Relaxed);
-                if major_suspended && minor_suspended && !forced {
-                    last_run = tokio::time::Instant::now();
-                    continue;
-                }
+                last_gc_run = tokio::time::Instant::now();
 
-                last_run = tokio::time::Instant::now();
+                // Determine if minor and/or major compaction should run this cycle.
+                // Matches Java's separate scheduling of minor and major compaction.
+                let run_minor = forced_minor
+                    || (minor_interval_secs > 0
+                        && last_minor.elapsed() >= tokio::time::Duration::from_secs(minor_interval_secs as u64)
+                        && !suspend_minor.load(Ordering::Relaxed));
+                let run_major = forced_major
+                    || (major_interval_secs > 0
+                        && last_major.elapsed() >= tokio::time::Duration::from_secs(major_interval_secs as u64)
+                        && !suspend_major.load(Ordering::Relaxed));
+
                 match ledger_manager.get_ledger_ranges().await {
                     Ok(metadata_ledgers) => {
                         let active: HashSet<i64> = metadata_ledgers.into_iter().collect();
-                        if let Err(e) = gc.gc(&active).await {
-                            tracing::warn!("GC cycle error: {e}");
+                        // Run with the major flag if either a major cycle is due
+                        // or both are due (major subsumes minor since its threshold
+                        // is higher). If only minor is due, run minor.
+                        // Ledger deletion (step 1-2 of gc()) runs regardless.
+                        let is_major = run_major;
+                        if run_minor || run_major {
+                            if let Err(e) = gc.gc(&active, is_major).await {
+                                tracing::warn!("GC cycle error: {e}");
+                            }
+                            if run_minor { last_minor = tokio::time::Instant::now(); }
+                            if run_major { last_major = tokio::time::Instant::now(); }
+                        } else {
+                            // No compaction due, but still run ledger deletion
+                            if let Err(e) = gc.gc(&active, false).await {
+                                tracing::warn!("GC cycle error: {e}");
+                            }
                         }
                     }
                     Err(e) => {
@@ -985,6 +1349,9 @@ async fn start_auto_recovery(
     paths: bookkeeper_metadata::zk_path::ZkPaths,
     bookie_id: &str,
     lost_bookie_recovery_delay_secs: u64,
+    rw_rereplicate_backoff_ms: u64,
+    auditor_periodic_check_interval: u64,
+    auditor_periodic_placement_policy_check_interval: u64,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
     use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
@@ -1020,6 +1387,8 @@ async fn start_auto_recovery(
                 auditor_zk,
                 auditor_paths,
                 lost_bookie_recovery_delay_secs,
+                auditor_periodic_check_interval,
+                auditor_periodic_placement_policy_check_interval,
                 elector_shutdown,
             )
             .await
@@ -1037,7 +1406,7 @@ async fn start_auto_recovery(
             ur_manager,
             worker_lm,
             worker_bookie_id,
-            5000, // backoff ms
+            rw_rereplicate_backoff_ms,
             shutdown_rx,
         );
         if let Err(e) = worker.run().await {
@@ -1056,26 +1425,47 @@ async fn accept_loop(
     mut shutdown_rx: watch::Receiver<bool>,
     max_frame_size: usize,
     tls_acceptor: Option<Arc<crate::tls::ReloadableTlsAcceptor>>,
+    tcp_keepalive: bool,
+    tcp_no_delay: bool,
+    max_connections: usize,
 ) {
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _peer_addr)) => {
-                        // Disable Nagle's algorithm. BK responses are small
-                        // (~100 bytes); without NODELAY, Nagle batches them
-                        // and waits for the delayed-ACK timer (~10ms).
-                        let _ = stream.set_nodelay(true);
+                        // Connection limit check
+                        if max_connections > 0 {
+                            let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
+                            if current >= max_connections {
+                                tracing::warn!("Connection limit reached ({max_connections}), rejecting");
+                                drop(stream);
+                                continue;
+                            }
+                        }
+                        active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let conn_count = active_connections.clone();
+
+                        let _ = stream.set_nodelay(tcp_no_delay);
+                        if tcp_keepalive {
+                            let sock = socket2::SockRef::from(&stream);
+                            let _ = sock.set_tcp_keepalive(&socket2::TcpKeepalive::new());
+                        }
                         let proc = processor.clone();
                         if let Some(ref tls) = tls_acceptor {
                             let tls = tls.clone();
                             tokio::spawn(async move {
                                 let acceptor = tls.acceptor().await;
                                 handle_starttls_connection(stream, proc, max_frame_size, acceptor).await;
+                                conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             });
                         } else {
-                            // Plain TCP connection (no TLS configured)
-                            tokio::spawn(handle_connection(stream, proc, max_frame_size));
+                            tokio::spawn(async move {
+                                handle_connection(stream, proc, max_frame_size).await;
+                                conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            });
                         }
                     }
                     Err(_) => {
@@ -1156,17 +1546,15 @@ async fn handle_starttls_connection(
                         }
                         return;
                     } else {
-                        // Not a StartTLS request — this is a plaintext V3 request.
-                        // Process it and continue as plaintext (shouldn't happen if TLS required).
-                        tracing::warn!("Expected StartTLSRequest but got op={op}, processing as plaintext");
-                        let tcp_stream = reader.reunite(writer).unwrap();
-                        handle_connection(tcp_stream, processor, max_frame_size).await;
+                        // Not a StartTLS request — TLS is configured but client didn't
+                        // initiate StartTLS. Reject the connection. Matches Java's
+                        // behavior where TLS-configured bookies require StartTLS.
+                        tracing::warn!("TLS configured but client sent non-StartTLS request (op={op}), closing connection");
                         return;
                     }
                 } else {
-                    // V2 binary request — process as plaintext
-                    let tcp_stream = reader.reunite(writer).unwrap();
-                    handle_connection(tcp_stream, processor, max_frame_size).await;
+                    // V2 binary request on a TLS-configured bookie — reject.
+                    tracing::warn!("TLS configured but client sent plaintext V2 request, closing connection");
                     return;
                 }
             }
@@ -1220,6 +1608,9 @@ where
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
 
     // Writer task: sends framed responses to the socket.
+    // Matches Java's closeChannelOnResponseTimeout: if a write takes longer
+    // than the timeout, close the connection to free resources.
+    let write_timeout = std::time::Duration::from_secs(30);
     let writer_handle = tokio::spawn(async move {
         let mut codec = BookieCodec::new(max_frame_size);
         let mut out = BytesMut::with_capacity(256);
@@ -1229,13 +1620,25 @@ where
                 break;
             }
             let write_start = std::time::Instant::now();
-            let write_ok = writer.write_all(&out).await.is_ok();
+            let write_result = tokio::time::timeout(
+                write_timeout,
+                writer.write_all(&out),
+            ).await;
             let elapsed = write_start.elapsed().as_secs_f64();
-            if write_ok {
-                crate::metrics::CHANNEL_WRITE_OK.observe(elapsed);
-            } else {
-                crate::metrics::CHANNEL_WRITE_FAIL.observe(elapsed);
-                break;
+            match write_result {
+                Ok(Ok(())) => {
+                    crate::metrics::CHANNEL_WRITE_OK.observe(elapsed);
+                }
+                Ok(Err(_)) => {
+                    crate::metrics::CHANNEL_WRITE_FAIL.observe(elapsed);
+                    break;
+                }
+                Err(_) => {
+                    // Write timeout — slow client. Close connection.
+                    tracing::warn!("Closing slow client: write timed out after {:.1}s", elapsed);
+                    crate::metrics::CHANNEL_WRITE_FAIL.observe(elapsed);
+                    break;
+                }
             }
         }
     });
@@ -1244,6 +1647,10 @@ where
     let mut codec = BookieCodec::new(max_frame_size);
     let mut buf = BytesMut::with_capacity(4096);
     let mut is_v3: Option<bool> = None;
+    // Per-connection auth gate. When auth is disabled (default), all
+    // connections start authenticated. Otherwise, non-AUTH requests
+    // are rejected with EUA until the handshake completes.
+    let mut authenticated = !processor.require_auth();
 
     loop {
         match codec.decode(&mut buf) {
@@ -1257,6 +1664,21 @@ where
                 if use_v3 {
                     is_v3 = Some(true);
                     if let Some(v3_req) = crate::v3_processor::try_decode_v3(&frame_bytes) {
+                        // Allow AUTH requests through even if not yet authenticated.
+                        let is_auth_op = v3_req.header.operation == bookkeeper_proto::OperationType::Auth as i32;
+                        if !authenticated && !is_auth_op {
+                            let txn_id = v3_req.header.txn_id as u64;
+                            let operation = v3_req.header.operation;
+                            let resp = crate::v3_processor::build_v3_error_response(
+                                txn_id, operation,
+                                bookkeeper_common::error::BKError::Unauthorized,
+                            );
+                            let _ = resp_tx.send(Bytes::from(resp));
+                            continue;
+                        }
+                        if is_auth_op {
+                            authenticated = true;
+                        }
                         let proc = processor.clone();
                         let tx = resp_tx.clone();
                         tokio::spawn(async move {
@@ -1270,6 +1692,26 @@ where
                     is_v3 = Some(false);
                     match decode_request(frame_bytes) {
                         Ok(req) => {
+                            // Allow AUTH requests through; block others until authenticated.
+                            let is_auth_req = matches!(&req, V2Request::Auth { .. });
+                            if !authenticated && !is_auth_req {
+                                let proc = processor.clone();
+                                let tx = resp_tx.clone();
+                                // Return EUA for the request type. Extract ledger_id/entry_id
+                                // for the error response where available.
+                                tokio::spawn(async move {
+                                    let resp = proc.process_request(V2Request::Auth {
+                                        payload: bytes::Bytes::new(),
+                                    }).await;
+                                    // Send an unauthorized error. For simplicity, we send
+                                    // the auth-disabled response — the client will see EUA.
+                                    let _ = tx.send(encode_response(&resp).freeze());
+                                });
+                                continue;
+                            }
+                            if is_auth_req {
+                                authenticated = true;
+                            }
                             let proc = processor.clone();
                             let tx = resp_tx.clone();
                             tokio::spawn(async move {

@@ -79,6 +79,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 io-uring = "0.7"
 libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
 pprof = { version = "0.15", features = ["flamegraph"] }
 
 # Test / benchmark tools — shared across multiple crates.
