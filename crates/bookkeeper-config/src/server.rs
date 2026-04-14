@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::properties::parse_bool;
+
 /// Complete bookie server configuration with all parameters from the spec.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -132,8 +134,13 @@ pub struct ServerConfig {
     pub max_reads_in_progress_limit: usize,
     /// Max concurrent connections. 0 = unlimited.
     pub max_connections: usize,
-    /// Close connection if response write takes longer than this (ms). 0 = disabled.
-    pub close_channel_on_response_timeout_ms: u64,
+    /// When the server times out sending a response (see
+    /// `waitTimeoutOnResponseBackpressureMs`), either close the channel
+    /// and drop the response (true) or just drop the response (false).
+    /// Matches Java's boolean `closeChannelOnResponseTimeout`. Was
+    /// incorrectly typed as `u64` before: `=true` in a Java-shaped
+    /// config would silently fail to parse and be ignored.
+    pub close_channel_on_response_timeout: bool,
 
     // Journal (extended)
     /// Skip invalid records during journal replay instead of aborting.
@@ -435,15 +442,25 @@ impl Default for ServerConfig {
             gc_entry_log_metadata_cache_enabled: false,
             minor_compaction_max_time_ms: -1,
             major_compaction_max_time_ms: -1,
-            compaction_max_outstanding_requests: 10000,
+            // Java's `compactionMaxOutstandingRequests` default is 100_000;
+            // 10_000 forced 10× more compaction flushes → higher write
+            // amplification. Aligning with the Java default restores the
+            // intended batching size.
+            compaction_max_outstanding_requests: 100_000,
             is_force_gc_allow_when_no_space: false,
             journal_max_queue_memory_mb: 0,
             journal_flush_when_queue_empty: false,
-            journal_remove_from_page_cache: false,
+            // Java defaults `journalRemoveFromPageCache` to true, which
+            // calls `posix_fadvise(DONTNEED)` after each journal write so
+            // the Linux page cache isn't polluted with journal pages the
+            // bookie will never re-read. Leaving this `false` (the prior
+            // Rust default) lets journal data accumulate in page cache
+            // and creates OS-level memory pressure on busy bookies.
+            journal_remove_from_page_cache: true,
             max_adds_in_progress_limit: 0,
             max_reads_in_progress_limit: 10000,
             max_connections: 0,
-            close_channel_on_response_timeout_ms: 0,
+            close_channel_on_response_timeout: false,
             skip_replay_journal_invalid_record: false,
             verify_storage_on_unclean_shutdown: false,
             journal_pre_alloc_size_mb: 16,
@@ -636,20 +653,20 @@ impl ServerConfig {
         let mut config = Self::default();
         if let Some(v) = props.get("bookiePort") { if let Ok(n) = v.parse() { config.bookie_port = n; } }
         if let Some(v) = props.get("advertisedAddress") { config.advertised_address = Some(v.clone()); }
-        if let Some(v) = props.get("useHostNameAsBookieID") { config.use_hostname_as_bookie_id = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("useShortHostName") { config.use_short_hostname = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("useHostNameAsBookieID") { config.use_hostname_as_bookie_id = parse_bool(v); }
+        if let Some(v) = props.get("useShortHostName") { config.use_short_hostname = parse_bool(v); }
         if let Some(v) = props.get("listeningInterface") { config.listening_interface = Some(v.clone()); }
-        if let Some(v) = props.get("allowLoopback") { config.allow_loopback = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("allowLoopback") { config.allow_loopback = parse_bool(v); }
         if let Some(v) = props.get("journalDirectory") { config.journal_directory = v.clone(); }
         if let Some(v) = props.get("journalDirectories") { config.journal_directory = v.split('|').next().unwrap_or("").to_string(); }
         if let Some(v) = props.get("ledgerDirectories") { config.ledger_directories = v.split(',').map(|s| s.trim().to_string()).collect(); }
         if let Some(v) = props.get("indexDirectories") { config.index_directories = Some(v.split(',').map(|s| s.trim().to_string()).collect()); }
-        if let Some(v) = props.get("allowStorageExpansion") { config.allow_storage_expansion = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("allowStorageExpansion") { config.allow_storage_expansion = parse_bool(v); }
         if let Some(v) = props.get("journalMaxSizeMB") { if let Ok(n) = v.parse() { config.journal_max_size_mb = n; } }
         if let Some(v) = props.get("journalMaxBackups") { if let Ok(n) = v.parse() { config.journal_max_backups = n; } }
-        if let Some(v) = props.get("journalWriteData") { config.journal_write_data = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("journalSyncData") { config.journal_sync_data = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("journalAdaptiveGroupWrites") { config.journal_adaptive_group_writes = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("journalWriteData") { config.journal_write_data = parse_bool(v); }
+        if let Some(v) = props.get("journalSyncData") { config.journal_sync_data = parse_bool(v); }
+        if let Some(v) = props.get("journalAdaptiveGroupWrites") { config.journal_adaptive_group_writes = parse_bool(v); }
         if let Some(v) = props.get("journalMaxGroupWaitMSec") { if let Ok(n) = v.parse() { config.journal_max_group_wait_ms = n; } }
         if let Some(v) = props.get("journalBufferedWritesThreshold") { if let Ok(n) = v.parse() { config.journal_buffered_writes_threshold = n; } }
         if let Some(v) = props.get("journalBufferedEntriesThreshold") { if let Ok(n) = v.parse() { config.journal_buffered_entries_threshold = n; } }
@@ -657,7 +674,7 @@ impl ServerConfig {
         if let Some(v) = props.get("journalFormatVersionToWrite") { if let Ok(n) = v.parse() { config.journal_format_version_to_write = n; } }
         if let Some(v) = props.get("flushInterval") { if let Ok(n) = v.parse() { config.flush_interval = n; } }
         if let Some(v) = props.get("logSizeLimit") { if let Ok(n) = v.parse() { config.log_size_limit = n; } }
-        if let Some(v) = props.get("entryLogPerLedgerEnabled") { config.entry_log_per_ledger_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("entryLogPerLedgerEnabled") { config.entry_log_per_ledger_enabled = parse_bool(v); }
         if let Some(v) = props.get("dbStorage_writeCacheMaxSizeMb") { if let Ok(n) = v.parse() { config.db_storage_write_cache_max_size_mb = n; } }
         if let Some(v) = props.get("dbStorage_readAheadCacheMaxSizeMb") { if let Ok(n) = v.parse() { config.db_storage_read_cache_max_size_mb = n; } }
         if let Some(v) = props.get("dbStorage_rocksDB_writeBufferSizeMB") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_write_buffer_size_mb = n; } }
@@ -670,8 +687,8 @@ impl ServerConfig {
         if let Some(v) = props.get("dbStorage_rocksDB_maxSizeInLevel1MB") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_max_size_in_level1_mb = n; } }
         if let Some(v) = props.get("entryLocationRocksdbConf") { config.entry_location_rocksdb_conf = Some(v.clone()); }
         if let Some(v) = props.get("ledgerMetadataRocksdbConf") { config.ledger_metadata_rocksdb_conf = Some(v.clone()); }
-        if let Some(v) = props.get("serverTcpNoDelay") { config.server_tcp_no_delay = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("serverSockKeepalive") { config.server_sock_keepalive = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("serverTcpNoDelay") { config.server_tcp_no_delay = parse_bool(v); }
+        if let Some(v) = props.get("serverSockKeepalive") { config.server_sock_keepalive = parse_bool(v); }
         if let Some(v) = props.get("nettyMaxFrameSizeBytes") { if let Ok(n) = v.parse() { config.max_frame_size = n; } }
         if let Some(v) = props.get("serverNumIOThreads") { if let Ok(n) = v.parse() { config.server_num_io_threads = n; } }
         if let Some(v) = props.get("numAddWorkerThreads") { if let Ok(n) = v.parse() { config.num_add_worker_threads = n; } }
@@ -680,7 +697,7 @@ impl ServerConfig {
         if let Some(v) = props.get("tlsKeyStore") { config.tls_key_path = Some(v.clone()); }
         if let Some(v) = props.get("tlsKeyFilePath") { config.tls_key_path = Some(v.clone()); }
         if let Some(v) = props.get("tlsTrustStore") { config.tls_trust_store_path = Some(v.clone()); }
-        if let Some(v) = props.get("tlsClientAuthentication") { config.tls_client_authentication = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("tlsClientAuthentication") { config.tls_client_authentication = parse_bool(v); }
         if let Some(v) = props.get("tlsKeyStoreType") { config.tls_keystore_type = v.clone(); }
         if let Some(v) = props.get("tlsEnabledCipherSuites") { config.tls_enabled_cipher_suites = Some(v.clone()); }
         if let Some(v) = props.get("tlsEnabledProtocols") { config.tls_enabled_protocols = Some(v.clone()); }
@@ -690,7 +707,7 @@ impl ServerConfig {
         if let Some(v) = props.get("diskUsageWarnThreshold") { if let Ok(n) = v.parse() { config.disk_usage_warn_threshold = n; } }
         if let Some(v) = props.get("diskUsageLwmThreshold") { if let Ok(n) = v.parse() { config.disk_usage_lwm_threshold = n; } }
         if let Some(v) = props.get("diskCheckInterval") { if let Ok(n) = v.parse() { config.disk_check_interval = n; } }
-        if let Some(v) = props.get("readOnlyModeEnabled") { config.read_only_mode_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("readOnlyModeEnabled") { config.read_only_mode_enabled = parse_bool(v); }
         if let Some(v) = props.get("minorCompactionInterval") { if let Ok(n) = v.parse() { config.minor_compaction_interval = n; } }
         if let Some(v) = props.get("minorCompactionThreshold") { if let Ok(n) = v.parse() { config.minor_compaction_threshold = n; } }
         if let Some(v) = props.get("majorCompactionInterval") { if let Ok(n) = v.parse() { config.major_compaction_interval = n; } }
@@ -698,15 +715,15 @@ impl ServerConfig {
         if let Some(v) = props.get("gcWaitTime") { if let Ok(n) = v.parse() { config.gc_wait_time = n; } }
         if let Some(v) = props.get("compactionRateByBytes") { if let Ok(n) = v.parse() { config.compaction_rate_bytes_per_sec = n; } }
         if let Some(v) = props.get("compactionMaxTimeMillis") { if let Ok(n) = v.parse() { config.compaction_max_time_ms = n; } }
-        if let Some(v) = props.get("gcEntryLogMetadataCacheEnabled") { config.gc_entry_log_metadata_cache_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("gcEntryLogMetadataCacheEnabled") { config.gc_entry_log_metadata_cache_enabled = parse_bool(v); }
         if let Some(v) = props.get("journalMaxMemorySizeMb") { if let Ok(n) = v.parse() { config.journal_max_queue_memory_mb = n; } }
-        if let Some(v) = props.get("journalFlushWhenQueueEmpty") { config.journal_flush_when_queue_empty = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("journalRemoveFromPageCache") { config.journal_remove_from_page_cache = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("journalFlushWhenQueueEmpty") { config.journal_flush_when_queue_empty = parse_bool(v); }
+        if let Some(v) = props.get("journalRemoveFromPageCache") { config.journal_remove_from_page_cache = parse_bool(v); }
         // GC extended
         if let Some(v) = props.get("minorCompactionMaxTimeMillis") { if let Ok(n) = v.parse() { config.minor_compaction_max_time_ms = n; } }
         if let Some(v) = props.get("majorCompactionMaxTimeMillis") { if let Ok(n) = v.parse() { config.major_compaction_max_time_ms = n; } }
         if let Some(v) = props.get("compactionMaxOutstandingRequests") { if let Ok(n) = v.parse() { config.compaction_max_outstanding_requests = n; } }
-        if let Some(v) = props.get("isForceGCAllowWhenNoSpace") { config.is_force_gc_allow_when_no_space = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("isForceGCAllowWhenNoSpace") { config.is_force_gc_allow_when_no_space = parse_bool(v); }
         // Journal queue + page cache
         if let Some(v) = props.get("journalQueueSize") { if let Ok(n) = v.parse() { config.journal_queue_size = n; } }
         if let Some(v) = props.get("journalPageCacheFlushIntervalMSec") { if let Ok(n) = v.parse() { config.journal_page_cache_flush_interval_ms = n; } }
@@ -715,22 +732,22 @@ impl ServerConfig {
         if let Some(v) = props.get("maxAddsInProgressLimit") { if let Ok(n) = v.parse() { config.max_adds_in_progress_limit = n; } }
         if let Some(v) = props.get("maxReadsInProgressLimit") { if let Ok(n) = v.parse() { config.max_reads_in_progress_limit = n; } }
         if let Some(v) = props.get("maxConnections") { if let Ok(n) = v.parse() { config.max_connections = n; } }
-        if let Some(v) = props.get("closeChannelOnResponseTimeout") { if let Ok(n) = v.parse() { config.close_channel_on_response_timeout_ms = n; } }
+        if let Some(v) = props.get("closeChannelOnResponseTimeout") { config.close_channel_on_response_timeout = parse_bool(v); }
         // Journal extended
-        if let Some(v) = props.get("skipReplayJournalInvalidRecord") { config.skip_replay_journal_invalid_record = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("verifyStorageOnUncleanShutdown") { config.verify_storage_on_unclean_shutdown = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("skipReplayJournalInvalidRecord") { config.skip_replay_journal_invalid_record = parse_bool(v); }
+        if let Some(v) = props.get("verifyStorageOnUncleanShutdown") { config.verify_storage_on_unclean_shutdown = parse_bool(v); }
         if let Some(v) = props.get("journalPreAllocSizeMB") { if let Ok(n) = v.parse() { config.journal_pre_alloc_size_mb = n; } }
         if let Some(v) = props.get("journalWriteBufferSizeKB") { if let Ok(n) = v.parse() { config.journal_write_buffer_size_kb = n; } }
-        if let Some(v) = props.get("journalReuseFiles") { config.journal_reuse_files = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("journalReuseFiles") { config.journal_reuse_files = parse_bool(v); }
         // GC extended
-        if let Some(v) = props.get("forceAllowCompaction") { config.force_allow_compaction = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("isThrottleByBytes") { config.is_throttle_by_bytes = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("verifyMetadataOnGC") { config.verify_metadata_on_gc = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("useTransactionalCompaction") { config.use_transactional_compaction = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("forceAllowCompaction") { config.force_allow_compaction = parse_bool(v); }
+        if let Some(v) = props.get("isThrottleByBytes") { config.is_throttle_by_bytes = parse_bool(v); }
+        if let Some(v) = props.get("verifyMetadataOnGC") { config.verify_metadata_on_gc = parse_bool(v); }
+        if let Some(v) = props.get("useTransactionalCompaction") { config.use_transactional_compaction = parse_bool(v); }
         // Disk extended
-        if let Some(v) = props.get("forceReadOnlyBookie") { config.force_read_only_bookie = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("persistBookieStatusEnabled") { config.persist_bookie_status_enabled = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("readOnlyModeOnAnyDiskFullEnabled") { config.read_only_mode_on_any_disk_full_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("forceReadOnlyBookie") { config.force_read_only_bookie = parse_bool(v); }
+        if let Some(v) = props.get("persistBookieStatusEnabled") { config.persist_bookie_status_enabled = parse_bool(v); }
+        if let Some(v) = props.get("readOnlyModeOnAnyDiskFullEnabled") { config.read_only_mode_on_any_disk_full_enabled = parse_bool(v); }
         // Network extended
         if let Some(v) = props.get("serverWriteBufferLowWaterMark") { if let Ok(n) = v.parse() { config.server_write_buffer_low_water_mark = n; } }
         if let Some(v) = props.get("serverWriteBufferHighWaterMark") { if let Ok(n) = v.parse() { config.server_write_buffer_high_water_mark = n; } }
@@ -745,7 +762,7 @@ impl ServerConfig {
         if let Some(v) = props.get("maxBatchReadSize") { if let Ok(n) = v.parse() { config.max_batch_read_size_bytes = n; } }
         if let Some(v) = props.get("maxBatchReadCount") { if let Ok(n) = v.parse() { config.max_batch_read_count = n; } }
         // Replication / Auditor
-        if let Some(v) = props.get("autoRecoveryDaemonEnabled") { config.auto_recovery_daemon_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("autoRecoveryDaemonEnabled") { config.auto_recovery_daemon_enabled = parse_bool(v); }
         if let Some(v) = props.get("lostBookieRecoveryDelay") { if let Ok(n) = v.parse() { config.lost_bookie_recovery_delay = n; } }
         if let Some(v) = props.get("auditorPeriodicCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_check_interval = n; } }
         if let Some(v) = props.get("auditorPeriodicBookieCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_bookie_check_interval = n; } }
@@ -759,15 +776,15 @@ impl ServerConfig {
         if let Some(v) = props.get("zkRetryBackoffStartMs") { if let Ok(n) = v.parse() { config.zk_retry_backoff_start_ms = n; } }
         if let Some(v) = props.get("zkRetryBackoffMaxMs") { if let Ok(n) = v.parse() { config.zk_retry_backoff_max_ms = n; } }
         // HTTP
-        if let Some(v) = props.get("httpServerEnabled") { config.http_server_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("httpServerEnabled") { config.http_server_enabled = parse_bool(v); }
         if let Some(v) = props.get("httpServerPort") { if let Ok(n) = v.parse() { config.http_server_port = n; } }
         if let Some(v) = props.get("httpServerHost") { config.http_server_host = v.clone(); }
         // Data integrity
         if let Some(v) = props.get("localScrubInterval") { if let Ok(n) = v.parse() { config.local_scrub_interval = n; } }
         if let Some(v) = props.get("localScrubRateLimit") { if let Ok(n) = v.parse() { config.local_scrub_rate_limit = n; } }
-        if let Some(v) = props.get("localConsistencyCheckOnStartup") { config.local_consistency_check_on_startup = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("dataIntegrityChecking") { config.data_integrity_checking = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("dataIntegrityStampMissingCookies") { config.data_integrity_stamp_missing_cookies = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("localConsistencyCheckOnStartup") { config.local_consistency_check_on_startup = parse_bool(v); }
+        if let Some(v) = props.get("dataIntegrityChecking") { config.data_integrity_checking = parse_bool(v); }
+        if let Some(v) = props.get("dataIntegrityStampMissingCookies") { config.data_integrity_stamp_missing_cookies = parse_bool(v); }
         if let Some(v) = props.get("bookieId") { config.bookie_id = Some(v.clone()); }
         // Storage extended
         if let Some(v) = props.get("openFileLimit") { if let Ok(n) = v.parse() { config.open_file_limit = n; } }
@@ -776,20 +793,20 @@ impl ServerConfig {
         // Network extended
         if let Some(v) = props.get("serverNumAcceptorThreads") { if let Ok(n) = v.parse() { config.server_num_acceptor_threads = n; } }
         if let Some(v) = props.get("waitTimeoutOnResponseBackpressureMs") { if let Ok(n) = v.parse() { config.wait_timeout_on_response_backpressure_ms = n; } }
-        if let Some(v) = props.get("readWorkerThreadsThrottlingEnabled") { config.read_worker_threads_throttling_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("readWorkerThreadsThrottlingEnabled") { config.read_worker_threads_throttling_enabled = parse_bool(v); }
         if let Some(v) = props.get("requestTimerTickDurationMs") { if let Ok(n) = v.parse() { config.request_timer_tick_duration_ms = n; } }
         if let Some(v) = props.get("requestTimerNumTicks") { if let Ok(n) = v.parse() { config.request_timer_num_ticks = n; } }
         // Auditor extended
         if let Some(v) = props.get("openLedgerRereplicationGracePeriod") { if let Ok(n) = v.parse() { config.open_ledger_rereplication_grace_period = n; } }
         if let Some(v) = props.get("lockReleaseOfFailedLedgerGracePeriod") { if let Ok(n) = v.parse() { config.lock_release_of_failed_ledger_grace_period = n; } }
         // HTTP TLS
-        if let Some(v) = props.get("httpServerTlsEnable") { config.http_server_tls_enable = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("httpServerTlsEnable") { config.http_server_tls_enable = parse_bool(v); }
         if let Some(v) = props.get("httpServerKeyStorePath") { config.http_server_key_store_path = Some(v.clone()); }
         if let Some(v) = props.get("httpServerKeyStorePassword") { config.http_server_key_store_password = Some(v.clone()); }
         if let Some(v) = props.get("httpServerTrustStorePath") { config.http_server_trust_store_path = Some(v.clone()); }
         if let Some(v) = props.get("httpServerTrustStorePassword") { config.http_server_trust_store_password = Some(v.clone()); }
         // Statistics
-        if let Some(v) = props.get("enableStatistics") { config.enable_statistics = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("enableStatistics") { config.enable_statistics = parse_bool(v); }
         if let Some(v) = props.get("prometheusStatsHttpPort") { if let Ok(n) = v.parse() { config.prometheus_stats_http_port = n; } }
         if let Some(v) = props.get("statsProviderClass") { config.stats_provider_class = Some(v.clone()); }
         // Not yet wired
@@ -798,30 +815,30 @@ impl ServerConfig {
         if let Some(v) = props.get("fileInfoCacheInitialCapacity") { if let Ok(n) = v.parse() { config.file_info_cache_initial_capacity = n; } }
         if let Some(v) = props.get("fileInfoMaxIdleTime") { if let Ok(n) = v.parse() { config.file_info_max_idle_time = n; } }
         if let Some(v) = props.get("fileInfoFormatVersionToWrite") { if let Ok(n) = v.parse() { config.file_info_format_version_to_write = n; } }
-        if let Some(v) = props.get("sortedLedgerStorageEnabled") { config.sorted_ledger_storage_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("sortedLedgerStorageEnabled") { config.sorted_ledger_storage_enabled = parse_bool(v); }
         if let Some(v) = props.get("skipListSizeLimit") { if let Ok(n) = v.parse() { config.skip_list_size_limit = n; } }
         if let Some(v) = props.get("skipListArenaChunkSize") { if let Ok(n) = v.parse() { config.skip_list_arena_chunk_size = n; } }
         if let Some(v) = props.get("skipListArenaMaxAllocSize") { if let Ok(n) = v.parse() { config.skip_list_arena_max_alloc_size = n; } }
         if let Some(v) = props.get("serverTcpLinger") { if let Ok(n) = v.parse() { config.server_tcp_linger = n; } }
-        if let Some(v) = props.get("allowEphemeralPorts") { config.allow_ephemeral_ports = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("enableLocalTransport") { config.enable_local_transport = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("disableServerSocketBind") { config.disable_server_socket_bind = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("allowEphemeralPorts") { config.allow_ephemeral_ports = parse_bool(v); }
+        if let Some(v) = props.get("enableLocalTransport") { config.enable_local_transport = parse_bool(v); }
+        if let Some(v) = props.get("disableServerSocketBind") { config.disable_server_socket_bind = parse_bool(v); }
         if let Some(v) = props.get("byteBufAllocatorSizeInitial") { if let Ok(n) = v.parse() { config.byte_buf_allocator_size_initial = n; } }
         if let Some(v) = props.get("byteBufAllocatorSizeMin") { if let Ok(n) = v.parse() { config.byte_buf_allocator_size_min = n; } }
         if let Some(v) = props.get("byteBufAllocatorSizeMax") { if let Ok(n) = v.parse() { config.byte_buf_allocator_size_max = n; } }
         if let Some(v) = props.get("extraServerComponents") { config.extra_server_components = Some(v.clone()); }
-        if let Some(v) = props.get("sanityCheckMetricsEnabled") { config.sanity_check_metrics_enabled = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("enableTaskExecutionStats") { config.enable_task_execution_stats = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("sanityCheckMetricsEnabled") { config.sanity_check_metrics_enabled = parse_bool(v); }
+        if let Some(v) = props.get("enableTaskExecutionStats") { config.enable_task_execution_stats = parse_bool(v); }
         if let Some(v) = props.get("authorizedRoles") { config.authorized_roles = Some(v.clone()); }
         if let Some(v) = props.get("readBufferSizeBytes") { if let Ok(n) = v.parse() { config.read_buffer_size_bytes = n; } }
         if let Some(v) = props.get("writeBufferSizeBytes") { if let Ok(n) = v.parse() { config.write_buffer_size_bytes = n; } }
         // Missing config options from Java compatibility audit
         if let Some(v) = props.get("metadataServiceUri") { config.metadata_service_uri = Some(v.clone()); }
         if let Some(v) = props.get("minNumRacksPerWriteQuorum") { if let Ok(n) = v.parse() { config.min_num_racks_per_write_quorum = n; } }
-        if let Some(v) = props.get("enforceMinNumRacksPerWriteQuorum") { config.enforce_min_num_racks_per_write_quorum = v.eq_ignore_ascii_case("true"); }
-        if let Some(v) = props.get("enforceMinNumFaultDomainsForWrite") { config.enforce_min_num_fault_domains_for_write = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("enforceMinNumRacksPerWriteQuorum") { config.enforce_min_num_racks_per_write_quorum = parse_bool(v); }
+        if let Some(v) = props.get("enforceMinNumFaultDomainsForWrite") { config.enforce_min_num_fault_domains_for_write = parse_bool(v); }
         if let Some(v) = props.get("permittedStartupUsers") { config.permitted_startup_users = Some(v.clone()); }
-        if let Some(v) = props.get("repairedPlacementPolicyNotAdheringBookieEnabled") { config.repaired_placement_policy_not_adhering_bookie_enabled = v.eq_ignore_ascii_case("true"); }
+        if let Some(v) = props.get("repairedPlacementPolicyNotAdheringBookieEnabled") { config.repaired_placement_policy_not_adhering_bookie_enabled = parse_bool(v); }
         if let Some(v) = props.get("auditorReplicasCheckInterval") { if let Ok(n) = v.parse() { config.auditor_replicas_check_interval = n; } }
         if let Some(v) = props.get("auditorMaxNumberOfConcurrentOpenLedgerOperations") { if let Ok(n) = v.parse() { config.auditor_max_concurrent_open_ledger_operations = n; } }
         if let Some(v) = props.get("bookieDeathWatchInterval") { if let Ok(n) = v.parse() { config.bookie_death_watch_interval = n; } }
@@ -836,9 +853,14 @@ impl ServerConfig {
         config
     }
 
+    /// Load the server config from a Java-Properties-shaped file, then
+    /// overlay any `BK_<propertyName>` environment variables so container
+    /// platforms can inject secrets/endpoints without rewriting the file.
+    /// Matches Apache BookKeeper's Docker `apply-config-from-env.py` flow.
     pub fn from_file(path: &Path) -> Result<Self, std::io::Error> {
         let text = std::fs::read_to_string(path)?;
-        let props = crate::properties::parse_properties(&text);
+        let mut props = crate::properties::parse_properties(&text);
+        crate::properties::apply_env_overrides(&mut props);
         Ok(Self::from_properties(&props))
     }
 }

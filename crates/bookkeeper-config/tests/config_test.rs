@@ -135,7 +135,8 @@ fn server_config_new_fields_defaults() {
     assert!(!config.use_transactional_compaction);
     assert_eq!(config.minor_compaction_max_time_ms, -1);
     assert_eq!(config.major_compaction_max_time_ms, -1);
-    assert_eq!(config.compaction_max_outstanding_requests, 10000);
+    // Matches Java's default (100_000); prior 10_000 caused 10× more flushes.
+    assert_eq!(config.compaction_max_outstanding_requests, 100_000);
     assert!(!config.is_force_gc_allow_when_no_space);
     // Disk extended
     assert!(!config.force_read_only_bookie);
@@ -650,4 +651,98 @@ fn max_batch_read_count_parse() {
     let props = parse_properties(text);
     let config = ServerConfig::from_properties(&props);
     assert_eq!(config.max_batch_read_count, 5000);
+}
+
+// ---------------------------------------------------------------------------
+// Config parity items: env overrides, boolean variants, fixed types/defaults.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn close_channel_on_response_timeout_parses_as_bool() {
+    // C2: field must be a bool, not u64. A Java-shaped "=true" must stick
+    // (previously it silently failed to parse and stayed at 0/false).
+    let text = "closeChannelOnResponseTimeout=true\n";
+    let props = parse_properties(text);
+    let config = ServerConfig::from_properties(&props);
+    assert!(config.close_channel_on_response_timeout);
+
+    let text = "closeChannelOnResponseTimeout=false\n";
+    let props = parse_properties(text);
+    let config = ServerConfig::from_properties(&props);
+    assert!(!config.close_channel_on_response_timeout);
+}
+
+#[test]
+fn compaction_and_page_cache_defaults_match_java() {
+    // C3 + C4: two defaults drifted from Java. Lock them down so future
+    // edits don't silently regress operator-visible behaviour.
+    let config = ServerConfig::default();
+    assert_eq!(
+        config.compaction_max_outstanding_requests, 100_000,
+        "compactionMaxOutstandingRequests must match Java default"
+    );
+    assert!(
+        config.journal_remove_from_page_cache,
+        "journalRemoveFromPageCache must default true to match Java"
+    );
+}
+
+#[test]
+fn parse_bool_accepts_java_forms_in_server_config() {
+    // C5: yes/y/on/1 should all parse as true; garbage as false.
+    for (raw, expect) in [
+        ("true", true),
+        ("Yes", true),
+        ("y", true),
+        ("on", true),
+        ("1", true),
+        ("false", false),
+        ("no", false),
+        ("0", false),
+        ("garbage", false),
+    ] {
+        let text = format!("journalSyncData={raw}\n");
+        let props = parse_properties(&text);
+        let config = ServerConfig::from_properties(&props);
+        assert_eq!(
+            config.journal_sync_data, expect,
+            "journalSyncData={raw:?} expected {expect}"
+        );
+    }
+}
+
+#[test]
+fn env_overrides_apply_on_top_of_file() {
+    // C1: env vars prefixed with `BK_` take precedence over the file.
+    use bookkeeper_config::properties::{apply_env_overrides_from, parse_properties};
+    let text = "bookiePort=3181\njournalDirectory=/data/journal\n";
+    let mut props = parse_properties(text);
+    // Simulate `BK_bookiePort=3281` + a new key that wasn't in the file.
+    apply_env_overrides_from(&mut props, vec![
+        ("BK_bookiePort".into(), "3281".into()),
+        ("BK_advertisedAddress".into(), "10.0.0.5".into()),
+        ("PATH".into(), "/usr/bin".into()), // unrelated env must not leak
+    ]);
+    let config = ServerConfig::from_properties(&props);
+    assert_eq!(config.bookie_port, 3281);
+    assert_eq!(config.advertised_address.as_deref(), Some("10.0.0.5"));
+    // File value that was NOT overridden should be untouched.
+    assert_eq!(config.journal_directory, "/data/journal");
+}
+
+#[test]
+fn env_overrides_work_for_client_config() {
+    use bookkeeper_config::properties::{apply_env_overrides_from, parse_properties};
+    let text = "zkTimeout=30000\n";
+    let mut props = parse_properties(text);
+    apply_env_overrides_from(&mut props, vec![
+        ("BK_zkTimeout".into(), "60000".into()),
+        ("BK_metadataServiceUri".into(), "zk+hierarchical://zk1:2181/ledgers".into()),
+    ]);
+    let config = ClientConfig::from_properties(&props);
+    assert_eq!(config.zk_timeout, 60000);
+    assert_eq!(
+        config.metadata_service_uri.as_deref(),
+        Some("zk+hierarchical://zk1:2181/ledgers")
+    );
 }
