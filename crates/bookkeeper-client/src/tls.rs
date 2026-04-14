@@ -185,7 +185,6 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
         // Use a wildcard-like name that the inner verifier will accept the chain for.
         // Since rustls always validates SAN, we instead bypass the hostname check
         // by directly verifying the cert chain via webpki.
-        use rustls::client::danger::ServerCertVerifier as _;
         // Try with a dummy name first; if that fails on hostname, manually verify chain.
         let dummy = ServerName::try_from("localhost").unwrap();
         match self.inner.verify_server_cert(end_entity, intermediates, &dummy, ocsp_response, now) {

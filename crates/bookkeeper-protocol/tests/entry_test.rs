@@ -8,7 +8,7 @@ fn entry_round_trip_crc32c() {
     let payload = Bytes::from_static(b"hello world");
     let entry_bytes = EntryBuilder::new(&dm)
         .ledger_id(42).entry_id(7).lac(-1).length(11)
-        .payload(payload.clone()).build();
+        .payload(&payload).build();
     assert_eq!(entry_bytes.len(), 32 + 4 + 11);
     let parsed = bookkeeper_protocol::entry::parse_entry(&dm, entry_bytes.freeze()).unwrap();
     assert_eq!(parsed.ledger_id, 42);
@@ -24,7 +24,7 @@ fn entry_round_trip_dummy() {
     let payload = Bytes::from_static(b"test");
     let entry_bytes = EntryBuilder::new(&dm)
         .ledger_id(1).entry_id(0).lac(-1).length(4)
-        .payload(payload.clone()).build();
+        .payload(&payload).build();
     assert_eq!(entry_bytes.len(), 36);
     let parsed = bookkeeper_protocol::entry::parse_entry(&dm, entry_bytes.freeze()).unwrap();
     assert_eq!(parsed.payload, payload);
@@ -35,7 +35,7 @@ fn entry_corrupt_digest_detected() {
     let dm = DigestManager::new(DigestType::Crc32c);
     let mut entry_bytes = EntryBuilder::new(&dm)
         .ledger_id(1).entry_id(0).lac(-1).length(5)
-        .payload(Bytes::from_static(b"hello")).build();
+        .payload(b"hello").build();
     let last = entry_bytes.len() - 1;
     entry_bytes[last] ^= 0xFF;
     let result = bookkeeper_protocol::entry::parse_entry(&dm, entry_bytes.freeze());

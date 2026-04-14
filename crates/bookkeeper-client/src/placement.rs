@@ -537,12 +537,6 @@ impl RackAwarePlacementPolicy {
         self.resolver.resolve(bookie)
     }
 
-    /// Count distinct racks in a set of bookies.
-    fn count_racks(&self, bookies: &[String]) -> usize {
-        let racks: HashSet<String> = bookies.iter().map(|b| self.rack_of(b)).collect();
-        racks.len()
-    }
-
     /// Group available bookies by rack.
     fn bookies_by_rack(&self, exclude: &HashSet<String>) -> HashMap<String, Vec<String>> {
         let mut by_rack: HashMap<String, Vec<String>> = HashMap::new();

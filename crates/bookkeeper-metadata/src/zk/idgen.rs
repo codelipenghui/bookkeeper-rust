@@ -50,7 +50,7 @@ impl ZkLedgerIdGenerator {
         let long_base = paths.idgen_long().to_string();
 
         // Ensure the short idgen directory exists
-        ensure_path(&client, &idgen_path).await?;
+        crate::zk_path::ensure_zk_path(&client, &idgen_path).await?;
 
         Ok(Self {
             client,
@@ -111,7 +111,7 @@ impl ZkLedgerIdGenerator {
 
     /// Transition to long ID generation by creating the idgen-long path.
     async fn create_long_id_path(&self) -> Result<(), MetadataError> {
-        ensure_path(&self.client, &self.long_base).await?;
+        crate::zk_path::ensure_zk_path(&self.client, &self.long_base).await?;
         let mut status = self.long_path_status.lock().unwrap();
         *status = LongIdPathStatus::Present;
         Ok(())
@@ -185,9 +185,13 @@ impl ZkLedgerIdGenerator {
         Ok(hobs)
     }
 
+    fn hob_path(&self, hob: i32) -> String {
+        format!("{}/{}{:010}", self.long_base, HOB_PREFIX, hob)
+    }
+
     /// Create a new HOB directory. Ignores NodeExists (race-safe).
     async fn create_hob_directory(&self, hob: i32) -> Result<(), MetadataError> {
-        let path = format!("{}/{}{:010}", self.long_base, HOB_PREFIX, hob);
+        let path = self.hob_path(hob);
         let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
         match self.client.create(&path, &[], &options).await {
             Ok(_) => Ok(()),
@@ -199,8 +203,7 @@ impl ZkLedgerIdGenerator {
     /// Generate low bits under a specific HOB directory.
     /// Returns the combined 63-bit ID: `(high_bits << 32) | low_bits`.
     async fn generate_long_id_low_bits(&self, high_bits: i32) -> Result<i64, MetadataError> {
-        let hob_path = format!("{}/{}{:010}", self.long_base, HOB_PREFIX, high_bits);
-        let id_prefix = format!("{}/{}", hob_path, LEDGER_ID_GEN_PREFIX);
+        let id_prefix = format!("{}/{}", self.hob_path(high_bits), LEDGER_ID_GEN_PREFIX);
 
         // Ensure HOB directory exists
         let _ = self.create_hob_directory(high_bits).await;
@@ -242,9 +245,8 @@ impl ZkLedgerIdGenerator {
         // Delete all but the last 3
         let to_delete = &hobs[..hobs.len() - HOB_GC_KEEP];
         for &hob in to_delete {
-            let path = format!("{}/{}{:010}", self.long_base, HOB_PREFIX, hob);
             // Ignore errors — directory might not be empty or already deleted
-            let _ = self.client.delete(&path, None).await;
+            let _ = self.client.delete(&self.hob_path(hob), None).await;
         }
     }
 
@@ -279,10 +281,6 @@ impl LedgerIdGenerator for ZkLedgerIdGenerator {
         // Phase 2: Long 63-bit generation
         self.generate_long_id().await
     }
-}
-
-async fn ensure_path(client: &zk::Client, path: &str) -> Result<(), MetadataError> {
-    crate::zk_path::ensure_zk_path(client, path).await
 }
 
 #[cfg(test)]

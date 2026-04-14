@@ -171,7 +171,7 @@ impl LacState {
             if deferred_sync {
                 // Deferred sync: fire callback immediately on ack quorum.
                 // LAC does NOT advance here — it will catch up when the
-                // user calls force() which invokes `flush_lac_for_force`.
+                // user calls force().
                 st.pending.remove(&entry_id).map(|tx| vec![(entry_id, tx)]).unwrap_or_default()
             } else if ensemble_info.changing_ensemble.load(Ordering::Acquire) {
                 // Gated: ensemble change in progress.  The caller will
@@ -199,20 +199,6 @@ impl LacState {
     /// Drain any held-back signals after an ensemble change completes.
     /// Called from `flush_after_ensemble_change`.
     fn flush_after_ensemble_change(&self, lac_value: &AtomicI64) {
-        let to_signal = {
-            let mut st = self.state.lock().unwrap();
-            Self::drain_in_lac_order(&mut st, lac_value)
-        };
-        for (eid, tx) in to_signal {
-            let _ = tx.send(Ok(eid));
-        }
-    }
-
-    /// Called from `force()` / deferred-sync LAC flush path.  Walks the
-    /// acked set and advances LAC; any pending signals for entries that
-    /// reach LAC are fired (typically empty in deferred-sync since they
-    /// were already signaled in `signal_success`).
-    fn flush_lac_for_force(&self, lac_value: &AtomicI64) {
         let to_signal = {
             let mut st = self.state.lock().unwrap();
             Self::drain_in_lac_order(&mut st, lac_value)
@@ -873,12 +859,7 @@ impl WriteHandle {
                 self.flush_lac();
 
                 // Step 6: Process any delayed failures accumulated during the change
-                let delayed = {
-                    let mut df = self.ensemble_info.delayed_failures.lock().unwrap();
-                    let d = df.clone();
-                    df.clear();
-                    d
-                };
+                let delayed = std::mem::take(&mut *self.ensemble_info.delayed_failures.lock().unwrap());
                 if !delayed.is_empty() {
                     // Recursive handling: set flag again and process
                     self.ensemble_info.changing_ensemble.store(true, Ordering::Release);
@@ -917,9 +898,7 @@ impl WriteHandle {
             if df.is_empty() {
                 return Ok(());
             }
-            let d = df.clone();
-            df.clear();
-            d
+            std::mem::take(&mut *df)
         };
 
         // Set changing_ensemble flag — gates LAC advancement
@@ -1159,7 +1138,7 @@ impl WriteHandle {
             .entry_id(entry_id)
             .lac(lac)
             .length(self.current_length)
-            .payload(Bytes::copy_from_slice(payload))
+            .payload(payload)
             .build()
             .freeze()
     }

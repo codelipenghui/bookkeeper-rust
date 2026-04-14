@@ -412,7 +412,7 @@ impl ZkBookKeeper {
             let version = versioned.version();
             let md = versioned.value();
 
-            let closed_md = build_closed_metadata(md, ledger_id, lac, length, Some(&segments))?;
+            let closed_md = build_closed_metadata(md, lac, length, Some(&segments))?;
 
             match self.ledger_manager.write_ledger_metadata(ledger_id, &closed_md, version).await {
                 Ok(_) => return Ok(()),
@@ -615,7 +615,7 @@ impl ZkBookKeeper {
             let version = versioned.version();
             let md = versioned.value();
 
-            let closed_md = build_closed_metadata(md, ledger_id, last_entry, total_length, None)?;
+            let closed_md = build_closed_metadata(md, last_entry, total_length, None)?;
 
             match self.ledger_manager.write_ledger_metadata(ledger_id, &closed_md, version).await {
                 Ok(_) => {
@@ -782,7 +782,6 @@ fn parse_metadata_uri(uri: &str) -> Result<(String, String), ClientError> {
 /// If `segments_override` is Some, uses those segments; otherwise copies from existing metadata.
 fn build_closed_metadata(
     md: &bookkeeper_metadata::ledger_metadata::LedgerMetadata,
-    ledger_id: i64,
     last_entry_id: i64,
     length: i64,
     segments_override: Option<&std::collections::BTreeMap<i64, Vec<String>>>,

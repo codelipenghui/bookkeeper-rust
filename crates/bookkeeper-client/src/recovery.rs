@@ -221,7 +221,7 @@ impl RecoveryHandle {
             .entry_id(entry_id)
             .lac(self.recovery_lac)
             .length(payload.len() as i64)
-            .payload(Bytes::copy_from_slice(payload))
+            .payload(payload)
             .build()
             .freeze();
 

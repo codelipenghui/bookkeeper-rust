@@ -383,7 +383,7 @@ impl ReadHandle {
             })
             .collect();
 
-        let mut best_lac: i64 = current_lac;
+        let best_lac: i64 = current_lac;
         let mut saw_any = false;
         while let Some(result) = futs.next().await {
             if let Ok(V2Response::Read { error_code, entry_id, .. }) = result {

@@ -11,7 +11,10 @@ use crate::text_format;
 const LAYOUT_TYPE: &str = "BASIC";
 const LAYOUT_VERSION: i32 = 1;
 
-/// Maximum CAS retry attempts before giving up.
+/// Maximum CAS retry attempts before giving up on an underreplication CAS.
+/// Higher than `bookkeeper_common::MAX_CAS_RETRIES` (10) because marker updates
+/// are lower-priority than ledger-metadata updates and we'd rather retry longer
+/// than lose the mark.
 const MAX_CAS_RETRIES: usize = 20;
 
 /// Manages underreplicated ledger tracking in ZooKeeper.

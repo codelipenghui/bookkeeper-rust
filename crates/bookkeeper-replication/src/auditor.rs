@@ -7,7 +7,6 @@ use tokio::sync::watch;
 use zookeeper_client as zk;
 use bookkeeper_client::bookie_connection::BookieConnection;
 use bookkeeper_client::distribution::RoundRobinDistributionSchedule;
-use bookkeeper_metadata::ledger_metadata::DigestType as MetaDigestType;
 use bookkeeper_metadata::zk_path::ZkPaths;
 use bookkeeper_metadata::traits::LedgerManager;
 use bookkeeper_protocol::constants::*;
@@ -603,9 +602,6 @@ impl Auditor {
         let ledger_ids = self.ledger_manager.get_ledger_ranges().await
             .map_err(|e| ReplicationError::Failed(format!("enumerate ledgers: {e}")))?;
 
-        let mut availability_marked = 0usize;
-        let mut placement_marked = 0usize;
-
         // Process ledgers concurrently with bounded parallelism.
         // Matches Java's auditorMaxNumberOfConcurrentOpenLedgerOperations
         // semaphore-bounded concurrent processing.
@@ -681,8 +677,7 @@ impl Auditor {
             })
             .await;
 
-        availability_marked = results.0;
-        placement_marked = results.1;
+        let (availability_marked, placement_marked) = results;
 
         if check_availability {
             tracing::info!("audit: availability check marked {availability_marked} ledger(s) as underreplicated");
@@ -749,14 +744,6 @@ impl Auditor {
                     write_quorum,
                     ack_quorum,
                 );
-                let digest = match metadata.digest_type() {
-                    Some(MetaDigestType::Crc32) => bookkeeper_protocol::digest::DigestType::Crc32,
-                    Some(MetaDigestType::Crc32c) => bookkeeper_protocol::digest::DigestType::Crc32c,
-                    Some(MetaDigestType::Hmac) => bookkeeper_protocol::digest::DigestType::HmacSha1,
-                    Some(MetaDigestType::Dummy) => bookkeeper_protocol::digest::DigestType::Dummy,
-                    None => bookkeeper_protocol::digest::DigestType::Crc32c,
-                };
-                let _ = digest; // currently unused — keeps digest handling consistent with worker
                 let password = metadata.password().unwrap_or(b"");
                 let master_key: [u8; MASTER_KEY_LENGTH] = generate_master_key(password);
 

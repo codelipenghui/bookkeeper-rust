@@ -32,7 +32,7 @@ impl LedgerMetadataIndex {
     pub fn open(path: &Path, rocksdb_conf: Option<&Path>) -> Result<Self, StorageError> {
         let (opts, block_cache) =
             rocksdb_options::load_or_default(rocksdb_conf, rocksdb_options::DEFAULT_LEDGER_METADATA_CONF)?;
-        let db = DB::open(&opts, path).map_err(|e| StorageError::RocksDb(e.to_string()))?;
+        let db = DB::open(&opts, path)?;
         Ok(Self { db, block_cache })
     }
 
@@ -46,12 +46,12 @@ impl LedgerMetadataIndex {
             limbo: None,
         };
         let value = proto.encode_to_vec();
-        self.db.put(&key, &value).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.put(&key, &value).map_err(StorageError::from)
     }
 
     pub fn get(&self, ledger_id: i64) -> Result<Option<LedgerData>, StorageError> {
         let key = ledger_id.to_be_bytes();
-        match self.db.get(&key).map_err(|e| StorageError::RocksDb(e.to_string()))? {
+        match self.db.get(&key)? {
             Some(v) => {
                 let proto = bookkeeper_proto::LedgerData::decode(&v[..])
                     .map_err(|e| StorageError::CorruptData(format!("ledger data decode: {e}")))?;
@@ -96,7 +96,7 @@ impl LedgerMetadataIndex {
         let mut ledgers = Vec::new();
         let iter = self.db.iterator(rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            let (key, value) = item?;
             if key.len() == 8 {
                 let ledger_id = i64::from_be_bytes(key[..8].try_into().unwrap());
                 // Only include ledgers that actually exist
@@ -124,7 +124,7 @@ impl LedgerMetadataIndex {
         });
         proto.explicit_lac = Some(body.to_vec());
         let value = proto.encode_to_vec();
-        self.db.put(&key, &value).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.put(&key, &value).map_err(StorageError::from)
     }
 
     /// Get the raw explicit LAC body from the LedgerData protobuf.
@@ -138,18 +138,18 @@ impl LedgerMetadataIndex {
 
     pub fn delete(&self, ledger_id: i64) -> Result<(), StorageError> {
         let key = ledger_id.to_be_bytes();
-        self.db.delete(&key).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.delete(&key).map_err(StorageError::from)
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
         let mut opts = rocksdb::FlushOptions::default();
         opts.set_wait(true);
-        self.db.flush_opt(&opts).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.flush_opt(&opts).map_err(StorageError::from)
     }
 
     fn get_raw(&self, ledger_id: i64) -> Result<Option<bookkeeper_proto::LedgerData>, StorageError> {
         let key = ledger_id.to_be_bytes();
-        match self.db.get(&key).map_err(|e| StorageError::RocksDb(e.to_string()))? {
+        match self.db.get(&key)? {
             Some(v) => {
                 let proto = bookkeeper_proto::LedgerData::decode(&v[..])
                     .map_err(|e| StorageError::CorruptData(format!("ledger data decode: {e}")))?;
@@ -162,6 +162,6 @@ impl LedgerMetadataIndex {
     fn put_raw(&self, ledger_id: i64, data: &bookkeeper_proto::LedgerData) -> Result<(), StorageError> {
         let key = ledger_id.to_be_bytes();
         let value = data.encode_to_vec();
-        self.db.put(&key, &value).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.put(&key, &value).map_err(StorageError::from)
     }
 }

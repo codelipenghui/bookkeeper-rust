@@ -228,12 +228,10 @@ pub async fn cmd_whoisauditor(
     if let Some(leader) = votes.first() {
         let vote_path = format!("{}/{}", election_path, leader);
         let (data, _) = client.get_data(&vote_path).await?;
-        let text = String::from_utf8_lossy(&data);
-        // Extract bookieId from protobuf text format: bookieId: "host:port"
-        let auditor_id = text.lines()
-            .find_map(|l| l.trim().strip_prefix("bookieId: \"")
-                .and_then(|r| r.strip_suffix('"')))
-            .unwrap_or_else(|| text.trim());
+        let auditor_id = bookkeeper_replication::text_format::parse_auditor_vote(&data)
+            .ok()
+            .and_then(|v| v.bookie_id)
+            .unwrap_or_else(|| String::from_utf8_lossy(&data).trim().to_string());
         println!("Auditor: {auditor_id}");
     } else {
         println!("No auditor elected.");
@@ -309,12 +307,10 @@ pub async fn cmd_clusterinfo(
             if let Some(leader) = votes.first() {
                 let vote_path = format!("{}/{}", election_path, leader);
                 if let Ok((data, _)) = zk_client.get_data(&vote_path).await {
-                    let text = String::from_utf8_lossy(&data);
-                    // Extract bookieId from protobuf text format
-                    let auditor_id = text.lines()
-                        .find_map(|l| l.trim().strip_prefix("bookieId: \"")
-                            .and_then(|r| r.strip_suffix('"')))
-                        .unwrap_or_else(|| text.trim());
+                    let auditor_id = bookkeeper_replication::text_format::parse_auditor_vote(&data)
+                        .ok()
+                        .and_then(|v| v.bookie_id)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&data).trim().to_string());
                     println!("  Auditor:     {auditor_id}");
                 } else {
                     println!("  Auditor:     (elected but data unreadable)");
@@ -664,7 +660,8 @@ async fn recover_ledger_fragments(
     // If open and bad bookie is in last segment, fence the ledger first
     let md = if md.state() == bookkeeper_metadata::ledger_metadata::LedgerState::Open {
         let ensembles = md.all_ensembles();
-        let (last_seg_entry, last_ensemble) = ensembles.iter().next_back().unwrap();
+        let (last_seg_entry, last_ensemble) = ensembles.iter().next_back()
+            .ok_or("no ensemble segments found")?;
         if last_ensemble.iter().any(|b| b == bad_bookie) {
             use bookkeeper_client::recovery::RecoveryHandle;
             let dm = DigestManager::new(digest_type).with_password(password);

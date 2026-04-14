@@ -25,10 +25,7 @@ use std::path::{Path, PathBuf};
 /// Java's `UncleanShutdownDetectionImpl.DIRTY_FILENAME`.
 pub const DIRTY_FILENAME: &str = "DIRTY";
 
-/// Subdirectory inside each ledger dir where the DIRTY marker lives.
-/// Matches `BookieImpl.getCurrentDirectory(dir)` / our own
-/// `storage::db_ledger_storage::CURRENT_DIR`.
-const CURRENT_DIR: &str = "current";
+use bookkeeper_storage::db_ledger_storage::CURRENT_DIR;
 
 /// Writes and reads DIRTY markers in each ledger directory.
 pub struct UncleanShutdownDetection<'a> {

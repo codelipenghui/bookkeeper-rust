@@ -125,8 +125,6 @@ pub fn decode_response(data: Bytes) -> Result<V2Response, ResponseDecodeError> {
             };
             Ok(V2Response::Read { error_code, ledger_id, entry_id, data: body })
         }
-        // OP_AUTH is handled above before reading the standard header.
-        OP_AUTH => Ok(V2Response::Auth { error_code: V2_EOK, payload: Bytes::new() }),
         OP_WRITE_LAC => Ok(V2Response::WriteLac { error_code, ledger_id, entry_id }),
         OP_READ_LAC => {
             let mut lac_body = None;
@@ -180,8 +178,7 @@ pub fn decode_response(data: Bytes) -> Result<V2Response, ResponseDecodeError> {
 fn try_decode_v3_to_v2(data: &Bytes) -> Option<V2Response> {
     use prost::Message;
     let resp = bookkeeper_proto::Response::decode(data.as_ref()).ok()?;
-    let status = resp.status;
-    let v2_code = v3_status_to_v2_code(status);
+    let v2_code = bookkeeper_common::error::BKError::from_v3_code(resp.status).to_v2_code();
     let op = resp.header.operation;
 
     if let Some(add) = resp.add_response {
@@ -219,18 +216,16 @@ fn try_decode_v3_to_v2(data: &Bytes) -> Option<V2Response> {
             free_disk_space: bi.free_disk_space.unwrap_or(0),
             total_disk_capacity: bi.total_disk_capacity.unwrap_or(0),
         })
-    } else if resp.force_ledger_response.is_some() {
+    } else if let Some(fl) = resp.force_ledger_response {
         // ForceLedger has no equivalent V2 response type.
         // Return an Add response with the status code — the caller
         // (send_force_ledger) checks for Ok/Err, not the response variant.
-        let fl = resp.force_ledger_response.unwrap();
         Some(V2Response::Add {
             error_code: v2_code,
             ledger_id: fl.ledger_id,
             entry_id: 0,
         })
-    } else if resp.auth_response.is_some() {
-        let auth = resp.auth_response.unwrap();
+    } else if let Some(auth) = resp.auth_response {
         Some(V2Response::Auth {
             error_code: v2_code,
             payload: Bytes::from(auth.payload),
@@ -240,26 +235,6 @@ fn try_decode_v3_to_v2(data: &Bytes) -> Option<V2Response> {
         Some(V2Response::Add { error_code: v2_code, ledger_id: 0, entry_id: 0 })
     } else {
         None
-    }
-}
-
-/// Convert a V3 StatusCode to a V2 error code.
-fn v3_status_to_v2_code(status: i32) -> i32 {
-    // Inline mapping to avoid cross-crate dependency.
-    // V3 StatusCode → V2 error code.
-    match status {
-        0 => V2_EOK,                            // EOK
-        402 => V2_ENOLEDGER,                     // ENOLEDGER
-        403 => V2_ENOENTRY,                      // ENOENTRY
-        404 => V2_EBADREQ,                       // EBADREQ
-        501 => V2_EIO,                            // EIO
-        502 => V2_EUA,                            // EUA
-        503 => V2_EBADVERSION,                    // EBADVERSION
-        504 => V2_EFENCED,                        // EFENCED
-        505 => V2_EREADONLY,                       // EREADONLY
-        506 => V2_ETOOMANYREQUESTS,                // ETOOMANYREQUESTS
-        507 => V2_EUNKNOWNLEDGERSTATE,             // EUNKNOWNLEDGERSTATE
-        _ => V2_EBADREQ,
     }
 }
 

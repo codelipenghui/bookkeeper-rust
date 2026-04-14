@@ -321,7 +321,7 @@ async fn gc_never_deletes_or_compacts_the_current_log_file() {
         .entry_id(0)
         .lac(-1)
         .length(8)
-        .payload(bytes::Bytes::from_static(b"keep-me!"))
+        .payload(b"keep-me!")
         .build()
         .freeze();
     storage.add_entry(&entry).await.unwrap();

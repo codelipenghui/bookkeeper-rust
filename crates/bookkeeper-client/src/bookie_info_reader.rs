@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::bookie_connection::{BookieConnection, ClientError};
+use crate::bookie_connection::BookieConnection;
 use crate::placement::BookieInfo;
 use bookkeeper_protocol::v2::response::V2Response;
 

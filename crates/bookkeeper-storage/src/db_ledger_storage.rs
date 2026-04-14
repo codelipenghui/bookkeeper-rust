@@ -385,11 +385,16 @@ impl DbLedgerStorage {
 
     fn ensure_entry_log_exists(&self, log_id: u32) -> Result<(), StorageError> {
         let path = self.entry_log_path(log_id);
-        if !path.exists() {
-            let header = EntryLogHeader::new(elf::HEADER_CURRENT_VERSION);
-            fs::write(&path, header.to_bytes())?;
+        match fs::OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                let header = EntryLogHeader::new(elf::HEADER_CURRENT_VERSION);
+                f.write_all(&header.to_bytes())?;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
 
     /// Append the ledgers map to a rotated entry-log file and patch the

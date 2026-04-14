@@ -34,7 +34,7 @@ fn build_entry(size: usize, ledger_id: i64, entry_id: i64) -> Vec<u8> {
         .entry_id(entry_id)
         .lac(entry_id.saturating_sub(1))
         .length(size as i64)
-        .payload(bytes::Bytes::copy_from_slice(&payload))
+        .payload(&payload)
         .build()
         .to_vec()
 }

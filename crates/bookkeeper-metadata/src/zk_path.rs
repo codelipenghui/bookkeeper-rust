@@ -94,7 +94,7 @@ impl ZkPaths {
 }
 
 /// Create all ZK znodes along a path (like `mkdir -p`), including the leaf.
-/// Ignores `NodeExists` errors. Shared utility replacing 4 duplicate implementations.
+/// Ignores `NodeExists` errors.
 pub async fn ensure_zk_path(
     client: &zookeeper_client::Client,
     path: &str,

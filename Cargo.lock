@@ -678,6 +678,7 @@ dependencies = [
 name = "bookkeeper-protocol"
 version = "0.1.0"
 dependencies = [
+ "bookkeeper-common",
  "bookkeeper-proto",
  "bytes",
  "crc32c",

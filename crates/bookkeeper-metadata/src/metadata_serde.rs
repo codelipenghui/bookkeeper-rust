@@ -8,7 +8,6 @@ const LINE_SPLITTER: u8 = b'\n';
 /// Serialize LedgerMetadata to v3 binary protobuf format.
 /// Format: "BookieMetadataFormatVersion\t3\n" + varint-length-prefixed protobuf.
 pub fn serialize_metadata(md: &LedgerMetadata) -> Result<Vec<u8>, MetadataError> {
-    // FIX 7: pre-compute proto first to know encoded_len for pre-sizing the buffer
     let proto = to_proto(md);
     let msg_len = proto.encoded_len();
     let mut buf = Vec::with_capacity(VERSION_HEADER.len() + 2 + 10 + msg_len);
@@ -64,7 +63,6 @@ fn parse_header(data: &[u8]) -> Result<(i32, &[u8]), MetadataError> {
 fn parse_v3(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError> {
     let proto = bookkeeper_proto::LedgerMetadataFormat::decode_length_delimited(body)
         .map_err(|e| MetadataError::SerializationError(format!("protobuf decode: {e}")))?;
-    // FIX 6: pass owned proto instead of a borrow
     from_proto(ledger_id, proto)
 }
 
@@ -310,7 +308,6 @@ fn to_proto(md: &LedgerMetadata) -> bookkeeper_proto::LedgerMetadataFormat {
     }
 }
 
-// FIX 6: take ownership of proto to avoid clones on ensemble members and password
 fn from_proto(ledger_id: i64, proto: bookkeeper_proto::LedgerMetadataFormat) -> Result<LedgerMetadata, MetadataError> {
     use bookkeeper_proto::ledger_metadata_format as lmf;
 

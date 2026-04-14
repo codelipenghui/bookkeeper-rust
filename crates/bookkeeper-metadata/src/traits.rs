@@ -85,22 +85,6 @@ pub trait LayoutManager: Send + Sync {
     async fn delete_ledger_layout(&self) -> Result<(), MetadataError>;
 }
 
-/// Server-side metadata driver (used by bookies).
-#[async_trait]
-pub trait MetadataBookieDriver: Send + Sync {
-    fn get_layout_manager(&self) -> &dyn LayoutManager;
-    async fn close(&self);
-}
-
-/// Client-side metadata driver (used by BK clients).
-#[async_trait]
-pub trait MetadataClientDriver: Send + Sync {
-    fn get_ledger_manager(&self) -> &dyn LedgerManager;
-    fn get_ledger_id_generator(&self) -> &dyn LedgerIdGenerator;
-    fn get_layout_manager(&self) -> &dyn LayoutManager;
-    async fn close(&self);
-}
-
 /// Manages bookie registration and discovery in the metadata store.
 #[async_trait]
 pub trait RegistrationManager: Send + Sync {

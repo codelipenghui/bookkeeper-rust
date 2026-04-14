@@ -24,3 +24,9 @@ pub enum StorageError {
     #[error("operation rejected: write cache full, flush throttle timeout")]
     OperationRejected,
 }
+
+impl From<rocksdb::Error> for StorageError {
+    fn from(e: rocksdb::Error) -> Self {
+        StorageError::RocksDb(e.to_string())
+    }
+}

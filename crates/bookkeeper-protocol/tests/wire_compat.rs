@@ -71,7 +71,7 @@ fn entry_format_layout() {
         .entry_id(5)
         .lac(4)
         .length(4)
-        .payload(payload)
+        .payload(&payload)
         .build();
     assert_eq!(entry.len(), 40);
     assert_eq!(i64::from_be_bytes(entry[0..8].try_into().unwrap()), 100);
@@ -103,7 +103,7 @@ fn full_stack_add_entry() {
         .entry_id(0)
         .lac(-1)
         .length(16)
-        .payload(payload)
+        .payload(&payload)
         .build();
 
     // Wrap in ADD_ENTRY request — entry_data is the FULL entry bytes

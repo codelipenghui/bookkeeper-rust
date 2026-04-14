@@ -22,14 +22,14 @@ impl EntryLocationIndex {
     pub fn open(path: &Path, rocksdb_conf: Option<&Path>) -> Result<Self, StorageError> {
         let (opts, block_cache) =
             rocksdb_options::load_or_default(rocksdb_conf, rocksdb_options::DEFAULT_ENTRY_LOCATION_CONF)?;
-        let db = DB::open(&opts, path).map_err(|e| StorageError::RocksDb(e.to_string()))?;
+        let db = DB::open(&opts, path)?;
         Ok(Self { db, block_cache })
     }
 
     pub fn put(&self, ledger_id: i64, entry_id: i64, location: u64) -> Result<(), StorageError> {
         let key = encode_location_key(ledger_id, entry_id);
         let value = location.to_be_bytes();
-        self.db.put(&key, &value).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.put(&key, &value).map_err(StorageError::from)
     }
 
     pub fn put_batch(&self, entries: &[(i64, i64, u64)]) -> Result<(), StorageError> {
@@ -39,12 +39,12 @@ impl EntryLocationIndex {
             let value = location.to_be_bytes();
             batch.put(&key, &value);
         }
-        self.db.write(batch).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.write(batch).map_err(StorageError::from)
     }
 
     pub fn get(&self, ledger_id: i64, entry_id: i64) -> Result<Option<u64>, StorageError> {
         let key = encode_location_key(ledger_id, entry_id);
-        match self.db.get(&key).map_err(|e| StorageError::RocksDb(e.to_string()))? {
+        match self.db.get(&key)? {
             Some(v) => {
                 let loc = u64::from_be_bytes(v[..8].try_into().unwrap());
                 Ok(Some(loc))
@@ -68,13 +68,13 @@ impl EntryLocationIndex {
 
         let mut batch = WriteBatch::default();
         batch.delete_range(&start, &end);
-        self.db.write(batch).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.write(batch).map_err(StorageError::from)
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
         let mut opts = rocksdb::FlushOptions::default();
         opts.set_wait(true);
-        self.db.flush_opt(&opts).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.flush_opt(&opts).map_err(StorageError::from)
     }
 
     /// Iterate all entries for a given ledger, returning (entry_id, location) pairs.
@@ -88,7 +88,7 @@ impl EntryLocationIndex {
         let mut results = Vec::new();
         let iter = self.db.iterator(rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward));
         for item in iter {
-            let (key, value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            let (key, value) = item?;
             if key.len() != 16 || &key[..] >= &end[..] {
                 break;
             }
@@ -114,7 +114,7 @@ impl EntryLocationIndex {
             rocksdb::IteratorMode::From(&seek_key, rocksdb::Direction::Reverse),
         );
         for item in iter {
-            let (key, _value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            let (key, _value) = item?;
             if key.len() != 16 {
                 break;
             }

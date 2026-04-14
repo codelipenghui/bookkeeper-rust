@@ -129,7 +129,7 @@ impl EntryLogMetadataMap {
         std::fs::create_dir_all(path)?;
         let (opts, _cache) =
             rocksdb_options::load_or_default(None, rocksdb_options::DEFAULT_LEDGER_METADATA_CONF)?;
-        let db = DB::open(&opts, path).map_err(|e| StorageError::RocksDb(e.to_string()))?;
+        let db = DB::open(&opts, path)?;
         Ok(Self { db })
     }
 
@@ -138,13 +138,13 @@ impl EntryLogMetadataMap {
         let key = encode_key(log_id);
         self.db.get_pinned(&key)
             .map(|v| v.is_some())
-            .map_err(|e| StorageError::RocksDb(e.to_string()))
+            .map_err(StorageError::from)
     }
 
     /// Get cached metadata for a log file.
     pub fn get(&self, log_id: u32) -> Result<Option<EntryLogMeta>, StorageError> {
         let key = encode_key(log_id);
-        match self.db.get(&key).map_err(|e| StorageError::RocksDb(e.to_string()))? {
+        match self.db.get(&key)? {
             Some(data) => Ok(Some(EntryLogMeta::deserialize(&data)?)),
             None => Ok(None),
         }
@@ -154,13 +154,13 @@ impl EntryLogMetadataMap {
     pub fn put(&self, meta: &EntryLogMeta) -> Result<(), StorageError> {
         let key = encode_key(meta.log_id);
         let value = meta.serialize();
-        self.db.put(&key, &value).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.put(&key, &value).map_err(StorageError::from)
     }
 
     /// Remove metadata for a log file (called when the log is deleted or compacted).
     pub fn remove(&self, log_id: u32) -> Result<(), StorageError> {
         let key = encode_key(log_id);
-        self.db.delete(&key).map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.delete(&key).map_err(StorageError::from)
     }
 
     /// Iterate over all cached metadata entries.
@@ -170,7 +170,7 @@ impl EntryLogMetadataMap {
     {
         let iter = self.db.iterator(IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            let (key, value) = item?;
             if key.len() < 4 {
                 continue;
             }
@@ -187,7 +187,7 @@ impl EntryLogMetadataMap {
         let mut stale = Vec::new();
         let iter = self.db.iterator(IteratorMode::Start);
         for item in iter {
-            let (key, _) = item.map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            let (key, _) = item?;
             if key.len() < 4 { continue; }
             let log_id = u32::from_be_bytes(key[..4].try_into().unwrap());
             let path = entry_log_dir.join(format!("{:x}.log", log_id));
@@ -201,12 +201,12 @@ impl EntryLogMetadataMap {
             for log_id in stale {
                 batch.delete(encode_key(log_id));
             }
-            self.db.write(batch).map_err(|e| StorageError::RocksDb(e.to_string()))?;
+            self.db.write(batch)?;
         }
         Ok(count)
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
-        self.db.flush().map_err(|e| StorageError::RocksDb(e.to_string()))
+        self.db.flush().map_err(StorageError::from)
     }
 }

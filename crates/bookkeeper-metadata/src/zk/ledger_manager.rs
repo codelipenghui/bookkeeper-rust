@@ -29,9 +29,6 @@ impl ZkLedgerManager {
         ledger_path(self.paths.root(), ledger_id)
     }
 
-    async fn ensure_parents(&self, path: &str) -> Result<(), MetadataError> {
-        crate::zk_path::ensure_zk_parents(&self.client, path).await
-    }
 
     /// Delete a znode and clean up empty parent directories.
     /// Matches Java's ZkUtils.asyncDeleteFullPathOptimistic.
@@ -159,7 +156,7 @@ impl LedgerManager for ZkLedgerManager {
         let data = serialize_metadata(metadata)?;
 
         // Ensure parent directories exist
-        self.ensure_parents(&path).await?;
+        crate::zk_path::ensure_zk_parents(&self.client, &path).await?;
 
         // Create the znode
         let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());

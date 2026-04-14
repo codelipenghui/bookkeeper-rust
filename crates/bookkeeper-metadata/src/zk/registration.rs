@@ -29,20 +29,9 @@ impl ZkRegistrationManager {
         &self.client
     }
 
-    async fn ensure_path_exists(&self, path: &str) -> Result<(), MetadataError> {
-        let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
-        match self.client.create(path, &[], &options).await {
-            Ok(_) => Ok(()),
-            Err(zk::Error::NodeExists) => Ok(()),
-            Err(e) => Err(MetadataError::ConnectionError(format!("ensure path {path}: {e}"))),
-        }
-    }
-
     async fn ensure_parent_paths(&self) -> Result<(), MetadataError> {
-        self.ensure_path_exists(self.paths.root()).await?;
-        self.ensure_path_exists(self.paths.available()).await?;
-        self.ensure_path_exists(self.paths.available_readonly()).await?;
-        self.ensure_path_exists(self.paths.cookies()).await?;
+        crate::zk_path::ensure_zk_path(&self.client, self.paths.available_readonly()).await?;
+        crate::zk_path::ensure_zk_path(&self.client, self.paths.cookies()).await?;
         Ok(())
     }
 }
@@ -112,7 +101,7 @@ impl RegistrationManager for ZkRegistrationManager {
     }
 
     async fn create_cookie(&self, bookie_id: &str, data: &[u8]) -> Result<(), MetadataError> {
-        self.ensure_path_exists(self.paths.cookies()).await?;
+        crate::zk_path::ensure_zk_path(&self.client, self.paths.cookies()).await?;
         let path = self.paths.cookie_path(bookie_id);
         let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
         self.client.create(&path, data, &options).await

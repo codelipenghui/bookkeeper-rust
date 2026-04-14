@@ -78,7 +78,7 @@ fn bench_entry_codec(c: &mut Criterion) {
                     .entry_id(0)
                     .lac(-1)
                     .length(size as i64)
-                    .payload(Bytes::copy_from_slice(&payload))
+                    .payload(&payload)
                     .build()
             });
         });
@@ -89,7 +89,7 @@ fn bench_entry_codec(c: &mut Criterion) {
             .entry_id(0)
             .lac(-1)
             .length(size as i64)
-            .payload(Bytes::copy_from_slice(&payload))
+            .payload(&payload)
             .build()
             .freeze();
 
@@ -117,7 +117,7 @@ fn bench_frame_codec(c: &mut Criterion) {
             .entry_id(0)
             .lac(-1)
             .length(size as i64)
-            .payload(Bytes::copy_from_slice(&payload))
+            .payload(&payload)
             .build()
             .freeze();
 

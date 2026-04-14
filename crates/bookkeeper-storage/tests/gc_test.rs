@@ -19,7 +19,7 @@ fn make_entry(ledger_id: i64, entry_id: i64) -> bytes::Bytes {
         .entry_id(entry_id)
         .lac(entry_id - 1)
         .length(8)
-        .payload(bytes::Bytes::from_static(b"test-pay"))
+        .payload(b"test-pay")
         .build()
         .freeze()
 }

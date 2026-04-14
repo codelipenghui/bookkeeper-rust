@@ -555,10 +555,6 @@ impl BookieConnection {
     /// Matches Java's `ReadLastConfirmedAndEntryOp` which sends a ReadRequest
     /// with `previousLAC` and `timeOut` to enable server-side blocking until
     /// LAC advances. Critical for tailing reads (Pulsar managed ledger cursors).
-    /// Send a V3 long poll read request.
-    /// Matches Java's `ReadLastConfirmedAndEntryOp` which sends a ReadRequest
-    /// with `previousLAC` and `timeOut` to enable server-side blocking until
-    /// LAC advances. Critical for tailing reads (Pulsar managed ledger cursors).
     pub async fn send_long_poll_read(
         &self,
         ledger_id: i64,

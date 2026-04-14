@@ -26,7 +26,7 @@ fn build_entry(dm: &DigestManager, ledger_id: i64, entry_id: i64, payload: &[u8]
         .entry_id(entry_id)
         .lac(entry_id.saturating_sub(1))
         .length(payload.len() as i64)
-        .payload(bytes::Bytes::copy_from_slice(payload))
+        .payload(payload)
         .build()
         .freeze()
 }
