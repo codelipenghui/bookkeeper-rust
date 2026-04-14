@@ -96,49 +96,161 @@ impl EnsembleInfo {
 }
 
 // ---------------------------------------------------------------------------
-// LacState — shared, ordered LAC advancement
+// LacState — shared, ordered LAC advancement + ordered callback signaling
 // ---------------------------------------------------------------------------
+//
+// Java's `LedgerHandle.sendAddSuccessCallbacks` (in `LedgerHandle.java`)
+// runs on the OrderedExecutor thread for the ledger.  It walks
+// `pendingAddOps` in entry-ID order, advances `lastAddConfirmed`, AND
+// invokes the user callback — all under that single thread.  This makes
+// the invariant hold trivially: "when the callback for entry N fires,
+// LAC ≥ N".
+//
+// The Rust implementation (Option C) preserves the same invariant without
+// a dedicated executor thread: the oneshot `Sender` for each PendingAdd
+// is stored inside `LacState` when the add is submitted, and drained in
+// LAC-advancement order inside the `advance_lac` critical section.  This
+// guarantees that `p.wait().await` only resolves once `lac_value` has
+// reached (or exceeded) the entry ID.
+
+/// Per-entry signaling slot — the sender end of a `PendingAdd`'s oneshot.
+type PendingTx = oneshot::Sender<Result<i64, ClientError>>;
+
+struct CompletedState {
+    /// Entries that have reached ack quorum but whose predecessors haven't yet.
+    acked: BTreeSet<i64>,
+    /// Pending per-entry signaling slots, keyed by entry ID.  Drained in
+    /// LAC-advancement order so the caller sees callbacks fire in the
+    /// same order as Java's `sendAddSuccessCallbacks`.
+    pending: BTreeMap<i64, PendingTx>,
+}
 
 struct LacState {
-    /// Entries that have reached ack quorum but whose predecessors haven't yet.
-    completed: std::sync::Mutex<BTreeSet<i64>>,
+    state: std::sync::Mutex<CompletedState>,
 }
 
 impl LacState {
     fn new() -> Self {
-        Self { completed: std::sync::Mutex::new(BTreeSet::new()) }
+        Self {
+            state: std::sync::Mutex::new(CompletedState {
+                acked: BTreeSet::new(),
+                pending: BTreeMap::new(),
+            }),
+        }
     }
 
-    /// Mark `entry_id` as complete and advance LAC as far as possible in order.
+    /// Register a new in-flight add's signaling slot at submission time.
+    /// The returned `PendingAdd` wraps the receiver end.
+    fn register(&self, entry_id: i64) -> PendingAdd {
+        let (tx, rx) = oneshot::channel();
+        self.state.lock().unwrap().pending.insert(entry_id, tx);
+        PendingAdd { rx }
+    }
+
+    /// Signal success for `entry_id` and advance LAC as far as possible.
     ///
-    /// LAC is NOT advanced when:
-    /// - `changing_ensemble` is true — matches Java's `sendAddSuccessCallbacks()`
-    ///   gating with `!changingEnsemble`.
-    /// - `deferred_sync` is true — matches Java's guard
-    ///   `if (!writeFlags.contains(WriteFlag.DEFERRED_SYNC))` in
-    ///   `sendAddSuccessCallbacks()`. LAC is only advanced when `force()` calls
-    ///   `flush_lac()`.
-    fn advance_lac(
+    /// Behavior mirrors Java's `sendAddSuccessCallbacks`:
+    /// - `deferred_sync`: signal immediately on ack; LAC advances only on
+    ///   `force()` (Java's `WriteFlag.DEFERRED_SYNC` guard on `lastAddConfirmed`).
+    /// - `changing_ensemble`: signal nothing; entries are held back until
+    ///   `flush_after_ensemble_change` is called post-change (Java's
+    ///   `!changingEnsemble` predicate).
+    /// - Otherwise: walk acked set; each newly-LAC'd entry's sender fires
+    ///   in strict entry-ID order *after* `lac_value` has been updated.
+    fn signal_success(
         &self,
         entry_id: i64,
         lac_value: &AtomicI64,
         ensemble_info: &EnsembleInfo,
         deferred_sync: bool,
     ) {
-        let mut completed = self.completed.lock().unwrap();
-        completed.insert(entry_id);
+        let to_signal = {
+            let mut st = self.state.lock().unwrap();
+            st.acked.insert(entry_id);
 
-        if deferred_sync || ensemble_info.changing_ensemble.load(Ordering::Acquire) {
-            // Gate: don't advance LAC during ensemble change or deferred sync
-            return;
+            if deferred_sync {
+                // Deferred sync: fire callback immediately on ack quorum.
+                // LAC does NOT advance here — it will catch up when the
+                // user calls force() which invokes `flush_lac_for_force`.
+                st.pending.remove(&entry_id).map(|tx| vec![(entry_id, tx)]).unwrap_or_default()
+            } else if ensemble_info.changing_ensemble.load(Ordering::Acquire) {
+                // Gated: ensemble change in progress.  The caller will
+                // invoke `flush_after_ensemble_change` once the change
+                // commits, which drains the held-back callbacks.
+                Vec::new()
+            } else {
+                Self::drain_in_lac_order(&mut st, lac_value)
+            }
+        };
+        for (eid, tx) in to_signal {
+            let _ = tx.send(Ok(eid));
         }
+    }
 
+    /// Signal failure for a specific entry.  Does NOT touch the acked
+    /// set or LAC — the failure is surfaced directly to `PendingAdd::wait`.
+    fn signal_error(&self, entry_id: i64, err: ClientError) {
+        let tx = self.state.lock().unwrap().pending.remove(&entry_id);
+        if let Some(tx) = tx {
+            let _ = tx.send(Err(err));
+        }
+    }
+
+    /// Drain any held-back signals after an ensemble change completes.
+    /// Called from `flush_after_ensemble_change`.
+    fn flush_after_ensemble_change(&self, lac_value: &AtomicI64) {
+        let to_signal = {
+            let mut st = self.state.lock().unwrap();
+            Self::drain_in_lac_order(&mut st, lac_value)
+        };
+        for (eid, tx) in to_signal {
+            let _ = tx.send(Ok(eid));
+        }
+    }
+
+    /// Called from `force()` / deferred-sync LAC flush path.  Walks the
+    /// acked set and advances LAC; any pending signals for entries that
+    /// reach LAC are fired (typically empty in deferred-sync since they
+    /// were already signaled in `signal_success`).
+    fn flush_lac_for_force(&self, lac_value: &AtomicI64) {
+        let to_signal = {
+            let mut st = self.state.lock().unwrap();
+            Self::drain_in_lac_order(&mut st, lac_value)
+        };
+        for (eid, tx) in to_signal {
+            let _ = tx.send(Ok(eid));
+        }
+    }
+
+    /// Drain all outstanding pending signals with `LedgerClosed`.
+    /// Used by `close()` to error out any callers still waiting.
+    /// Matches Java's `errorOutPendingAdds(rc)` semantics.
+    fn signal_all_closed(&self) {
+        let to_signal: Vec<_> = {
+            let mut st = self.state.lock().unwrap();
+            std::mem::take(&mut st.pending).into_iter().collect()
+        };
+        for (_, tx) in to_signal {
+            let _ = tx.send(Err(ClientError::LedgerClosed));
+        }
+    }
+
+    /// Walk `st.acked` contiguously from `lac_value + 1` upward, collecting
+    /// each pending signal to fire.  Updates `lac_value` under the mutex.
+    /// Caller fires the signals AFTER releasing the lock.
+    fn drain_in_lac_order(
+        st: &mut CompletedState,
+        lac_value: &AtomicI64,
+    ) -> Vec<(i64, PendingTx)> {
         let mut current_lac = lac_value.load(Ordering::Acquire);
-        while completed.contains(&(current_lac + 1)) {
+        while st.acked.remove(&(current_lac + 1)) {
             current_lac += 1;
-            completed.remove(&current_lac);
         }
         lac_value.store(current_lac, Ordering::Release);
+        // Drain pending entries with id <= current_lac, in ascending order.
+        let keep = st.pending.split_off(&(current_lac + 1));
+        let to_signal = std::mem::replace(&mut st.pending, keep);
+        to_signal.into_iter().collect()
     }
 }
 
@@ -502,7 +614,11 @@ impl WriteHandle {
             .map(|(pos, &ensemble_idx)| (ensemble_idx, Arc::clone(&conns[pos])))
             .collect();
 
-        let (tx, rx) = oneshot::channel::<Result<i64, ClientError>>();
+        // Register the PendingAdd's signaling slot BEFORE spawning so the
+        // callback order is deterministic relative to LAC advancement.
+        // Matches Java's pendingAddOps queue which is populated at submit
+        // time and drained in-order by sendAddSuccessCallbacks.
+        let pending_add = self.lac_state.register(entry_id);
         let quorum_timeout = self.add_entry_quorum_timeout;
 
         let handle = tokio::spawn(async move {
@@ -608,13 +724,25 @@ impl WriteHandle {
                 }
             }).await;
 
-            let outcome = match write_result {
+            // Remove from in-flight registry now that the entry is resolved.
+            ensemble_info.remove_in_flight(entry_id);
+
+            // Signal the PendingAdd.  Success path goes through LacState
+            // which fires callbacks in LAC-advancement order (matching
+            // Java's sendAddSuccessCallbacks).  Error paths signal
+            // immediately with the specific error.
+            match write_result {
                 Err(_) => {
-                    Err(ClientError::Protocol(format!(
-                        "add entry quorum timeout ({quorum_timeout:?}) for entry {entry_id}"
-                    )))
+                    lac_state.signal_error(
+                        entry_id,
+                        ClientError::Protocol(format!(
+                            "add entry quorum timeout ({quorum_timeout:?}) for entry {entry_id}"
+                        )),
+                    );
                 }
-                Ok(Err(e)) => Err(e),
+                Ok(Err(e)) => {
+                    lac_state.signal_error(entry_id, e);
+                }
                 Ok(Ok((failed_indices, _last_err))) => {
                     // Record pre-quorum failures for ensemble change
                     if !failed_indices.is_empty() {
@@ -626,15 +754,18 @@ impl WriteHandle {
                             }
                         }
                     }
-                    lac_state.advance_lac(entry_id, &lac_value, &ensemble_info, use_deferred_sync);
-                    Ok(entry_id)
+                    // Success: enter LacState.  This either fires our
+                    // oneshot right away (single-entry / in-order case),
+                    // defers it until an earlier entry's ack arrives
+                    // (out-of-order case — matches Java's pendingAddOps
+                    // head-of-queue wait), holds it until an ensemble
+                    // change completes, or fires immediately for
+                    // deferred-sync mode.
+                    lac_state.signal_success(
+                        entry_id, &lac_value, &ensemble_info, use_deferred_sync,
+                    );
                 }
-            };
-
-            // Remove from in-flight registry now that the entry is resolved.
-            ensemble_info.remove_in_flight(entry_id);
-
-            let _ = tx.send(outcome);
+            }
         });
 
         // Periodically prune completed handles to prevent unbounded growth.
@@ -643,7 +774,7 @@ impl WriteHandle {
             self.pending_adds.retain(|h| !h.is_finished());
         }
         self.pending_adds.push(handle);
-        Ok(PendingAdd { rx })
+        Ok(pending_add)
     }
 
     /// Blocking append — fires writes and waits for ack quorum before returning.
@@ -857,17 +988,20 @@ impl WriteHandle {
         }
     }
 
-    /// Drain the completed set and advance the atomic LAC value.
-    /// Called after ensemble change completes to flush entries that were
-    /// gated during `changing_ensemble = true`.
+    /// Drain the acked set, advance the atomic LAC value, and signal any
+    /// pending callbacks whose entry IDs have now reached LAC.
+    ///
+    /// Called after:
+    /// - an ensemble change completes (unblocks signals gated by
+    ///   `changing_ensemble`)
+    /// - `force()` for deferred-sync mode (advances LAC after ForceLedger
+    ///   acks come back)
+    ///
+    /// Delegates to `LacState::flush_after_ensemble_change` (both call
+    /// sites want the same behavior: walk acked set, advance LAC, fire
+    /// any held-back callbacks).
     fn flush_lac(&self) {
-        let mut completed = self.lac_state.completed.lock().unwrap();
-        let mut current_lac = self.lac_value.load(Ordering::Acquire);
-        while completed.contains(&(current_lac + 1)) {
-            current_lac += 1;
-            completed.remove(&current_lac);
-        }
-        self.lac_value.store(current_lac, Ordering::Release);
+        self.lac_state.flush_after_ensemble_change(&self.lac_value);
     }
 
     /// Force durability of all entries written with DEFERRED_SYNC.
@@ -1002,6 +1136,17 @@ impl WriteHandle {
         for handle in handles {
             let _ = handle.await;
         }
+        // Try one last LAC advance — if changing_ensemble was somehow still
+        // set it should have been cleared by ensemble-change completion,
+        // but an extra flush is cheap and defends against leaks.
+        self.flush_lac();
+        // Any signals still pending at this point represent entries whose
+        // earlier neighbours never ack'd (e.g., entry 0 errored but we
+        // successfully wrote entry 1 — LAC can never advance past 0, so
+        // entry 1's PendingAdd would hang forever).  Fail them with
+        // LedgerClosed so callers unblock, matching Java's
+        // `errorOutPendingAdds(BKException.Code.ClientClosedException)`.
+        self.lac_state.signal_all_closed();
         Ok((self.last_add_confirmed(), self.current_length))
     }
 
@@ -1152,7 +1297,9 @@ impl WriteHandleAdv {
             .map(|(pos, &ensemble_idx)| (ensemble_idx, Arc::clone(&conns_for_write.get(pos).unwrap_or(&conns_for_write[0]))))
             .collect();
 
-        let (tx, rx) = oneshot::channel::<Result<i64, ClientError>>();
+        // Register the PendingAdd's signaling slot in LacState up front
+        // — see WriteHandle::append_async for the rationale.
+        let pending_add = self.inner.lac_state.register(entry_id);
 
         tokio::spawn(async move {
             let write_result = tokio::time::timeout(quorum_timeout, async {
@@ -1184,8 +1331,7 @@ impl WriteHandleAdv {
                         _ => { fail_count += 1; }
                     }
                     if ack_count >= ack_quorum {
-                        lac_state.advance_lac(entry_id, &lac_value, &ensemble_info, use_deferred_sync);
-                        return Ok(entry_id);
+                        return Ok(());
                     }
                     if fail_count > max_tolerable {
                         return Err(ClientError::Protocol(format!(
@@ -1194,23 +1340,35 @@ impl WriteHandleAdv {
                     }
                 }
                 if ack_count >= ack_quorum {
-                    lac_state.advance_lac(entry_id, &lac_value, &ensemble_info, use_deferred_sync);
-                    Ok(entry_id)
+                    Ok(())
                 } else {
                     Err(ClientError::Protocol(format!("failed to reach ack quorum for entry {entry_id}")))
                 }
             }).await;
 
-            let outcome = match write_result {
-                Err(_) => Err(ClientError::Protocol(format!(
-                    "add entry quorum timeout ({quorum_timeout:?}) for entry {entry_id}"
-                ))),
-                Ok(r) => r,
-            };
-            let _ = tx.send(outcome);
+            // Signal via LacState — success path fires in LAC-advancement
+            // order (even for adv where entry IDs may be sparse; entries
+            // without contiguous predecessors wait in the pending map
+            // until their predecessor arrives).
+            match write_result {
+                Err(_) => {
+                    lac_state.signal_error(
+                        entry_id,
+                        ClientError::Protocol(format!(
+                            "add entry quorum timeout ({quorum_timeout:?}) for entry {entry_id}"
+                        )),
+                    );
+                }
+                Ok(Err(e)) => lac_state.signal_error(entry_id, e),
+                Ok(Ok(())) => {
+                    lac_state.signal_success(
+                        entry_id, &lac_value, &ensemble_info, use_deferred_sync,
+                    );
+                }
+            }
         });
 
-        Ok(PendingAdd { rx })
+        Ok(pending_add)
     }
 
     /// Synchronous append with explicit entry ID.

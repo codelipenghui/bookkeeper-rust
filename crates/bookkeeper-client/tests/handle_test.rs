@@ -926,16 +926,28 @@ async fn write_handle_adv_out_of_order_lac() {
     let conns = vec![Arc::new(BookieConnection::connect(addr).await.unwrap())];
     let mut wh = WriteHandleAdv::new(1, ensemble, schedule, dm, master_key);
 
-    // Write entry 0 first
+    // Entry 0 first — fires immediately, LAC=0.
     wh.append_adv(&conns, 0, b"zero").await.unwrap();
     assert_eq!(wh.last_add_confirmed(), 0);
 
-    // Write entry 2 (gap at 1) — LAC should NOT advance past 0
-    wh.append_adv(&conns, 2, b"two").await.unwrap();
-    assert_eq!(wh.last_add_confirmed(), 0, "LAC should not advance past gap");
+    // Out-of-order adv writes (entry 2 before entry 1): matches Java's
+    // `LedgerHandleAdv` which uses a PriorityBlockingQueue ordered by
+    // entryId.  Each callback fires only after its entry becomes head of
+    // the queue AND reaches `pendingAddsSequenceHead + 1` — so we MUST
+    // submit both concurrently, then await.  Sequential submit+await of
+    // entry 2 alone would deadlock (matches Java's behavior).
+    let p2 = wh.append_adv_async(&conns, 2, b"two").unwrap();
+    let p1 = wh.append_adv_async(&conns, 1, b"one").unwrap();
 
-    // Fill the gap with entry 1 — LAC should advance to 2
-    wh.append_adv(&conns, 1, b"one").await.unwrap();
+    // Entry 1 fires first (LAC advances 0 → 1).  Java invariant holds:
+    // after p1.wait() returns Ok(1), LAC ≥ 1.
+    let eid1 = p1.wait().await.unwrap();
+    assert_eq!(eid1, 1);
+    assert!(wh.last_add_confirmed() >= 1, "LAC should be ≥1 after p1");
+
+    // Entry 2 fires next (LAC 1 → 2).
+    let eid2 = p2.wait().await.unwrap();
+    assert_eq!(eid2, 2);
     assert_eq!(wh.last_add_confirmed(), 2, "LAC should advance through contiguous entries");
 
     server.shutdown().await;
@@ -1133,3 +1145,56 @@ async fn read_last_confirmed_and_entry_parallel_mode_returns_entry() {
     server.shutdown().await;
 }
 
+
+// ---------------------------------------------------------------------------
+// LAC-invariant after PendingAdd resolves (Option C — Java parity)
+// ---------------------------------------------------------------------------
+
+/// Java invariant: when `addEntry` callback fires for entry N, the ledger
+/// handle's `lastAddConfirmed` is guaranteed to be ≥ N.  This is because
+/// Java's `sendAddSuccessCallbacks` walks `pendingAddOps` in entry-ID order
+/// and advances `lastAddConfirmed` BEFORE invoking each per-entry callback.
+///
+/// The Rust equivalent: after `p.wait().await` returns `Ok(N)`,
+/// `wh.last_add_confirmed()` must be ≥ N.
+///
+/// This test fires many out-of-order concurrent appends and asserts the
+/// invariant holds.  With ensemble=1 the ack arrival order naturally
+/// matches submission order, but the test also verifies the
+/// single-entry fast path.
+#[tokio::test]
+async fn pending_add_resolves_implies_lac_advanced_past_entry() {
+    let dir = TempDir::new().unwrap();
+    let server = BookieServer::start(test_config(&dir)).await.unwrap();
+    let addr = server.local_addr();
+
+    let ensemble = vec![addr.to_string()];
+    let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = [0u8; 20];
+
+    let conns = vec![Arc::new(BookieConnection::connect(addr).await.unwrap())];
+    let mut wh = WriteHandle::new(123, ensemble, schedule, dm, master_key);
+
+    // Fire 50 appends, collect futures, then await them in reverse order.
+    let mut pendings = Vec::with_capacity(50);
+    for i in 0..50 {
+        let payload = format!("e{i}");
+        let p = wh.append_async(&conns, payload.as_bytes()).unwrap();
+        pendings.push((i as i64, p));
+    }
+
+    // Await from the LAST submitted entry backwards.  After each .await,
+    // the LAC must be >= that entry's id (Java invariant).
+    while let Some((eid, p)) = pendings.pop() {
+        let got = p.wait().await.unwrap();
+        assert_eq!(got, eid);
+        let lac = wh.last_add_confirmed();
+        assert!(
+            lac >= eid,
+            "LAC invariant violated: after p.await() returned Ok({eid}), LAC = {lac}"
+        );
+    }
+
+    server.shutdown().await;
+}
