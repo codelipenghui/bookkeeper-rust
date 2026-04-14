@@ -215,6 +215,10 @@ pub struct ServerConfig {
     pub auditor_periodic_bookie_check_interval: i64,
     /// Auditor placement policy check interval (seconds). 0 = disabled.
     pub auditor_periodic_placement_policy_check_interval: i64,
+    /// Auditor replicas-check interval (seconds). 0 = disabled.
+    /// Matches Java's `auditorPeriodicReplicasCheckInterval` — probes
+    /// each bookie for each entry to detect silent partial data loss.
+    pub auditor_periodic_replicas_check_interval: i64,
     /// Replication worker rereplicate backoff (ms).
     pub rw_rereplicate_backoff_ms: i64,
 
@@ -471,6 +475,7 @@ impl Default for ServerConfig {
             auditor_periodic_check_interval: 604800,
             auditor_periodic_bookie_check_interval: 86400,
             auditor_periodic_placement_policy_check_interval: 0,
+            auditor_periodic_replicas_check_interval: 0,
             rw_rereplicate_backoff_ms: 5000,
             zk_servers: None,
             zk_ledger_root: "/ledgers".to_string(),
@@ -745,6 +750,7 @@ impl ServerConfig {
         if let Some(v) = props.get("auditorPeriodicCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_check_interval = n; } }
         if let Some(v) = props.get("auditorPeriodicBookieCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_bookie_check_interval = n; } }
         if let Some(v) = props.get("auditorPeriodicPlacementPolicyCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_placement_policy_check_interval = n; } }
+        if let Some(v) = props.get("auditorPeriodicReplicasCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_replicas_check_interval = n; } }
         if let Some(v) = props.get("rwRereplicateBackoffMs") { if let Ok(n) = v.parse() { config.rw_rereplicate_backoff_ms = n; } }
         // ZooKeeper
         if let Some(v) = props.get("zkServers") { config.zk_servers = Some(v.clone()); }

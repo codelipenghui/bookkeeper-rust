@@ -16,6 +16,8 @@ futures = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
+rand = { workspace = true }
+prost = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

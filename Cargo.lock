@@ -705,6 +705,8 @@ dependencies = [
  "bookkeeper-test-utils",
  "bytes",
  "futures",
+ "prost",
+ "rand 0.10.0",
  "tempfile",
  "testcontainers",
  "thiserror 2.0.18",

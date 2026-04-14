@@ -112,6 +112,8 @@ pub fn create_router(http_state: HttpState) -> Router {
             axum::routing::put(trigger_audit_endpoint))
         .route("/api/v1/autorecovery/list_under_replicated_ledger",
             axum::routing::get(list_under_replicated_endpoint))
+        .route("/api/v1/autorecovery/replication_status",
+            axum::routing::get(replication_status_endpoint))
         .route("/api/v1/autorecovery/bookie",
             axum::routing::put(recover_bookie_endpoint))
         .route("/api/v1/autorecovery/decommission",
@@ -910,7 +912,7 @@ struct ListUnderReplicatedQuery {
 
 async fn list_under_replicated_endpoint(
     State(state): State<HttpState>,
-    Query(_query): Query<ListUnderReplicatedQuery>,
+    Query(query): Query<ListUnderReplicatedQuery>,
 ) -> impl IntoResponse {
     let (client, paths) = match (&state.zk_client, &state.zk_paths) {
         (Some(c), Some(p)) => (c, p),
@@ -919,44 +921,97 @@ async fn list_under_replicated_endpoint(
         ]))),
     };
 
-    // Note: filters (missingreplica/excludingmissingreplica) require reading
-    // znode data; current scan_underreplicated only collects IDs.
-    let ur_path = format!("{}/ledgers", paths.underreplication());
-    let mut results = Vec::new();
-    scan_underreplicated(client, &ur_path, &mut results).await;
+    // Use the full under-replication manager so we can filter by replica
+    // identity (missingreplica / excludingmissingreplica), matching
+    // Java's ListUnderReplicatedLedgerService query parameters.
+    let ur_mgr = match bookkeeper_replication::underreplication::ZkUnderreplicationManager::new(
+        client.clone(), paths.clone(), "http-lister".into(),
+    ).await {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!([
+            format!("init ur manager: {e}")
+        ]))),
+    };
 
-    if results.is_empty() {
+    let include = query.missingreplica.clone();
+    let exclude = query.excludingmissingreplica.clone();
+    let entries = ur_mgr.list_ledgers_to_rereplicate(|_lid, replicas| {
+        if let Some(ref req) = include {
+            if !replicas.iter().any(|r| r == req) { return false; }
+        }
+        if let Some(ref req) = exclude {
+            if replicas.iter().any(|r| r == req) { return false; }
+        }
+        true
+    }).await.unwrap_or_default();
+
+    if entries.is_empty() {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!([
             "No under replicated ledgers found"
         ])));
     }
 
-    // Java format: JSON array of ledger IDs
-    let array: Vec<serde_json::Value> = results.into_iter()
-        .map(|lid| serde_json::Value::Number(serde_json::Number::from(lid)))
+    // Java format: JSON array of ledger IDs (we add replicas when
+    // printmissingreplica=true for parity with the Java service).
+    if query.printmissingreplica.as_deref() == Some("true") {
+        let arr: Vec<serde_json::Value> = entries.into_iter()
+            .map(|(lid, replicas)| serde_json::json!({
+                "ledgerId": lid,
+                "missingReplicas": replicas,
+            })).collect();
+        return (StatusCode::OK, Json(serde_json::Value::Array(arr)));
+    }
+    let array: Vec<serde_json::Value> = entries.into_iter()
+        .map(|(lid, _)| serde_json::Value::Number(serde_json::Number::from(lid)))
         .collect();
     (StatusCode::OK, Json(serde_json::Value::Array(array)))
 }
 
-async fn scan_underreplicated(
-    client: &zookeeper_client::Client,
-    path: &str,
-    results: &mut Vec<i64>,
-) {
-    let children = match client.get_children(path).await {
-        Ok((c, _)) => c,
-        Err(_) => return,
+// ---------------------------------------------------------------------------
+// /api/v1/autorecovery/replication_status
+//
+// Summary endpoint for operational visibility: tells operators whether the
+// auditor is healthy (last-run timestamps within the expected interval),
+// how many ledgers are currently under-replicated, and whether replication
+// is enabled cluster-wide. Mirrors what Java's HTTP layer surfaces via the
+// combination of `GetLedgerReplicationStatusService` + `AuditorStats` Prom
+// gauges — single endpoint here instead of three so operators can poll one
+// URL for a dashboard.
+// ---------------------------------------------------------------------------
+async fn replication_status_endpoint(State(state): State<HttpState>) -> impl IntoResponse {
+    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
+        (Some(c), Some(p)) => (c, p),
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": "ZK not configured"
+        }))),
     };
-    for child in &children {
-        if let Some(suffix) = child.strip_prefix("urL") {
-            if let Ok(lid) = suffix.parse::<i64>() {
-                results.push(lid);
-                continue;
-            }
-        }
-        let child_path = format!("{}/{}", path, child);
-        Box::pin(scan_underreplicated(client, &child_path, results)).await;
-    }
+
+    let ur_mgr = match bookkeeper_replication::underreplication::ZkUnderreplicationManager::new(
+        client.clone(), paths.clone(), "http-status".into(),
+    ).await {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("init ur manager: {e}")
+        }))),
+    };
+
+    let enabled = ur_mgr.is_replication_enabled().await.unwrap_or(true);
+    let lost_delay = ur_mgr.get_lost_bookie_recovery_delay(0).await.unwrap_or(0);
+    let check_all_ledgers_ctime = ur_mgr.get_check_all_ledgers_ctime().await.unwrap_or(-1);
+    let placement_check_ctime = ur_mgr.get_placement_policy_check_ctime().await.unwrap_or(-1);
+    let replicas_check_ctime = ur_mgr.get_replicas_check_ctime().await.unwrap_or(-1);
+    let count = ur_mgr.list_ledgers_to_rereplicate(|_, _| true).await
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "replicationEnabled": enabled,
+        "underReplicatedLedgerCount": count,
+        "lostBookieRecoveryDelaySecs": lost_delay,
+        "checkAllLedgersCTime": check_all_ledgers_ctime,
+        "placementPolicyCheckCTime": placement_check_ctime,
+        "replicasCheckCTime": replicas_check_ctime,
+    })))
 }
 
 // ---------------------------------------------------------------------------

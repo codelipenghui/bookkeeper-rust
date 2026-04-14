@@ -64,6 +64,8 @@ async fn spawn_elector(
                 0, // lost_bookie_recovery_delay_secs
                 0, // auditor_periodic_check_interval_secs (disabled)
                 0, // auditor_periodic_placement_check_interval_secs (disabled)
+                0, // auditor_periodic_replicas_check_interval_secs (disabled)
+                None, // placement_policy
                 shutdown_rx,
             )
             .await;

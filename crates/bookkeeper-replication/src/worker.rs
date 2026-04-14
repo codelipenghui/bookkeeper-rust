@@ -5,6 +5,7 @@ use tokio::sync::watch;
 use bytes::Bytes;
 use bookkeeper_client::bookie_connection::BookieConnection;
 use bookkeeper_client::distribution::RoundRobinDistributionSchedule;
+use bookkeeper_client::placement::{EnsemblePlacementPolicy, PolicyAdherence};
 use bookkeeper_client::recovery::RecoveryHandle;
 use bookkeeper_metadata::traits::LedgerManager;
 use bookkeeper_metadata::ledger_metadata::{
@@ -42,6 +43,52 @@ pub struct ReplicationWorker {
     /// Gives the writing client time to handle bookie failure itself.
     /// 0 = immediate fencing. Matches Java's `openLedgerRereplicationGracePeriod`.
     open_ledger_grace_period_ms: u64,
+    /// Bounds how often the worker walks the ZK under-replication tree.
+    /// Each `try_rereplicate` call can enumerate many znodes in a large
+    /// cluster, so without a cap a restart storm could flood ZK. The
+    /// limiter enforces ≤ `max_claims_per_second` attempts — matches
+    /// the spirit of Java's `replicationRateByBytes` / ZK client rate
+    /// controls used to protect ZK from compaction-style scans.
+    /// 0 = unbounded.
+    rate_limit: Option<ClaimRateLimiter>,
+    /// Placement policy used to pick replacement bookies and to detect
+    /// fragments that violate placement even when availability is fine.
+    /// When set, the worker will:
+    ///   1. Invoke `replace_bookie(..)` instead of naive first-available
+    ///      to honour region/rack-aware constraints.
+    ///   2. During closed-ledger repair, check each segment's adherence
+    ///      and re-place the full segment when the existing bookies are
+    ///      live but violate placement. Matches Java's
+    ///      `ReplicationWorker.handlePlacementPolicyViolation` path.
+    placement_policy: Option<Arc<dyn EnsemblePlacementPolicy>>,
+}
+
+/// Simple sleep-based token bucket for rate-limiting ZK claim attempts.
+/// Not thread-safe — the worker is single-tasked by design.
+struct ClaimRateLimiter {
+    min_interval: std::time::Duration,
+    next_allowed: std::time::Instant,
+}
+
+impl ClaimRateLimiter {
+    fn new(claims_per_second: u32) -> Self {
+        let min_interval = std::time::Duration::from_nanos(
+            1_000_000_000u64 / claims_per_second.max(1) as u64,
+        );
+        Self {
+            min_interval,
+            next_allowed: std::time::Instant::now(),
+        }
+    }
+
+    /// Await until the next claim is allowed; update the deadline.
+    async fn acquire(&mut self) {
+        let now = std::time::Instant::now();
+        if self.next_allowed > now {
+            tokio::time::sleep(self.next_allowed - now).await;
+        }
+        self.next_allowed = std::time::Instant::now() + self.min_interval;
+    }
 }
 
 impl ReplicationWorker {
@@ -61,13 +108,30 @@ impl ReplicationWorker {
             consecutive_failures: 0,
             failed_ledger_cache: std::collections::VecDeque::new(),
             open_ledger_grace_period_ms: 30_000, // default 30s matching Java
+            rate_limit: None,
+            placement_policy: None,
         }
+    }
+
+    /// Install the placement policy used for replacement-bookie selection
+    /// and placement-violation detection. Matches Java's
+    /// `EnsemblePlacementPolicy` wiring in `ReplicationWorker`.
+    pub fn set_placement_policy(&mut self, policy: Arc<dyn EnsemblePlacementPolicy>) {
+        self.placement_policy = Some(policy);
     }
 
     /// Set the grace period before fencing open ledgers (ms).
     /// 0 = immediate. Matches Java's `openLedgerRereplicationGracePeriod`.
     pub fn set_open_ledger_grace_period_ms(&mut self, ms: u64) {
         self.open_ledger_grace_period_ms = ms;
+    }
+
+    /// Cap how many ZK under-replication scans the worker launches per
+    /// second. 0 disables the limiter. Mirrors operator tuning that Java
+    /// exposes via `rwReRereplicateBackoffMs` + ZK client throttling —
+    /// prevents a newly-woken worker from flooding ZK with tree walks.
+    pub fn set_max_claims_per_second(&mut self, cps: u32) {
+        self.rate_limit = if cps > 0 { Some(ClaimRateLimiter::new(cps)) } else { None };
     }
 
     fn current_backoff_ms(&self) -> u64 {
@@ -94,8 +158,26 @@ impl ReplicationWorker {
     }
 
     /// Run the replication worker main loop.
+    ///
+    /// Instead of polling, the worker installs a `PERSISTENT_RECURSIVE`
+    /// ZK watch on the under-replication tree and sleeps on it when idle.
+    /// That matches Java's `getLedgerToRereplicate()` internal
+    /// `notifyUnderReplicationLedgerChanged` wait — a new under-replicated
+    /// ledger wakes every worker immediately rather than at the next
+    /// backoff tick.
     pub async fn run(&mut self) -> Result<(), ReplicationError> {
         tracing::info!("ReplicationWorker started (bookie: {})", self.bookie_id);
+
+        // Arm the persistent watch up front so we never miss events between
+        // the scan and the sleep. Re-armed after every fire.
+        let mut tree_watcher: Option<zookeeper_client::PersistentWatcher> =
+            match self.ur_manager.watch_underreplicated_tree().await {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::warn!("ReplicationWorker: watch setup failed ({e}) — falling back to polling");
+                    None
+                }
+            };
 
         loop {
             if *self.shutdown_rx.borrow() {
@@ -110,15 +192,40 @@ impl ReplicationWorker {
                     self.record_success();
                 }
                 Ok(false) => {
+                    // Idle: sleep until the persistent watch fires OR a
+                    // backoff timeout elapses. The timeout acts as a
+                    // safety net against lost events (ZOOKEEPER-4698).
                     let backoff = self.current_backoff_ms();
+                    let timeout = tokio::time::Duration::from_millis(backoff);
+                    let watch_fut = async {
+                        match tree_watcher.as_mut() {
+                            Some(w) => {
+                                let _ = w.changed().await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    };
                     tokio::select! {
                         _ = self.shutdown_rx.changed() => {
-                            if *self.shutdown_rx.borrow() {
-                                tracing::info!("ReplicationWorker shutting down");
-                                break;
+                            if *self.shutdown_rx.borrow() { break; }
+                        }
+                        _ = watch_fut => {
+                            // Event received; drop and re-arm so we don't
+                            // accumulate dangling subscriptions.
+                            tree_watcher = match self.ur_manager.watch_underreplicated_tree().await {
+                                Ok(w) => Some(w),
+                                Err(e) => {
+                                    tracing::warn!("ReplicationWorker: re-arm watch failed: {e}");
+                                    None
+                                }
+                            };
+                        }
+                        _ = tokio::time::sleep(timeout) => {
+                            if tree_watcher.is_none() {
+                                tree_watcher = self.ur_manager
+                                    .watch_underreplicated_tree().await.ok();
                             }
                         }
-                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(backoff)) => {}
                     }
                 }
                 Err(e) => {
@@ -127,10 +234,7 @@ impl ReplicationWorker {
                     let backoff = self.current_backoff_ms();
                     tokio::select! {
                         _ = self.shutdown_rx.changed() => {
-                            if *self.shutdown_rx.borrow() {
-                                tracing::info!("ReplicationWorker shutting down");
-                                break;
-                            }
+                            if *self.shutdown_rx.borrow() { break; }
                         }
                         _ = tokio::time::sleep(tokio::time::Duration::from_millis(backoff)) => {}
                     }
@@ -141,6 +245,13 @@ impl ReplicationWorker {
     }
 
     async fn try_rereplicate(&mut self) -> Result<bool, ReplicationError> {
+        // Rate-limit ZK scan attempts before any ZK read. Keeps a single
+        // worker — or a fleet of them after a bookie restart — from
+        // hammering ZK with tree walks.
+        if let Some(limiter) = self.rate_limit.as_mut() {
+            limiter.acquire().await;
+        }
+
         if !self.ur_manager.is_replication_enabled().await? {
             return Ok(false);
         }
@@ -256,14 +367,45 @@ impl ReplicationWorker {
         // Get available bookies for replacement selection
         let available = self.get_available_bookies().await?;
 
+        // Write/ack quorum for policy adherence + replace_bookie calls.
+        let wq = md.write_quorum_size() as usize;
+        let aq = md.ack_quorum_size() as usize;
+        let es = md.ensemble_size() as usize;
+
         for (seg_start, seg_end, ensemble) in &segments {
             // Detect bad bookies by verifying ALL entries per bookie.
             // Returns a map: bad_bookie_index -> set of missing entry IDs.
-            let bad_bookies = self
+            let mut bad_bookies = self
                 .detect_bad_bookies(
                     ledger_id, *seg_start, *seg_end, ensemble, schedule, &master_key,
                 )
                 .await?;
+
+            // Placement-aware repair: even when all bookies are alive, an
+            // existing ensemble may violate region/rack constraints (for
+            // example after a topology change). Mark those bookies as "bad"
+            // so they get replaced via the placement policy. Matches Java's
+            // `AuditorPlacementPolicyCheckTask` → `ReplicationWorker`
+            // cooperative flow.
+            if let Some(ref policy) = self.placement_policy {
+                if bad_bookies.is_empty()
+                    && policy.is_ensemble_adhering(ensemble, wq, aq) == PolicyAdherence::Fail
+                {
+                    // Nominate the first bookie for replacement — the
+                    // replace_bookie call below will pick a location that
+                    // actually improves adherence.
+                    let missing_range: HashSet<i64> = (*seg_start..=*seg_end)
+                        .filter(|eid| schedule.write_set(*eid).contains(&0))
+                        .collect();
+                    if !missing_range.is_empty() {
+                        bad_bookies.insert(0, missing_range);
+                        tracing::info!(
+                            "ReplicationWorker: ledger {ledger_id} segment [{seg_start}..{seg_end}] \
+                             violates placement policy — rereplicating bookie index 0"
+                        );
+                    }
+                }
+            }
 
             if bad_bookies.is_empty() {
                 continue; // this segment is fine
@@ -275,18 +417,38 @@ impl ReplicationWorker {
                 bad_indices
             );
 
-            // Select replacement bookies
+            // Select replacement bookies — via placement policy when we
+            // have one, otherwise the simple first-fit picker.
             let mut replacements: HashMap<usize, String> = HashMap::new();
-            let mut exclude: HashSet<&str> = ensemble.iter().map(|s| s.as_str()).collect();
+            let mut exclude: HashSet<String> = ensemble.iter().cloned().collect();
             for &bad_idx in &bad_indices {
-                if let Some(replacement) = pick_replacement(&available, &exclude) {
-                    exclude.insert(replacement);
-                    replacements.insert(bad_idx, replacement.to_string());
+                let bad_addr = ensemble.get(bad_idx).cloned().unwrap_or_default();
+                let replacement = if let Some(ref policy) = self.placement_policy {
+                    match policy.replace_bookie(es, wq, aq, ensemble, &bad_addr, &exclude) {
+                        Ok(addr) => addr,
+                        Err(e) => {
+                            tracing::warn!(
+                                "ReplicationWorker: placement policy replace_bookie failed \
+                                 ({e}) — falling back to first-available"
+                            );
+                            match pick_replacement(&available, &exclude) {
+                                Some(a) => a.to_string(),
+                                None => return Err(ReplicationError::Failed(
+                                    "no available replacement bookie".into(),
+                                )),
+                            }
+                        }
+                    }
                 } else {
-                    return Err(ReplicationError::Failed(
-                        "no available replacement bookie".into(),
-                    ));
-                }
+                    match pick_replacement(&available, &exclude) {
+                        Some(a) => a.to_string(),
+                        None => return Err(ReplicationError::Failed(
+                            "no available replacement bookie".into(),
+                        )),
+                    }
+                };
+                exclude.insert(replacement.clone());
+                replacements.insert(bad_idx, replacement);
             }
 
             // Connect to all bookies (original ensemble + replacements)
@@ -683,10 +845,10 @@ impl ReplicationWorker {
 }
 
 /// Pick a replacement bookie from available list, excluding specified bookies.
-fn pick_replacement<'a>(available: &'a [String], exclude: &HashSet<&str>) -> Option<&'a str> {
+fn pick_replacement<'a>(available: &'a [String], exclude: &HashSet<String>) -> Option<&'a str> {
     available
         .iter()
-        .find(|addr| !exclude.contains(addr.as_str()))
+        .find(|addr| !exclude.contains(*addr))
         .map(|s| s.as_str())
 }
 

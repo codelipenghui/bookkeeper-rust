@@ -38,6 +38,13 @@ impl AuditorElector {
     /// Run the election loop. When elected, starts the Auditor. When the auditor
     /// loses leadership (e.g., ZK session expires), re-enters election.
     /// This method blocks until shutdown is signaled.
+    ///
+    /// `placement_policy` is forwarded to the elected `Auditor` so the
+    /// periodic placement-policy check actually applies it. Before this
+    /// was wired, `check_placement_policy()` was a no-op even when the
+    /// operator configured a policy — defeating the whole purpose of the
+    /// audit. Matches Java's
+    /// `AuditorElector → Auditor.setPlacementPolicy(EnsemblePlacementPolicy)`.
     pub async fn run(
         &mut self,
         ur_manager: Arc<ZkUnderreplicationManager>,
@@ -47,6 +54,8 @@ impl AuditorElector {
         lost_bookie_recovery_delay_secs: u64,
         auditor_periodic_check_interval_secs: u64,
         auditor_periodic_placement_check_interval_secs: u64,
+        auditor_periodic_replicas_check_interval_secs: u64,
+        placement_policy: Option<Arc<dyn bookkeeper_client::placement::EnsemblePlacementPolicy>>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<(), ReplicationError> {
         // Ensure election path exists
@@ -86,6 +95,10 @@ impl AuditorElector {
                     );
                     auditor.set_all_ledgers_check_interval(auditor_periodic_check_interval_secs);
                     auditor.set_placement_check_interval(auditor_periodic_placement_check_interval_secs);
+                    auditor.set_replicas_check_interval(auditor_periodic_replicas_check_interval_secs);
+                    if let Some(ref policy) = placement_policy {
+                        auditor.set_placement_policy(policy.clone());
+                    }
                     if let Err(e) = auditor.run().await {
                         tracing::warn!("Auditor exited: {e}");
                     }

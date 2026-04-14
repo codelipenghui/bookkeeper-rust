@@ -357,6 +357,7 @@ impl BookieServer {
                     config.rw_rereplicate_backoff_ms as u64,
                     config.auditor_periodic_check_interval as u64,
                     config.auditor_periodic_placement_policy_check_interval as u64,
+                    config.auditor_periodic_replicas_check_interval as u64,
                     shutdown_rx.clone(),
                 )
                 .await?;
@@ -1366,6 +1367,7 @@ async fn start_auto_recovery(
     rw_rereplicate_backoff_ms: u64,
     auditor_periodic_check_interval: u64,
     auditor_periodic_placement_policy_check_interval: u64,
+    auditor_periodic_replicas_check_interval: u64,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
     use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
@@ -1394,6 +1396,16 @@ async fn start_auto_recovery(
 
     let auditor_handle = tokio::spawn(async move {
         let mut elector = AuditorElector::new(elector_zk, &elector_paths, elector_bookie_id);
+        // Build a default placement policy instance so the auditor's
+        // periodic placement check is actually applied. Previously this
+        // was None and `check_placement_policy()` was a silent no-op.
+        // Rack-aware and region-aware policies can be swapped in by
+        // operators — this default matches Java's
+        // `DefaultEnsemblePlacementPolicy` which is the out-of-the-box
+        // choice when `ensemblePlacementPolicy` isn't explicitly set.
+        let policy: Arc<dyn bookkeeper_client::placement::EnsemblePlacementPolicy> =
+            Arc::new(bookkeeper_client::placement::DefaultPlacementPolicy::new());
+
         if let Err(e) = elector
             .run(
                 elector_ur,
@@ -1403,6 +1415,8 @@ async fn start_auto_recovery(
                 lost_bookie_recovery_delay_secs,
                 auditor_periodic_check_interval,
                 auditor_periodic_placement_policy_check_interval,
+                auditor_periodic_replicas_check_interval,
+                Some(policy),
                 elector_shutdown,
             )
             .await

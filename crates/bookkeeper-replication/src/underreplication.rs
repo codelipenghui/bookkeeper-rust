@@ -1,7 +1,10 @@
 use std::collections::HashSet;
+use rand::seq::SliceRandom;
 use zookeeper_client as zk;
 use bookkeeper_metadata::zk_path::{ZkPaths, underreplication_ledger_path, underreplication_lock_path};
-use bookkeeper_proto::{UnderreplicatedLedgerFormat, LockDataFormat, LedgerRereplicationLayoutFormat};
+use bookkeeper_proto::{UnderreplicatedLedgerFormat, LockDataFormat, LedgerRereplicationLayoutFormat,
+    CheckAllLedgersFormat, PlacementPolicyCheckFormat, ReplicasCheckFormat};
+use prost::Message;
 use crate::text_format;
 
 /// Layout type for the underreplication subsystem, matching Java's constant.
@@ -185,17 +188,24 @@ impl ZkUnderreplicationManager {
     }
 
     /// Try to claim a ledger for replication. Returns Some(ledger_id) if lock acquired.
+    ///
+    /// Walks the 4-level hex hierarchy under `ur/ledgers`, **shuffling children
+    /// at every depth** so that multiple workers scanning the same tree do
+    /// not all start at the lowest-ID ledger and collide on the same lock.
+    /// Matches Java's `ZkLedgerUnderreplicationManager.getLedgerToRereplicateFromHierarchy()`
+    /// which calls `Collections.shuffle(children)` at each recursion level.
     pub async fn get_ledger_to_rereplicate(&self) -> Result<Option<i64>, ReplicationError> {
         let ur_ledgers_path = format!("{}/ledgers", self.paths.underreplication());
 
         // Scan for underreplicated ledgers by listing children recursively.
-        let children = match self.client.get_children(&ur_ledgers_path).await {
+        let mut children = match self.client.get_children(&ur_ledgers_path).await {
             Ok((c, _)) => c,
             Err(zk::Error::NoNode) => return Ok(None),
             Err(e) => return Err(ReplicationError::Zk(format!("list underrep: {e}"))),
         };
+        children.shuffle(&mut rand::rng());
 
-        // Recursively find urL* znodes
+        // Recursively find urL* znodes (shuffled inside the recursive helper too).
         for dir1 in &children {
             if let Ok(Some(lid)) = self
                 .find_underreplicated_in_tree(&format!("{}/{}", ur_ledgers_path, dir1))
@@ -218,6 +228,72 @@ impl ZkUnderreplicationManager {
             }
         }
         Ok(None)
+    }
+
+    /// Enumerate all under-replicated ledgers, optionally filtering by a
+    /// predicate on `(ledger_id, missing_replicas)`. Matches Java's
+    /// `ZkLedgerUnderreplicationManager.listLedgersToRereplicate(Predicate)`
+    /// used by admin/HTTP tools and the auditor's replicasCheck.
+    ///
+    /// Does NOT acquire locks — this is a read-only scan.
+    pub async fn list_ledgers_to_rereplicate<F>(
+        &self,
+        mut predicate: F,
+    ) -> Result<Vec<(i64, Vec<String>)>, ReplicationError>
+    where
+        F: FnMut(i64, &[String]) -> bool + Send,
+    {
+        let ur_ledgers_path = format!("{}/ledgers", self.paths.underreplication());
+        let mut out: Vec<(i64, Vec<String>)> = Vec::new();
+        self.walk_underreplicated(&ur_ledgers_path, &mut |lid, replicas| {
+            predicate(lid, replicas)
+        }, &mut out).await?;
+        Ok(out)
+    }
+
+    /// DFS through the hierarchy and invoke `visit` for every `urL*` leaf.
+    /// Collects entries that the predicate accepts. Silent on transient
+    /// NoNode errors (another worker may be cleaning up in parallel), like
+    /// Java's traversal which catches `KeeperException.NoNodeException`.
+    fn walk_underreplicated<'a, F>(
+        &'a self,
+        path: &'a str,
+        visit: &'a mut F,
+        out: &'a mut Vec<(i64, Vec<String>)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ReplicationError>> + Send + 'a>>
+    where
+        F: FnMut(i64, &[String]) -> bool + Send,
+    {
+        Box::pin(async move {
+            let children = match self.client.get_children(path).await {
+                Ok((c, _)) => c,
+                Err(zk::Error::NoNode) => return Ok(()),
+                Err(e) => return Err(ReplicationError::Zk(format!("list: {e}"))),
+            };
+            for child in &children {
+                if let Some(suffix) = child.strip_prefix("urL") {
+                    if let Ok(lid) = suffix.parse::<i64>() {
+                        // Read the marker payload to get missing_replicas.
+                        let leaf_path = format!("{}/{}", path, child);
+                        match self.client.get_data(&leaf_path).await {
+                            Ok((data, _)) => {
+                                let parsed = text_format::parse_underreplicated_ledger(&data)
+                                    .unwrap_or(UnderreplicatedLedgerFormat::default());
+                                if visit(lid, &parsed.replica) {
+                                    out.push((lid, parsed.replica));
+                                }
+                            }
+                            Err(zk::Error::NoNode) => {} // cleaned up between listing and reading
+                            Err(e) => return Err(ReplicationError::Zk(format!("read leaf: {e}"))),
+                        }
+                        continue;
+                    }
+                }
+                let child_path = format!("{}/{}", path, child);
+                self.walk_underreplicated(&child_path, visit, out).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Mark a ledger as replicated (done). Deletes the marker and lock.
@@ -283,6 +359,24 @@ impl ZkUnderreplicationManager {
         Ok(())
     }
 
+    /// Install a persistent-recursive watch on the under-replication tree.
+    /// The returned [`zk::PersistentWatcher`] fires on any create/delete
+    /// anywhere under `ur/ledgers` — used by the worker to sleep until a
+    /// new ledger is marked for replication (or an existing one is
+    /// removed by a peer) without polling.
+    ///
+    /// Matches Java's
+    /// `ZkLedgerUnderreplicationManager.notifyUnderReplicationLedgerChanged`
+    /// which calls `zkc.addWatch(urLedgerPath, PERSISTENT_RECURSIVE)`.
+    pub async fn watch_underreplicated_tree(&self) -> Result<zk::PersistentWatcher, ReplicationError> {
+        let ur_ledgers_path = format!("{}/ledgers", self.paths.underreplication());
+        self.ensure_path(&ur_ledgers_path).await?;
+        self.client
+            .watch(&ur_ledgers_path, zk::AddWatchMode::PersistentRecursive)
+            .await
+            .map_err(|e| ReplicationError::Zk(format!("persistent watch: {e}")))
+    }
+
     /// Check if replication is enabled (absence of disable znode).
     pub async fn is_replication_enabled(&self) -> Result<bool, ReplicationError> {
         let disable_path = format!("{}/disable", self.paths.underreplication());
@@ -323,6 +417,124 @@ impl ZkUnderreplicationManager {
         }
     }
 
+    /// Same as `get_lost_bookie_recovery_delay` but also installs a ZK
+    /// watch on the delay znode so the caller can react to runtime
+    /// changes. Matches Java's
+    /// `ZkLedgerUnderreplicationManager.notifyLostBookieRecoveryDelayChanged(GenericCallback)`
+    /// which internally uses `zkc.getData(path, watcher, null)` so the
+    /// operator changing the delay via `bookkeeper shell` triggers the
+    /// auditor to re-read the value rather than waiting for the next
+    /// audit cycle.
+    ///
+    /// If the znode doesn't exist, a watch is installed via
+    /// `check_and_watch_stat` so creation also fires the watcher.
+    pub async fn watch_lost_bookie_recovery_delay(
+        &self,
+        default_secs: u64,
+    ) -> Result<(u64, zk::OneshotWatcher), ReplicationError> {
+        let delay_path = format!("{}/lostBookieRecoveryDelay", self.paths.underreplication());
+        match self.client.get_and_watch_data(&delay_path).await {
+            Ok((data, _stat, watcher)) => {
+                let s = String::from_utf8_lossy(&data);
+                let secs = s.trim().parse::<u64>().unwrap_or(default_secs);
+                Ok((secs, watcher))
+            }
+            Err(zk::Error::NoNode) => {
+                // Watch for creation of the znode.
+                match self.client.check_and_watch_stat(&delay_path).await {
+                    Ok((_stat, watcher)) => Ok((default_secs, watcher)),
+                    Err(e) => Err(ReplicationError::Zk(format!("watch delay (absent): {e}"))),
+                }
+            }
+            Err(e) => Err(ReplicationError::Zk(format!("watch delay: {e}"))),
+        }
+    }
+
+    /// Last-run timestamp (ms since epoch) for the periodic full-ledger
+    /// availability check. Returns -1 when the znode has never been
+    /// written, matching Java's `getCheckAllLedgersCTime()`.
+    pub async fn get_check_all_ledgers_ctime(&self) -> Result<i64, ReplicationError> {
+        let path = format!("{}/checkallledgersctime", self.paths.underreplication());
+        match self.client.get_data(&path).await {
+            Ok((data, _)) => {
+                let fmt = CheckAllLedgersFormat::decode(&data[..])
+                    .map_err(|e| ReplicationError::Zk(format!("parse ctime: {e}")))?;
+                Ok(fmt.check_all_ledgers_c_time.unwrap_or(-1))
+            }
+            Err(zk::Error::NoNode) => Ok(-1),
+            Err(e) => Err(ReplicationError::Zk(format!("read ctime: {e}"))),
+        }
+    }
+
+    pub async fn set_check_all_ledgers_ctime(&self, ctime: i64) -> Result<(), ReplicationError> {
+        let path = format!("{}/checkallledgersctime", self.paths.underreplication());
+        let fmt = CheckAllLedgersFormat { check_all_ledgers_c_time: Some(ctime) };
+        let data = fmt.encode_to_vec();
+        self.upsert_znode(&path, &data).await
+    }
+
+    /// Last-run timestamp (ms since epoch) for the periodic placement-policy
+    /// check. Returns -1 when never run. Matches Java's
+    /// `getPlacementPolicyCheckCTime()`.
+    pub async fn get_placement_policy_check_ctime(&self) -> Result<i64, ReplicationError> {
+        let path = format!("{}/placementpolicycheckctime", self.paths.underreplication());
+        match self.client.get_data(&path).await {
+            Ok((data, _)) => {
+                let fmt = PlacementPolicyCheckFormat::decode(&data[..])
+                    .map_err(|e| ReplicationError::Zk(format!("parse ctime: {e}")))?;
+                Ok(fmt.placement_policy_check_c_time.unwrap_or(-1))
+            }
+            Err(zk::Error::NoNode) => Ok(-1),
+            Err(e) => Err(ReplicationError::Zk(format!("read ctime: {e}"))),
+        }
+    }
+
+    pub async fn set_placement_policy_check_ctime(&self, ctime: i64) -> Result<(), ReplicationError> {
+        let path = format!("{}/placementpolicycheckctime", self.paths.underreplication());
+        let fmt = PlacementPolicyCheckFormat { placement_policy_check_c_time: Some(ctime) };
+        let data = fmt.encode_to_vec();
+        self.upsert_znode(&path, &data).await
+    }
+
+    /// Last-run timestamp (ms since epoch) for the periodic replicas check
+    /// (which verifies that every fragment's replica count matches the
+    /// expected write quorum). Matches Java's `getReplicasCheckCTime()`.
+    pub async fn get_replicas_check_ctime(&self) -> Result<i64, ReplicationError> {
+        let path = format!("{}/replicascheckctime", self.paths.underreplication());
+        match self.client.get_data(&path).await {
+            Ok((data, _)) => {
+                let fmt = ReplicasCheckFormat::decode(&data[..])
+                    .map_err(|e| ReplicationError::Zk(format!("parse ctime: {e}")))?;
+                Ok(fmt.replicas_check_c_time.unwrap_or(-1))
+            }
+            Err(zk::Error::NoNode) => Ok(-1),
+            Err(e) => Err(ReplicationError::Zk(format!("read ctime: {e}"))),
+        }
+    }
+
+    pub async fn set_replicas_check_ctime(&self, ctime: i64) -> Result<(), ReplicationError> {
+        let path = format!("{}/replicascheckctime", self.paths.underreplication());
+        let fmt = ReplicasCheckFormat { replicas_check_c_time: Some(ctime) };
+        let data = fmt.encode_to_vec();
+        self.upsert_znode(&path, &data).await
+    }
+
+    /// Write or create a persistent znode with the given bytes. Helper used
+    /// by the CTime setters — matches Java's pattern of `exists + setData
+    /// else create(PERSISTENT)` in `setCheckAllLedgersCTime` et al.
+    async fn upsert_znode(&self, path: &str, data: &[u8]) -> Result<(), ReplicationError> {
+        match self.client.set_data(path, data, None).await {
+            Ok(_) => Ok(()),
+            Err(zk::Error::NoNode) => {
+                let opts = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
+                self.client.create(path, data, &opts).await
+                    .map(|_| ())
+                    .map_err(|e| ReplicationError::Zk(format!("create ctime znode: {e}")))
+            }
+            Err(e) => Err(ReplicationError::Zk(format!("set ctime: {e}"))),
+        }
+    }
+
     /// Set the lost bookie recovery delay in ZK (seconds).
     /// Matches Java's `ZkLedgerUnderreplicationManager.setLostBookieRecoveryDelay()`.
     pub async fn set_lost_bookie_recovery_delay(&self, secs: u64) -> Result<(), ReplicationError> {
@@ -345,11 +557,16 @@ impl ZkUnderreplicationManager {
         path: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<i64>, ReplicationError>> + Send + 'a>> {
         Box::pin(async move {
-            let children = match self.client.get_children(path).await {
+            let mut children = match self.client.get_children(path).await {
                 Ok((c, _)) => c,
                 Err(zk::Error::NoNode) => return Ok(None),
                 Err(e) => return Err(ReplicationError::Zk(format!("list: {e}"))),
             };
+            // Shuffle at every recursion level so concurrent workers don't
+            // converge on the same ledger. Matches Java's
+            // `Collections.shuffle(children)` in
+            // `getLedgerToRereplicateFromHierarchy`.
+            children.shuffle(&mut rand::rng());
             for child in &children {
                 if let Some(suffix) = child.strip_prefix("urL") {
                     // Extract ledger ID (may be zero-padded)

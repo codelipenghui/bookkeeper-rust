@@ -204,3 +204,133 @@ async fn underreplication_multiple_ledgers_sequential_lifecycle() {
     // After all are replicated, no more work
     assert_eq!(mgr.get_ledger_to_rereplicate().await.unwrap(), None);
 }
+
+// ---------------------------------------------------------------------------
+// #45 list_ledgers_to_rereplicate — enumeration with predicate filter
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_ledgers_to_rereplicate_enumerates_with_filter() {
+    let Some(connect) = shared_zk().await else { return; };
+    let root = "/test_list_ur";
+    bootstrap_cluster(&connect, root).await;
+
+    let client = zookeeper_client::Client::connect(&connect).await.unwrap();
+    let paths = ZkPaths::new(root);
+    let mgr = ZkUnderreplicationManager::new(
+        client, paths, "lister:3181".to_string()
+    ).await.unwrap();
+
+    mgr.mark_ledger_underreplicated(10, &["boom:3181".into()]).await.unwrap();
+    mgr.mark_ledger_underreplicated(11, &["other:3181".into()]).await.unwrap();
+    mgr.mark_ledger_underreplicated(12, &["boom:3181".into(), "other:3181".into()]).await.unwrap();
+
+    // All three.
+    let all = mgr.list_ledgers_to_rereplicate(|_, _| true).await.unwrap();
+    assert_eq!(all.len(), 3);
+
+    // Filter to "boom": ledgers 10 and 12.
+    let boom = mgr.list_ledgers_to_rereplicate(|_, r| r.iter().any(|x| x == "boom:3181"))
+        .await.unwrap();
+    let boom_ids: std::collections::HashSet<i64> = boom.iter().map(|(l, _)| *l).collect();
+    assert_eq!(boom_ids, [10i64, 12i64].into_iter().collect());
+}
+
+// ---------------------------------------------------------------------------
+// #43 CTime persistence
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ctime_set_get_roundtrip() {
+    let Some(connect) = shared_zk().await else { return; };
+    let root = "/test_ctime";
+    bootstrap_cluster(&connect, root).await;
+
+    let client = zookeeper_client::Client::connect(&connect).await.unwrap();
+    let paths = ZkPaths::new(root);
+    let mgr = ZkUnderreplicationManager::new(
+        client, paths, "auditor:3181".to_string()
+    ).await.unwrap();
+
+    // Absent znode reads as -1 (Java default).
+    assert_eq!(mgr.get_check_all_ledgers_ctime().await.unwrap(), -1);
+    assert_eq!(mgr.get_placement_policy_check_ctime().await.unwrap(), -1);
+    assert_eq!(mgr.get_replicas_check_ctime().await.unwrap(), -1);
+
+    mgr.set_check_all_ledgers_ctime(1_700_000_000_000).await.unwrap();
+    mgr.set_placement_policy_check_ctime(1_700_000_000_111).await.unwrap();
+    mgr.set_replicas_check_ctime(1_700_000_000_222).await.unwrap();
+
+    assert_eq!(mgr.get_check_all_ledgers_ctime().await.unwrap(), 1_700_000_000_000);
+    assert_eq!(mgr.get_placement_policy_check_ctime().await.unwrap(), 1_700_000_000_111);
+    assert_eq!(mgr.get_replicas_check_ctime().await.unwrap(), 1_700_000_000_222);
+
+    // Updating is an upsert (set→create fallback is transparent).
+    mgr.set_check_all_ledgers_ctime(1_700_000_000_999).await.unwrap();
+    assert_eq!(mgr.get_check_all_ledgers_ctime().await.unwrap(), 1_700_000_000_999);
+}
+
+// ---------------------------------------------------------------------------
+// #44 Delay znode watch fires on change
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn delay_watch_fires_on_update() {
+    let Some(connect) = shared_zk().await else { return; };
+    let root = "/test_delay_watch";
+    bootstrap_cluster(&connect, root).await;
+
+    let client = zookeeper_client::Client::connect(&connect).await.unwrap();
+    let paths = ZkPaths::new(root);
+    let mgr = ZkUnderreplicationManager::new(
+        client, paths, "auditor:3181".to_string()
+    ).await.unwrap();
+
+    // Prime the znode so watch_lost_bookie_recovery_delay returns a normal watcher.
+    mgr.set_lost_bookie_recovery_delay(7).await.unwrap();
+
+    let (initial, watcher) = mgr.watch_lost_bookie_recovery_delay(0).await.unwrap();
+    assert_eq!(initial, 7);
+
+    let mgr_clone = std::sync::Arc::new(mgr);
+    let updater = mgr_clone.clone();
+    tokio::spawn(async move {
+        // Small delay so the watcher is really listening.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        updater.set_lost_bookie_recovery_delay(42).await.unwrap();
+    });
+
+    // Wait up to 5s for the watch to fire.
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), watcher.changed()).await;
+    assert!(event.is_ok(), "delay watcher should fire on update");
+
+    assert_eq!(mgr_clone.get_lost_bookie_recovery_delay(0).await.unwrap(), 42);
+}
+
+// ---------------------------------------------------------------------------
+// #42 Persistent tree watch fires when ledger marked
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn underreplication_tree_watch_fires_on_new_marker() {
+    let Some(connect) = shared_zk().await else { return; };
+    let root = "/test_tree_watch";
+    bootstrap_cluster(&connect, root).await;
+
+    let client = zookeeper_client::Client::connect(&connect).await.unwrap();
+    let paths = ZkPaths::new(root);
+    let mgr = std::sync::Arc::new(
+        ZkUnderreplicationManager::new(client, paths, "w:3181".into()).await.unwrap()
+    );
+
+    let mut watcher = mgr.watch_underreplicated_tree().await.unwrap();
+
+    let marker = mgr.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        marker.mark_ledger_underreplicated(9_999, &["dead:3181".into()]).await.unwrap();
+    });
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), watcher.changed()).await;
+    assert!(event.is_ok(), "tree watcher should fire when a marker is created");
+}

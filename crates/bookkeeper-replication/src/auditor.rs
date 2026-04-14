@@ -1,11 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use futures::stream::{self, StreamExt};
 use tokio::sync::watch;
 use zookeeper_client as zk;
+use bookkeeper_client::bookie_connection::BookieConnection;
+use bookkeeper_client::distribution::RoundRobinDistributionSchedule;
+use bookkeeper_metadata::ledger_metadata::DigestType as MetaDigestType;
 use bookkeeper_metadata::zk_path::ZkPaths;
 use bookkeeper_metadata::traits::LedgerManager;
+use bookkeeper_protocol::constants::*;
+use bookkeeper_protocol::digest::generate_master_key;
+use bookkeeper_protocol::v2::response::V2Response;
 use crate::underreplication::ZkUnderreplicationManager;
 use crate::ReplicationError;
 
@@ -40,6 +47,12 @@ pub struct Auditor {
     /// Interval for periodic placement policy check (seconds). 0 = disabled.
     /// Matches Java's `auditorPeriodicPlacementPolicyCheckInterval` (default 0 = disabled).
     placement_check_interval_secs: u64,
+    /// Interval for periodic replicas check (seconds). 0 = disabled.
+    /// Matches Java's `auditorPeriodicReplicasCheckInterval` (default 604800 = 7 days).
+    /// Unlike `all_ledgers_check`, this actually probes each bookie for
+    /// each entry — it detects entries whose replica count has dropped
+    /// below the write quorum even when all ensemble members are alive.
+    replicas_check_interval_secs: u64,
 }
 
 impl Auditor {
@@ -64,7 +77,14 @@ impl Auditor {
             placement_policy: None,
             all_ledgers_check_interval_secs: 0,
             placement_check_interval_secs: 0,
+            replicas_check_interval_secs: 0,
         }
+    }
+
+    /// Set the interval for periodic replicas check (0 = disabled).
+    /// Matches Java's `auditorPeriodicReplicasCheckInterval`.
+    pub fn set_replicas_check_interval(&mut self, secs: u64) {
+        self.replicas_check_interval_secs = secs;
     }
 
     /// Set the interval for periodic all-ledgers availability check.
@@ -105,24 +125,65 @@ impl Auditor {
         }
 
         // Set up periodic check intervals matching Java's scheduled tasks.
-        // Each runs independently on its own cadence.
+        // Each runs independently on its own cadence. When a previous run's
+        // timestamp is persisted in ZK (matching Java's checkAllLedgersCTime
+        // / placementPolicyCheckCTime), the first tick is deferred so we
+        // don't immediately re-run an expensive scan on restart — we pay
+        // the full interval minus the time elapsed since the last run.
         let mut all_ledgers_interval = if self.all_ledgers_check_interval_secs > 0 {
-            let mut iv = tokio::time::interval(
-                tokio::time::Duration::from_secs(self.all_ledgers_check_interval_secs),
+            let interval_secs = self.all_ledgers_check_interval_secs;
+            let last_run_ms = self.ur_manager.get_check_all_ledgers_ctime().await.unwrap_or(-1);
+            let remaining = remaining_before_next_run(last_run_ms, interval_secs);
+            let start_at = tokio::time::Instant::now() + remaining;
+            let iv = tokio::time::interval_at(
+                start_at,
+                tokio::time::Duration::from_secs(interval_secs),
             );
-            iv.tick().await; // consume the immediate first tick
             Some(iv)
         } else {
             None
         };
         let mut placement_interval = if self.placement_check_interval_secs > 0 {
-            let mut iv = tokio::time::interval(
-                tokio::time::Duration::from_secs(self.placement_check_interval_secs),
+            let interval_secs = self.placement_check_interval_secs;
+            let last_run_ms = self.ur_manager.get_placement_policy_check_ctime().await.unwrap_or(-1);
+            let remaining = remaining_before_next_run(last_run_ms, interval_secs);
+            let start_at = tokio::time::Instant::now() + remaining;
+            let iv = tokio::time::interval_at(
+                start_at,
+                tokio::time::Duration::from_secs(interval_secs),
             );
-            iv.tick().await; // consume the immediate first tick
             Some(iv)
         } else {
             None
+        };
+        let mut replicas_interval = if self.replicas_check_interval_secs > 0 {
+            let interval_secs = self.replicas_check_interval_secs;
+            let last_run_ms = self.ur_manager.get_replicas_check_ctime().await.unwrap_or(-1);
+            let remaining = remaining_before_next_run(last_run_ms, interval_secs);
+            let start_at = tokio::time::Instant::now() + remaining;
+            let iv = tokio::time::interval_at(
+                start_at,
+                tokio::time::Duration::from_secs(interval_secs),
+            );
+            Some(iv)
+        } else {
+            None
+        };
+
+        // Watch the lostBookieRecoveryDelay znode so operator changes via
+        // `bookkeeper shell` take effect without waiting for the next
+        // audit cycle. Matches Java's
+        // `ZkLedgerUnderreplicationManager.notifyLostBookieRecoveryDelayChanged`.
+        let mut delay_watcher = match self.ur_manager
+            .watch_lost_bookie_recovery_delay(self.lost_bookie_recovery_delay_secs).await {
+            Ok((delay, w)) => {
+                self.lost_bookie_recovery_delay_secs = delay;
+                Some(w)
+            }
+            Err(e) => {
+                tracing::warn!("Auditor: failed to set delay watcher: {e}");
+                None
+            }
         };
 
         loop {
@@ -152,6 +213,18 @@ impl Auditor {
                     None => { std::future::pending::<tokio::time::Instant>().await }
                 }
             };
+            let replicas_fut = async {
+                match replicas_interval.as_mut() {
+                    Some(iv) => iv.tick().await,
+                    None => { std::future::pending::<tokio::time::Instant>().await }
+                }
+            };
+            let delay_fut = async {
+                match delay_watcher.take() {
+                    Some(w) => Some(w.changed().await),
+                    None => { std::future::pending::<Option<zk::WatchedEvent>>().await }
+                }
+            };
 
             tokio::select! {
                 _ = self.shutdown_rx.changed() => {
@@ -172,7 +245,15 @@ impl Auditor {
                     // Periodic all-ledgers check. Matches Java's scheduleCheckAllLedgersTask.
                     tracing::info!("Auditor: running periodic all-ledgers check");
                     match self.check_all_ledgers().await {
-                        Ok(n) => if n > 0 { tracing::info!("Auditor: marked {n} underreplicated ledger(s)"); }
+                        Ok(n) => {
+                            if n > 0 { tracing::info!("Auditor: marked {n} underreplicated ledger(s)"); }
+                            // Persist completion timestamp so a restart before
+                            // the next interval doesn't re-run the scan.
+                            let now_ms = current_time_millis();
+                            if let Err(e) = self.ur_manager.set_check_all_ledgers_ctime(now_ms).await {
+                                tracing::warn!("Auditor: failed to persist checkAllLedgersCTime: {e}");
+                            }
+                        }
                         Err(e) => tracing::warn!("Auditor: all-ledgers check error: {e}"),
                     }
                 }
@@ -180,8 +261,52 @@ impl Auditor {
                     // Periodic placement policy check. Matches Java's schedulePlacementPolicyCheckTask.
                     tracing::info!("Auditor: running periodic placement policy check");
                     match self.check_placement_policy().await {
-                        Ok(n) => if n > 0 { tracing::info!("Auditor: marked {n} placement-violating ledger(s)"); }
+                        Ok(n) => {
+                            if n > 0 { tracing::info!("Auditor: marked {n} placement-violating ledger(s)"); }
+                            let now_ms = current_time_millis();
+                            if let Err(e) = self.ur_manager.set_placement_policy_check_ctime(now_ms).await {
+                                tracing::warn!("Auditor: failed to persist placementPolicyCheckCTime: {e}");
+                            }
+                        }
                         Err(e) => tracing::warn!("Auditor: placement check error: {e}"),
+                    }
+                }
+                _ = replicas_fut => {
+                    // Periodic replicas check: actually probes bookies for
+                    // each entry to detect silent partial data loss.
+                    // Matches Java's scheduleReplicasCheckTask.
+                    tracing::info!("Auditor: running periodic replicas check");
+                    match self.check_replicas().await {
+                        Ok(n) => {
+                            if n > 0 { tracing::info!("Auditor: replicas check marked {n} under-replicated ledger(s)"); }
+                            let now_ms = current_time_millis();
+                            if let Err(e) = self.ur_manager.set_replicas_check_ctime(now_ms).await {
+                                tracing::warn!("Auditor: failed to persist replicasCheckCTime: {e}");
+                            }
+                        }
+                        Err(e) => tracing::warn!("Auditor: replicas check error: {e}"),
+                    }
+                }
+                event = delay_fut => {
+                    // lostBookieRecoveryDelay znode changed — re-read so
+                    // the next scheduled audit honours the new value.
+                    if event.is_some() {
+                        match self.ur_manager
+                            .watch_lost_bookie_recovery_delay(self.lost_bookie_recovery_delay_secs).await {
+                            Ok((delay, w)) => {
+                                if delay != self.lost_bookie_recovery_delay_secs {
+                                    tracing::info!(
+                                        "Auditor: lostBookieRecoveryDelay changed {} -> {} secs",
+                                        self.lost_bookie_recovery_delay_secs, delay
+                                    );
+                                    self.lost_bookie_recovery_delay_secs = delay;
+                                }
+                                delay_watcher = Some(w);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Auditor: re-arm delay watcher failed: {e}");
+                            }
+                        }
                     }
                 }
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
@@ -194,6 +319,13 @@ impl Auditor {
                     }
                     if cur_readonly_watcher.is_none() {
                         cur_readonly_watcher = self.try_set_readonly_watch().await;
+                    }
+                    if delay_watcher.is_none() {
+                        if let Ok((delay, w)) = self.ur_manager
+                            .watch_lost_bookie_recovery_delay(self.lost_bookie_recovery_delay_secs).await {
+                            self.lost_bookie_recovery_delay_secs = delay;
+                            delay_watcher = Some(w);
+                        }
                     }
                 }
             }
@@ -560,6 +692,165 @@ impl Auditor {
         }
         Ok((availability_marked, placement_marked))
     }
+
+    /// Verify that every entry of every ledger has at least `write_quorum`
+    /// replicas actually present on the bookies. Mirrors Java's
+    /// `AuditorReplicasCheckTask.replicasCheck()` which, unlike
+    /// `check_all_ledgers`, reads from each bookie to detect entries that
+    /// are present on the ensemble at metadata level but missing from the
+    /// actual storage — the only way to catch silent partial data loss.
+    ///
+    /// Returns the number of ledgers newly marked as under-replicated.
+    /// Skips ledgers that already have an under-replication marker to
+    /// avoid redundant work — matches Java's
+    /// `checkUnderReplicationForReplicasCheck` short-circuit.
+    pub async fn check_replicas(&self) -> Result<usize, ReplicationError> {
+        // Pre-compute the set of ledger ids that are already flagged so
+        // we don't re-scan them.
+        let already_marked: HashSet<i64> = self
+            .ur_manager
+            .list_ledgers_to_rereplicate(|_, _| true)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(lid, _)| lid)
+            .collect();
+
+        let ledger_ids = self
+            .ledger_manager
+            .get_ledger_ranges()
+            .await
+            .map_err(|e| ReplicationError::Failed(format!("enumerate ledgers: {e}")))?;
+
+        let lm = &self.ledger_manager;
+        let ur = &self.ur_manager;
+
+        let marked = stream::iter(ledger_ids.into_iter().filter(|lid| !already_marked.contains(lid)))
+            .map(|ledger_id| async move {
+                // Read metadata. On error we just skip — the availability
+                // task will surface missing-metadata cases.
+                let md = match lm.read_ledger_metadata(ledger_id).await {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                let metadata = md.value();
+
+                // Empty ledgers have no entries to check.
+                let last_entry_id = metadata.last_entry_id().unwrap_or(-1);
+                if last_entry_id < 0 {
+                    return false;
+                }
+
+                let ensemble_size = metadata.ensemble_size() as usize;
+                let write_quorum = metadata.write_quorum_size() as usize;
+                let ack_quorum = metadata.ack_quorum_size() as usize;
+                let schedule = RoundRobinDistributionSchedule::new(
+                    ensemble_size,
+                    write_quorum,
+                    ack_quorum,
+                );
+                let digest = match metadata.digest_type() {
+                    Some(MetaDigestType::Crc32) => bookkeeper_protocol::digest::DigestType::Crc32,
+                    Some(MetaDigestType::Crc32c) => bookkeeper_protocol::digest::DigestType::Crc32c,
+                    Some(MetaDigestType::Hmac) => bookkeeper_protocol::digest::DigestType::HmacSha1,
+                    Some(MetaDigestType::Dummy) => bookkeeper_protocol::digest::DigestType::Dummy,
+                    None => bookkeeper_protocol::digest::DigestType::Crc32c,
+                };
+                let _ = digest; // currently unused — keeps digest handling consistent with worker
+                let password = metadata.password().unwrap_or(b"");
+                let master_key: [u8; MASTER_KEY_LENGTH] = generate_master_key(password);
+
+                // Build per-segment bounds, same shape as the worker uses.
+                let ensembles = metadata.all_ensembles();
+                let keys: Vec<i64> = ensembles.keys().copied().collect();
+                let segments: Vec<(i64, i64, Vec<String>)> = keys.iter().enumerate().map(|(i, &start)| {
+                    let end = if i + 1 < keys.len() { keys[i + 1] - 1 } else { last_entry_id };
+                    (start, end, ensembles[&start].clone())
+                }).collect();
+
+                // For each segment walk entries and count replicas. If any
+                // entry has fewer than `write_quorum` replicas confirmed,
+                // mark the ledger.
+                let mut under_replicated = false;
+                let mut reason: Vec<String> = Vec::new();
+                'segment_loop: for (seg_first, seg_last, ensemble) in &segments {
+                    // Open a connection to every bookie in the ensemble
+                    // exactly once; ignore individual connection errors
+                    // (those bookies will count as "missing the entry").
+                    let mut conns: Vec<Option<Arc<BookieConnection>>> = Vec::with_capacity(ensemble.len());
+                    for addr in ensemble {
+                        let sock: Option<SocketAddr> = addr.parse().ok();
+                        let c = match sock {
+                            Some(sa) => BookieConnection::connect(sa).await.ok().map(Arc::new),
+                            None => None,
+                        };
+                        conns.push(c);
+                    }
+
+                    for eid in *seg_first..=*seg_last {
+                        let write_set = schedule.write_set(eid);
+                        let mut replicas_present = 0usize;
+                        for &idx in &write_set {
+                            let Some(conn) = conns.get(idx).and_then(|c| c.as_ref()) else { continue };
+                            match conn.send_read_entry(0, ledger_id, eid, Some(master_key)).await {
+                                Ok(V2Response::Read { error_code, .. }) if error_code == V2_EOK => {
+                                    replicas_present += 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if replicas_present < write_quorum {
+                            under_replicated = true;
+                            reason.push(format!("replicas_check_missing_eid_{eid}"));
+                            break 'segment_loop;
+                        }
+                    }
+                }
+
+                if under_replicated {
+                    if let Err(e) = ur.mark_ledger_underreplicated(ledger_id, &reason).await {
+                        tracing::warn!("replicasCheck: failed to mark ledger {ledger_id}: {e}");
+                        return false;
+                    }
+                    true
+                } else {
+                    false
+                }
+            })
+            .buffer_unordered(AUDIT_CONCURRENCY)
+            .fold(0usize, |acc, hit| async move { acc + (hit as usize) })
+            .await;
+
+        tracing::info!("replicasCheck: marked {marked} ledger(s) as underreplicated");
+        Ok(marked)
+    }
+}
+
+fn current_time_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Compute how long to wait before the next periodic audit run, given a
+/// previously persisted completion timestamp and the configured interval.
+///
+/// * If the ZK znode never existed (`last_run_ms < 0`), fire immediately.
+/// * If enough time has already elapsed, fire immediately.
+/// * Otherwise return the remaining delay.
+///
+/// Mirrors Java's `AbstractAuditorTask.getScheduledDelay()` which uses
+/// `checkAllLedgersCTime` / `placementPolicyCheckCTime` to avoid re-running
+/// expensive scans immediately after an auditor restart.
+fn remaining_before_next_run(last_run_ms: i64, interval_secs: u64) -> tokio::time::Duration {
+    if last_run_ms < 0 {
+        return tokio::time::Duration::from_millis(0);
+    }
+    let now_ms = current_time_millis();
+    let elapsed_ms = (now_ms - last_run_ms).max(0) as u64;
+    let interval_ms = interval_secs.saturating_mul(1000);
+    tokio::time::Duration::from_millis(interval_ms.saturating_sub(elapsed_ms))
 }
 
 /// Build bookie→ledger index and mark affected ledgers as underreplicated.
