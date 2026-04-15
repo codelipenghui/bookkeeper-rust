@@ -179,3 +179,34 @@ fn limbo_requires_existing_ledger() {
     assert!(index.clear_limbo(999).is_ok());
     assert!(!index.has_limbo(999).unwrap());
 }
+
+#[test]
+fn batch_update_lac_overwrites_existing_and_preserves_other_fields() {
+    let dir = TempDir::new().unwrap();
+    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
+    // Seed 3 ledgers with master keys + one initial LAC, leave one absent.
+    index.set(1, false, Some(b"pw1"), Some(10)).unwrap();
+    index.set(2, true,  Some(b"pw2"), None).unwrap();
+    index.set(3, false, Some(b"pw3"), Some(5)).unwrap();
+
+    index
+        .batch_update_lac(&[(1, 42), (2, 100), (3, 7), (99, 1)]) // 99 absent — skipped
+        .unwrap();
+
+    // LAC updates persisted.
+    assert_eq!(index.get(1).unwrap().unwrap().lac, Some(42));
+    assert_eq!(index.get(2).unwrap().unwrap().lac, Some(100));
+    assert_eq!(index.get(3).unwrap().unwrap().lac, Some(7));
+    // Other fields preserved.
+    assert_eq!(index.get(2).unwrap().unwrap().fenced, true);
+    assert_eq!(index.get(1).unwrap().unwrap().master_key.as_deref(), Some(&b"pw1"[..]));
+    // Missing ledger remained absent.
+    assert!(index.get(99).unwrap().is_none());
+}
+
+#[test]
+fn batch_update_lac_empty_is_noop() {
+    let dir = TempDir::new().unwrap();
+    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
+    index.batch_update_lac(&[]).unwrap();
+}

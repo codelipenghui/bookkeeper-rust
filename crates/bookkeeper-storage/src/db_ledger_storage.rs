@@ -845,13 +845,16 @@ impl DbLedgerStorage {
         self.entry_location_index.flush()?;
         storage_metrics::FLUSH_LOCATIONS_INDEX.observe(locations_start.elapsed().as_secs_f64());
 
-        // Persist in-memory LAC cache to RocksDB (batch write, not per-entry).
-        // This replaces the per-add_entry RocksDB write with one batch per flush.
+        // Persist in-memory LAC cache to RocksDB in one WriteBatch.
+        // Previously this was a per-ledger read-modify-write loop (2N
+        // RocksDB ops per flush); multi-partition workloads made it the
+        // dominant write-amplification source. batch_update_lac coalesces
+        // into one multi_get + one write_batch regardless of ledger count.
         let lac_entries: Vec<(i64, i64)> = self.lac_cache.iter()
             .map(|e| (*e.key(), *e.value()))
             .collect();
-        for (ledger_id, lac) in &lac_entries {
-            let _ = self.ledger_index.update_lac(*ledger_id, *lac);
+        if let Err(e) = self.ledger_index.batch_update_lac(&lac_entries) {
+            tracing::warn!("batch LAC update failed during flush: {e}");
         }
 
         let ledger_start = Instant::now();

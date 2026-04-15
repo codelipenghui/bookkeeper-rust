@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 use prost::Message;
-use rocksdb::{Cache, DB};
+use rocksdb::{Cache, DB, WriteBatch};
 use crate::rocksdb_options;
 use crate::StorageError;
 
@@ -97,6 +97,32 @@ impl LedgerMetadataIndex {
         } else {
             Err(StorageError::LedgerNotFound(ledger_id))
         }
+    }
+
+    /// Persist a batch of `(ledger_id, lac)` updates in a single RocksDB
+    /// `WriteBatch`. Reads are coalesced into one `multi_get` so the whole
+    /// path is two RocksDB calls (multi_get + write_batch) regardless of
+    /// how many ledgers are touched. Called from the write-cache flush path;
+    /// Java's `SingleDirectoryDbLedgerStorage.flush` does the same.
+    ///
+    /// Ledgers missing from the index are silently skipped — the flush path
+    /// can race with a concurrent `delete_ledger`, and a missing row is not
+    /// a recovery error.
+    pub fn batch_update_lac(&self, entries: &[(i64, i64)]) -> Result<(), StorageError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<[u8; 8]> = entries.iter().map(|(id, _)| id.to_be_bytes()).collect();
+        let results = self.db.multi_get(keys.iter());
+        let mut batch = WriteBatch::default();
+        for ((ledger_id, lac), result) in entries.iter().zip(results) {
+            let Some(raw) = result? else { continue };
+            let mut proto = bookkeeper_proto::LedgerData::decode(&raw[..])
+                .map_err(|e| StorageError::CorruptData(format!("ledger data decode: {e}")))?;
+            proto.explicit_lac = Some(lac.to_be_bytes().to_vec());
+            batch.put(ledger_id.to_be_bytes(), proto.encode_to_vec());
+        }
+        self.db.write(batch).map_err(StorageError::from)
     }
 
     /// Enumerate all ledger IDs in the index.
