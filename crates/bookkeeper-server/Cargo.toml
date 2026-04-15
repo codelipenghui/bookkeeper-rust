@@ -53,3 +53,4 @@ bookkeeper-test-utils = { workspace = true }
 rcgen = { workspace = true }
 testcontainers = { workspace = true }
 uuid = { workspace = true }
+tracing-subscriber = { workspace = true }
