@@ -315,7 +315,7 @@ impl BookieServer {
             )
             .await
             .map_err(|e| format!("ZK connect: {e}"))?;
-            validate_cookie(&reg_mgr, &bookie_id, &config).await?;
+            run_cookie_validation(&reg_mgr, &bookie_id, &config).await?;
             let info = bookkeeper_metadata::service_info::BookieServiceInfo::new(
                 &bookie_id,
                 &advertised_host,
@@ -572,6 +572,24 @@ impl BookieServer {
                 config.local_scrub_interval as u64,
                 config.local_scrub_rate_limit as u64,
             ))
+        } else {
+            None
+        };
+
+        // Optionally start the data-integrity service (Java parity).
+        // Gated on `data_integrity_checking` config — disabled by default.
+        // Requires ZK registration to be active (otherwise we have no
+        // bookie_id to identify ourselves in metadata ensembles).
+        let _data_integ_handle = if let Some(zk_bookie_id) =
+            zk_reg.as_ref().map(|(_, bid)| bid.clone())
+        {
+            maybe_start_data_integrity(
+                &config,
+                &zk_bookie_id,
+                storage_for_shutdown.clone(),
+                shutdown_tx.subscribe(),
+            )
+            .await?
         } else {
             None
         };
@@ -1924,4 +1942,119 @@ where
     // Drop the sender so the writer task exits after draining.
     drop(resp_tx);
     let _ = writer_handle.await;
+}
+
+/// Optionally start the data-integrity service when `data_integrity_checking`
+/// is enabled in config. Returns the task handle, or `None` if the feature
+/// is off. The service itself respects `shutdown_rx`; the caller doesn't need
+/// a separate stop signal.
+///
+/// Builds a fresh ZK client + ZkBookKeeper purely for the service — the
+/// bookie's main ZkRegistrationManager is not shared (it's a different
+/// lifecycle and uses different code paths).
+async fn maybe_start_data_integrity(
+    config: &ServerConfig,
+    bookie_id: &str,
+    storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<Option<tokio::task::JoinHandle<()>>, Box<dyn std::error::Error>> {
+    if !config.data_integrity_checking {
+        return Ok(None);
+    }
+    let Some(zk_servers) = config.zk_servers.as_deref() else {
+        tracing::warn!("data-integrity checking enabled but no ZK servers configured — skipping");
+        return Ok(None);
+    };
+
+    use crate::datainteg::check::DataIntegrityCheck;
+    use crate::datainteg::entry_copier::EntryCopier;
+    use crate::datainteg::recovery::ZkRecoveryClient;
+    use crate::datainteg::service;
+    use bookkeeper_client::zk_client::ZkBookKeeper;
+    use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
+    use bookkeeper_metadata::zk_path::ZkPaths;
+
+    // ZkLedgerManager for the integrity iteration (independent from the
+    // registration manager so we can keep Arc<dyn LedgerManager>).
+    let zk_client = zookeeper_client::Client::connect(zk_servers)
+        .await
+        .map_err(|e| format!("data-integ: ZK connect: {e}"))?;
+    let paths = ZkPaths::new(&config.zk_ledger_root);
+    let ledger_manager: Arc<dyn bookkeeper_metadata::traits::LedgerManager> =
+        Arc::new(ZkLedgerManager::new(zk_client, paths));
+
+    // Recovery client — a real bookkeeper client so limbo ledgers can be
+    // fenced and closed.
+    let bk_client = ZkBookKeeper::new(zk_servers, &config.zk_ledger_root)
+        .await
+        .map_err(|e| format!("data-integ: bookkeeper client: {e}"))?;
+    let recovery = Arc::new(ZkRecoveryClient::new(Arc::new(tokio::sync::Mutex::new(bk_client))));
+
+    let entry_copier = Arc::new(EntryCopier::new(bookie_id.to_string(), storage.clone()));
+    let check = Arc::new(DataIntegrityCheck::new(
+        bookie_id.to_string(),
+        ledger_manager,
+        storage,
+        entry_copier,
+        recovery,
+    ));
+
+    tracing::info!("data-integrity: service starting");
+    let handle = service::spawn(check, service::DEFAULT_INTERVAL, shutdown_rx);
+    Ok(Some(handle))
+}
+
+/// Run the cookie validation. When `data_integrity_stamp_missing_cookies`
+/// is enabled, uses the DataIntegrityCookieValidator path (stamp-on-mismatch).
+/// Otherwise falls through to the existing strict `validate_cookie` flow.
+async fn run_cookie_validation(
+    zk_reg: &bookkeeper_metadata::zk::registration::ZkRegistrationManager,
+    bookie_id: &str,
+    config: &ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !config.data_integrity_stamp_missing_cookies {
+        return validate_cookie(zk_reg, bookie_id, config).await;
+    }
+    use crate::datainteg::cookie_validator::{CookieLayout, DataIntegrityCookieValidator};
+    // Build a fresh RegistrationManager for the validator so we don't need to
+    // clone/share the bookie's primary handle. An extra ZK connection is minor.
+    let zk_servers = config
+        .zk_servers
+        .as_deref()
+        .ok_or("data-integ cookie validation requires zkServers")?;
+    let reg = bookkeeper_metadata::zk::registration::ZkRegistrationManager::new(
+        zk_servers,
+        &config.zk_ledger_root,
+    )
+    .await
+    .map_err(|e| format!("data-integ: ZK connect: {e}"))?;
+    let layout = CookieLayout {
+        bookie_id: bookie_id.to_string(),
+        journal_dir: std::path::PathBuf::from(&config.journal_directory),
+        ledger_dirs: config
+            .ledger_directories
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+        index_dirs: config
+            .index_directories
+            .as_ref()
+            .map(|v| v.iter().map(std::path::PathBuf::from).collect())
+            .unwrap_or_default(),
+    };
+    // The pre-boot check is not wired here because the DataIntegrityCheck
+    // requires storage + a recovery client, neither of which exist yet at
+    // cookie-validation time. Operators who rely on stamp-on-mismatch to
+    // also trigger a pre-boot check should enable `data_integrity_checking`
+    // too — the subsequent full check picks up the limbo set.
+    let validator = DataIntegrityCookieValidator::new(
+        layout,
+        Arc::new(reg),
+        None,
+        config.data_integrity_stamp_missing_cookies,
+    );
+    validator
+        .check_and_stamp()
+        .await
+        .map_err(|e| format!("data-integ cookie validation: {e}").into())
 }
