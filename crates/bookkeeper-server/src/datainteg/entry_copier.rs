@@ -278,7 +278,11 @@ fn preferred_bookie_order(
 /// Compute the write-quorum indices that hold `entry_id`. Uses Java's
 /// round-robin distribution: `[entry_id % ensemble_size, +1, +2, ...]`
 /// modulo ensemble size, `write_quorum_size` entries total.
-fn write_set_for_entry(entry_id: i64, ensemble_size: i32, write_quorum_size: i32) -> Vec<usize> {
+pub(super) fn write_set_for_entry(
+    entry_id: i64,
+    ensemble_size: i32,
+    write_quorum_size: i32,
+) -> Vec<usize> {
     let ens = ensemble_size.max(1) as i64;
     let wq = write_quorum_size.max(1).min(ensemble_size.max(1)) as i64;
     (0..wq)

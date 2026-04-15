@@ -722,6 +722,7 @@ dependencies = [
 name = "bookkeeper-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bookkeeper-client",
  "bookkeeper-common",
@@ -733,6 +734,7 @@ dependencies = [
  "bookkeeper-storage",
  "bookkeeper-test-utils",
  "bytes",
+ "futures",
  "lazy_static",
  "libc",
  "parking_lot",

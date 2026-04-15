@@ -5,4 +5,5 @@
 //! etc.) rebuild the entries it owns by copying from the peer bookies
 //! that still have them.
 
+pub mod check;
 pub mod entry_copier;

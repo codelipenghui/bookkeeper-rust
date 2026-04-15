@@ -39,6 +39,8 @@ rustls-pemfile = { workspace = true }
 pprof = { workspace = true, optional = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
