@@ -26,7 +26,7 @@ use bookkeeper_protocol::v2::response::V2Response;
 use bookkeeper_replication::auditor::Auditor;
 use bookkeeper_replication::underreplication::ZkUnderreplicationManager;
 use bookkeeper_replication::worker::ReplicationWorker;
-use bookkeeper_test_utils::{bootstrap_cluster, shared_zk, spawn_bookies};
+use bookkeeper_test_utils::{bootstrap_cluster, shared_zk, spawn_bookies, spawn_bookies_with};
 use tokio::sync::watch;
 
 /// Read entry payload from a single bookie via direct V2 read.
@@ -442,7 +442,13 @@ async fn worker_skips_when_replication_disabled() {
     let root = "/test_worker_disabled";
     bootstrap_cluster(&zk_connect, root).await;
 
-    let (bookies, _dirs, _addrs) = spawn_bookies(3, &zk_connect, root).await;
+    // The bookies' own auto-recovery workers would race with this test's
+    // explicit ReplicationWorker — disable them so only the test-owned
+    // worker exercises the disable-znode behaviour.
+    let (bookies, _dirs, _addrs) = spawn_bookies_with(3, &zk_connect, root, |c| {
+        c.auto_recovery_daemon_enabled = false;
+    })
+    .await;
 
     let zk_client = zookeeper_client::Client::connect(&zk_connect).await.unwrap();
     let paths = ZkPaths::new(root);

@@ -8,7 +8,9 @@
 //! Skipped gracefully if Docker is unavailable.
 
 use assert_cmd::Command;
-use bookkeeper_test_utils::{create_ledger_and_close, shared_zk, spawn_bookies};
+use bookkeeper_test_utils::{
+    create_ledger_and_close, shared_zk, spawn_bookies, spawn_bookies_with,
+};
 use predicates::prelude::*;
 
 /// Build a `bk` Command with logging suppressed. Without this the CLI's
@@ -255,7 +257,12 @@ async fn cli_listunderreplicated_count_and_filter() {
     bk().args(["initnewcluster", "--zk", &zk_connect, "--ledger-root", root])
         .assert()
         .success();
-    let (bookies, _dirs, _) = spawn_bookies(3, &zk_connect, root).await;
+    // Disable the daemon — an active ReplicationWorker would claim and
+    // delete the marker we're about to write before the CLI read runs.
+    let (bookies, _dirs, _) = spawn_bookies_with(3, &zk_connect, root, |c| {
+        c.auto_recovery_daemon_enabled = false;
+    })
+    .await;
     let lid = create_test_ledger(&zk_connect, root, 3).await;
 
     // Initially: no under-replicated ledgers

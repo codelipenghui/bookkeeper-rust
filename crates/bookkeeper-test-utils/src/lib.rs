@@ -184,10 +184,28 @@ pub async fn spawn_bookie(connect: &str, root: &str) -> (BookieServer, TempDir) 
 /// for autorecovery (status, lostBookieRecoveryDelay, triggerAudit) all
 /// operate on that subtree.
 pub async fn spawn_bookie_with_http(connect: &str, root: &str) -> (BookieServer, TempDir) {
+    spawn_bookie_with_http_and(connect, root, |_| {}).await
+}
+
+/// Like [`spawn_bookie_with_http`] but applies an extra config
+/// customization after the HTTP/auto-recovery defaults.
+/// Use this to set `auto_recovery_daemon_enabled = false` in tests that
+/// manually manipulate the under-replication subtree, otherwise the
+/// bookie's own ReplicationWorker will race to claim and delete any
+/// markers written by the test.
+pub async fn spawn_bookie_with_http_and<F>(
+    connect: &str,
+    root: &str,
+    extra: F,
+) -> (BookieServer, TempDir)
+where
+    F: FnOnce(&mut ServerConfig),
+{
     let (server, dir) = spawn_bookie_raw(connect, root, |config| {
         config.http_server_enabled = true;
         config.http_server_port = 0;
         config.auto_recovery_daemon_enabled = true;
+        extra(config);
     })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -216,15 +234,32 @@ pub async fn spawn_bookies(
     connect: &str,
     root: &str,
 ) -> (Vec<BookieServer>, Vec<TempDir>, Vec<String>) {
-    let mut bookies = Vec::with_capacity(n);
-    let mut dirs = Vec::with_capacity(n);
-    let mut addrs = Vec::with_capacity(n);
     // Enable auto-recovery so the auditor/worker threads create the
     // `underreplication` ZK subtree that CLI and HTTP admin tests depend on.
     // Without this, autorecovery-related endpoints fail with "node not exists".
-    let customize = |config: &mut ServerConfig| {
+    spawn_bookies_with(n, connect, root, |config| {
         config.auto_recovery_daemon_enabled = true;
-    };
+    })
+    .await
+}
+
+/// Like [`spawn_bookies`] but accepts a config customization callback.
+/// Tests that manually write to the under-replication subtree should pass
+/// a closure that sets `auto_recovery_daemon_enabled = false`, otherwise
+/// the bookies' own ReplicationWorkers race to claim and delete the
+/// markers under test.
+pub async fn spawn_bookies_with<F>(
+    n: usize,
+    connect: &str,
+    root: &str,
+    customize: F,
+) -> (Vec<BookieServer>, Vec<TempDir>, Vec<String>)
+where
+    F: Fn(&mut ServerConfig) + Copy,
+{
+    let mut bookies = Vec::with_capacity(n);
+    let mut dirs = Vec::with_capacity(n);
+    let mut addrs = Vec::with_capacity(n);
     for _ in 0..n {
         let (server, dir) = spawn_bookie_raw(connect, root, customize).await;
         addrs.push(server.local_addr().to_string());

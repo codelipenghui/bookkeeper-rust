@@ -32,6 +32,7 @@ use std::time::Duration;
 use bookkeeper_server::server::BookieServer;
 use bookkeeper_test_utils::{
     bootstrap_cluster, create_ledger_and_close, shared_zk, spawn_bookie_with_http,
+    spawn_bookie_with_http_and,
 };
 
 fn http_url(server: &BookieServer, path: &str) -> String {
@@ -304,7 +305,12 @@ async fn list_under_replicated_ledger_returns_array_when_populated() {
     let Some(connect) = shared_zk().await else { return; };
     let root = "/test_http_ur_populated";
     bootstrap_cluster(&connect, root).await;
-    let (bookie, _dir) = spawn_bookie(&connect, root).await;
+    // Disable the daemon — an active ReplicationWorker would claim and
+    // delete the marker we're about to write before the HTTP GET runs.
+    let (bookie, _dir) = spawn_bookie_with_http_and(&connect, root, |c| {
+        c.auto_recovery_daemon_enabled = false;
+    })
+    .await;
 
     // Create a ledger and mark it under-replicated via the UR manager
     // directly (the auditor would normally do this; we're isolating the
