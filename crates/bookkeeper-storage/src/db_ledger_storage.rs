@@ -165,6 +165,18 @@ pub struct DbLedgerStorage {
     lac_watchers: crate::lac_watcher::LacWatcherRegistry,
     /// Configurable storage parameters (cache sizes, read-ahead, log size).
     storage_config: StorageConfig,
+    /// Sender for the dedicated flush worker. When unset (tests / startup
+    /// before `start_flush_worker` is called), flush routines fall back to
+    /// running inline on the caller's runtime.
+    flush_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<FlushReq>>,
+}
+
+/// Request to the dedicated flush worker. Callers pick `OnSwap` for the fast
+/// add-entry unblock path (signal as soon as active cache is empty) or
+/// `OnDrain` for the checkpoint path (signal once data is durable).
+enum FlushReq {
+    OnSwap(tokio::sync::oneshot::Sender<()>),
+    OnDrain(tokio::sync::oneshot::Sender<Result<(), StorageError>>),
 }
 
 impl DbLedgerStorage {
@@ -241,7 +253,148 @@ impl DbLedgerStorage {
             meta_cache: dashmap::DashMap::new(),
             lac_watchers: crate::lac_watcher::LacWatcherRegistry::new(),
             storage_config,
+            flush_tx: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Install a dedicated flush worker thread. Must be called exactly once
+    /// after wrapping `self` in `Arc`. The worker owns its own single-threaded
+    /// tokio runtime so flushes do not contend with the server's multi-threaded
+    /// request runtime.
+    ///
+    /// The worker holds a `Weak<Self>`, so dropping all strong references to the
+    /// storage will close the request channel and let the thread exit cleanly.
+    pub fn start_flush_worker(self: &Arc<Self>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FlushReq>();
+        if self.flush_tx.set(tx).is_err() {
+            tracing::warn!("flush worker already installed; ignoring second call");
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let spawn_res = std::thread::Builder::new()
+            .name("bookie-flush".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .thread_name("bookie-flush-rt")
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("failed to build flush runtime: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    while let Some(first) = rx.recv().await {
+                        let storage = match weak.upgrade() {
+                            Some(s) => s,
+                            None => break,
+                        };
+
+                        // Coalesce: one swap + drain cycle serves every waiter
+                        // enqueued before we picked up the mutex. Many concurrent
+                        // add_entry callers that all hit a full cache get woken
+                        // by the same swap.
+                        let mut swap_waiters: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+                        let mut drain_waiter: Option<
+                            tokio::sync::oneshot::Sender<Result<(), StorageError>>,
+                        > = None;
+                        let push = |req: FlushReq,
+                                        swap_waiters: &mut Vec<_>,
+                                        drain_waiter: &mut Option<_>| {
+                            match req {
+                                FlushReq::OnSwap(s) => swap_waiters.push(s),
+                                FlushReq::OnDrain(d) => {
+                                    // StorageError is not Clone, so only one drain
+                                    // waiter per batch gets the real result; any
+                                    // extras see the dropped oneshot and surface a
+                                    // synthesized error back to their caller.
+                                    if drain_waiter.is_none() {
+                                        *drain_waiter = Some(d);
+                                    }
+                                }
+                            }
+                        };
+                        push(first, &mut swap_waiters, &mut drain_waiter);
+                        while let Ok(next) = rx.try_recv() {
+                            push(next, &mut swap_waiters, &mut drain_waiter);
+                        }
+
+                        let flush_start = Instant::now();
+                        let _lock = storage.flush_mutex.lock().await;
+                        storage.swap_caches();
+                        // Wake add-entry waiters before the expensive drain;
+                        // the swap alone is enough to unblock them.
+                        for s in swap_waiters {
+                            let _ = s.send(());
+                        }
+                        let res = storage.drain_flushing(flush_start).await;
+                        if let Some(d) = drain_waiter {
+                            let _ = d.send(res);
+                        } else if let Err(e) = res {
+                            tracing::warn!("background flush drain failed: {e}");
+                        }
+                    }
+                });
+            });
+        if let Err(e) = spawn_res {
+            tracing::error!("failed to spawn bookie-flush thread: {e}");
+        }
+    }
+
+    /// Request a swap and wake as soon as the active cache is empty, without
+    /// waiting for drain-to-disk. Cancel-safe: dropping the receiver does not
+    /// abort the swap/drain in flight. Falls back to a drain-blocking inline
+    /// flush when no worker is installed.
+    async fn trigger_cache_swap_wait(&self) -> Result<(), StorageError> {
+        let Some(tx) = self.flush_tx.get() else {
+            return self.flush().await;
+        };
+        let (sig_tx, sig_rx) = tokio::sync::oneshot::channel();
+        if tx.send(FlushReq::OnSwap(sig_tx)).is_err() {
+            return self.flush().await;
+        }
+        match sig_rx.await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "flush worker dropped the swap signal",
+            ))),
+        }
+    }
+
+    /// Dispatch a flush to the worker and wait for drain-to-disk. Used by
+    /// checkpoint / shutdown paths. Falls back to inline flush when no worker
+    /// is installed.
+    async fn flush_via_dispatcher(&self) -> Result<(), StorageError> {
+        let Some(tx) = self.flush_tx.get() else {
+            return self.flush().await;
+        };
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        if tx.send(FlushReq::OnDrain(resp_tx)).is_err() {
+            return self.flush().await;
+        }
+        match resp_rx.await {
+            Ok(res) => res,
+            Err(_) => Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "flush worker dropped the response channel",
+            ))),
+        }
+    }
+
+    /// Publish a snapshot of write-cache utilization to Prometheus gauges.
+    /// Called from a periodic sampler — not the hot path — because
+    /// `WriteCache::count()` walks every DashMap shard.
+    pub fn publish_cache_metrics(&self) {
+        let cache = self.write_cache.read();
+        let used = cache.bytes_used();
+        let max = cache.max_size();
+        storage_metrics::WRITE_CACHE_SIZE.set(used as i64);
+        storage_metrics::WRITE_CACHE_COUNT.set(cache.count() as i64);
+        let ratio = if max == 0 { 0.0 } else { used as f64 / max as f64 };
+        storage_metrics::WRITE_CACHE_FILL_RATIO.set(ratio);
     }
 
     /// Scan `entry_log_dir` for `<hex>.log` files and return the next
@@ -473,6 +626,223 @@ impl DbLedgerStorage {
         ).await?;
         Ok(entry)
     }
+
+    /// Swap active ↔ being_flushed. O(microseconds); no I/O.
+    ///
+    /// # Invariant
+    /// Caller must hold `flush_mutex`. Violating this races the swap against
+    /// a concurrent drain and corrupts the being_flushed cache.
+    fn swap_caches(&self) {
+        let swap_start = Instant::now();
+        let mut active = self.write_cache.write();
+        let mut flushing = self.write_cache_being_flushed.write();
+        std::mem::swap(&mut *active, &mut *flushing);
+        storage_metrics::FLUSH_CACHE_SWAP.observe(swap_start.elapsed().as_secs_f64());
+    }
+
+    /// Drain `write_cache_being_flushed` to disk (entry log + RocksDB).
+    ///
+    /// # Invariant
+    /// Caller must hold `flush_mutex` and have just performed a swap.
+    async fn drain_flushing(&self, flush_start: Instant) -> Result<(), StorageError> {
+        // Phase 1: Under log_state mutex, collect all framed entries and metadata.
+        // We cannot hold non-Send guards (MutexGuard, RwLockReadGuard) across
+        // an .await point, so we read from the flushing cache, frame entries,
+        // and drop all guards before the async I/O phase.
+        struct FlushSegment {
+            fd: RawFd,
+            /// Keeps the file handle alive so `fd` remains valid through the
+            /// async write phase. Without this, log rotation drops the File
+            /// and invalidates the fd (bad file descriptor).
+            _file_guard: fs::File,
+            write_offset: u64,
+            framed_entries: Vec<Vec<u8>>,
+            locations: Vec<(i64, i64, u32, u64)>, // (ledger_id, entry_id, log_id, position)
+        }
+        /// A log file that was rotated away mid-flush. Carries the ledger→bytes
+        /// map built while the file was active, so Phase 2 can append the
+        /// self-describing ledgers map (matching Java's `appendLedgersMap()`
+        /// in `DefaultEntryLogger.BufferedLogChannel`). Without this, GC has
+        /// to scan the whole log body to discover which ledgers it contains.
+        struct RotatedLog {
+            log_id: u32,
+            file: fs::File,
+            ledger_sizes: std::collections::HashMap<i64, u64>,
+        }
+        let segments: Vec<FlushSegment>;
+        let rotated_logs: Vec<RotatedLog>;
+        let entry_count: usize;
+        let total_bytes: u64;
+
+        {
+            let flushing = self.write_cache_being_flushed.read();
+            let entries = flushing.sorted_entries();
+            if entries.is_empty() {
+                drop(flushing);
+                self.write_cache_being_flushed.write().clear();
+                storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
+                return Ok(());
+            }
+
+            entry_count = entries.len();
+            let flushing_data = flushing.data();
+
+            let mut segs: Vec<FlushSegment> = Vec::new();
+            let mut rotated: Vec<RotatedLog> = Vec::new();
+            let mut flush_bytes: u64 = 0;
+
+            {
+                let mut log_state = self.log_state.lock().unwrap();
+
+                // Open file if not already open
+                if log_state.file.is_none() {
+                    self.ensure_entry_log_exists(log_state.log_id)?;
+                    let path = self.entry_log_path(log_state.log_id);
+                    let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+                    log_state.file = Some(file);
+                }
+
+                let file_ref = log_state.file.as_ref().unwrap();
+                let mut current = FlushSegment {
+                    fd: file_ref.as_raw_fd(),
+                    _file_guard: file_ref.try_clone()?,
+                    write_offset: log_state.offset,
+                    framed_entries: Vec::new(),
+                    locations: Vec::new(),
+                };
+
+                for &(ledger_id, entry_id, offset, size) in &entries {
+                    let entry_data = &flushing_data[offset..offset + size];
+                    let encoded_size = (4 + entry_data.len()) as u64;
+
+                    if log_state.offset + encoded_size > self.storage_config.max_entry_log_size {
+                        // Push the current segment if it has entries
+                        if !current.framed_entries.is_empty() {
+                            segs.push(current);
+                        }
+
+                        // Rotate: hand off the old file + ledger-size map
+                        // to Phase 2 so it can write the ledgers map after
+                        // the entry writes land. This mirrors Java's
+                        // `EntryLogManagerBase.createNewLog` which calls
+                        // `logChannel.appendLedgersMap()` before swapping
+                        // in a fresh log channel.
+                        let old_log_id = log_state.log_id;
+                        let old_file = log_state.file.take().unwrap();
+                        let old_sizes = std::mem::take(&mut log_state.current_log_ledger_sizes);
+                        rotated.push(RotatedLog {
+                            log_id: old_log_id,
+                            file: old_file,
+                            ledger_sizes: old_sizes,
+                        });
+
+                        log_state.log_id += 1;
+                        log_state.offset = LOGFILE_HEADER_SIZE as u64;
+                        self.ensure_entry_log_exists(log_state.log_id)?;
+                        let new_path = self.entry_log_path(log_state.log_id);
+                        let file = fs::OpenOptions::new().read(true).write(true).open(&new_path)?;
+                        log_state.file = Some(file);
+
+                        let new_file_ref = log_state.file.as_ref().unwrap();
+                        current = FlushSegment {
+                            fd: new_file_ref.as_raw_fd(),
+                            _file_guard: new_file_ref.try_clone()?,
+                            write_offset: log_state.offset,
+                            framed_entries: Vec::new(),
+                            locations: Vec::new(),
+                        };
+                    }
+
+                    let framed = Self::frame_entry(entry_data);
+                    let position = log_state.offset + 4;
+                    current.locations.push((ledger_id, entry_id, log_state.log_id, position));
+                    current.framed_entries.push(framed);
+                    log_state.offset += encoded_size;
+                    // Track per-ledger bytes for the currently-open log so
+                    // its ledgers map is accurate at rotation time.
+                    *log_state.current_log_ledger_sizes
+                        .entry(ledger_id).or_insert(0) += encoded_size;
+                    flush_bytes += encoded_size;
+                }
+
+                if !current.framed_entries.is_empty() {
+                    segs.push(current);
+                }
+            } // log_state MutexGuard dropped
+
+            segments = segs;
+            rotated_logs = rotated;
+            total_bytes = flush_bytes;
+        } // flushing RwLockReadGuard dropped
+
+        // Phase 2: Async I/O (no non-Send guards held)
+        let entrylog_start = Instant::now();
+        let mut batch = Vec::with_capacity(entry_count);
+        let mut file_guards: Vec<fs::File> = Vec::new();
+        for segment in segments {
+            self.ledger_io.write_batch(
+                segment.fd,
+                segment.write_offset,
+                segment.framed_entries,
+            ).await?;
+            for (ledger_id, entry_id, log_id, position) in segment.locations {
+                batch.push((ledger_id, entry_id,
+                    EntryLocation::new(log_id, position as u32).to_u64()));
+            }
+            file_guards.push(segment._file_guard);
+        }
+
+        // Fsync all entry log files BEFORE updating the RocksDB index.
+        // Without this, a crash after the index update but before the
+        // entry log data reaches disk would leave the index pointing
+        // to unwritten/partial data — corrupting reads after recovery.
+        for guard in &file_guards {
+            guard.sync_data()?;
+        }
+
+        // Append the ledgers map to every log file that rotated during this
+        // flush. This makes rotated log files self-describing so GC can
+        // enumerate their ledgers without scanning the whole body.
+        // Matches Java's `DefaultEntryLogger.BufferedLogChannel.appendLedgersMap()`,
+        // invoked from `EntryLogManagerBase.createNewLog` before rolling
+        // over to a new log file.
+        for mut rl in rotated_logs {
+            if let Err(e) = Self::append_ledgers_map(&mut rl.file, &rl.ledger_sizes) {
+                // Non-fatal: the file is still readable, GC just falls back
+                // to scanning the body as it does for pre-existing files.
+                tracing::warn!("failed to append ledgers map for log {:x}: {e}", rl.log_id);
+            }
+        }
+
+        storage_metrics::FLUSH_ENTRYLOG.observe(entrylog_start.elapsed().as_secs_f64());
+
+        if !batch.is_empty() {
+            self.entry_location_index.put_batch(&batch)?;
+        }
+
+        let locations_start = Instant::now();
+        self.entry_location_index.flush()?;
+        storage_metrics::FLUSH_LOCATIONS_INDEX.observe(locations_start.elapsed().as_secs_f64());
+
+        // Persist in-memory LAC cache to RocksDB (batch write, not per-entry).
+        // This replaces the per-add_entry RocksDB write with one batch per flush.
+        let lac_entries: Vec<(i64, i64)> = self.lac_cache.iter()
+            .map(|e| (*e.key(), *e.value()))
+            .collect();
+        for (ledger_id, lac) in &lac_entries {
+            let _ = self.ledger_index.update_lac(*ledger_id, *lac);
+        }
+
+        let ledger_start = Instant::now();
+        self.ledger_index.flush()?;
+        storage_metrics::FLUSH_LEDGER_INDEX.observe(ledger_start.elapsed().as_secs_f64());
+
+        self.write_cache_being_flushed.write().clear();
+
+        storage_metrics::FLUSH_SIZE.observe(total_bytes as f64);
+        storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -561,17 +931,10 @@ impl LedgerStorage for DbLedgerStorage {
                 return Err(StorageError::OperationRejected);
             }
 
-            // Call flush with a remaining-time deadline. If a peer flush
-            // is in progress holding `flush_mutex`, the timeout covers the
-            // mutex wait too — so a single slow flush can no longer stall
-            // every in-flight add_entry for unbounded time.
-            //
-            // Cancelling an in-flight flush is safe here: the cache swap
-            // is atomic under a parking_lot write lock, and all
-            // write_cache_being_flushed mutations are re-done idempotently
-            // by a subsequent flush (entries stay in being_flushed until a
-            // successful flush clears them — see the bottom of flush()).
-            match tokio::time::timeout(remaining, self.flush()).await {
+            // Wait only for the swap, not the drain — putting into the
+            // now-empty active cache succeeds on the next iteration while
+            // the drain continues on the worker thread.
+            match tokio::time::timeout(remaining, self.trigger_cache_swap_wait()).await {
                 Ok(Ok(())) => {
                     // Flush succeeded — one more put attempt in next loop iter.
                 }
@@ -919,214 +1282,8 @@ impl LedgerStorage for DbLedgerStorage {
     async fn flush(&self) -> Result<(), StorageError> {
         let flush_start = Instant::now();
         let _lock = self.flush_mutex.lock().await;
-
-        // Swap: active → being_flushed, being_flushed (cleared) → active.
-        // The write lock briefly blocks all concurrent add_entry() read-lock attempts.
-        {
-            let swap_start = Instant::now();
-            let mut active = self.write_cache.write();
-            let mut flushing = self.write_cache_being_flushed.write();
-            std::mem::swap(&mut *active, &mut *flushing);
-            storage_metrics::FLUSH_CACHE_SWAP.observe(swap_start.elapsed().as_secs_f64());
-        }
-
-        // Phase 1: Under log_state mutex, collect all framed entries and metadata.
-        // We cannot hold non-Send guards (MutexGuard, RwLockReadGuard) across
-        // an .await point, so we read from the flushing cache, frame entries,
-        // and drop all guards before the async I/O phase.
-        struct FlushSegment {
-            fd: RawFd,
-            /// Keeps the file handle alive so `fd` remains valid through the
-            /// async write phase. Without this, log rotation drops the File
-            /// and invalidates the fd (bad file descriptor).
-            _file_guard: fs::File,
-            write_offset: u64,
-            framed_entries: Vec<Vec<u8>>,
-            locations: Vec<(i64, i64, u32, u64)>, // (ledger_id, entry_id, log_id, position)
-        }
-        /// A log file that was rotated away mid-flush. Carries the ledger→bytes
-        /// map built while the file was active, so Phase 2 can append the
-        /// self-describing ledgers map (matching Java's `appendLedgersMap()`
-        /// in `DefaultEntryLogger.BufferedLogChannel`). Without this, GC has
-        /// to scan the whole log body to discover which ledgers it contains.
-        struct RotatedLog {
-            log_id: u32,
-            file: fs::File,
-            ledger_sizes: std::collections::HashMap<i64, u64>,
-        }
-        let segments: Vec<FlushSegment>;
-        let rotated_logs: Vec<RotatedLog>;
-        let entry_count: usize;
-        let total_bytes: u64;
-
-        {
-            let flushing = self.write_cache_being_flushed.read();
-            let entries = flushing.sorted_entries();
-            if entries.is_empty() {
-                drop(flushing);
-                self.write_cache_being_flushed.write().clear();
-                storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
-                return Ok(());
-            }
-
-            entry_count = entries.len();
-            let flushing_data = flushing.data();
-
-            let mut segs: Vec<FlushSegment> = Vec::new();
-            let mut rotated: Vec<RotatedLog> = Vec::new();
-            let mut flush_bytes: u64 = 0;
-
-            {
-                let mut log_state = self.log_state.lock().unwrap();
-
-                // Open file if not already open
-                if log_state.file.is_none() {
-                    self.ensure_entry_log_exists(log_state.log_id)?;
-                    let path = self.entry_log_path(log_state.log_id);
-                    let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
-                    log_state.file = Some(file);
-                }
-
-                let file_ref = log_state.file.as_ref().unwrap();
-                let mut current = FlushSegment {
-                    fd: file_ref.as_raw_fd(),
-                    _file_guard: file_ref.try_clone()?,
-                    write_offset: log_state.offset,
-                    framed_entries: Vec::new(),
-                    locations: Vec::new(),
-                };
-
-                for &(ledger_id, entry_id, offset, size) in &entries {
-                    let entry_data = &flushing_data[offset..offset + size];
-                    let encoded_size = (4 + entry_data.len()) as u64;
-
-                    if log_state.offset + encoded_size > self.storage_config.max_entry_log_size {
-                        // Push the current segment if it has entries
-                        if !current.framed_entries.is_empty() {
-                            segs.push(current);
-                        }
-
-                        // Rotate: hand off the old file + ledger-size map
-                        // to Phase 2 so it can write the ledgers map after
-                        // the entry writes land. This mirrors Java's
-                        // `EntryLogManagerBase.createNewLog` which calls
-                        // `logChannel.appendLedgersMap()` before swapping
-                        // in a fresh log channel.
-                        let old_log_id = log_state.log_id;
-                        let old_file = log_state.file.take().unwrap();
-                        let old_sizes = std::mem::take(&mut log_state.current_log_ledger_sizes);
-                        rotated.push(RotatedLog {
-                            log_id: old_log_id,
-                            file: old_file,
-                            ledger_sizes: old_sizes,
-                        });
-
-                        log_state.log_id += 1;
-                        log_state.offset = LOGFILE_HEADER_SIZE as u64;
-                        self.ensure_entry_log_exists(log_state.log_id)?;
-                        let new_path = self.entry_log_path(log_state.log_id);
-                        let file = fs::OpenOptions::new().read(true).write(true).open(&new_path)?;
-                        log_state.file = Some(file);
-
-                        let new_file_ref = log_state.file.as_ref().unwrap();
-                        current = FlushSegment {
-                            fd: new_file_ref.as_raw_fd(),
-                            _file_guard: new_file_ref.try_clone()?,
-                            write_offset: log_state.offset,
-                            framed_entries: Vec::new(),
-                            locations: Vec::new(),
-                        };
-                    }
-
-                    let framed = Self::frame_entry(entry_data);
-                    let position = log_state.offset + 4;
-                    current.locations.push((ledger_id, entry_id, log_state.log_id, position));
-                    current.framed_entries.push(framed);
-                    log_state.offset += encoded_size;
-                    // Track per-ledger bytes for the currently-open log so
-                    // its ledgers map is accurate at rotation time.
-                    *log_state.current_log_ledger_sizes
-                        .entry(ledger_id).or_insert(0) += encoded_size;
-                    flush_bytes += encoded_size;
-                }
-
-                if !current.framed_entries.is_empty() {
-                    segs.push(current);
-                }
-            } // log_state MutexGuard dropped
-
-            segments = segs;
-            rotated_logs = rotated;
-            total_bytes = flush_bytes;
-        } // flushing RwLockReadGuard dropped
-
-        // Phase 2: Async I/O (no non-Send guards held)
-        let entrylog_start = Instant::now();
-        let mut batch = Vec::with_capacity(entry_count);
-        let mut file_guards: Vec<fs::File> = Vec::new();
-        for segment in segments {
-            self.ledger_io.write_batch(
-                segment.fd,
-                segment.write_offset,
-                segment.framed_entries,
-            ).await?;
-            for (ledger_id, entry_id, log_id, position) in segment.locations {
-                batch.push((ledger_id, entry_id,
-                    EntryLocation::new(log_id, position as u32).to_u64()));
-            }
-            file_guards.push(segment._file_guard);
-        }
-
-        // Fsync all entry log files BEFORE updating the RocksDB index.
-        // Without this, a crash after the index update but before the
-        // entry log data reaches disk would leave the index pointing
-        // to unwritten/partial data — corrupting reads after recovery.
-        for guard in &file_guards {
-            guard.sync_data()?;
-        }
-
-        // Append the ledgers map to every log file that rotated during this
-        // flush. This makes rotated log files self-describing so GC can
-        // enumerate their ledgers without scanning the whole body.
-        // Matches Java's `DefaultEntryLogger.BufferedLogChannel.appendLedgersMap()`,
-        // invoked from `EntryLogManagerBase.createNewLog` before rolling
-        // over to a new log file.
-        for mut rl in rotated_logs {
-            if let Err(e) = Self::append_ledgers_map(&mut rl.file, &rl.ledger_sizes) {
-                // Non-fatal: the file is still readable, GC just falls back
-                // to scanning the body as it does for pre-existing files.
-                tracing::warn!("failed to append ledgers map for log {:x}: {e}", rl.log_id);
-            }
-        }
-
-        storage_metrics::FLUSH_ENTRYLOG.observe(entrylog_start.elapsed().as_secs_f64());
-
-        if !batch.is_empty() {
-            self.entry_location_index.put_batch(&batch)?;
-        }
-
-        let locations_start = Instant::now();
-        self.entry_location_index.flush()?;
-        storage_metrics::FLUSH_LOCATIONS_INDEX.observe(locations_start.elapsed().as_secs_f64());
-
-        // Persist in-memory LAC cache to RocksDB (batch write, not per-entry).
-        // This replaces the per-add_entry RocksDB write with one batch per flush.
-        let lac_entries: Vec<(i64, i64)> = self.lac_cache.iter()
-            .map(|e| (*e.key(), *e.value()))
-            .collect();
-        for (ledger_id, lac) in &lac_entries {
-            let _ = self.ledger_index.update_lac(*ledger_id, *lac);
-        }
-
-        let ledger_start = Instant::now();
-        self.ledger_index.flush()?;
-        storage_metrics::FLUSH_LEDGER_INDEX.observe(ledger_start.elapsed().as_secs_f64());
-
-        self.write_cache_being_flushed.write().clear();
-
-        storage_metrics::FLUSH_SIZE.observe(total_bytes as f64);
-        storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
-        Ok(())
+        self.swap_caches();
+        self.drain_flushing(flush_start).await
     }
 
     async fn checkpoint(&self) -> Result<(), StorageError> {
@@ -1148,8 +1305,8 @@ impl LedgerStorage for DbLedgerStorage {
                 crate::checkpoint::Checkpoint::new(log_id as i64, offset as i64)
             });
 
-        // Phase 2: Flush everything
-        self.flush().await?;
+        // Phase 2: Flush everything (routes through dedicated worker when installed)
+        self.flush_via_dispatcher().await?;
 
         // Phase 3: Persist lastMark only after successful flush.
         // Matches Java's `journal.checkpointComplete(cp, true)`.

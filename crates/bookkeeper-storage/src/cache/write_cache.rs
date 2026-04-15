@@ -87,6 +87,15 @@ impl WriteCache {
         self.index.len()
     }
 
+    /// Bytes currently reserved in the cache (monotonic until `clear`).
+    pub(crate) fn bytes_used(&self) -> usize {
+        self.offset.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn max_size(&self) -> usize {
+        self.max_size
+    }
+
     pub fn clear(&self) {
         self.index.clear();
         self.last_entry.clear();

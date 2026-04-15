@@ -4,7 +4,7 @@
 //! Hyphens in Java metric names are replaced with underscores for Prometheus compatibility.
 
 use lazy_static::lazy_static;
-use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge};
+use prometheus::{Gauge, Histogram, HistogramOpts, IntCounter, IntGauge};
 
 lazy_static! {
     // -----------------------------------------------------------------------
@@ -194,6 +194,13 @@ lazy_static! {
         "bookie_write_cache_count", "Write cache current entry count"
     ).unwrap();
 
+    /// Write cache fill ratio (bytes_used / max_size) in [0.0, 1.0].
+    /// Values approaching 1.0 precede add_entry back-pressure.
+    pub static ref WRITE_CACHE_FILL_RATIO: Gauge = Gauge::new(
+        "bookie_write_cache_fill_ratio",
+        "Write cache fill ratio (bytes_used / max_size), in [0, 1]"
+    ).unwrap();
+
     /// Read cache current size in bytes. Matches Java's `read-cache-size`.
     pub static ref READ_CACHE_SIZE: IntGauge = IntGauge::new(
         "bookie_read_cache_size", "Read cache current size in bytes"
@@ -281,6 +288,7 @@ pub fn register_storage_metrics(registry: &prometheus::Registry) {
     reg!(READ_CACHE_MISSES);
     reg!(WRITE_CACHE_SIZE);
     reg!(WRITE_CACHE_COUNT);
+    reg!(WRITE_CACHE_FILL_RATIO);
     reg!(READ_CACHE_SIZE);
     reg!(READ_CACHE_COUNT);
 

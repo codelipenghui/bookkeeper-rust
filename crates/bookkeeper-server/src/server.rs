@@ -177,8 +177,11 @@ impl BookieServer {
             tracing::info!("Journal disabled (journalWriteData=false)");
         }
 
+        let storage_concrete = Arc::new(storage);
+        storage_concrete.start_flush_worker();
+        let metrics_sampler_storage = storage_concrete.clone();
         let storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage> =
-            Arc::new(storage);
+            storage_concrete;
 
         // Post-crash integrity scan — walks the entry_location_index and
         // verifies each entry can be read from its recorded entry log
@@ -504,6 +507,20 @@ impl BookieServer {
         let sync_handle = Some(tokio::spawn(async move {
             run_sync_thread(sync_storage, flush_interval_ms, sync_shutdown).await;
         }));
+
+        // Sample write-cache gauges once per second. Kept off the add-entry
+        // hot path because the underlying counters walk every DashMap shard.
+        let metrics_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut shutdown = metrics_shutdown;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => if *shutdown.borrow() { break },
+                    _ = tick.tick() => metrics_sampler_storage.publish_cache_metrics(),
+                }
+            }
+        });
 
         // Build TLS acceptor if configured
         let tls_acceptor = if let (Some(ref cert), Some(ref key)) =
