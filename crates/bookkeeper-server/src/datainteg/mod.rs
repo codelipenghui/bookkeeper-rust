@@ -6,4 +6,5 @@
 //! that still have them.
 
 pub mod check;
+pub mod cookie_validator;
 pub mod entry_copier;

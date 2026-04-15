@@ -2,7 +2,7 @@ use crate::ledger_metadata::MetadataError;
 
 const CURRENT_COOKIE_LAYOUT_VERSION: i32 = 5;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cookie {
     bookie_id: String,
     journal_dirs: String,
