@@ -18,7 +18,9 @@ use std::time::Duration;
 use std::sync::Once;
 
 use bookkeeper_client::bookie_connection::BookieConnection;
+use bookkeeper_client::zk_client::ZkBookKeeper;
 use bookkeeper_config::server::ServerConfig;
+use bookkeeper_protocol::digest::DigestType;
 
 static LOGGER: Once = Once::new();
 fn init_logging() {
@@ -195,4 +197,172 @@ async fn recovers_closed_ledger_after_data_wipe() {
     }
     let _ = dirs; // drop at end to keep dirs alive
     let _ = Arc::<()>::new(()); // silence unused std::sync::Arc warning if any
+}
+
+/// Create a ledger, write `n_entries`, and return (ledger_id, last_entry_id)
+/// WITHOUT closing the ledger. The metadata stays in OPEN state — this
+/// is the pre-condition for the limbo recovery path.
+async fn create_ledger_leave_open(
+    connect: &str,
+    root: &str,
+    ensemble_size: i32,
+    write_quorum_size: i32,
+    ack_quorum_size: i32,
+    password: &[u8],
+    n_entries: i64,
+) -> i64 {
+    let mut bk = ZkBookKeeper::new(connect, root).await.unwrap();
+    let (mut wh, conns) = bk
+        .create_ledger(
+            ensemble_size,
+            write_quorum_size,
+            ack_quorum_size,
+            DigestType::Crc32c,
+            password,
+        )
+        .await
+        .unwrap();
+    let lid = wh.ledger_id();
+    for i in 0..n_entries {
+        wh.append(&conns, format!("entry-{i}").as_bytes())
+            .await
+            .unwrap();
+    }
+    // Deliberately DROP wh without calling close_ledger — the metadata
+    // stays OPEN so the next reader must fence+recover it.
+    drop(wh);
+    drop(conns);
+    drop(bk);
+    lid
+}
+
+/// Scenario 2: open ledger. Pre-boot must mark the ledger limbo+fenced
+/// locally; the service's full-check must fence-close it cluster-wide via
+/// the ZkRecoveryClient; then entries are copied.
+#[tokio::test]
+async fn recovers_open_ledger_via_limbo_path() {
+    init_logging();
+    let Some(connect) = shared_zk().await else {
+        eprintln!("[SKIP] Docker/ZK unavailable");
+        return;
+    };
+    let root = "/test_dataint_open";
+    bootstrap_cluster(&connect, root).await;
+
+    let (mut servers, dirs) = spawn_three(&connect, root).await;
+
+    // Open ledger (NOT closed).
+    let ledger_id =
+        create_ledger_leave_open(&connect, root, 3, 3, 2, b"pw", N_ENTRIES).await;
+
+    // Sanity — the target bookie serves every entry while alive.
+    let target_addr = servers[0].local_addr();
+    for eid in 0..N_ENTRIES {
+        assert!(
+            read_entry_direct(target_addr, ledger_id, eid).await.is_some(),
+            "pre-wipe: entry {eid} missing on target"
+        );
+    }
+
+    // Stop + wipe bookie 0.
+    let target_dir = dirs[0].path().to_path_buf();
+    let original_port = target_addr.port();
+    servers.remove(0).shutdown().await;
+    wipe_dir(&target_dir);
+
+    // Restart with data-integrity flags; same port so its bookie_id is
+    // unchanged and the ensemble metadata still names it.
+    let restarted = spawn_on_dir(&connect, root, &target_dir, |c| {
+        c.bookie_port = original_port;
+        c.data_integrity_checking = true;
+        c.data_integrity_stamp_missing_cookies = true;
+    })
+    .await;
+    let new_addr = restarted.local_addr();
+    assert_eq!(new_addr.port(), original_port);
+
+    // Wait for full-check to complete (limbo recovery + entry copy).
+    // Larger deadline than scenario 1 because fence-and-close adds latency.
+    let deadline = Duration::from_secs(60);
+    for eid in [0i64, N_ENTRIES / 2, N_ENTRIES - 1] {
+        assert!(
+            await_entry_recovered(new_addr, ledger_id, eid, deadline).await,
+            "entry {eid} still missing after {:?}",
+            deadline
+        );
+    }
+    for eid in 0..N_ENTRIES {
+        assert!(
+            read_entry_direct(new_addr, ledger_id, eid).await.is_some(),
+            "entry {eid} missing after limbo-path recovery"
+        );
+    }
+
+    restarted.shutdown().await;
+    for s in servers {
+        s.shutdown().await;
+    }
+    let _ = dirs;
+}
+
+/// Scenario 3: one peer offline during recovery. Verifies the EntryCopier's
+/// sinbin + fallback works — the copier should try the dead peer, sinbin it,
+/// then fall back to the surviving peer (which still has every entry because
+/// we wrote at w=3/a=2).
+#[tokio::test]
+async fn recovers_with_one_peer_offline() {
+    init_logging();
+    let Some(connect) = shared_zk().await else {
+        eprintln!("[SKIP] Docker/ZK unavailable");
+        return;
+    };
+    let root = "/test_dataint_onepeer";
+    bootstrap_cluster(&connect, root).await;
+
+    let (mut servers, dirs) = spawn_three(&connect, root).await;
+
+    let ledger_id =
+        create_ledger_and_close(&connect, root, 3, 3, 2, b"pw", N_ENTRIES).await;
+
+    // Take bookies 0 (our target) and 1 (soon-to-be-unreachable peer)
+    // out of the pool. Only bookie 2 stays up.
+    let target_addr = servers[0].local_addr();
+    let target_dir = dirs[0].path().to_path_buf();
+    let original_port = target_addr.port();
+    servers.remove(0).shutdown().await;
+    wipe_dir(&target_dir);
+
+    // Stop the second bookie too. Its data directory stays intact but its
+    // ZK ephemeral is gone; the restarted bookie's EntryCopier will try to
+    // open a socket at its address and fail.
+    let second_peer = servers.remove(0);
+    second_peer.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Restart bookie 0.
+    let restarted = spawn_on_dir(&connect, root, &target_dir, |c| {
+        c.bookie_port = original_port;
+        c.data_integrity_checking = true;
+        c.data_integrity_stamp_missing_cookies = true;
+    })
+    .await;
+    let new_addr = restarted.local_addr();
+
+    // Fallback path is slower than the straight copy because each entry
+    // now has to timeout-or-fail on the dead peer before the copier
+    // retries against the live one. Allow more wall clock.
+    let deadline = Duration::from_secs(90);
+    for eid in [0i64, N_ENTRIES / 2, N_ENTRIES - 1] {
+        assert!(
+            await_entry_recovered(new_addr, ledger_id, eid, deadline).await,
+            "entry {eid} still missing after {:?}",
+            deadline
+        );
+    }
+
+    restarted.shutdown().await;
+    for s in servers {
+        s.shutdown().await;
+    }
+    let _ = dirs;
 }

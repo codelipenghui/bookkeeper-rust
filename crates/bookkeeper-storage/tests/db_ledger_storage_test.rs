@@ -476,3 +476,23 @@ async fn entry_exists_reports_presence() {
     storage.clear_limbo_state(1).unwrap();
     assert!(!storage.has_limbo_state(1).unwrap());
 }
+
+#[tokio::test]
+async fn empty_master_key_is_replaced_by_real_key_on_check() {
+    // Regression guard: data-integrity pre-boot calls set_master_key(id, &[])
+    // to reserve the ledger row before the real master key is known. A
+    // subsequent check_master_key with the real key must succeed (and
+    // upgrade the stored key) rather than returning Unauthorized.
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    storage.set_master_key(42, b"").unwrap();
+    // Cache hit path — empty key must not be compared to the real one.
+    storage
+        .check_master_key(42, b"real-pw")
+        .expect("empty master key should be upgraded, not rejected");
+    // Subsequent check with the real key must match via the now-populated cache.
+    storage.check_master_key(42, b"real-pw").expect("real key persists");
+    // A different key is rejected.
+    assert!(storage.check_master_key(42, b"other-pw").is_err());
+}

@@ -1078,12 +1078,15 @@ impl LedgerStorage for DbLedgerStorage {
             None => (false, None),
         };
         self.ledger_index.set(ledger_id, fenced, Some(master_key), existing_lac)?;
+        // Empty master key is the "not-yet-set" sentinel used by the
+        // data-integrity pre-boot check (`processPreBoot` creates the row
+        // before the real key is known). Cache it as None so a subsequent
+        // check_master_key with the real key stores it and moves forward
+        // rather than failing with Unauthorized.
+        let cached_key = if master_key.is_empty() { None } else { Some(master_key.to_vec()) };
         self.meta_cache.insert(
             ledger_id,
-            Arc::new(LedgerMetaCacheEntry {
-                fenced,
-                master_key: Some(master_key.to_vec()),
-            }),
+            Arc::new(LedgerMetaCacheEntry { fenced, master_key: cached_key }),
         );
         Ok(())
     }
