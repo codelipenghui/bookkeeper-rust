@@ -14,7 +14,12 @@ use crate::entry_log::format::{self as elf, EntryLogHeader, EntryLocation, LOGFI
 use crate::index::entry_location::EntryLocationIndex;
 use crate::index::ledger_index::LedgerMetadataIndex;
 use crate::StorageError;
-use crate::ledger_storage::LedgerStorage;
+use crate::ledger_storage::{LedgerStorage, StorageStateFlag};
+
+/// Matches `bookkeeper_common::LAST_ADD_CONFIRMED`. Duplicated here to
+/// avoid pulling the `bookkeeper-common` crate into `bookkeeper-storage`
+/// just for one constant.
+const LAST_ADD_CONFIRMED: i64 = -1;
 use crate::storage_metrics;
 
 /// Constant-time byte comparison to prevent timing attacks on master key checks.
@@ -1455,5 +1460,60 @@ impl LedgerStorage for DbLedgerStorage {
         }
         tracing::info!("scrub: checked {checked} entries across {} ledgers, {errors} errors", ledgers.len());
         Ok(errors)
+    }
+
+    fn entry_exists(&self, ledger_id: i64, entry_id: i64) -> Result<bool, StorageError> {
+        if entry_id == LAST_ADD_CONFIRMED {
+            return Ok(false);
+        }
+        if self.write_cache.read().get(ledger_id, entry_id).is_some() {
+            return Ok(true);
+        }
+        if self.write_cache_being_flushed.read().get(ledger_id, entry_id).is_some() {
+            return Ok(true);
+        }
+        Ok(self.entry_location_index.get(ledger_id, entry_id)?.is_some())
+    }
+
+    fn get_storage_state_flags(&self) -> Result<u64, StorageError> {
+        self.ledger_index.get_storage_state_flags()
+    }
+
+    fn set_storage_state_flag(&self, flag: StorageStateFlag) -> Result<(), StorageError> {
+        loop {
+            let current = self.ledger_index.get_storage_state_flags()?;
+            let new = current | flag.bits();
+            if current == new {
+                return Ok(());
+            }
+            if self.ledger_index.set_storage_state_flags(current, new)? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn clear_storage_state_flag(&self, flag: StorageStateFlag) -> Result<(), StorageError> {
+        loop {
+            let current = self.ledger_index.get_storage_state_flags()?;
+            let new = current & !flag.bits();
+            if current == new {
+                return Ok(());
+            }
+            if self.ledger_index.set_storage_state_flags(current, new)? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn set_limbo_state(&self, ledger_id: i64) -> Result<(), StorageError> {
+        self.ledger_index.set_limbo(ledger_id)
+    }
+
+    fn clear_limbo_state(&self, ledger_id: i64) -> Result<(), StorageError> {
+        self.ledger_index.clear_limbo(ledger_id)
+    }
+
+    fn has_limbo_state(&self, ledger_id: i64) -> Result<bool, StorageError> {
+        self.ledger_index.has_limbo(ledger_id)
     }
 }

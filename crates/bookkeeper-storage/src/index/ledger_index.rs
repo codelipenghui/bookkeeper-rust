@@ -1,8 +1,13 @@
 use std::path::Path;
+use std::sync::Mutex;
 use prost::Message;
 use rocksdb::{Cache, DB};
 use crate::rocksdb_options;
 use crate::StorageError;
+
+/// Reserved RocksDB key used to store whole-storage state flags.
+/// On-disk compatible with Java's `LedgerMetadataIndex.STORAGE_FLAGS` constant.
+pub(crate) const STORAGE_FLAGS_KEY: i64 = -0xeefd;
 
 /// Ledger metadata stored in the bookie's RocksDB.
 #[derive(Debug, Clone)]
@@ -22,6 +27,10 @@ pub struct LedgerMetadataIndex {
     /// here so it stays alive as long as the index.
     #[allow(dead_code)]
     block_cache: Option<Cache>,
+    /// Serializes check-then-write on the reserved storage-flags key so
+    /// concurrent `set_storage_state_flag`/`clear_storage_state_flag` callers
+    /// don't clobber each other. Matches Java's `synchronized(ledgersDb)`.
+    flags_lock: Mutex<()>,
 }
 
 impl LedgerMetadataIndex {
@@ -33,7 +42,7 @@ impl LedgerMetadataIndex {
         let (opts, block_cache) =
             rocksdb_options::load_or_default(rocksdb_conf, rocksdb_options::DEFAULT_LEDGER_METADATA_CONF)?;
         let db = DB::open(&opts, path)?;
-        Ok(Self { db, block_cache })
+        Ok(Self { db, block_cache, flags_lock: Mutex::new(()) })
     }
 
     pub fn set(&self, ledger_id: i64, fenced: bool, master_key: Option<&[u8]>, lac: Option<i64>) -> Result<(), StorageError> {
@@ -99,6 +108,9 @@ impl LedgerMetadataIndex {
             let (key, value) = item?;
             if key.len() == 8 {
                 let ledger_id = i64::from_be_bytes(key[..8].try_into().unwrap());
+                if ledger_id == STORAGE_FLAGS_KEY {
+                    continue;
+                }
                 // Only include ledgers that actually exist
                 if let Ok(proto) = bookkeeper_proto::LedgerData::decode(&value[..]) {
                     if proto.exists {
@@ -139,6 +151,52 @@ impl LedgerMetadataIndex {
     pub fn delete(&self, ledger_id: i64) -> Result<(), StorageError> {
         let key = ledger_id.to_be_bytes();
         self.db.delete(&key).map_err(StorageError::from)
+    }
+
+    /// Read the whole-storage state flags bitmask. Returns 0 if unset.
+    pub fn get_storage_state_flags(&self) -> Result<u64, StorageError> {
+        let key = STORAGE_FLAGS_KEY.to_be_bytes();
+        match self.db.get(&key)? {
+            Some(v) if v.len() >= 8 => Ok(u64::from_be_bytes(v[..8].try_into().unwrap())),
+            _ => Ok(0),
+        }
+    }
+
+    /// Atomically update the storage state flags from `expected` to `new_flags`.
+    /// Returns `true` on success, `false` if the current value doesn't match
+    /// `expected` (caller should retry with the fresh value).
+    pub fn set_storage_state_flags(&self, expected: u64, new_flags: u64) -> Result<bool, StorageError> {
+        let _guard = self.flags_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let current = self.get_storage_state_flags()?;
+        if current != expected {
+            return Ok(false);
+        }
+        let key = STORAGE_FLAGS_KEY.to_be_bytes();
+        self.db.put(&key, &new_flags.to_be_bytes())?;
+        Ok(true)
+    }
+
+    /// Mark a ledger as in limbo (awaiting data-integrity recovery).
+    pub fn set_limbo(&self, ledger_id: i64) -> Result<(), StorageError> {
+        let mut proto = self.get_raw(ledger_id)?.ok_or(StorageError::LedgerNotFound(ledger_id))?;
+        proto.limbo = Some(true);
+        self.put_raw(ledger_id, &proto)
+    }
+
+    /// Clear a ledger's limbo state.
+    pub fn clear_limbo(&self, ledger_id: i64) -> Result<(), StorageError> {
+        if let Some(mut proto) = self.get_raw(ledger_id)? {
+            if proto.limbo != Some(false) {
+                proto.limbo = Some(false);
+                self.put_raw(ledger_id, &proto)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Check whether a ledger is in limbo. Absent/unset means not in limbo.
+    pub fn has_limbo(&self, ledger_id: i64) -> Result<bool, StorageError> {
+        Ok(self.get_raw(ledger_id)?.and_then(|p| p.limbo).unwrap_or(false))
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {

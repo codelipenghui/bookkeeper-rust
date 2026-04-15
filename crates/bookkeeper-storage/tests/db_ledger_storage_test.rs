@@ -438,3 +438,41 @@ async fn local_consistency_check_with_multiple_ledgers() {
     let errors = storage.local_consistency_check(0).await.unwrap();
     assert_eq!(errors, 0, "multiple clean ledgers should have no errors");
 }
+
+// ---------------------------------------------------------------------------
+// Data-integrity primitives (entry_exists, storage flags, limbo)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn entry_exists_reports_presence() {
+    use bookkeeper_storage::ledger_storage::StorageStateFlag;
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    // not-yet-added entry
+    assert!(!storage.entry_exists(1, 0).unwrap());
+
+    storage.add_entry(&make_entry(1, 0, -1, b"a")).await.unwrap();
+    // present via write cache
+    assert!(storage.entry_exists(1, 0).unwrap());
+
+    // flush to disk; still present via location index
+    storage.flush().await.unwrap();
+    assert!(storage.entry_exists(1, 0).unwrap());
+
+    // LAST_ADD_CONFIRMED (-1) is never considered "present"
+    assert!(!storage.entry_exists(1, -1).unwrap());
+
+    // flags + limbo round-trip through the storage trait
+    assert_eq!(storage.get_storage_state_flags().unwrap(), 0);
+    storage.set_storage_state_flag(StorageStateFlag::NeedsIntegrityCheck).unwrap();
+    assert_eq!(storage.get_storage_state_flags().unwrap(), 0x1);
+    storage.clear_storage_state_flag(StorageStateFlag::NeedsIntegrityCheck).unwrap();
+    assert_eq!(storage.get_storage_state_flags().unwrap(), 0);
+
+    assert!(!storage.has_limbo_state(1).unwrap());
+    storage.set_limbo_state(1).unwrap();
+    assert!(storage.has_limbo_state(1).unwrap());
+    storage.clear_limbo_state(1).unwrap();
+    assert!(!storage.has_limbo_state(1).unwrap());
+}

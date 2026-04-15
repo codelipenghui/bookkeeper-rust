@@ -3,6 +3,24 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use crate::StorageError;
 
+/// Whole-storage state flags persisted alongside ledger metadata.
+/// Matches Java's `LedgerStorage.StorageState` enum. Values are bitmask
+/// positions so multiple flags can be set simultaneously.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u64)]
+pub enum StorageStateFlag {
+    /// Set by the data-integrity pre-boot check when the bookie may have
+    /// lost data. While this flag is set, the data-integrity service will
+    /// keep running full checks until the flag can be cleared.
+    NeedsIntegrityCheck = 0x0000_0001,
+}
+
+impl StorageStateFlag {
+    pub fn bits(self) -> u64 {
+        self as u64
+    }
+}
+
 /// The LedgerStorage trait defines the interface for bookie storage backends.
 #[async_trait]
 pub trait LedgerStorage: Send + Sync {
@@ -116,4 +134,29 @@ pub trait LedgerStorage: Send + Sync {
     /// operation and admin tooling. Returns a sorted Vec of entry IDs.
     /// Matches Java's `Bookie.getListOfEntriesOfLedger()`.
     fn get_entries_of_ledger(&self, ledger_id: i64) -> Result<Vec<i64>, StorageError>;
+
+    /// Check whether `(ledger_id, entry_id)` is present in local storage.
+    /// Returns `false` for `LAST_ADD_CONFIRMED` sentinel (`-1`) — matching
+    /// Java's `SingleDirectoryDbLedgerStorage.entryExists`.
+    fn entry_exists(&self, ledger_id: i64, entry_id: i64) -> Result<bool, StorageError>;
+
+    /// Read the current whole-storage state flag bitmask.
+    fn get_storage_state_flags(&self) -> Result<u64, StorageError>;
+
+    /// Set a single storage-state flag with CAS retries.
+    fn set_storage_state_flag(&self, flag: StorageStateFlag) -> Result<(), StorageError>;
+
+    /// Clear a single storage-state flag with CAS retries.
+    fn clear_storage_state_flag(&self, flag: StorageStateFlag) -> Result<(), StorageError>;
+
+    /// Mark a ledger as in limbo (data-integrity recovery in progress).
+    /// The ledger must already exist.
+    fn set_limbo_state(&self, ledger_id: i64) -> Result<(), StorageError>;
+
+    /// Clear a ledger's limbo state. No-op if the ledger doesn't exist
+    /// or is not in limbo.
+    fn clear_limbo_state(&self, ledger_id: i64) -> Result<(), StorageError>;
+
+    /// Check whether a ledger is currently in limbo.
+    fn has_limbo_state(&self, ledger_id: i64) -> Result<bool, StorageError>;
 }

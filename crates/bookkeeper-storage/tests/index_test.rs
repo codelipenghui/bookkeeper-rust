@@ -130,3 +130,52 @@ fn get_last_entry_in_ledger_does_not_cross_ledger_boundary() {
     let last3 = index.get_last_entry_in_ledger(3).unwrap();
     assert_eq!(last3, None);
 }
+
+// ---------------------------------------------------------------------------
+// Data-integrity primitives (storage state flags + limbo state)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn storage_state_flags_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
+    assert_eq!(index.get_storage_state_flags().unwrap(), 0);
+    assert!(index.set_storage_state_flags(0, 0x1).unwrap());
+    assert_eq!(index.get_storage_state_flags().unwrap(), 0x1);
+    // CAS with stale expected must fail
+    assert!(!index.set_storage_state_flags(0, 0x2).unwrap());
+    assert_eq!(index.get_storage_state_flags().unwrap(), 0x1);
+}
+
+#[test]
+fn storage_flags_key_is_not_a_ledger() {
+    // STORAGE_FLAGS_KEY must not appear in list_all_ledgers.
+    let dir = TempDir::new().unwrap();
+    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
+    assert!(index.set_storage_state_flags(0, 0x1).unwrap());
+    index.set(42, false, Some(b"pw"), None).unwrap();
+    let ledgers = index.list_all_ledgers().unwrap();
+    assert_eq!(ledgers, vec![42]);
+}
+
+#[test]
+fn limbo_state_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
+    index.set(7, false, Some(b"pw"), None).unwrap();
+    assert!(!index.has_limbo(7).unwrap());
+    index.set_limbo(7).unwrap();
+    assert!(index.has_limbo(7).unwrap());
+    index.clear_limbo(7).unwrap();
+    assert!(!index.has_limbo(7).unwrap());
+}
+
+#[test]
+fn limbo_requires_existing_ledger() {
+    let dir = TempDir::new().unwrap();
+    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
+    assert!(index.set_limbo(999).is_err());
+    // clear is a no-op on absent ledgers
+    assert!(index.clear_limbo(999).is_ok());
+    assert!(!index.has_limbo(999).unwrap());
+}
