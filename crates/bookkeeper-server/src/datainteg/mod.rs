@@ -8,3 +8,4 @@
 pub mod check;
 pub mod cookie_validator;
 pub mod entry_copier;
+pub mod service;
