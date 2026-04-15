@@ -220,7 +220,12 @@ impl LedgerManager for ZkLedgerManager {
         version: i32,
     ) -> Result<(), MetadataError> {
         let path = self.ledger_znode_path(ledger_id);
-        self.delete_with_parent_cleanup(&path, Some(version)).await
+        self.delete_with_parent_cleanup(&path, Some(version))
+            .await
+            .map_err(|e| match e {
+                MetadataError::NotFound(_) => MetadataError::NotFound(ledger_id),
+                other => other,
+            })
     }
 
     /// Scan the entire hierarchical ZK tree to find all ledger IDs.

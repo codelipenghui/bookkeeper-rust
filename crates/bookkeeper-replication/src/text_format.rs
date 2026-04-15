@@ -130,12 +130,9 @@ pub fn parse_layout(data: &[u8]) -> Result<LedgerRereplicationLayoutFormat, Stri
 // ---------------------------------------------------------------------------
 
 fn strip_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
-    let prefix = format!("{}: ", field);
-    line.strip_prefix(&prefix).or_else(|| {
-        // Also try without space after colon (shouldn't happen but be safe)
-        let prefix2 = format!("{}:", field);
-        line.strip_prefix(&prefix2).map(|s| s.trim_start())
-    })
+    line.strip_prefix(field)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .map(|rest| rest.trim_start())
 }
 
 fn unquote_string(s: &str) -> Result<String, String> {

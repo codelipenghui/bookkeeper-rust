@@ -198,7 +198,6 @@ impl RequestProcessor {
                     if is_recovery {
                         crate::metrics::BOOKIE_RECOVERY_ADD_ENTRY_FAIL.observe(elapsed);
                     }
-                    crate::metrics::ADD_ENTRY_REJECTED.inc();
                 }
                 resp
             }
@@ -240,7 +239,6 @@ impl RequestProcessor {
                 } else {
                     crate::metrics::BOOKIE_READ_ENTRY_FAIL.observe(elapsed);
                 }
-                let _ = is_fence;
                 resp
             }
             V2Request::WriteLac { ledger_id, lac, master_key, body } => {
@@ -515,7 +513,7 @@ impl RequestProcessor {
         }
     }
 
-    async fn handle_batch_read(&self, flags: u16, ledger_id: i64, start_entry_id: i64, request_id: i64, max_count: i32, max_size: i64) -> V2Response {
+    async fn handle_batch_read(&self, _flags: u16, ledger_id: i64, start_entry_id: i64, request_id: i64, max_count: i32, max_size: i64) -> V2Response {
         // Check readable state
         if !self.state.is_readable() {
             return V2Response::BatchRead {
@@ -527,9 +525,7 @@ impl RequestProcessor {
             };
         }
 
-        // Note: batch_read does not fence — fencing requires master key auth
-        // which our v2 BatchReadEntry codec does not yet include.
-        let _ = flags; // suppress unused warning
+        // batch_read does not fence: V2 BatchReadEntry codec carries no master key.
 
         // Cap max_count using the configured limit (default 10K).
         let capped_count = max_count.clamp(0, self.max_batch_read_count);

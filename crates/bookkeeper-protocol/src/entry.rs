@@ -46,6 +46,17 @@ impl<'a> EntryBuilder<'a> {
     }
 }
 
+/// Zero-copy peek of `(ledger_id, entry_id)` from the 32-byte entry header
+/// prefix. Returns `None` if `entry_data` is shorter than 16 bytes.
+pub fn peek_ids(entry_data: &[u8]) -> Option<(i64, i64)> {
+    if entry_data.len() < 16 {
+        return None;
+    }
+    let ledger_id = i64::from_be_bytes(entry_data[0..8].try_into().unwrap());
+    let entry_id = i64::from_be_bytes(entry_data[8..16].try_into().unwrap());
+    Some((ledger_id, entry_id))
+}
+
 pub fn parse_entry(dm: &DigestManager, data: Bytes) -> Result<Entry, EntryError> {
     let digest_len = dm.digest_type().digest_length();
     let min_len = METADATA_LENGTH + digest_len;

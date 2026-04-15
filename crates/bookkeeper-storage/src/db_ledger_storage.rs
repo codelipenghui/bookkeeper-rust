@@ -132,7 +132,6 @@ struct LedgerMetaCacheEntry {
 }
 
 pub struct DbLedgerStorage {
-    #[allow(dead_code)]
     base_dir: PathBuf,
     write_cache: RwLock<WriteCache>,
     write_cache_being_flushed: RwLock<WriteCache>,

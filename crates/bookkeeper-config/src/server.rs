@@ -135,11 +135,8 @@ pub struct ServerConfig {
     /// Max concurrent connections. 0 = unlimited.
     pub max_connections: usize,
     /// When the server times out sending a response (see
-    /// `waitTimeoutOnResponseBackpressureMs`), either close the channel
-    /// and drop the response (true) or just drop the response (false).
-    /// Matches Java's boolean `closeChannelOnResponseTimeout`. Was
-    /// incorrectly typed as `u64` before: `=true` in a Java-shaped
-    /// config would silently fail to parse and be ignored.
+    /// `waitTimeoutOnResponseBackpressureMs`): close the channel and
+    /// drop the response (true) or just drop the response (false).
     pub close_channel_on_response_timeout: bool,
 
     // Journal (extended)
@@ -341,9 +338,7 @@ pub struct ServerConfig {
     pub read_buffer_size_bytes: i32,
     pub write_buffer_size_bytes: i32,
 
-    // ------------------------------------------------------------------
-    // Missing config options identified in Java compatibility audit
-    // ------------------------------------------------------------------
+    // Java-compatibility options
 
     /// Metadata service URI (alternative to zkServers). e.g. "zk+hierarchical://host:2181/ledgers"
     /// Matches Java's `metadataServiceUri`.

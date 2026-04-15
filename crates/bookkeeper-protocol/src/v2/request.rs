@@ -26,35 +26,30 @@ pub enum V2Request {
 }
 
 impl V2Request {
-    /// For AddEntry: peek at ledgerId from the entry data (first 8 bytes).
     pub fn ledger_id(&self) -> Option<i64> {
         match self {
-            V2Request::AddEntry { entry_data, .. } if entry_data.len() >= 8 => {
-                Some(i64::from_be_bytes(entry_data[0..8].try_into().unwrap()))
+            V2Request::AddEntry { entry_data, .. } => {
+                crate::entry::peek_ids(entry_data).map(|(l, _)| l)
             }
-            V2Request::AddEntry { .. } => None,
-            V2Request::ReadEntry { ledger_id, .. } => Some(*ledger_id),
-            V2Request::WriteLac { ledger_id, .. } => Some(*ledger_id),
-            V2Request::ReadLac { ledger_id, .. } => Some(*ledger_id),
-            V2Request::GetBookieInfo { .. } => None,
-            V2Request::BatchReadEntry { ledger_id, .. } => Some(*ledger_id),
-            V2Request::Auth { .. } => None,
+            V2Request::ReadEntry { ledger_id, .. }
+            | V2Request::WriteLac { ledger_id, .. }
+            | V2Request::ReadLac { ledger_id, .. }
+            | V2Request::BatchReadEntry { ledger_id, .. } => Some(*ledger_id),
+            V2Request::GetBookieInfo { .. } | V2Request::Auth { .. } => None,
         }
     }
 
-    /// For AddEntry: peek at entryId from the entry data (bytes 8..16).
     pub fn entry_id(&self) -> Option<i64> {
         match self {
-            V2Request::AddEntry { entry_data, .. } if entry_data.len() >= 16 => {
-                Some(i64::from_be_bytes(entry_data[8..16].try_into().unwrap()))
+            V2Request::AddEntry { entry_data, .. } => {
+                crate::entry::peek_ids(entry_data).map(|(_, e)| e)
             }
-            V2Request::AddEntry { .. } => None,
             V2Request::ReadEntry { entry_id, .. } => Some(*entry_id),
-            V2Request::WriteLac { .. } => None,
-            V2Request::ReadLac { .. } => None,
-            V2Request::GetBookieInfo { .. } => None,
             V2Request::BatchReadEntry { start_entry_id, .. } => Some(*start_entry_id),
-            V2Request::Auth { .. } => None,
+            V2Request::WriteLac { .. }
+            | V2Request::ReadLac { .. }
+            | V2Request::GetBookieInfo { .. }
+            | V2Request::Auth { .. } => None,
         }
     }
 }

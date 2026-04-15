@@ -82,17 +82,15 @@ impl std::ops::Deref for DigestOutput {
 #[derive(Debug, Clone)]
 pub struct DigestManager {
     digest_type: DigestType,
-    password: Vec<u8>,
-    hmac_key: [u8; 20],  // cached SHA1("mac" + password), only used for HmacSha1
+    hmac_key: [u8; 20],
 }
 
 impl DigestManager {
     pub fn new(digest_type: DigestType) -> Self {
-        Self { digest_type, password: Vec::new(), hmac_key: [0u8; 20] }
+        Self { digest_type, hmac_key: [0u8; 20] }
     }
 
     pub fn with_password(mut self, password: &[u8]) -> Self {
-        self.password = password.to_vec();
         self.hmac_key = gen_digest(b"mac", password);
         self
     }

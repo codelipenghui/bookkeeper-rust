@@ -587,7 +587,6 @@ impl WriteHandle {
         let write_quorum = self.schedule.write_quorum_size();
         let mk = self.master_key;
         let use_deferred_sync = self.deferred_sync;
-        let _use_delay_ensemble_change = self.delay_ensemble_change;
         let lac_value = Arc::clone(&self.lac_value);
         let lac_state = Arc::clone(&self.lac_state);
         let ensemble_info = Arc::clone(&self.ensemble_info);
