@@ -426,4 +426,57 @@ mod tests {
         let journal_cookie = std::fs::read_to_string(journal.join("current/VERSION")).unwrap();
         assert_eq!(Cookie::deserialize(&journal_cookie).unwrap(), stamped);
     }
+
+    #[tokio::test]
+    async fn mismatch_with_stamping_runs_preboot_check() {
+        use crate::datainteg::check::{DataIntegrityCheck, DataIntegrityConfig};
+        use crate::datainteg::entry_copier::EntryCopier;
+        use crate::datainteg::test_helpers::{EmptyLedgerManager, NoopRecovery, StubStorage};
+        use bookkeeper_metadata::traits::LedgerManager;
+        use bookkeeper_storage::ledger_storage::{LedgerStorage, StorageStateFlag};
+
+        let tmp = TempDir::new().unwrap();
+        let journal = tmp.path().join("journal");
+        let ledger = tmp.path().join("ledger");
+        let stale = Cookie::new(
+            "bk1:3181",
+            journal.to_str().unwrap(),
+            &[ledger.to_str().unwrap()],
+            Some("OLD-INSTANCE"),
+            None,
+        );
+        let reg = MockReg::with_cookie("inst-1", stale.serialize().as_bytes(), 1);
+
+        // Build a real DataIntegrityCheck over a stub storage — run_preboot_check
+        // sets `NEEDS_INTEGRITY_CHECK` on the storage, which we can observe.
+        let storage = StubStorage::new(0);
+        let lm: Arc<dyn LedgerManager> = Arc::new(EmptyLedgerManager);
+        let copier = Arc::new(EntryCopier::new(
+            "bk1:3181".to_string(),
+            storage.clone() as Arc<dyn LedgerStorage>,
+        ));
+        let check = Arc::new(DataIntegrityCheck::with_config(
+            "bk1:3181".to_string(),
+            lm,
+            storage.clone() as Arc<dyn LedgerStorage>,
+            copier,
+            Arc::new(NoopRecovery),
+            DataIntegrityConfig { max_inflight: 4, max_entries_inflight: 4 },
+        ));
+
+        let v = DataIntegrityCookieValidator::new(
+            layout(&journal, &ledger),
+            reg,
+            Some(check),
+            true,
+        );
+        v.check_and_stamp().await.unwrap();
+
+        let flags = *storage.flags.lock().unwrap();
+        assert_eq!(
+            flags & StorageStateFlag::NeedsIntegrityCheck.bits(),
+            StorageStateFlag::NeedsIntegrityCheck.bits(),
+            "pre-boot hook must have been invoked (NEEDS_INTEGRITY_CHECK set)"
+        );
+    }
 }
