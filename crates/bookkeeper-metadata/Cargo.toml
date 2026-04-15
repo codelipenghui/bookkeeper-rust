@@ -12,6 +12,7 @@ async-trait = { workspace = true }
 zookeeper-client = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
