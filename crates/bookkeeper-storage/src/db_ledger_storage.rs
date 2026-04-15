@@ -188,6 +188,23 @@ impl DbLedgerStorage {
         Self::open_with_conf(base_dir, ledger_io, None, None)
     }
 
+    /// Read-modify-write the storage-state bitmask with a CAS retry loop.
+    fn update_storage_state_flags(
+        &self,
+        mutate: impl Fn(u64) -> u64,
+    ) -> Result<(), StorageError> {
+        loop {
+            let current = self.ledger_index.get_storage_state_flags()?;
+            let new = mutate(current);
+            if current == new {
+                return Ok(());
+            }
+            if self.ledger_index.set_storage_state_flags(current, new)? {
+                return Ok(());
+            }
+        }
+    }
+
     /// Open the storage, optionally loading rocksdb tuning from the two
     /// Java BK-style INI files. Passing `None` for either falls back to
     /// the embedded defaults (`rocksdb_options::DEFAULT_*_CONF`).
@@ -1483,29 +1500,11 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn set_storage_state_flag(&self, flag: StorageStateFlag) -> Result<(), StorageError> {
-        loop {
-            let current = self.ledger_index.get_storage_state_flags()?;
-            let new = current | flag.bits();
-            if current == new {
-                return Ok(());
-            }
-            if self.ledger_index.set_storage_state_flags(current, new)? {
-                return Ok(());
-            }
-        }
+        self.update_storage_state_flags(|cur| cur | flag.bits())
     }
 
     fn clear_storage_state_flag(&self, flag: StorageStateFlag) -> Result<(), StorageError> {
-        loop {
-            let current = self.ledger_index.get_storage_state_flags()?;
-            let new = current & !flag.bits();
-            if current == new {
-                return Ok(());
-            }
-            if self.ledger_index.set_storage_state_flags(current, new)? {
-                return Ok(());
-            }
-        }
+        self.update_storage_state_flags(|cur| cur & !flag.bits())
     }
 
     fn set_limbo_state(&self, ledger_id: i64) -> Result<(), StorageError> {

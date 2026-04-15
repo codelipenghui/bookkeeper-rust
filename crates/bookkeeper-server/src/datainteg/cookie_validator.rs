@@ -1,7 +1,6 @@
 //! Cookie validation with optional auto-stamp on mismatch.
-//! Port of Java's `DataIntegrityCookieValidation`.
 //!
-//! Usage: the server computes the "master" cookie it would stamp now from
+//! The server computes the "master" cookie it would stamp now from
 //! current config + ZK `instanceId`, then compares it against the ZK cookie
 //! and every local directory's cookie. If anything disagrees AND the
 //! `data_integrity_stamp_missing_cookies` knob is on, the validator

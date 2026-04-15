@@ -1,11 +1,10 @@
 //! Data-integrity orchestration: pre-boot check and full recovery check.
-//! Port of Java's `DataIntegrityCheckImpl`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bookkeeper_metadata::iterator::stream_all_ledgers;
+use bookkeeper_metadata::iterator::{stream_all_ledgers, DEFAULT_MAX_INFLIGHT};
 use bookkeeper_metadata::ledger_metadata::{LedgerMetadata, LedgerState, MetadataError};
 use bookkeeper_metadata::traits::LedgerManager;
 use bookkeeper_metadata::versioned::Versioned;
@@ -18,8 +17,6 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::entry_copier::{write_set_for_entry, Batch, EntryCopier, EntryCopyError};
 
-/// Limits matched to Java's `DataIntegrityCheckImpl`.
-const DEFAULT_MAX_INFLIGHT: usize = 300;
 const DEFAULT_MAX_ENTRIES_INFLIGHT: usize = 3000;
 
 #[derive(Debug, Error)]
@@ -185,13 +182,10 @@ impl DataIntegrityCheck {
         }
 
         self.storage.flush().await?;
+        let count = ledgers.len();
         *self.cached.lock() = Some(ledgers);
         *done = true;
-        tracing::info!(
-            reason,
-            count = self.cached.lock().as_ref().map(|m| m.len()).unwrap_or(0),
-            "data-integrity: pre-boot check complete"
-        );
+        tracing::info!(reason, count, "data-integrity: pre-boot check complete");
         Ok(())
     }
 

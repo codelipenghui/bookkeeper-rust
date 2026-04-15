@@ -1,5 +1,4 @@
 //! Copy entries from peer bookies when a bookie has lost its local copy.
-//! Port of Java's `EntryCopierImpl`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -34,7 +33,7 @@ pub enum EntryCopyError {
         ledger_id: i64,
         entry_id: i64,
         #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: Box<EntryCopyError>,
     },
     #[error("bookie returned non-OK status {0}")]
     BookieError(i32),

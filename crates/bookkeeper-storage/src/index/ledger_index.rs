@@ -7,7 +7,7 @@ use crate::StorageError;
 
 /// Reserved RocksDB key used to store whole-storage state flags.
 /// On-disk compatible with Java's `LedgerMetadataIndex.STORAGE_FLAGS` constant.
-pub(crate) const STORAGE_FLAGS_KEY: i64 = -0xeefd;
+const STORAGE_FLAGS_KEY: i64 = -0xeefd;
 
 /// Ledger metadata stored in the bookie's RocksDB.
 #[derive(Debug, Clone)]
@@ -183,10 +183,11 @@ impl LedgerMetadataIndex {
         self.put_raw(ledger_id, &proto)
     }
 
-    /// Clear a ledger's limbo state.
+    /// Clear a ledger's limbo state. No-op when the ledger is absent or
+    /// already out of limbo (limbo field unset or `Some(false)`).
     pub fn clear_limbo(&self, ledger_id: i64) -> Result<(), StorageError> {
         if let Some(mut proto) = self.get_raw(ledger_id)? {
-            if proto.limbo != Some(false) {
+            if proto.limbo.unwrap_or(false) {
                 proto.limbo = Some(false);
                 self.put_raw(ledger_id, &proto)?;
             }

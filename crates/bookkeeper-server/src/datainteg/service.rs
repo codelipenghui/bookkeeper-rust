@@ -1,10 +1,8 @@
 //! Background task that drives [`DataIntegrityCheck::run_full_check`]
-//! at a fixed interval. Port of Java's `DataIntegrityService`.
-//!
-//! While the `NEEDS_INTEGRITY_CHECK` storage flag is set, the service
-//! invokes the full check on every tick until it completes cleanly.
-//! Transient errors (single-ledger failures) keep the flag set so the
-//! service naturally re-attempts them on the next tick.
+//! at a fixed interval. While the `NEEDS_INTEGRITY_CHECK` storage flag
+//! is set, the service invokes the full check on every tick until it
+//! completes cleanly. Transient errors keep the flag set so the next
+//! tick naturally re-attempts them.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,20 +41,17 @@ async fn run(
     loop {
         select! {
             _ = ticker.tick() => {}
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() {
-                    break;
-                }
-                continue;
-            }
+            _ = shutdown_rx.changed() => break,
         }
-        match check.needs_full_check() {
-            Ok(false) => continue,
-            Ok(true) => {}
+        let should_run = match check.needs_full_check() {
+            Ok(v) => v,
             Err(e) => {
                 tracing::error!(error = ?e, "data-integrity: needs_full_check failed");
                 continue;
             }
+        };
+        if !should_run {
+            continue;
         }
         tracing::info!("data-integrity: running full check");
         if let Err(e) = check.run_full_check().await {
