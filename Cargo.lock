@@ -658,6 +658,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bookkeeper-proto",
+ "futures",
  "prost",
  "testcontainers",
  "thiserror 2.0.18",
