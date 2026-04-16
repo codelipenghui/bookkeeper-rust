@@ -362,3 +362,42 @@ fn unified_put_read_oversized_data_is_silently_dropped() {
     assert_eq!(c.get(1, 0), None, "oversized data must not be cached");
     assert!(c.peek_entry(1, 0).is_none(), "no entry should be indexed");
 }
+
+use std::sync::Arc as StdArc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// I1 regression: while a drain is hammering the write buffer (start_flush
+/// + drain + flip back) a reader looping on `get()` must never see torn
+/// bytes. We encode `ledger_id` + a magic marker in every payload and
+/// check it on every read.
+#[test]
+fn unified_get_holds_ref_across_drain() {
+    let c = StdArc::new(UnifiedCache::new(1024 * 1024, 1024 * 1024));
+
+    // Populate with a recognizable payload.
+    const PAYLOAD: &[u8] = b"\xDE\xAD\xBE\xEF--ledger=42--entry=7--";
+    c.put_write(42, 7, PAYLOAD).unwrap();
+
+    let stop = StdArc::new(std::sync::atomic::AtomicBool::new(false));
+    let c_r = StdArc::clone(&c);
+    let stop_r = StdArc::clone(&stop);
+    let reader = thread::spawn(move || {
+        while !stop_r.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(data) = c_r.get(42, 7) {
+                assert_eq!(&data, PAYLOAD, "torn read detected");
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        // Cycle: flush(active→other), drain (removes entry), put it back, flip again.
+        let g = c.start_flush();
+        c.drain(g, |_l, _e, _d| Ok::<(), std::convert::Infallible>(())).unwrap();
+        c.put_write(42, 7, PAYLOAD).unwrap();
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    reader.join().unwrap();
+}
