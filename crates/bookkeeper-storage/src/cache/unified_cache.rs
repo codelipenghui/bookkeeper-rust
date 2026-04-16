@@ -300,7 +300,7 @@ impl UnifiedCache {
             // Already cached (writer beat us) — fast path, no segment allocation.
             return;
         }
-        let Some((seg_idx, offset)) = self.read_ring_append(l, e, data) else {
+        let Some((seg_idx, offset)) = self.read_ring_append(data) else {
             return; // data too big for a segment — rare; drop.
         };
         let ce = CacheEntry::read(seg_idx, offset as u32, data.len() as u32);
@@ -323,7 +323,8 @@ impl UnifiedCache {
 
     /// Reserve and write bytes into the current read segment, rotating to
     /// the next segment when full. Returns `Some((seg_idx, offset))` where
-    /// bytes landed. Does NOT call `track_entry` — the caller (`put_read`)
+    /// bytes landed, or `None` if the data is too large to fit in any
+    /// segment. Does NOT call `track_entry` — the caller (`put_read`)
     /// is responsible for tracking only after confirming the DashMap insert
     /// actually won the race, so we never track a key that isn't indexed
     /// into this segment.
@@ -333,8 +334,14 @@ impl UnifiedCache {
     /// the segment's offset (invariant I3 — remove-before-reset). Other
     /// threads that race on the CAS spin until they see the new
     /// `current_segment`, then retry the reservation.
-    fn read_ring_append(&self, l: i64, e: i64, data: &[u8]) -> Option<(u8, usize)> {
-        let _ = (l, e); // caller handles tracking after the index insert.
+    fn read_ring_append(&self, data: &[u8]) -> Option<(u8, usize)> {
+        // Guard: refuse oversized data that no segment can hold. Without this,
+        // the rotation CAS loop spins forever because every `reserve` fails.
+        // All segments are the same size — if it doesn't fit in one, it doesn't
+        // fit in any.
+        if align64(data.len()) > self.read_segments[0].max_size() {
+            return None;
+        }
         loop {
             let cur = self.current_segment.load(Ordering::Acquire);
             let seg = &self.read_segments[cur];

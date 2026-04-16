@@ -351,3 +351,14 @@ fn unified_read_ring_rotates_and_evicts_oldest_segment() {
     assert_eq!(c.get(1, 0), None, "oldest segment's entries must be evicted");
     assert_eq!(c.peek_entry(1, 4).unwrap().region(), Region::ReadSegment(0));
 }
+
+#[test]
+fn unified_put_read_oversized_data_is_silently_dropped() {
+    // Read-cache total = 512 bytes → 128 bytes per segment. A 200-byte
+    // payload cannot fit in any segment. `put_read` must silently drop
+    // it without infinite-looping.
+    let c = UnifiedCache::new(1024 * 1024, 512);
+    c.put_read(1, 0, &[0u8; 200]);
+    assert_eq!(c.get(1, 0), None, "oversized data must not be cached");
+    assert!(c.peek_entry(1, 0).is_none(), "no entry should be indexed");
+}
