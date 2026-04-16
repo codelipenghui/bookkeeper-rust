@@ -201,6 +201,56 @@ async fn read_ahead_populates_cache() {
     }
 }
 
+/// Sequential readahead must stop at ledger boundaries. The entry log can
+/// contain interleaved ledgers, and walking past the current ledger's last
+/// entry would populate the cache under the wrong `(ledger_id, entry_id)`
+/// key — corrupting subsequent lookups. Regression guard for the sequential
+/// entry-log-walk readahead (replaces the old RocksDB-per-entry planning).
+#[tokio::test]
+async fn read_ahead_stops_at_ledger_boundary() {
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    // Interleave two ledgers into the same entry log: ledger 1 entries 0..4,
+    // then ledger 2 entries 0..4. No flush between — they land in one log.
+    for i in 0..5i64 {
+        let entry = make_entry(1, i, i.saturating_sub(1), &vec![0xAAu8; 128]);
+        storage.add_entry(&entry).await.unwrap();
+    }
+    for i in 0..5i64 {
+        let entry = make_entry(2, i, i.saturating_sub(1), &vec![0xBBu8; 128]);
+        storage.add_entry(&entry).await.unwrap();
+    }
+    storage.flush().await.unwrap();
+
+    // Reading (ledger=1, entry=0) triggers readahead. After ledger 1's 5
+    // entries, the next frame in the log belongs to ledger 2 — the walk
+    // must detect the mismatch and stop, NOT cache ledger-2 data under
+    // ledger-1's (ledger_id, entry_id) keys.
+    let _ = storage.get_entry(1, 0).await.unwrap();
+
+    // Give readahead a moment to run (and to have stopped cleanly).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Ledger 1 only has entries 0..4. Asking for 5..9 must surface as a
+    // genuine NotFound — if readahead had spilled ledger-2 data into
+    // cache slots (1, 5)..(1, 9), the read cache would short-circuit and
+    // return corrupted data with ledger_id=2 in its header.
+    for i in 5..10i64 {
+        let res = storage.get_entry(1, i).await;
+        assert!(res.is_err(), "entry (1, {i}) should not exist");
+    }
+
+    // Ledger 2 entries are still readable via the regular on-demand path.
+    for i in 0..5i64 {
+        let entry = storage.get_entry(2, i).await.unwrap();
+        let lid = i64::from_be_bytes(entry[0..8].try_into().unwrap());
+        let eid = i64::from_be_bytes(entry[8..16].try_into().unwrap());
+        assert_eq!(lid, 2);
+        assert_eq!(eid, i);
+    }
+}
+
 /// Tests add_entry overflow → implicit flush with the platform engine.
 /// The bench hits this when the write cache fills during iteration.
 #[tokio::test]

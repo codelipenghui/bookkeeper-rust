@@ -141,6 +141,9 @@ const EXPECTED_COUNTER_AND_GAUGE_METRICS: &[&str] = &[
     "bookie_RECLAIMED_COMPACTION_SPACE_BYTES",
     "bookie_ACTIVE_ENTRY_LOG_TOTAL",
     "bookie_ENTRY_LOG_SPACE_BYTES",
+    // io_uring backpressure
+    "bookie_io_uring_sq_full_total",
+    "bookie_io_uring_buf_pool_exhausted_total",
     // Replication metrics
     "replication_auditor_NUM_UNDER_REPLICATED_LEDGERS",
     "replication_replication_worker_NUM_FULL_OR_PARTIAL_LEDGERS_REPLICATED",

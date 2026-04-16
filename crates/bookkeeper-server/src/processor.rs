@@ -9,6 +9,7 @@ use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::v2::request::V2Request;
 use bookkeeper_protocol::v2::response::V2Response;
 use bookkeeper_storage::ledger_storage::LedgerStorage;
+use tracing::warn;
 use crate::state::BookieStateManager;
 
 /// Default concurrency limits matching Java's defaults (0 = unlimited).
@@ -423,7 +424,13 @@ impl RequestProcessor {
                 entry_id,
                 data: Some(data),
             },
-            Err(e) => self.read_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id),
+            Err(e) => {
+                // `storage_error_to_bk` collapses every variant outside the
+                // named ones to `BKError::Io`, which the bookie client sees
+                // as opaque EIO. Log the actual variant so it's diagnosable.
+                warn!(ledger_id, entry_id, error = ?e, "read_entry failed");
+                self.read_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id)
+            }
         }
     }
 
@@ -548,7 +555,17 @@ impl RequestProcessor {
                     }
                     entries.push(data);
                 }
-                Err(_) => break,
+                Err(e) => {
+                    // Distinguish `EntryNotFound` (the normal end-of-batch
+                    // signal — Pulsar over-requests) from real I/O errors.
+                    warn!(
+                        ledger_id, entry_id = eid, request_id,
+                        returned = entries.len(),
+                        error = ?e,
+                        "batch_read entry failed (loop terminates)",
+                    );
+                    break;
+                }
             }
         }
 

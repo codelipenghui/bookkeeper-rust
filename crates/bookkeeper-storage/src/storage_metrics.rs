@@ -136,6 +136,30 @@ lazy_static! {
     )
     .unwrap();
 
+    /// Canary for `try_push_with_backpressure`. Increments only when all
+    /// retry attempts (drain CQEs + retry) fail to free an SQ slot — i.e.,
+    /// the kernel's submission queue stayed full across multiple
+    /// submit-and-drain cycles. Should be 0 in normal operation. A sustained
+    /// non-zero rate points at the helper or the kernel scheduling, not at
+    /// `LEDGER_SQ_DEPTH` sizing — the original "raise the constant" response
+    /// is no longer correct after the backpressure refactor.
+    pub static ref IO_URING_SQ_FULL_TOTAL: IntCounter = IntCounter::new(
+        "bookie_io_uring_sq_full_total",
+        "io_uring SQ-full failures after backpressure retries (canary; should be 0)",
+    )
+    .unwrap();
+
+    /// Canary for the `in_flight_pool` gate in `ledger_ring_loop`. With the
+    /// gate, PoolReads are never pushed beyond the pool's capacity, so the
+    /// kernel should never return `-ENOBUFS`. A non-zero value indicates the
+    /// gate's counter is out of sync with the kernel's actual buffer state —
+    /// suspect the counter accounting, not the pool size.
+    pub static ref IO_URING_BUF_POOL_EXHAUSTED_TOTAL: IntCounter = IntCounter::new(
+        "bookie_io_uring_buf_pool_exhausted_total",
+        "io_uring buffer-pool ENOBUFS (canary; should be 0 — investigate gating logic)",
+    )
+    .unwrap();
+
     // -----------------------------------------------------------------------
     // Flush lock contention metrics (Rust-specific, not in Java)
     // -----------------------------------------------------------------------
@@ -278,6 +302,8 @@ pub fn register_storage_metrics(registry: &prometheus::Registry) {
     reg!(READ_ENTRYLOG_TIME);
     reg!(THROTTLED_WRITE_REQUESTS);
     reg!(REJECTED_WRITE_REQUESTS);
+    reg!(IO_URING_SQ_FULL_TOTAL);
+    reg!(IO_URING_BUF_POOL_EXHAUSTED_TOTAL);
     // Flush lock contention
     reg!(FLUSH_CACHE_SWAP);
     reg!(ADD_ENTRY_BLOCKED_BY_FLUSH);

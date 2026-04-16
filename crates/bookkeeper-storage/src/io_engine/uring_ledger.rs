@@ -18,15 +18,95 @@ use tokio::sync::oneshot;
 
 use super::fd_cache::FdCache;
 use super::LedgerIo;
+use crate::storage_metrics;
 
-const LEDGER_SQ_DEPTH: u32 = 256;
-const CHANNEL_BOUND: usize = 256;
+// SQ depth and request-channel bound must be large enough to absorb the
+// concurrent reads from Pulsar's catch-up workload (primary request + a
+// spawned readahead task per cache miss, each potentially in flight at
+// once). 4096 is well under the kernel's IORING_MAX_ENTRIES and costs
+// only ~256 KB of pinned ring memory per ring.
+const LEDGER_SQ_DEPTH: u32 = 4096;
+const CHANNEL_BOUND: usize = 4096;
 const FD_CACHE_CAPACITY: usize = 256;
+
+/// Returns an "SQ full" `io::Error` and increments the corresponding
+/// metric so operators can see when the ledger ring's submission queue
+/// is saturating *after* backpressure attempts. All call sites funnel
+/// through here so the counter is authoritative.
+fn sq_full_error() -> io::Error {
+    storage_metrics::IO_URING_SQ_FULL_TOTAL.inc();
+    io::Error::new(io::ErrorKind::Other, "SQ full")
+}
+
+/// Push an SQE into the ring with cooperative backpressure.
+///
+/// Fast path: a direct `submission().push()` succeeds (SQ not full) and
+/// returns immediately. Slow path: on `Err` (user-space SQ full because we
+/// have `LEDGER_SQ_DEPTH` unsubmitted SQEs queued), call `submit()` to hand
+/// the queued SQEs over to the kernel — this empties the user-space SQ —
+/// then drain any CQEs that are already ready into `results` so the
+/// dispatch loop downstream sees them as completed. Retry the push.
+///
+/// The drain-into-results step matters because it lets us complete
+/// in-flight ops *during* the push loop, which keeps the kernel-side
+/// CQ from filling up under sustained pressure.
+///
+/// Bounded retries (4) followed by a `submit_and_wait(1)` give the kernel
+/// time to release a slot. After all attempts fail, falls back to the
+/// previous behavior (returns an `SQ full` error and increments the
+/// counter) so the caller can surface it as before.
+fn try_push_with_backpressure(
+    ring: &mut IoUring,
+    sqe: &io_uring::squeue::Entry,
+    results: &mut [Option<(i32, u32)>],
+) -> io::Result<()> {
+    // Fast path
+    if unsafe { ring.submission().push(sqe) }.is_ok() {
+        return Ok(());
+    }
+    for attempt in 0..4 {
+        // Hand queued SQEs to kernel; this empties the user-space SQ.
+        ring.submit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("submit: {e}")))?;
+        // Opportunistically drain ready CQEs so subsequent pushes don't
+        // accumulate them beyond the CQ's capacity.
+        for cqe in ring.completion() {
+            let idx = cqe.user_data() as usize;
+            if idx < results.len() {
+                results[idx] = Some((cqe.result(), cqe.flags()));
+            }
+        }
+        if unsafe { ring.submission().push(sqe) }.is_ok() {
+            return Ok(());
+        }
+        // Still full — wait for at least one CQE before the next attempt.
+        // Skip on first iter (we just submitted, kernel may not have produced
+        // CQEs yet but the SQ should be free; only block if the second push
+        // also fails).
+        if attempt > 0 {
+            ring.submit_and_wait(1).map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("submit_and_wait: {e}"))
+            })?;
+            for cqe in ring.completion() {
+                let idx = cqe.user_data() as usize;
+                if idx < results.len() {
+                    results[idx] = Some((cqe.result(), cqe.flags()));
+                }
+            }
+        }
+    }
+    Err(sq_full_error())
+}
 
 /// Size of each buffer in the provided buffer pool (64 KB).
 const BUF_POOL_SIZE: usize = 64 * 1024;
-/// Number of buffers in the pool (256 buffers = 16 MB total).
-const BUF_POOL_COUNT: u16 = 256;
+/// Number of buffers in the pool. Sized to match `LEDGER_SQ_DEPTH` so the
+/// pool can absorb the same peak in-flight read count the SQ allows. With
+/// 64 KB buffers and 4096 slots the pool reserves ~256 MB up front — under
+/// catch-up workloads the alternative was per-PoolRead `ENOBUFS` errors
+/// surfacing to Pulsar as EIO + 15 s subscription retries (see the
+/// `bookie_io_uring_buf_pool_exhausted_total` counter).
+const BUF_POOL_COUNT: u16 = 4096;
 /// Buffer group ID registered with the kernel.
 const BUF_GROUP_ID: u16 = 0;
 /// CQE flag indicating a provided buffer was consumed (IORING_CQE_F_BUFFER).
@@ -240,6 +320,10 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
         tracing::debug!("ledger-io: provided buffer pool unavailable, using per-read alloc");
     }
 
+    // Reused across batches to avoid the per-iter alloc + zero of a
+    // CHANNEL_BOUND-sized buffer (64 KB at LEDGER_SQ_DEPTH=4096).
+    let mut results: Vec<Option<(i32, u32)>> = Vec::new();
+
     loop {
         // ---- 1. Block on the first request ----
         let first = match rx.recv() {
@@ -265,6 +349,19 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
         // so they are handled inline and never added here.
         let mut pending: Vec<PendingOp> = Vec::with_capacity(batch.len());
         let mut num_sqes: usize = 0;
+        // Reset the hoisted results buffer to all-None for this batch's slots
+        // (sqe_idx never exceeds pending.len() ≤ batch.len()).
+        results.clear();
+        results.resize(batch.len(), None);
+        // Tracks PoolRead SQEs pushed in this batch. The kernel-side
+        // provided-buffer pool can hand out at most `BUF_POOL_COUNT` buffers
+        // before returning `-ENOBUFS`; cap our submissions at that to gate
+        // the pool path and fall back to a per-read `Vec<u8>` allocation
+        // when the pool would be over-subscribed. Buffers are returned to
+        // the pool by the dispatch loop below (`pool.return_buf`), so a
+        // fresh batch always starts with a full pool — resetting the
+        // counter here is correct.
+        let mut in_flight_pool: usize = 0;
 
         for request in batch {
             match request {
@@ -292,7 +389,9 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                         }
                     };
 
-                    let use_pool = buf_pool.is_some() && len <= BUF_POOL_SIZE;
+                    let use_pool = buf_pool.is_some()
+                        && len <= BUF_POOL_SIZE
+                        && in_flight_pool < BUF_POOL_COUNT as usize;
                     let sqe_idx = pending.len() as u64;
 
                     if use_pool {
@@ -300,21 +399,24 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                             fixed_fds_available, fd, fixed_index,
                             len as u32, offset, BUF_GROUP_ID, sqe_idx,
                         );
-                        let pushed = unsafe { ring.submission().push(&read_sqe) };
-                        if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "SQ full")));
+                        if let Err(e) = try_push_with_backpressure(
+                            &mut ring, &read_sqe, &mut results,
+                        ) {
+                            let _ = reply.send(Err(e));
                             continue;
                         }
                         pending.push(PendingOp::PoolRead { len, reply });
+                        in_flight_pool += 1;
                     } else {
                         let mut buf = vec![0u8; len];
                         let read_sqe = build_read_sqe(
                             fixed_fds_available, fd, fixed_index,
                             buf.as_mut_ptr(), len as u32, offset, sqe_idx,
                         );
-                        let pushed = unsafe { ring.submission().push(&read_sqe) };
-                        if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "SQ full")));
+                        if let Err(e) = try_push_with_backpressure(
+                            &mut ring, &read_sqe, &mut results,
+                        ) {
+                            let _ = reply.send(Err(e));
                             continue;
                         }
                         pending.push(PendingOp::Read { buf, len, reply });
@@ -377,7 +479,9 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     }
 
                     let data_offset = offset + 4;
-                    let use_pool = buf_pool.is_some() && size <= BUF_POOL_SIZE;
+                    let use_pool = buf_pool.is_some()
+                        && size <= BUF_POOL_SIZE
+                        && in_flight_pool < BUF_POOL_COUNT as usize;
                     let sqe_idx = pending.len() as u64;
 
                     if use_pool {
@@ -385,21 +489,24 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                             fixed_fds_available, fd, fixed_index,
                             size as u32, data_offset, BUF_GROUP_ID, sqe_idx,
                         );
-                        let pushed = unsafe { ring.submission().push(&read_sqe) };
-                        if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "SQ full")));
+                        if let Err(e) = try_push_with_backpressure(
+                            &mut ring, &read_sqe, &mut results,
+                        ) {
+                            let _ = reply.send(Err(e));
                             continue;
                         }
                         pending.push(PendingOp::PoolRead { len: size, reply });
+                        in_flight_pool += 1;
                     } else {
                         let mut buf = vec![0u8; size];
                         let read_sqe = build_read_sqe(
                             fixed_fds_available, fd, fixed_index,
                             buf.as_mut_ptr(), size as u32, data_offset, sqe_idx,
                         );
-                        let pushed = unsafe { ring.submission().push(&read_sqe) };
-                        if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "SQ full")));
+                        if let Err(e) = try_push_with_backpressure(
+                            &mut ring, &read_sqe, &mut results,
+                        ) {
+                            let _ = reply.send(Err(e));
                             continue;
                         }
                         pending.push(PendingOp::Read { buf, len: size, reply });
@@ -433,12 +540,10 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                         .build()
                         .user_data(sqe_idx);
 
-                        let pushed = unsafe { ring.submission().push(&write_sqe) };
-                        if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "SQ full",
-                            )));
+                        if let Err(e) = try_push_with_backpressure(
+                            &mut ring, &write_sqe, &mut results,
+                        ) {
+                            let _ = reply.send(Err(e));
                             continue;
                         }
 
@@ -471,12 +576,10 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                         .build()
                         .user_data(sqe_idx);
 
-                        let pushed = unsafe { ring.submission().push(&write_sqe) };
-                        if pushed.is_err() {
-                            let _ = reply.send(Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "SQ full",
-                            )));
+                        if let Err(e) = try_push_with_backpressure(
+                            &mut ring, &write_sqe, &mut results,
+                        ) {
+                            let _ = reply.send(Err(e));
                             continue;
                         }
 
@@ -509,32 +612,44 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
             continue;
         }
 
-        // ---- 4. Submit and wait for all I/O SQEs ----
-        if let Err(e) = ring.submit_and_wait(num_sqes) {
-            // Fatal ring error — notify all pending callers.
-            let err_msg = e.to_string();
-            let err_kind = e.kind();
-            for op in pending {
-                match op {
-                    PendingOp::Read { reply, .. } => {
-                        let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
-                    }
-                    PendingOp::PoolRead { reply, .. } => {
-                        let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
-                    }
-                    PendingOp::Write { reply, .. } => {
-                        let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
+        // ---- 4. Submit and wait for the remaining un-completed SQEs ----
+        // `try_push_with_backpressure` may have already populated some slots
+        // in `results` while making room during the push loop. Wait only for
+        // what's still in flight, otherwise `submit_and_wait` would block on
+        // CQEs that have already arrived and been consumed.
+        let still_in_flight = results[..pending.len()]
+            .iter()
+            .filter(|r| r.is_none())
+            .count();
+        if still_in_flight > 0 {
+            if let Err(e) = ring.submit_and_wait(still_in_flight) {
+                // Fatal ring error — notify all pending callers.
+                let err_msg = e.to_string();
+                let err_kind = e.kind();
+                for op in pending {
+                    match op {
+                        PendingOp::Read { reply, .. } => {
+                            let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
+                        }
+                        PendingOp::PoolRead { reply, .. } => {
+                            let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
+                        }
+                        PendingOp::Write { reply, .. } => {
+                            let _ = reply.send(Err(io::Error::new(err_kind, err_msg.clone())));
+                        }
                     }
                 }
+                continue;
             }
-            continue;
         }
 
         // ---- 5. Collect CQE results keyed by user_data ----
         // Unpin fds now that all SQEs have completed — safe to evict again.
         fd_cache.unpin_all();
 
-        let mut results: Vec<Option<(i32, u32)>> = vec![None; pending.len()];
+        // Drain any CQEs that arrived during the wait into the same `results`
+        // buffer the push loop wrote into. Slots already populated inline by
+        // `try_push_with_backpressure` are left as-is.
         for cqe in ring.completion() {
             let idx = cqe.user_data() as usize;
             if idx < results.len() {
@@ -564,9 +679,13 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                 PendingOp::PoolRead { len, reply } => {
                     let has_buffer = cqe_flags & CQE_F_BUFFER != 0;
                     let result = if ret == -(libc::ENOBUFS as i32) {
-                        // Pool exhausted — not a real I/O error. Return a
-                        // transient error so the caller can retry. The pool
-                        // refills as other in-flight reads complete.
+                        // Pool exhausted — not a real I/O error, but we still
+                        // surface it to the caller (which currently has no
+                        // retry logic and bubbles it up to the bookie client
+                        // as EIO + a 15-second managed-ledger backoff on
+                        // Pulsar). Increment the counter so operators can
+                        // see when BUF_POOL_COUNT needs raising.
+                        storage_metrics::IO_URING_BUF_POOL_EXHAUSTED_TOTAL.inc();
                         Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
                             "provided buffer pool exhausted",

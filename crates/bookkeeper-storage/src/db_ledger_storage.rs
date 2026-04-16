@@ -1001,53 +1001,70 @@ impl LedgerStorage for DbLedgerStorage {
 
             self.read_cache.put(ledger_id, entry_id, &data);
 
-            // Read-ahead: collect index locations synchronously (fast RocksDB
-            // point reads), then spawn the entry log I/O as a background task
-            // so the caller gets their entry immediately.
-            // Matches Java's DbLedgerStorage readAheadCacheBatchSize behavior.
-            let mut ahead_locs: Vec<(i64, u64)> = Vec::new();
-            let mut ahead_bytes = data.len();
+            // Read-ahead: walk the entry log sequentially from the entry we
+            // just read. Entries from the same ledger are written contiguously
+            // in the entry log, so the next entry's size prefix starts at
+            // `current_data_pos + current_data_len` — we don't need to ask
+            // RocksDB for each successor's location. This matches Java
+            // DbLedgerStorage's fillReadAheadCache and keeps the per-miss
+            // cost at ~0 RocksDB gets (was up to `batch_size` on the caller
+            // thread, which saturated Tokio workers under load).
+            //
+            // Bounds: stop at batch count, byte budget, read error (EOF /
+            // different log file), or ledger boundary.
             let ra_batch = self.storage_config.read_ahead_batch_size;
             let ra_max_bytes = self.storage_config.read_ahead_max_bytes;
-            for ahead_eid in (entry_id + 1)..(entry_id + 1 + ra_batch as i64) {
-                if ahead_bytes >= ra_max_bytes {
-                    break;
-                }
-                if self.read_cache.get(ledger_id, ahead_eid).is_some() {
-                    continue;
-                }
-                match self.entry_location_index.get(ledger_id, ahead_eid) {
-                    Ok(Some(loc)) => {
-                        ahead_locs.push((ahead_eid, loc));
-                        // Estimate ~4KB per entry for the byte budget
-                        ahead_bytes += 4096;
-                    }
-                    _ => break,
-                }
-            }
 
-            if !ahead_locs.is_empty() {
+            if ra_batch > 0 && data.len() < ra_max_bytes {
                 let cache = Arc::clone(&self.read_cache);
                 let io = Arc::clone(&self.ledger_io);
                 let dir = self.entry_log_dir.clone();
+                let loc = EntryLocation::from_u64(location);
+                let log_id = loc.log_id();
+                // `loc.position()` points to the start of the current entry's
+                // data (the 4-byte size prefix is at `position - 4`). The next
+                // entry's frame therefore starts at `position + data.len()`.
+                let mut next_size_offset = loc.position() as u64 + data.len() as u64;
+                let first_data_len = data.len();
+
                 tokio::spawn(async move {
-                    let mut total = 0usize;
-                    for (eid, loc_u64) in ahead_locs {
-                        if total >= ra_max_bytes {
-                            break;
-                        }
-                        let loc = EntryLocation::from_u64(loc_u64);
-                        let pos = loc.position() as u64;
-                        if pos < 4 {
-                            break;
-                        }
-                        match io.read_framed_entry(&dir, loc.log_id(), pos - 4, MAX_ENTRY_SIZE).await {
-                            Ok(ahead_data) => {
-                                total += ahead_data.len();
-                                cache.put(ledger_id, eid, &ahead_data);
-                            }
+                    let mut total = first_data_len;
+                    let mut count: usize = 0;
+                    while count < ra_batch && total < ra_max_bytes {
+                        let ahead_data = match io
+                            .read_framed_entry(&dir, log_id, next_size_offset, MAX_ENTRY_SIZE)
+                            .await
+                        {
+                            Ok(d) => d,
+                            // EOF, crossing into the next log file, or any
+                            // other read error — stop readahead cleanly.
                             Err(_) => break,
+                        };
+
+                        // Stop at ledger boundary — prefetching another
+                        // ledger's entries would just evict useful data.
+                        if ahead_data.len() < 16 {
+                            break;
                         }
+                        let ahead_ledger =
+                            i64::from_be_bytes(ahead_data[0..8].try_into().unwrap());
+                        if ahead_ledger != ledger_id {
+                            break;
+                        }
+                        let ahead_eid =
+                            i64::from_be_bytes(ahead_data[8..16].try_into().unwrap());
+
+                        // Skip re-populating entries already cached (e.g.
+                        // from an earlier readahead not yet evicted).
+                        if cache.get(ledger_id, ahead_eid).is_none() {
+                            cache.put(ledger_id, ahead_eid, &ahead_data);
+                        }
+
+                        count += 1;
+                        total += ahead_data.len();
+                        // Next frame begins right after this entry's
+                        // [4-byte size prefix][ahead_data.len() bytes].
+                        next_size_offset += 4 + ahead_data.len() as u64;
                     }
                 });
             }
