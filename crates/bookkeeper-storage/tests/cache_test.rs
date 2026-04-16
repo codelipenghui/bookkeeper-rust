@@ -183,3 +183,30 @@ fn write_buffer_reset_clears_offset_and_entries() {
     assert_eq!(buf.current_offset(), 0);
     assert!(buf.take_entries().is_empty());
 }
+
+use bookkeeper_storage::StorageError;
+
+#[test]
+fn unified_last_entry_tracks_max_per_ledger() {
+    let c = tiny_cache();
+    c.put_write(1, 0, b"a").unwrap();
+    c.put_write(1, 5, b"b").unwrap();
+    c.put_write(1, 3, b"c").unwrap();
+    c.put_write(2, 0, b"d").unwrap();
+    assert_eq!(c.last_entry_id(1), Some(5));
+    assert_eq!(c.last_entry_id(2), Some(0));
+    assert_eq!(c.last_entry_id(99), None);
+}
+
+#[test]
+fn unified_put_write_returns_storage_full_when_buffer_full() {
+    // 256-byte write buffers. 64-byte alignment → 4 entries fit.
+    let c = UnifiedCache::new(256, 1024 * 1024);
+    for i in 0..4i64 {
+        c.put_write(1, i, b"x").unwrap_or_else(|e| panic!("entry {i}: {e:?}"));
+    }
+    match c.put_write(1, 4, b"x") {
+        Err(StorageError::StorageFull) => {}
+        other => panic!("expected StorageFull, got {other:?}"),
+    }
+}

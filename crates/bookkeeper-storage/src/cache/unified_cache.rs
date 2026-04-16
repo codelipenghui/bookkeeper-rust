@@ -256,4 +256,8 @@ impl UnifiedCache {
     pub fn peek_entry(&self, l: i64, e: i64) -> Option<CacheEntry> {
         self.index.get(&(l, e)).map(|r| *r.value())
     }
+
+    pub fn last_entry_id(&self, ledger_id: i64) -> Option<i64> {
+        self.last_entry.get(&ledger_id).map(|v| *v.value())
+    }
 }
