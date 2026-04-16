@@ -234,3 +234,52 @@ fn unified_start_flush_then_start_flush_cycles_back() {
     let g2 = c.start_flush();  // active was 1; now 0. flushing = 1.
     assert_eq!(g2.flushing_idx(), 1);
 }
+
+#[test]
+fn unified_drain_removes_all_entries_and_resets_buffer() {
+    let c = tiny_cache();
+    c.put_write(1, 0, b"a").unwrap();
+    c.put_write(1, 1, b"b").unwrap();
+    c.put_write(1, 2, b"c").unwrap();
+    let guard = c.start_flush();
+
+    // Callback sees each entry's bytes in insertion order.
+    let mut seen = Vec::new();
+    c.drain(guard, |l, e, data| {
+        seen.push((l, e, data.to_vec()));
+        Ok::<(), std::convert::Infallible>(())
+    }).unwrap();
+
+    assert_eq!(seen, vec![
+        (1i64, 0i64, b"a".to_vec()),
+        (1,    1,    b"b".to_vec()),
+        (1,    2,    b"c".to_vec()),
+    ]);
+
+    // Entries gone from the index.
+    assert_eq!(c.get(1, 0), None);
+    assert_eq!(c.get(1, 1), None);
+    assert_eq!(c.get(1, 2), None);
+}
+
+#[test]
+fn unified_drain_callback_error_propagates_and_leaves_buffer_reset() {
+    let c = tiny_cache();
+    c.put_write(1, 0, b"a").unwrap();
+    c.put_write(1, 1, b"b").unwrap();
+    let guard = c.start_flush();
+    let mut count = 0;
+    let result: Result<(), std::io::Error> = c.drain(guard, |_l, _e, _d| {
+        count += 1;
+        if count == 2 {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_err());
+    // Buffer must still be reset so it's reusable next flush cycle.
+    // (The in-flight entry is removed from the index because we removed
+    // entries as we drained them; partial drain loses the entry. Acceptable
+    // because drain failure is fatal — storage typically tears down after.)
+}

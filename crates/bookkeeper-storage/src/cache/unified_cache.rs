@@ -289,4 +289,40 @@ impl UnifiedCache {
         self.active_write.store(old ^ 1, Ordering::Release);
         FlushGuard { flushing_idx: old }
     }
+
+    /// Walks the flushing buffer, invokes `f` with each entry's bytes, and
+    /// removes the entry from the unified index **before** resetting the
+    /// buffer's offset (invariant I3).
+    ///
+    /// The caller (flush worker) typically writes the bytes to the entry
+    /// log + RocksDB inside `f`. If `f` returns `Err`, drain stops and
+    /// returns that error; the buffer is still reset (it's unusable for
+    /// correct reads anyway because the interrupted entry was already
+    /// removed from the index before `f` ran).
+    pub fn drain<F, E>(&self, guard: FlushGuard, mut f: F) -> Result<(), E>
+    where
+        F: FnMut(i64, i64, &[u8]) -> Result<(), E>,
+    {
+        let buf = &self.write_bufs[guard.flushing_idx as usize];
+        let entries = buf.take_entries();
+        let mut result = Ok(());
+        for (l, e) in entries {
+            // Look up location *before* removing from index.
+            let ce = match self.index.get(&(l, e)) {
+                Some(r) => *r.value(),
+                None => continue, // entry was overwritten in a later put_write
+            };
+            let data = unsafe {
+                buf.read_at(ce.offset as usize, ce.size as usize)
+            };
+            // I3: remove BEFORE resetting the buffer's offset.
+            self.index.remove(&(l, e));
+            if let Err(err) = f(l, e, &data) {
+                result = Err(err);
+                break;
+            }
+        }
+        buf.reset();
+        result
+    }
 }
