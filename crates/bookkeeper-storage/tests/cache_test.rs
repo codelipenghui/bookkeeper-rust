@@ -90,3 +90,30 @@ fn read_cache_eviction() {
     // Recent entries should still be found
     assert!(cache.get(1, 11).is_some());
 }
+
+use bookkeeper_storage::cache::unified_cache::{CacheEntry, Region};
+
+#[test]
+fn cache_entry_round_trip_all_regions() {
+    // 2 write buffers
+    for i in 0..2u8 {
+        let ce = CacheEntry::write(i, 123, 456);
+        assert_eq!(ce.region(), Region::Write(i));
+        assert_eq!(ce.offset, 123);
+        assert_eq!(ce.size, 456);
+    }
+    // 4 read segments
+    for i in 0..4u8 {
+        let ce = CacheEntry::read(i, 789, 1011);
+        assert_eq!(ce.region(), Region::ReadSegment(i));
+        assert_eq!(ce.offset, 789);
+        assert_eq!(ce.size, 1011);
+    }
+}
+
+#[test]
+fn cache_entry_size_is_compact() {
+    // region_tag: u8, offset: u32, size: u32 = 9 bytes (+ padding to 12).
+    // Still smaller than the current (usize, usize) = 16 bytes on 64-bit.
+    assert!(std::mem::size_of::<CacheEntry>() <= 12);
+}
