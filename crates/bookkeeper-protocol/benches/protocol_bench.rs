@@ -1,6 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use bytes::Bytes;
 use bookkeeper_protocol::digest::{DigestManager, DigestType, generate_master_key};
 use bookkeeper_protocol::entry::{EntryBuilder, parse_entry};
 use bookkeeper_protocol::framing::BookieCodec;

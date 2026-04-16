@@ -931,7 +931,6 @@ mod quarantine_tests {
                 assert_eq!(needed, 3);
                 assert_eq!(available, 2, "only 2 bookies should be available after quarantine");
             }
-            Err(other) => panic!("expected NotEnoughBookies, got {other:?}"),
         }
     }
 

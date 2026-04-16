@@ -203,7 +203,7 @@ async fn open_ledger_rejects_wrong_digest_type() {
     let mut bk = ZkBookKeeper::new(&connect, root).await.unwrap();
 
     let password = b"pwd";
-    let (mut wh, _conns) = bk
+    let (wh, _conns) = bk
         .create_ledger(1, 1, 1, DigestType::Crc32c, password)
         .await
         .unwrap();

@@ -1,7 +1,7 @@
 //! Standard blocking I/O engine backed by `std::fs` / `std::io`.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 

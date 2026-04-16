@@ -769,8 +769,6 @@ async fn sticky_reads_use_single_bookie() {
 
 #[tokio::test]
 async fn explicit_lac_flush_timer_sends_write_lac() {
-    use bookkeeper_client::write_handle::ExplicitLacFlushHandle;
-
     let dir = TempDir::new().unwrap();
     let server = BookieServer::start(test_config(&dir)).await.unwrap();
     let addr = server.local_addr();
