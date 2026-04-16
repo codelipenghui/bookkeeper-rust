@@ -117,3 +117,42 @@ fn cache_entry_size_is_compact() {
     // Still smaller than the current (usize, usize) = 16 bytes on 64-bit.
     assert!(std::mem::size_of::<CacheEntry>() <= 12);
 }
+
+use bookkeeper_storage::cache::unified_cache::WriteBuffer;
+
+#[test]
+fn write_buffer_bump_alloc_returns_disjoint_offsets() {
+    let buf = WriteBuffer::new(1024);
+    let off1 = buf.reserve(100).expect("fits");
+    let off2 = buf.reserve(100).expect("fits");
+    assert_ne!(off1, off2);
+    assert!(off2 >= off1 + 100);
+}
+
+#[test]
+fn write_buffer_reserve_rejects_when_full() {
+    let buf = WriteBuffer::new(256); // 4 × 64B after align64
+    for i in 0..4 {
+        buf.reserve(1).unwrap_or_else(|_| panic!("entry {i} should fit"));
+    }
+    assert!(buf.reserve(1).is_err(), "5th 64B-aligned entry must not fit");
+}
+
+#[test]
+fn write_buffer_write_then_read_back() {
+    let buf = WriteBuffer::new(1024);
+    let off = buf.reserve(5).unwrap();
+    unsafe { buf.write_at(off, b"hello"); }
+    assert_eq!(unsafe { buf.read_at(off, 5) }, b"hello".to_vec());
+}
+
+#[test]
+fn write_buffer_reset_clears_offset_and_entries() {
+    let buf = WriteBuffer::new(1024);
+    let off = buf.reserve(10).unwrap();
+    unsafe { buf.write_at(off, b"0123456789"); }
+    buf.track_entry(1, 0);
+    buf.reset();
+    assert_eq!(buf.current_offset(), 0);
+    assert!(buf.take_entries().is_empty());
+}

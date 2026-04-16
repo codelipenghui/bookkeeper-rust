@@ -53,3 +53,99 @@ impl CacheEntry {
         }
     }
 }
+
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use parking_lot::Mutex;
+
+const ALIGNMENT: usize = 64;
+fn align64(n: usize) -> usize { (n + ALIGNMENT - 1) & !(ALIGNMENT - 1) }
+
+/// Fixed-capacity append-only buffer. The backing `Vec<u8>` is allocated
+/// once and never moves. `offset` is a bump-allocator head; `entries`
+/// tracks (ledger, entry) pairs stored here so drain/rotation can
+/// enumerate them without scanning the unified index.
+pub struct WriteBuffer {
+    data: UnsafeCell<Vec<u8>>,
+    offset: AtomicUsize,
+    max_size: usize,
+    entries: Mutex<Vec<(i64, i64)>>,
+}
+
+// SAFETY: concurrent appends use disjoint offsets (`fetch_add`-reserved);
+// reads against already-written regions are safe under the invariant that
+// no writer overwrites a region until the unified index's entry has been
+// removed (I3) — see design spec.
+unsafe impl Send for WriteBuffer {}
+unsafe impl Sync for WriteBuffer {}
+
+impl WriteBuffer {
+    pub fn new(max_size: usize) -> Self {
+        let aligned = align64(max_size);
+        Self {
+            data: UnsafeCell::new(vec![0u8; aligned]),
+            offset: AtomicUsize::new(0),
+            max_size: aligned,
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Reserve a 64-byte-aligned range. CAS loop to avoid the `fetch_add`/
+    /// `fetch_sub` race where two concurrent overflows would otherwise
+    /// corrupt the offset counter.
+    pub fn reserve(&self, len: usize) -> Result<usize, ()> {
+        let aligned = align64(len);
+        if aligned > self.max_size { return Err(()); }
+        loop {
+            let cur = self.offset.load(Ordering::SeqCst);
+            if cur + aligned > self.max_size { return Err(()); }
+            if self.offset.compare_exchange(
+                cur, cur + aligned, Ordering::SeqCst, Ordering::SeqCst,
+            ).is_ok() {
+                return Ok(cur);
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must hold a reserved range `[offset, offset + data.len())`
+    /// obtained from `reserve()` and not have written there yet.
+    pub unsafe fn write_at(&self, offset: usize, data: &[u8]) {
+        let buf = &mut *self.data.get();
+        buf[offset..offset + data.len()].copy_from_slice(data);
+    }
+
+    /// # Safety
+    /// Caller must hold the `DashMap::Ref` that points to this offset
+    /// (invariant I1) so no concurrent `reset()` can start.
+    pub unsafe fn read_at(&self, offset: usize, size: usize) -> Vec<u8> {
+        let buf = &*self.data.get();
+        buf[offset..offset + size].to_vec()
+    }
+
+    pub fn track_entry(&self, ledger_id: i64, entry_id: i64) {
+        self.entries.lock().push((ledger_id, entry_id));
+    }
+
+    pub fn take_entries(&self) -> Vec<(i64, i64)> {
+        std::mem::take(&mut *self.entries.lock())
+    }
+
+    pub fn current_offset(&self) -> usize {
+        self.offset.load(Ordering::SeqCst)
+    }
+
+    pub fn max_size(&self) -> usize { self.max_size }
+
+    /// Resets the offset to 0 — the buffer is now reusable. Entries in
+    /// the unified index pointing here MUST have been removed before this
+    /// call (I3).
+    pub fn reset(&self) {
+        self.offset.store(0, Ordering::Release);
+        self.entries.lock().clear();
+    }
+}
+
+/// Same shape as `WriteBuffer`. Logically distinct so call-sites stay
+/// self-documenting; same internal mechanics.
+pub type ReadSegment = WriteBuffer;
