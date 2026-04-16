@@ -312,3 +312,22 @@ fn unified_drain_skips_entries_superseded_by_later_put_write() {
     // And it must still be indexed as Write(1) (the active buffer after flush flip).
     assert_eq!(c.peek_entry(1, 0).unwrap().region(), Region::Write(1));
 }
+
+#[test]
+fn unified_put_read_round_trip() {
+    let c = tiny_cache();
+    c.put_read(1, 0, b"from-disk");
+    assert_eq!(c.get(1, 0), Some(b"from-disk".to_vec()));
+    assert!(matches!(c.peek_entry(1, 0).unwrap().region(), Region::ReadSegment(_)));
+}
+
+#[test]
+fn unified_put_read_does_not_clobber_existing_write() {
+    // I2: a write lands first; a later put_read for the same key must be a no-op.
+    let c = tiny_cache();
+    c.put_write(1, 0, b"writer-wins").unwrap();
+    c.put_read(1, 0, b"disk-version");
+    // Writer's entry is preserved.
+    assert_eq!(c.get(1, 0), Some(b"writer-wins".to_vec()));
+    assert_eq!(c.peek_entry(1, 0).unwrap().region(), Region::Write(0));
+}

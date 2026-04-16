@@ -302,6 +302,30 @@ impl UnifiedCache {
     ///
     /// The `FlushGuard` is taken by value and consumed — preventing a second
     /// drain on the same guard at the type level.
+    /// Populate the cache from a disk read. Uses `or_insert_with` so a
+    /// concurrent writer's newer value for the same key is preserved (I2).
+    pub fn put_read(&self, l: i64, e: i64, data: &[u8]) {
+        if self.index.contains_key(&(l, e)) {
+            // Already cached (writer beat us) — fast path, no segment allocation.
+            return;
+        }
+        let Some((seg_idx, offset)) = self.read_ring_append(l, e, data) else {
+            return; // data too big for a segment — rare; drop.
+        };
+        let ce = CacheEntry::read(seg_idx, offset as u32, data.len() as u32);
+        // Final I2 safety: only insert if still absent.
+        self.index.entry((l, e)).or_insert(ce);
+    }
+
+    fn read_ring_append(&self, _l: i64, _e: i64, data: &[u8]) -> Option<(u8, usize)> {
+        // Task 8 will add rotation. For now: just append to segment 0; fail if full.
+        let seg = &self.read_segments[0];
+        let off = seg.reserve(data.len()).ok()?;
+        unsafe { seg.write_at(off, data); }
+        seg.track_entry(_l, _e);
+        Some((0, off))
+    }
+
     pub fn drain<F, E>(&self, guard: FlushGuard, mut f: F) -> Result<(), E>
     where
         F: FnMut(i64, i64, &[u8]) -> Result<(), E>,
