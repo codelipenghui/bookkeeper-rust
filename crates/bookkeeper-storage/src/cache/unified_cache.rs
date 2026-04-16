@@ -55,8 +55,11 @@ impl CacheEntry {
 }
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
+use dashmap::DashMap;
 use parking_lot::Mutex;
+use crate::StorageError;
 
 const ALIGNMENT: usize = 64;
 fn align64(n: usize) -> usize { (n + ALIGNMENT - 1) & !(ALIGNMENT - 1) }
@@ -180,3 +183,68 @@ impl WriteBuffer {
 /// where the other is semantically expected. If that distinction starts
 /// mattering in practice, replace with a newtype wrapper.
 pub type ReadSegment = WriteBuffer;
+
+pub const READ_CACHE_SEGMENTS: usize = 4;
+
+pub struct UnifiedCache {
+    index: DashMap<(i64, i64), CacheEntry>,
+    write_bufs: [Arc<WriteBuffer>; 2],
+    active_write: AtomicU8,
+    read_segments: [Arc<ReadSegment>; READ_CACHE_SEGMENTS],
+    current_segment: AtomicUsize,
+    last_entry: DashMap<i64, i64>,
+}
+
+impl UnifiedCache {
+    pub fn new(write_buf_size: usize, read_cache_total_size: usize) -> Self {
+        let seg_size = read_cache_total_size / READ_CACHE_SEGMENTS;
+        Self {
+            index: DashMap::new(),
+            write_bufs: [
+                Arc::new(WriteBuffer::new(write_buf_size)),
+                Arc::new(WriteBuffer::new(write_buf_size)),
+            ],
+            active_write: AtomicU8::new(0),
+            read_segments: std::array::from_fn(|_| Arc::new(ReadSegment::new(seg_size))),
+            current_segment: AtomicUsize::new(0),
+            last_entry: DashMap::new(),
+        }
+    }
+
+    pub fn put_write(&self, l: i64, e: i64, data: &[u8]) -> Result<(), StorageError> {
+        let idx = self.active_write.load(Ordering::Acquire);
+        let buf = &self.write_bufs[idx as usize];
+        let offset = buf.reserve(data.len()).map_err(|_| StorageError::StorageFull)?;
+        unsafe { buf.write_at(offset, data); }
+        buf.track_entry(l, e);
+        self.index.insert((l, e), CacheEntry::write(idx, offset as u32, data.len() as u32));
+        self.last_entry
+            .entry(l)
+            .and_modify(|v| if e > *v { *v = e; })
+            .or_insert(e);
+        Ok(())
+    }
+
+    /// Invariant I1: the data copy happens inside the DashMap `.map(..)`
+    /// closure, which holds the shard read-lock (via `Ref`) for the entire
+    /// copy. This blocks concurrent `index.remove()` from drain/rotation,
+    /// preventing read of a region whose offset has been reset.
+    pub fn get(&self, l: i64, e: i64) -> Option<Vec<u8>> {
+        self.index.get(&(l, e)).map(|entry| {
+            let ce = *entry.value();
+            match ce.region() {
+                Region::Write(i) => unsafe {
+                    self.write_bufs[i as usize].read_at(ce.offset as usize, ce.size as usize)
+                },
+                Region::ReadSegment(i) => unsafe {
+                    self.read_segments[i as usize].read_at(ce.offset as usize, ce.size as usize)
+                },
+            }
+        })
+    }
+
+    /// Test-only peek at the CacheEntry for a key (without copying bytes).
+    pub fn peek_entry(&self, l: i64, e: i64) -> Option<CacheEntry> {
+        self.index.get(&(l, e)).map(|r| *r.value())
+    }
+}

@@ -118,7 +118,34 @@ fn cache_entry_size_is_compact() {
     assert!(std::mem::size_of::<CacheEntry>() <= 12);
 }
 
-use bookkeeper_storage::cache::unified_cache::WriteBuffer;
+use bookkeeper_storage::cache::unified_cache::{UnifiedCache, WriteBuffer};
+
+fn tiny_cache() -> UnifiedCache {
+    // 1 MB write buffers × 2, 1 MB read-cache (256 KB per segment).
+    UnifiedCache::new(1024 * 1024, 1024 * 1024)
+}
+
+#[test]
+fn unified_put_write_then_get_returns_bytes() {
+    let c = tiny_cache();
+    c.put_write(1, 0, b"hello").unwrap();
+    assert_eq!(c.get(1, 0), Some(b"hello".to_vec()));
+}
+
+#[test]
+fn unified_get_missing_returns_none() {
+    let c = tiny_cache();
+    assert_eq!(c.get(1, 0), None);
+}
+
+#[test]
+fn unified_put_write_uses_active_buffer() {
+    let c = tiny_cache();
+    c.put_write(1, 0, b"a").unwrap();
+    // Active is buffer 0 (default); the entry's region should reflect that.
+    let ce = c.peek_entry(1, 0).unwrap();
+    assert_eq!(ce.region(), Region::Write(0));
+}
 
 #[test]
 fn write_buffer_bump_alloc_returns_disjoint_offsets() {
