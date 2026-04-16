@@ -261,3 +261,27 @@ impl UnifiedCache {
         self.last_entry.get(&ledger_id).map(|v| *v.value())
     }
 }
+
+/// Opaque handle returned by `start_flush`. Must be passed to `drain()`
+/// so the drainer knows which buffer to walk.
+pub struct FlushGuard {
+    flushing_idx: u8,
+}
+
+impl FlushGuard {
+    pub fn flushing_idx(&self) -> u8 { self.flushing_idx }
+}
+
+impl UnifiedCache {
+    /// Flip which of the two write buffers is active. O(1) atomic. New
+    /// writes start going to the other buffer; entries in the now-flushing
+    /// buffer remain indexed and readable via their existing region tag.
+    ///
+    /// Caller is expected to hold the storage-level flush mutex so two
+    /// `start_flush` calls don't race.
+    pub fn start_flush(&self) -> FlushGuard {
+        let old = self.active_write.load(Ordering::Acquire);
+        self.active_write.store(old ^ 1, Ordering::Release);
+        FlushGuard { flushing_idx: old }
+    }
+}

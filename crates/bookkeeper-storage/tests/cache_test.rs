@@ -210,3 +210,29 @@ fn unified_put_write_returns_storage_full_when_buffer_full() {
         other => panic!("expected StorageFull, got {other:?}"),
     }
 }
+
+use bookkeeper_storage::cache::unified_cache::FlushGuard;
+
+#[test]
+fn unified_start_flush_flips_active_and_old_entries_remain_readable() {
+    let c = tiny_cache();
+    c.put_write(1, 0, b"pre-flush").unwrap();
+    let guard = c.start_flush();
+    // Old region index should still be 0 (flushing), new writes go to 1.
+    assert_eq!(guard.flushing_idx(), 0);
+    c.put_write(1, 1, b"post-flush").unwrap();
+    // Both entries are still readable — old via write_bufs[0], new via write_bufs[1].
+    assert_eq!(c.get(1, 0), Some(b"pre-flush".to_vec()));
+    assert_eq!(c.get(1, 1), Some(b"post-flush".to_vec()));
+    // The new entry's region tag should be Write(1).
+    assert_eq!(c.peek_entry(1, 1).unwrap().region(), Region::Write(1));
+}
+
+#[test]
+fn unified_start_flush_then_start_flush_cycles_back() {
+    let c = tiny_cache();
+    let g1 = c.start_flush();  // active was 0; now 1. flushing = 0.
+    assert_eq!(g1.flushing_idx(), 0);
+    let g2 = c.start_flush();  // active was 1; now 0. flushing = 1.
+    assert_eq!(g2.flushing_idx(), 1);
+}
