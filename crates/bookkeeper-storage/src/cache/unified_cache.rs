@@ -277,8 +277,13 @@ impl UnifiedCache {
     /// writes start going to the other buffer; entries in the now-flushing
     /// buffer remain indexed and readable via their existing region tag.
     ///
-    /// Caller is expected to hold the storage-level flush mutex so two
-    /// `start_flush` calls don't race.
+    /// # Caller contract
+    /// The caller **must** hold the storage-level flush mutex for the
+    /// entire `start_flush → drain` sequence. Without it, two concurrent
+    /// callers can read the same `active_write` value, both store the
+    /// same flipped result, and both receive a `FlushGuard` pointing at
+    /// the same buffer — causing `drain` to be called twice on the same
+    /// buffer and silently losing the flushed entries.
     pub fn start_flush(&self) -> FlushGuard {
         let old = self.active_write.load(Ordering::Acquire);
         self.active_write.store(old ^ 1, Ordering::Release);

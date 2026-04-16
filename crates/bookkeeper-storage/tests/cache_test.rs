@@ -211,8 +211,6 @@ fn unified_put_write_returns_storage_full_when_buffer_full() {
     }
 }
 
-use bookkeeper_storage::cache::unified_cache::FlushGuard;
-
 #[test]
 fn unified_start_flush_flips_active_and_old_entries_remain_readable() {
     let c = tiny_cache();
