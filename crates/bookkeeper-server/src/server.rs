@@ -585,6 +585,7 @@ impl BookieServer {
                 storage_for_shutdown.clone(),
                 config.local_scrub_interval as u64,
                 config.local_scrub_rate_limit as u64,
+                shutdown_tx.subscribe(),
             ))
         } else {
             None
@@ -671,6 +672,9 @@ impl BookieServer {
         }
         if let Some(h) = self.session_watcher_handle {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), h).await;
+        }
+        if let Some(h) = self.scrubber_handle {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
         tracing::info!("Background tasks stopped.");
 
