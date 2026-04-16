@@ -373,7 +373,12 @@ impl BookieSlot {
             .with_env_var("BK_ledgerDirectories", "/bk/data")
             .with_env_var("BK_bookiePort", "3181")
             .with_env_var("BK_httpServerEnabled", "true")
-            .with_env_var("BK_httpServerPort", "8080");
+            .with_env_var("BK_httpServerPort", "8080")
+            // Java BK 4.17 defaults to SortedLedgerStorage (file-based
+            // .idx index). The Rust bookie uses DbLedgerStorage (RocksDB
+            // index). Force Java to use DbLedgerStorage so both sides
+            // share the same on-disk index format for a rolling upgrade.
+            .with_env_var("BK_ledgerStorageClass", "org.apache.bookkeeper.bookie.storage.ldb.DbLedgerStorage");
         let container = img
             .start()
             .await
