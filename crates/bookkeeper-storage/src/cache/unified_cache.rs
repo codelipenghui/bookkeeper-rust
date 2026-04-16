@@ -15,7 +15,9 @@ pub enum Region {
 /// Location of an entry's bytes within one of the 6 regions.
 /// Stored as the value type in the unified `DashMap`.
 ///
-/// Packing: `region_tag` top bit = read/write flag, low 3 bits = index.
+/// Packing: `region_tag` top bit clear (0x00–0x7F) = WriteBuffer;
+/// top bit set (0x80–0xFF) = ReadSegment. Low 3 bits = index within
+/// that array (0..=1 for Write, 0..=3 for ReadSegment).
 /// Offsets and sizes are `u32` because no region exceeds 256 MB (fits in 28 bits).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +27,9 @@ pub struct CacheEntry {
     pub size: u32,
 }
 
+/// Top bit clear — region_tag 0x00..=0x7F — identifies a WriteBuffer slot.
 const WRITE_FLAG: u8 = 0x00;
+/// Top bit set — region_tag 0x80..=0xFF — identifies a ReadSegment slot.
 const READ_FLAG: u8 = 0x80;
 const INDEX_MASK: u8 = 0x07;
 

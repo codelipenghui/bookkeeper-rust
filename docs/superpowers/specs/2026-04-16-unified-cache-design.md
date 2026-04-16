@@ -50,12 +50,12 @@ Reader flow: hash `(ledger,entry)` once → DashMap lookup → dispatch on the r
 
 ```rust
 /// One entry's location in the unified cache.
-/// Packed to 9 bytes (or 10 with `repr(C)` padding — a 2× reduction vs the
+/// Packed to 9 bytes (or 12 with `repr(C)` padding — a 1.33× reduction vs the
 /// `(usize, usize)` = 16-byte values used today).
 #[derive(Clone, Copy)]
 pub struct CacheEntry {
-    /// Packed: top bit = is_write (1 for WriteBuffer, 0 for ReadSegment),
-    /// low 3 bits = index within the relevant array (0..1 for write, 0..3 for read).
+    /// Packed: top bit clear (0x00–0x7F) = WriteBuffer, top bit set (0x80–0xFF) = ReadSegment.
+    /// Low 3 bits = index within the relevant array (0..=1 for write, 0..=3 for read).
     pub region_tag: u8,
     pub offset: u32,
     pub size: u32,
