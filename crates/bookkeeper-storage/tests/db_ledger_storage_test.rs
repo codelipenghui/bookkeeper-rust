@@ -527,6 +527,62 @@ async fn entry_exists_reports_presence() {
     assert!(!storage.has_limbo_state(1).unwrap());
 }
 
+/// Regression guard: `publish_cache_metrics` must actually update the Prometheus
+/// gauges to reflect the current cache state.  Specifically:
+///   - After `add_entry`, the write-cache count/size gauges should be > 0.
+///   - After `flush` + `get_entry` (disk miss → read-cache fill), the
+///     read-cache count gauge should also be > 0.
+///
+/// We capture a baseline before the operations and assert on deltas rather than
+/// absolute values so the test stays correct even when earlier tests in the
+/// same binary have already touched the gauges.
+#[tokio::test]
+async fn cache_gauges_update_after_put() {
+    use bookkeeper_storage::storage_metrics::{
+        WRITE_CACHE_COUNT, WRITE_CACHE_SIZE, READ_CACHE_COUNT,
+    };
+
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    // Capture baseline — prior tests in the same binary may have left non-zero values.
+    let base_wc_count = WRITE_CACHE_COUNT.get();
+    let base_wc_size = WRITE_CACHE_SIZE.get();
+    let base_rc_count = READ_CACHE_COUNT.get();
+
+    // --- write-cache gauges ---
+    let entry = make_entry(1, 0, -1, &vec![0xAAu8; 128]);
+    storage.add_entry(&entry).await.unwrap();
+
+    // `publish_cache_metrics` is `pub` — call it directly to snapshot the gauges.
+    storage.publish_cache_metrics();
+
+    assert!(
+        WRITE_CACHE_COUNT.get() > base_wc_count,
+        "write_cache_count should have increased after add_entry: base={base_wc_count}, got={}",
+        WRITE_CACHE_COUNT.get()
+    );
+    assert!(
+        WRITE_CACHE_SIZE.get() > base_wc_size,
+        "write_cache_size should have increased after add_entry: base={base_wc_size}, got={}",
+        WRITE_CACHE_SIZE.get()
+    );
+
+    // --- read-cache gauge ---
+    // Flush so the entry lands on disk, then read it back; the read path
+    // inserts the result into the read cache.
+    storage.flush().await.unwrap();
+    let _ = storage.get_entry(1, 0).await.unwrap();
+
+    storage.publish_cache_metrics();
+
+    assert!(
+        READ_CACHE_COUNT.get() > base_rc_count,
+        "read_cache_count should have increased after get_entry: base={base_rc_count}, got={}",
+        READ_CACHE_COUNT.get()
+    );
+}
+
 #[tokio::test]
 async fn empty_master_key_is_replaced_by_real_key_on_check() {
     // Regression guard: data-integrity pre-boot calls set_master_key(id, &[])
