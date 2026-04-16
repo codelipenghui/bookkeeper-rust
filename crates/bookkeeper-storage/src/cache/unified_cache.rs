@@ -191,6 +191,7 @@ pub struct UnifiedCache {
     write_bufs: [Arc<WriteBuffer>; 2],
     active_write: AtomicU8,
     read_segments: [Arc<ReadSegment>; READ_CACHE_SEGMENTS],
+    #[allow(dead_code)] // Used in Task 8: read_ring_append rotation
     current_segment: AtomicUsize,
     last_entry: DashMap<i64, i64>,
 }
@@ -227,8 +228,12 @@ impl UnifiedCache {
 
     /// Invariant I1: the data copy happens inside the DashMap `.map(..)`
     /// closure, which holds the shard read-lock (via `Ref`) for the entire
-    /// copy. This blocks concurrent `index.remove()` from drain/rotation,
-    /// preventing read of a region whose offset has been reset.
+    /// copy. This blocks concurrent `index.remove()` from drain/rotation.
+    /// Without that block, a reader could release the `Ref` after capturing
+    /// the `CacheEntry`, drain would then remove the entry and `reset()`
+    /// the buffer's offset (invariant I3 — remove-before-reset), and a new
+    /// writer could begin overwriting those bytes while the copy is still
+    /// in flight.
     pub fn get(&self, l: i64, e: i64) -> Option<Vec<u8>> {
         self.index.get(&(l, e)).map(|entry| {
             let ce = *entry.value();
@@ -243,7 +248,11 @@ impl UnifiedCache {
         })
     }
 
-    /// Test-only peek at the CacheEntry for a key (without copying bytes).
+    /// Inspection helper used only by integration tests in
+    /// `tests/cache_test.rs` — callers should use [`get`] to read a cached
+    /// entry. Marked `#[doc(hidden)]` to keep it out of the public API
+    /// surface even though it must be `pub` for integration-test visibility.
+    #[doc(hidden)]
     pub fn peek_entry(&self, l: i64, e: i64) -> Option<CacheEntry> {
         self.index.get(&(l, e)).map(|r| *r.value())
     }
