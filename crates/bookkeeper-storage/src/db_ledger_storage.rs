@@ -744,8 +744,7 @@ impl DbLedgerStorage {
 
                         log_state.log_id += 1;
                         log_state.offset = LOGFILE_HEADER_SIZE as u64;
-                        self.ensure_entry_log_exists(log_state.log_id)
-                            .map_err(|e| e)?;
+                        self.ensure_entry_log_exists(log_state.log_id)?;
                         let new_path = self.entry_log_path(log_state.log_id);
                         let file = fs::OpenOptions::new().read(true).write(true).open(&new_path)
                             .map_err(StorageError::Io)?;
