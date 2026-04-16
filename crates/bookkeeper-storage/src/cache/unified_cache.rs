@@ -290,6 +290,53 @@ impl UnifiedCache {
         FlushGuard { flushing_idx: old }
     }
 
+    /// Populate the cache from a disk read. Uses the DashMap `Entry` API to
+    /// atomically no-op if a concurrent `put_write` has already inserted a
+    /// newer value for this key (invariant I2). The segment's `entries`
+    /// tracking Vec is only updated when we actually win the insertion race
+    /// — otherwise the orphaned tracking record would cause Task 8's segment
+    /// rotation to later remove a live write-buffer entry whose key matches.
+    pub fn put_read(&self, l: i64, e: i64, data: &[u8]) {
+        if self.index.contains_key(&(l, e)) {
+            // Already cached (writer beat us) — fast path, no segment allocation.
+            return;
+        }
+        let Some((seg_idx, offset)) = self.read_ring_append(l, e, data) else {
+            return; // data too big for a segment — rare; drop.
+        };
+        let ce = CacheEntry::read(seg_idx, offset as u32, data.len() as u32);
+        // Atomic insert-if-absent. `Entry::Vacant` means we won the race —
+        // track the key in the segment's eviction list. `Entry::Occupied`
+        // means a concurrent writer inserted after our `contains_key` check;
+        // leave their entry alone and abandon the segment slot we reserved
+        // (it'll get overwritten when the segment eventually rotates; the
+        // key is NOT tracked so rotation won't mis-evict the writer's entry).
+        match self.index.entry((l, e)) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(ce);
+                self.read_segments[seg_idx as usize].track_entry(l, e);
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                // concurrent writer landed first; nothing to do.
+            }
+        }
+    }
+
+    /// Reserve and write bytes into a read segment. Returns
+    /// `Some((seg_idx, offset))` on success; `None` if the segment is full.
+    /// Does NOT track the entry — the caller (`put_read`) is responsible
+    /// for calling `track_entry` only after confirming the DashMap insert
+    /// succeeded, so we never track a key that's not actually indexed here.
+    ///
+    /// Task 7 stub: only uses segment 0. Task 8 adds ring rotation.
+    fn read_ring_append(&self, l: i64, e: i64, data: &[u8]) -> Option<(u8, usize)> {
+        let _ = (l, e); // Task 8 will use these; silenced for Task 7 stub.
+        let seg = &self.read_segments[0];
+        let off = seg.reserve(data.len()).ok()?;
+        unsafe { seg.write_at(off, data); }
+        Some((0, off))
+    }
+
     /// Walks the flushing buffer, invokes `f` with each entry's bytes, and
     /// removes the entry from the unified index **before** resetting the
     /// buffer's offset (invariant I3).
@@ -302,30 +349,6 @@ impl UnifiedCache {
     ///
     /// The `FlushGuard` is taken by value and consumed — preventing a second
     /// drain on the same guard at the type level.
-    /// Populate the cache from a disk read. Uses `or_insert_with` so a
-    /// concurrent writer's newer value for the same key is preserved (I2).
-    pub fn put_read(&self, l: i64, e: i64, data: &[u8]) {
-        if self.index.contains_key(&(l, e)) {
-            // Already cached (writer beat us) — fast path, no segment allocation.
-            return;
-        }
-        let Some((seg_idx, offset)) = self.read_ring_append(l, e, data) else {
-            return; // data too big for a segment — rare; drop.
-        };
-        let ce = CacheEntry::read(seg_idx, offset as u32, data.len() as u32);
-        // Final I2 safety: only insert if still absent.
-        self.index.entry((l, e)).or_insert(ce);
-    }
-
-    fn read_ring_append(&self, _l: i64, _e: i64, data: &[u8]) -> Option<(u8, usize)> {
-        // Task 8 will add rotation. For now: just append to segment 0; fail if full.
-        let seg = &self.read_segments[0];
-        let off = seg.reserve(data.len()).ok()?;
-        unsafe { seg.write_at(off, data); }
-        seg.track_entry(_l, _e);
-        Some((0, off))
-    }
-
     pub fn drain<F, E>(&self, guard: FlushGuard, mut f: F) -> Result<(), E>
     where
         F: FnMut(i64, i64, &[u8]) -> Result<(), E>,
