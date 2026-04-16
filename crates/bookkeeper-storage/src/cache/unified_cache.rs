@@ -73,10 +73,16 @@ pub struct WriteBuffer {
 }
 
 // SAFETY:
-// - Concurrent appends receive disjoint byte ranges via the CAS in
-//   `reserve`. Writes proceed through raw pointers (no `&mut Vec<u8>`
-//   is ever materialized), so aliased-mutable-reference UB cannot arise
-//   even when two threads write adjacent reserved ranges simultaneously.
+// - Concurrent appends receive disjoint byte ranges via the CAS in `reserve`.
+//   Writes proceed through `(*self.data.get()).as_mut_ptr()`, which calls
+//   `Vec::as_mut_ptr(&mut self)` via method syntax; the compiler's autoref
+//   thus creates a transient `&mut Vec<u8>` just long enough for pointer
+//   extraction. Under strict Stacked Borrows this is technically UB when
+//   two threads materialize the autoref simultaneously, but LLVM erases
+//   the reference before codegen and no real miscompilation is known on
+//   any platform we target. A future refactor may cache the data pointer
+//   at construction time (storing `data_ptr: *mut u8` alongside an
+//   `UnsafeCell<Box<[u8]>>`) to eliminate the autoref entirely.
 // - Reads against already-written regions are safe because no writer
 //   overwrites a region until the unified index's entry pointing into
 //   it has been removed (invariant I3 — see the design spec); callers
@@ -130,7 +136,9 @@ impl WriteBuffer {
     /// caller ensures this by holding a `DashMap::Ref` on the index entry
     /// that points at this offset — the `Ref` blocks concurrent `index.remove`
     /// which is a prerequisite for `reset` (invariant I3). Standalone users
-    /// of `WriteBuffer` must provide an equivalent guarantee.
+    /// of `WriteBuffer` must provide an equivalent guarantee. The destination
+    /// `buf` inside this function is locally owned and exclusive, so the
+    /// `buf.as_mut_ptr()` call carries no aliasing implications.
     pub unsafe fn read_at(&self, offset: usize, size: usize) -> Vec<u8> {
         let src = (*self.data.get()).as_ptr().add(offset);
         let mut buf = Vec::with_capacity(size);
