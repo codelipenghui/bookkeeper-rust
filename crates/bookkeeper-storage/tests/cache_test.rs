@@ -282,4 +282,33 @@ fn unified_drain_callback_error_propagates_and_leaves_buffer_reset() {
     // (The in-flight entry is removed from the index because we removed
     // entries as we drained them; partial drain loses the entry. Acceptable
     // because drain failure is fatal — storage typically tears down after.)
+    // Buffer reusability: the cache must still accept new writes after the error.
+    c.put_write(2, 0, b"post-error").unwrap();
+    assert_eq!(c.get(2, 0), Some(b"post-error".to_vec()));
+}
+
+/// Regression: if a key is overwritten by `put_write` after `start_flush`
+/// but before `drain`, the drain loop must skip the stale entry in the
+/// flushing buffer and leave the live entry in the active buffer alone.
+#[test]
+fn unified_drain_skips_entries_superseded_by_later_put_write() {
+    let c = tiny_cache();
+    c.put_write(1, 0, b"first").unwrap();
+    let guard = c.start_flush();
+    // Overwrite the same key while it's still "in flight" on the flushing side.
+    c.put_write(1, 0, b"second").unwrap();
+    // Drain should skip (1, 0) because its index entry now points at the
+    // active buffer, not the flushing buffer we're draining.
+    let mut seen = Vec::new();
+    c.drain(guard, |l, e, data| {
+        seen.push((l, e, data.to_vec()));
+        Ok::<(), std::convert::Infallible>(())
+    }).unwrap();
+    // Nothing drained — the only entry tracked in the flushing buffer
+    // had been superseded.
+    assert!(seen.is_empty(), "drain should have skipped the superseded entry; got {seen:?}");
+    // The live entry must still be readable with the NEW bytes.
+    assert_eq!(c.get(1, 0), Some(b"second".to_vec()));
+    // And it must still be indexed as Write(1) (the active buffer after flush flip).
+    assert_eq!(c.peek_entry(1, 0).unwrap().region(), Region::Write(1));
 }

@@ -299,6 +299,9 @@ impl UnifiedCache {
     /// returns that error; the buffer is still reset (it's unusable for
     /// correct reads anyway because the interrupted entry was already
     /// removed from the index before `f` ran).
+    ///
+    /// The `FlushGuard` is taken by value and consumed — preventing a second
+    /// drain on the same guard at the type level.
     pub fn drain<F, E>(&self, guard: FlushGuard, mut f: F) -> Result<(), E>
     where
         F: FnMut(i64, i64, &[u8]) -> Result<(), E>,
@@ -312,6 +315,15 @@ impl UnifiedCache {
                 Some(r) => *r.value(),
                 None => continue, // entry was overwritten in a later put_write
             };
+            // Guard against overwrite: if the index now points into a different
+            // region, this (l, e) was superseded by a later `put_write` after
+            // `start_flush`. The newer value still lives in its current region
+            // and is correctly indexed — leave it alone. The stale bytes sitting
+            // in the flushing buffer will be overwritten when this buffer is
+            // re-used next cycle.
+            if ce.region() != Region::Write(guard.flushing_idx) {
+                continue;
+            }
             let data = unsafe {
                 buf.read_at(ce.offset as usize, ce.size as usize)
             };
