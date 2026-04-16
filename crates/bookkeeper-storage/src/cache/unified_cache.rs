@@ -191,7 +191,6 @@ pub struct UnifiedCache {
     write_bufs: [Arc<WriteBuffer>; 2],
     active_write: AtomicU8,
     read_segments: [Arc<ReadSegment>; READ_CACHE_SEGMENTS],
-    #[allow(dead_code)] // Used in Task 8: read_ring_append rotation
     current_segment: AtomicUsize,
     last_entry: DashMap<i64, i64>,
 }
@@ -322,19 +321,43 @@ impl UnifiedCache {
         }
     }
 
-    /// Reserve and write bytes into a read segment. Returns
-    /// `Some((seg_idx, offset))` on success; `None` if the segment is full.
-    /// Does NOT track the entry — the caller (`put_read`) is responsible
-    /// for calling `track_entry` only after confirming the DashMap insert
-    /// succeeded, so we never track a key that's not actually indexed here.
+    /// Reserve and write bytes into the current read segment, rotating to
+    /// the next segment when full. Returns `Some((seg_idx, offset))` where
+    /// bytes landed. Does NOT call `track_entry` — the caller (`put_read`)
+    /// is responsible for tracking only after confirming the DashMap insert
+    /// actually won the race, so we never track a key that isn't indexed
+    /// into this segment.
     ///
-    /// Task 7 stub: only uses segment 0. Task 8 adds ring rotation.
+    /// On rotation, the winning thread removes all entries from the evicted
+    /// segment's tracking list from the unified index **before** zeroing
+    /// the segment's offset (invariant I3 — remove-before-reset). Other
+    /// threads that race on the CAS spin until they see the new
+    /// `current_segment`, then retry the reservation.
     fn read_ring_append(&self, l: i64, e: i64, data: &[u8]) -> Option<(u8, usize)> {
-        let _ = (l, e); // Task 8 will use these; silenced for Task 7 stub.
-        let seg = &self.read_segments[0];
-        let off = seg.reserve(data.len()).ok()?;
-        unsafe { seg.write_at(off, data); }
-        Some((0, off))
+        let _ = (l, e); // caller handles tracking after the index insert.
+        loop {
+            let cur = self.current_segment.load(Ordering::Acquire);
+            let seg = &self.read_segments[cur];
+            if let Ok(off) = seg.reserve(data.len()) {
+                unsafe { seg.write_at(off, data); }
+                return Some((cur as u8, off));
+            }
+            // Current segment full. CAS to rotate. Winner evicts the next.
+            let next = (cur + 1) % READ_CACHE_SEGMENTS;
+            if self
+                .current_segment
+                .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // I3: remove-from-index before offset reset.
+                let evicted = self.read_segments[next].take_entries();
+                for (el, ee) in evicted {
+                    self.index.remove(&(el, ee));
+                }
+                self.read_segments[next].reset();
+            }
+            // Either we rotated or someone else did; retry on the new current.
+        }
     }
 
     /// Walks the flushing buffer, invokes `f` with each entry's bytes, and

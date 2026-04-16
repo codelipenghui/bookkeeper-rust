@@ -331,3 +331,23 @@ fn unified_put_read_does_not_clobber_existing_write() {
     assert_eq!(c.get(1, 0), Some(b"writer-wins".to_vec()));
     assert_eq!(c.peek_entry(1, 0).unwrap().region(), Region::Write(0));
 }
+
+#[test]
+fn unified_read_ring_rotates_and_evicts_oldest_segment() {
+    // Tiny read cache: 4 × 128B = 512B total. Each entry ~128B aligned.
+    let c = UnifiedCache::new(1024 * 1024, 512);
+    // Fill segment 0.
+    c.put_read(1, 0, &[0u8; 100]);
+    // Segment 0 full (100 rounds up to 128, matches segment size).
+    // Next put rotates into segment 1.
+    c.put_read(1, 1, &[0u8; 100]);
+    assert_eq!(c.peek_entry(1, 0).unwrap().region(), Region::ReadSegment(0));
+    assert_eq!(c.peek_entry(1, 1).unwrap().region(), Region::ReadSegment(1));
+    // Fill 2 and 3.
+    c.put_read(1, 2, &[0u8; 100]);
+    c.put_read(1, 3, &[0u8; 100]);
+    // Inserting a 5th rotates back to segment 0, evicting entry (1, 0).
+    c.put_read(1, 4, &[0u8; 100]);
+    assert_eq!(c.get(1, 0), None, "oldest segment's entries must be evicted");
+    assert_eq!(c.peek_entry(1, 4).unwrap().region(), Region::ReadSegment(0));
+}
