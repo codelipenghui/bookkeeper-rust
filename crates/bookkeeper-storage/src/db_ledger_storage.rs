@@ -7,9 +7,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
-use parking_lot::RwLock;
-use crate::cache::write_cache::WriteCache;
-use crate::cache::read_cache::ReadCache;
+use crate::cache::unified_cache::{UnifiedCache, FlushGuard};
 use crate::entry_log::format::{self as elf, EntryLogHeader, EntryLocation, LOGFILE_HEADER_SIZE};
 use crate::index::entry_location::EntryLocationIndex;
 use crate::index::ledger_index::LedgerMetadataIndex;
@@ -40,7 +38,6 @@ pub const CURRENT_DIR: &str = "current";
 
 const DEFAULT_WRITE_CACHE_SIZE: usize = 256 * 1024 * 1024; // 256MB
 const DEFAULT_READ_CACHE_SIZE: usize = 64 * 1024 * 1024;  // 64MB
-const READ_CACHE_SEGMENTS: usize = 4;
 const DEFAULT_MAX_ENTRY_LOG_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
 const MAX_ENTRY_SIZE: usize = 100 * 1024 * 1024; // 100MB sanity limit
 /// Number of consecutive entries to read ahead on a cache miss.
@@ -138,9 +135,7 @@ struct LedgerMetaCacheEntry {
 
 pub struct DbLedgerStorage {
     base_dir: PathBuf,
-    write_cache: RwLock<WriteCache>,
-    write_cache_being_flushed: RwLock<WriteCache>,
-    read_cache: Arc<ReadCache>,
+    unified_cache: Arc<UnifiedCache>,
     entry_location_index: EntryLocationIndex,
     ledger_index: LedgerMetadataIndex,
     entry_log_dir: PathBuf,
@@ -252,9 +247,10 @@ impl DbLedgerStorage {
 
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
-            write_cache: RwLock::new(WriteCache::new(storage_config.write_cache_max_size)),
-            write_cache_being_flushed: RwLock::new(WriteCache::new(storage_config.write_cache_max_size)),
-            read_cache: Arc::new(ReadCache::new(storage_config.read_cache_max_size, READ_CACHE_SEGMENTS)),
+            unified_cache: Arc::new(UnifiedCache::new(
+                storage_config.write_cache_max_size,
+                storage_config.read_cache_max_size,
+            )),
             entry_location_index,
             ledger_index,
             entry_log_dir,
@@ -344,13 +340,15 @@ impl DbLedgerStorage {
 
                         let flush_start = Instant::now();
                         let _lock = storage.flush_mutex.lock().await;
-                        storage.swap_caches();
+                        let swap_start = Instant::now();
+                        let flush_guard = storage.unified_cache.start_flush();
+                        storage_metrics::FLUSH_CACHE_SWAP.observe(swap_start.elapsed().as_secs_f64());
                         // Wake add-entry waiters before the expensive drain;
                         // the swap alone is enough to unblock them.
                         for s in swap_waiters {
                             let _ = s.send(());
                         }
-                        let res = storage.drain_flushing(flush_start).await;
+                        let res = storage.drain_flushing(flush_start, flush_guard).await;
                         if let Some(d) = drain_waiter {
                             let _ = d.send(res);
                         } else if let Err(e) = res {
@@ -406,16 +404,14 @@ impl DbLedgerStorage {
     }
 
     /// Publish a snapshot of write-cache utilization to Prometheus gauges.
-    /// Called from a periodic sampler — not the hot path — because
-    /// `WriteCache::count()` walks every DashMap shard.
+    /// Called from a periodic sampler — not the hot path.
     pub fn publish_cache_metrics(&self) {
-        let cache = self.write_cache.read();
-        let used = cache.bytes_used();
-        let max = cache.max_size();
-        storage_metrics::WRITE_CACHE_SIZE.set(used as i64);
-        storage_metrics::WRITE_CACHE_COUNT.set(cache.count() as i64);
-        let ratio = if max == 0 { 0.0 } else { used as f64 / max as f64 };
-        storage_metrics::WRITE_CACHE_FILL_RATIO.set(ratio);
+        let uc = &self.unified_cache;
+        storage_metrics::WRITE_CACHE_SIZE.set(uc.write_cache_bytes() as i64);
+        storage_metrics::WRITE_CACHE_COUNT.set(uc.write_cache_count() as i64);
+        storage_metrics::WRITE_CACHE_FILL_RATIO.set(uc.write_cache_fill_ratio());
+        storage_metrics::READ_CACHE_COUNT.set(uc.read_cache_count() as i64);
+        storage_metrics::READ_CACHE_SIZE.set(uc.read_cache_bytes() as i64);
     }
 
     /// Scan `entry_log_dir` for `<hex>.log` files and return the next
@@ -471,7 +467,7 @@ impl DbLedgerStorage {
                 if lac >= 0 {
                     self.lac_cache.insert(ledger_id, lac);
                 }
-                let _ = self.write_cache.read().put(ledger_id, entry_id, entry_data);
+                let _ = self.unified_cache.put_write(ledger_id, entry_id, entry_data);
             }
         })?;
 
@@ -648,28 +644,16 @@ impl DbLedgerStorage {
         Ok(entry)
     }
 
-    /// Swap active ↔ being_flushed. O(microseconds); no I/O.
+    /// Drain the flushing write buffer to disk (entry log + RocksDB).
     ///
     /// # Invariant
-    /// Caller must hold `flush_mutex`. Violating this races the swap against
-    /// a concurrent drain and corrupts the being_flushed cache.
-    fn swap_caches(&self) {
-        let swap_start = Instant::now();
-        let mut active = self.write_cache.write();
-        let mut flushing = self.write_cache_being_flushed.write();
-        std::mem::swap(&mut *active, &mut *flushing);
-        storage_metrics::FLUSH_CACHE_SWAP.observe(swap_start.elapsed().as_secs_f64());
-    }
-
-    /// Drain `write_cache_being_flushed` to disk (entry log + RocksDB).
-    ///
-    /// # Invariant
-    /// Caller must hold `flush_mutex` and have just performed a swap.
-    async fn drain_flushing(&self, flush_start: Instant) -> Result<(), StorageError> {
-        // Phase 1: Under log_state mutex, collect all framed entries and metadata.
-        // We cannot hold non-Send guards (MutexGuard, RwLockReadGuard) across
-        // an .await point, so we read from the flushing cache, frame entries,
-        // and drop all guards before the async I/O phase.
+    /// Caller must hold `flush_mutex` and must pass the `FlushGuard` returned
+    /// by `unified_cache.start_flush()` which was called just before this.
+    async fn drain_flushing(&self, flush_start: Instant, flush_guard: FlushGuard) -> Result<(), StorageError> {
+        // Phase 1: Under log_state mutex, collect all framed entries and metadata
+        // from the flushing write buffer via unified_cache.drain(). We cannot
+        // hold non-Send guards (MutexGuard) across an .await point, so we collect
+        // into plain Vecs here and drop all guards before the async I/O phase.
         struct FlushSegment {
             fd: RawFd,
             /// Keeps the file handle alive so `fd` remains valid through the
@@ -696,21 +680,11 @@ impl DbLedgerStorage {
         let total_bytes: u64;
 
         {
-            let flushing = self.write_cache_being_flushed.read();
-            let entries = flushing.sorted_entries();
-            if entries.is_empty() {
-                drop(flushing);
-                self.write_cache_being_flushed.write().clear();
-                storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
-                return Ok(());
-            }
-
-            entry_count = entries.len();
-            let flushing_data = flushing.data();
-
             let mut segs: Vec<FlushSegment> = Vec::new();
             let mut rotated: Vec<RotatedLog> = Vec::new();
             let mut flush_bytes: u64 = 0;
+            let mut count: usize = 0;
+            let mut empty_drain = true;
 
             {
                 let mut log_state = self.log_state.lock().unwrap();
@@ -732,14 +706,25 @@ impl DbLedgerStorage {
                     locations: Vec::new(),
                 };
 
-                for &(ledger_id, entry_id, offset, size) in &entries {
-                    let entry_data = &flushing_data[offset..offset + size];
+                // drain() removes each entry from the unified index as it goes
+                // (invariant I3: remove-before-reset). The closure receives
+                // (ledger_id, entry_id, entry_data) for each flushed entry.
+                self.unified_cache.drain(flush_guard, |ledger_id, entry_id, entry_data| {
+                    empty_drain = false;
                     let encoded_size = (4 + entry_data.len()) as u64;
 
                     if log_state.offset + encoded_size > self.storage_config.max_entry_log_size {
                         // Push the current segment if it has entries
                         if !current.framed_entries.is_empty() {
-                            segs.push(current);
+                            let next_seg = FlushSegment {
+                                fd: current.fd,
+                                _file_guard: current._file_guard.try_clone()
+                                    .map_err(StorageError::Io)?,
+                                write_offset: current.write_offset,
+                                framed_entries: std::mem::take(&mut current.framed_entries),
+                                locations: std::mem::take(&mut current.locations),
+                            };
+                            segs.push(next_seg);
                         }
 
                         // Rotate: hand off the old file + ledger-size map
@@ -759,19 +744,18 @@ impl DbLedgerStorage {
 
                         log_state.log_id += 1;
                         log_state.offset = LOGFILE_HEADER_SIZE as u64;
-                        self.ensure_entry_log_exists(log_state.log_id)?;
+                        self.ensure_entry_log_exists(log_state.log_id)
+                            .map_err(|e| e)?;
                         let new_path = self.entry_log_path(log_state.log_id);
-                        let file = fs::OpenOptions::new().read(true).write(true).open(&new_path)?;
+                        let file = fs::OpenOptions::new().read(true).write(true).open(&new_path)
+                            .map_err(StorageError::Io)?;
                         log_state.file = Some(file);
 
                         let new_file_ref = log_state.file.as_ref().unwrap();
-                        current = FlushSegment {
-                            fd: new_file_ref.as_raw_fd(),
-                            _file_guard: new_file_ref.try_clone()?,
-                            write_offset: log_state.offset,
-                            framed_entries: Vec::new(),
-                            locations: Vec::new(),
-                        };
+                        current.fd = new_file_ref.as_raw_fd();
+                        current._file_guard = new_file_ref.try_clone()
+                            .map_err(StorageError::Io)?;
+                        current.write_offset = log_state.offset;
                     }
 
                     let framed = Self::frame_entry(entry_data);
@@ -784,17 +768,25 @@ impl DbLedgerStorage {
                     *log_state.current_log_ledger_sizes
                         .entry(ledger_id).or_insert(0) += encoded_size;
                     flush_bytes += encoded_size;
-                }
+                    count += 1;
+                    Ok::<(), StorageError>(())
+                })?;
 
                 if !current.framed_entries.is_empty() {
                     segs.push(current);
                 }
             } // log_state MutexGuard dropped
 
+            if empty_drain {
+                storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
+                return Ok(());
+            }
+
             segments = segs;
             rotated_logs = rotated;
+            entry_count = count;
             total_bytes = flush_bytes;
-        } // flushing RwLockReadGuard dropped
+        }
 
         // Phase 2: Async I/O (no non-Send guards held)
         let entrylog_start = Instant::now();
@@ -861,8 +853,6 @@ impl DbLedgerStorage {
         self.ledger_index.flush()?;
         storage_metrics::FLUSH_LEDGER_INDEX.observe(ledger_start.elapsed().as_secs_f64());
 
-        self.write_cache_being_flushed.write().clear();
-
         storage_metrics::FLUSH_SIZE.observe(total_bytes as f64);
         storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
         Ok(())
@@ -905,18 +895,11 @@ impl LedgerStorage for DbLedgerStorage {
             self.lac_watchers.notify_lac_advance(ledger_id, lac);
         }
 
-        // Try write cache. Use try_read() first to detect lock contention
-        // from concurrent flush cache swap (write lock).
+        // Try write cache. UnifiedCache.put_write() is lock-free on the fast
+        // path (CAS bump-allocator) and returns StorageError::StorageFull when
+        // the active buffer is exhausted.
         {
-            let cache = match self.write_cache.try_read() {
-                Some(guard) => guard,
-                None => {
-                    // Read lock blocked — a flush cache swap is in progress.
-                    storage_metrics::ADD_ENTRY_BLOCKED_BY_FLUSH.inc();
-                    self.write_cache.read()
-                }
-            };
-            if cache.put(ledger_id, entry_id, entry).is_ok() {
+            if self.unified_cache.put_write(ledger_id, entry_id, entry).is_ok() {
                 storage_metrics::ADD_ENTRY.observe(add_start.elapsed().as_secs_f64());
                 return Ok(());
             }
@@ -939,10 +922,10 @@ impl LedgerStorage for DbLedgerStorage {
         // Java's version also loops on `writeCache.put()` with a sleep.
         loop {
             // Quick re-check: a concurrent flush may have rotated the
-            // cache already, so try the put again before starting work.
+            // cache already (new active buffer is empty), so try the put
+            // again before starting work.
             {
-                let cache = self.write_cache.read();
-                if cache.put(ledger_id, entry_id, entry).is_ok() {
+                if self.unified_cache.put_write(ledger_id, entry_id, entry).is_ok() {
                     storage_metrics::THROTTLED_WRITE.observe(throttle_start.elapsed().as_secs_f64());
                     storage_metrics::ADD_ENTRY.observe(add_start.elapsed().as_secs_f64());
                     return Ok(());
@@ -974,22 +957,13 @@ impl LedgerStorage for DbLedgerStorage {
 
     async fn get_entry(&self, ledger_id: i64, entry_id: i64) -> Result<Bytes, StorageError> {
         let read_start = Instant::now();
-        // 1. Check active write cache (most recent writes)
-        if let Some(data) = self.write_cache.read().get(ledger_id, entry_id) {
+        // Single unified cache lookup covers active write buffer, flushing
+        // write buffer, and read cache in one DashMap probe (O(1)).
+        if let Some(data) = self.unified_cache.get(ledger_id, entry_id) {
             storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
             return Ok(Bytes::from(data));
         }
-        // 2. Check write cache being flushed
-        if let Some(data) = self.write_cache_being_flushed.read().get(ledger_id, entry_id) {
-            storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
-            return Ok(Bytes::from(data));
-        }
-        // 3. Check read cache
-        if let Some(data) = self.read_cache.get(ledger_id, entry_id) {
-            storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
-            return Ok(Bytes::from(data));
-        }
-        // 4. Check RocksDB index → entry log file
+        // Check RocksDB index → entry log file
         let index_start = Instant::now();
         let location = self.entry_location_index.get(ledger_id, entry_id)?;
         storage_metrics::READ_LOCATIONS_INDEX_TIME.inc_by(index_start.elapsed().as_nanos() as u64);
@@ -999,7 +973,7 @@ impl LedgerStorage for DbLedgerStorage {
             let data = self.read_entry_from_log(location).await?;
             storage_metrics::READ_ENTRYLOG_TIME.inc_by(entrylog_start.elapsed().as_nanos() as u64);
 
-            self.read_cache.put(ledger_id, entry_id, &data);
+            self.unified_cache.put_read(ledger_id, entry_id, &data);
 
             // Read-ahead: walk the entry log sequentially from the entry we
             // just read. Entries from the same ledger are written contiguously
@@ -1016,7 +990,7 @@ impl LedgerStorage for DbLedgerStorage {
             let ra_max_bytes = self.storage_config.read_ahead_max_bytes;
 
             if ra_batch > 0 && data.len() < ra_max_bytes {
-                let cache = Arc::clone(&self.read_cache);
+                let cache = Arc::clone(&self.unified_cache);
                 let io = Arc::clone(&self.ledger_io);
                 let dir = self.entry_log_dir.clone();
                 let loc = EntryLocation::from_u64(location);
@@ -1054,11 +1028,9 @@ impl LedgerStorage for DbLedgerStorage {
                         let ahead_eid =
                             i64::from_be_bytes(ahead_data[8..16].try_into().unwrap());
 
-                        // Skip re-populating entries already cached (e.g.
-                        // from an earlier readahead not yet evicted).
-                        if cache.get(ledger_id, ahead_eid).is_none() {
-                            cache.put(ledger_id, ahead_eid, &ahead_data);
-                        }
+                        // put_read is a no-op if the entry is already in any
+                        // region (write buffer or read ring) — invariant I2.
+                        cache.put_read(ledger_id, ahead_eid, &ahead_data);
 
                         count += 1;
                         total += ahead_data.len();
@@ -1171,25 +1143,16 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn get_last_add_confirmed(&self, ledger_id: i64) -> Result<i64, StorageError> {
-        // 1. Check write cache (max entry_id = effective LAC on this bookie)
-        {
-            let cache = self.write_cache.read();
-            if let Some(entry_id) = cache.last_entry_id(ledger_id) {
-                return Ok(entry_id);
-            }
+        // 1. Check unified cache — last_entry_id tracks the maximum entry_id
+        //    written across both write buffers (never cleared on flush swap).
+        if let Some(entry_id) = self.unified_cache.last_entry_id(ledger_id) {
+            return Ok(entry_id);
         }
-        // 2. Check write cache being flushed
-        {
-            let cache = self.write_cache_being_flushed.read();
-            if let Some(entry_id) = cache.last_entry_id(ledger_id) {
-                return Ok(entry_id);
-            }
-        }
-        // 3. Check in-memory LAC cache
+        // 2. Check in-memory LAC cache
         if let Some(lac) = self.lac_cache.get(&ledger_id) {
             return Ok(*lac);
         }
-        // 4. Fall back to RocksDB ledger index (persisted LAC)
+        // 3. Fall back to RocksDB ledger index (persisted LAC)
         match self.ledger_index.get(ledger_id)? {
             Some(data) => Ok(data.lac.unwrap_or(-1)),
             None => Err(StorageError::LedgerNotFound(ledger_id)),
@@ -1326,8 +1289,10 @@ impl LedgerStorage for DbLedgerStorage {
     async fn flush(&self) -> Result<(), StorageError> {
         let flush_start = Instant::now();
         let _lock = self.flush_mutex.lock().await;
-        self.swap_caches();
-        self.drain_flushing(flush_start).await
+        let swap_start = Instant::now();
+        let flush_guard = self.unified_cache.start_flush();
+        storage_metrics::FLUSH_CACHE_SWAP.observe(swap_start.elapsed().as_secs_f64());
+        self.drain_flushing(flush_start, flush_guard).await
     }
 
     async fn checkpoint(&self) -> Result<(), StorageError> {
@@ -1506,10 +1471,8 @@ impl LedgerStorage for DbLedgerStorage {
         if entry_id == LAST_ADD_CONFIRMED {
             return Ok(false);
         }
-        if self.write_cache.read().get(ledger_id, entry_id).is_some() {
-            return Ok(true);
-        }
-        if self.write_cache_being_flushed.read().get(ledger_id, entry_id).is_some() {
+        // Single unified cache probe covers both write buffers and the read ring.
+        if self.unified_cache.get(ledger_id, entry_id).is_some() {
             return Ok(true);
         }
         Ok(self.entry_location_index.get(ledger_id, entry_id)?.is_some())

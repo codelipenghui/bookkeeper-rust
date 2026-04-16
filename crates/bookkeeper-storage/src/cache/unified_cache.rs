@@ -164,6 +164,11 @@ impl WriteBuffer {
 
     pub fn max_size(&self) -> usize { self.max_size }
 
+    /// Non-destructive count of entries currently tracked in this buffer.
+    pub fn entries_count(&self) -> usize {
+        self.entries.lock().len()
+    }
+
     /// Resets the offset to 0 — the buffer is now reusable. Entries in the
     /// unified index pointing here MUST have been removed before this call
     /// (invariant I3). Clears the tracking list **before** zeroing the offset
@@ -413,5 +418,36 @@ impl UnifiedCache {
         }
         buf.reset();
         result
+    }
+
+    /// Count of entries currently in the active write buffer.
+    /// Non-destructive; does not affect the buffer's tracked entry list.
+    pub fn write_cache_count(&self) -> usize {
+        self.write_bufs[self.active_write.load(Ordering::Acquire) as usize].entries_count()
+    }
+
+    /// Bytes consumed in the active write buffer (bump-allocator offset).
+    pub fn write_cache_bytes(&self) -> usize {
+        self.write_bufs[self.active_write.load(Ordering::Acquire) as usize].current_offset()
+    }
+
+    /// Fill ratio of the active write buffer (0.0 – 1.0).
+    pub fn write_cache_fill_ratio(&self) -> f64 {
+        let buf = &self.write_bufs[self.active_write.load(Ordering::Acquire) as usize];
+        if buf.max_size() == 0 {
+            0.0
+        } else {
+            buf.current_offset() as f64 / buf.max_size() as f64
+        }
+    }
+
+    /// Total count of entries across all 4 read-cache segments.
+    pub fn read_cache_count(&self) -> usize {
+        self.read_segments.iter().map(|s| s.entries_count()).sum()
+    }
+
+    /// Total bytes consumed across all 4 read-cache segments.
+    pub fn read_cache_bytes(&self) -> usize {
+        self.read_segments.iter().map(|s| s.current_offset()).sum()
     }
 }
