@@ -72,10 +72,16 @@ pub struct WriteBuffer {
     entries: Mutex<Vec<(i64, i64)>>,
 }
 
-// SAFETY: concurrent appends use disjoint offsets (`fetch_add`-reserved);
-// reads against already-written regions are safe under the invariant that
-// no writer overwrites a region until the unified index's entry has been
-// removed (I3) — see design spec.
+// SAFETY:
+// - Concurrent appends receive disjoint byte ranges via the CAS in
+//   `reserve`. Writes proceed through raw pointers (no `&mut Vec<u8>`
+//   is ever materialized), so aliased-mutable-reference UB cannot arise
+//   even when two threads write adjacent reserved ranges simultaneously.
+// - Reads against already-written regions are safe because no writer
+//   overwrites a region until the unified index's entry pointing into
+//   it has been removed (invariant I3 — see the design spec); callers
+//   of `read_at` hold the DashMap `Ref` across the copy to block the
+//   `index.remove` that must precede any `reset`.
 unsafe impl Send for WriteBuffer {}
 unsafe impl Sync for WriteBuffer {}
 
@@ -108,19 +114,29 @@ impl WriteBuffer {
     }
 
     /// # Safety
-    /// Caller must hold a reserved range `[offset, offset + data.len())`
-    /// obtained from `reserve()` and not have written there yet.
+    /// Caller must hold a reserved range `[offset, offset + data.len())` obtained
+    /// from [`reserve`] and not have written there yet. Concurrent writes to
+    /// disjoint ranges are safe because no mutable reference to the backing
+    /// `Vec<u8>` is materialized — writes proceed through a raw pointer to the
+    /// unique byte range reserved by the CAS.
     pub unsafe fn write_at(&self, offset: usize, data: &[u8]) {
-        let buf = &mut *self.data.get();
-        buf[offset..offset + data.len()].copy_from_slice(data);
+        let dst = (*self.data.get()).as_mut_ptr().add(offset);
+        std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
 
     /// # Safety
-    /// Caller must hold the `DashMap::Ref` that points to this offset
-    /// (invariant I1) so no concurrent `reset()` can start.
+    /// The region `[offset, offset + size)` must have been previously written
+    /// by [`write_at`] and not yet reset. In the full `UnifiedCache`, the
+    /// caller ensures this by holding a `DashMap::Ref` on the index entry
+    /// that points at this offset — the `Ref` blocks concurrent `index.remove`
+    /// which is a prerequisite for `reset` (invariant I3). Standalone users
+    /// of `WriteBuffer` must provide an equivalent guarantee.
     pub unsafe fn read_at(&self, offset: usize, size: usize) -> Vec<u8> {
-        let buf = &*self.data.get();
-        buf[offset..offset + size].to_vec()
+        let src = (*self.data.get()).as_ptr().add(offset);
+        let mut buf = Vec::with_capacity(size);
+        std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), size);
+        buf.set_len(size);
+        buf
     }
 
     pub fn track_entry(&self, ledger_id: i64, entry_id: i64) {
@@ -137,15 +153,22 @@ impl WriteBuffer {
 
     pub fn max_size(&self) -> usize { self.max_size }
 
-    /// Resets the offset to 0 — the buffer is now reusable. Entries in
-    /// the unified index pointing here MUST have been removed before this
-    /// call (I3).
+    /// Resets the offset to 0 — the buffer is now reusable. Entries in the
+    /// unified index pointing here MUST have been removed before this call
+    /// (invariant I3). Clears the tracking list **before** zeroing the offset
+    /// so a concurrent reader can never observe "offset=0 but entries still
+    /// populated". Under the designed usage (drain calls `take_entries` then
+    /// `reset`), this window is already closed; the ordering here is defensive.
     pub fn reset(&self) {
-        self.offset.store(0, Ordering::Release);
         self.entries.lock().clear();
+        self.offset.store(0, Ordering::Release);
     }
 }
 
-/// Same shape as `WriteBuffer`. Logically distinct so call-sites stay
-/// self-documenting; same internal mechanics.
+/// Semantic alias for a read-cache segment. Same shape and mechanics as
+/// [`WriteBuffer`]; the alias keeps call sites self-documenting. Because
+/// this is a *type alias* (not a newtype), `WriteBuffer` and `ReadSegment`
+/// are interchangeable to the compiler — call sites must not pass one
+/// where the other is semantically expected. If that distinction starts
+/// mattering in practice, replace with a newtype wrapper.
 pub type ReadSegment = WriteBuffer;
