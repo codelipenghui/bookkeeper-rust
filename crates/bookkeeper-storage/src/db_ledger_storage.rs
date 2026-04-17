@@ -972,7 +972,14 @@ impl LedgerStorage for DbLedgerStorage {
             let data = self.read_entry_from_log(location).await?;
             storage_metrics::READ_ENTRYLOG_TIME.inc_by(entrylog_start.elapsed().as_nanos() as u64);
 
-            self.unified_cache.put_read(ledger_id, entry_id, &data);
+            // Primary-read caching: remember this entry so the next reader
+            // doesn't hit disk. Skipped when the read cache is disabled
+            // (size = 0) — relies entirely on the kernel page cache for
+            // repeated access. This removes two DashMap hashes per read
+            // (contains_key + entry insert) from the hot path.
+            if self.storage_config.read_cache_max_size > 0 {
+                self.unified_cache.put_read(ledger_id, entry_id, &data);
+            }
 
             // Read-ahead: walk the entry log sequentially from the entry we
             // just read. Entries from the same ledger are written contiguously
