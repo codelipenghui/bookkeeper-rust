@@ -375,22 +375,14 @@ impl BookieServer {
             // Start ZK session watcher — monitors for session expiry.
             // On expiry, exits the process for supervisor restart (matching Java behavior).
             {
-                let watcher_zk_servers = zk_servers.clone();
-                let watcher_ledger_root = config.zk_ledger_root.clone();
                 let watcher_bookie_id = bookie_id.clone();
                 let watcher_shutdown = shutdown_rx.clone();
-                let watcher_state = state.clone();
                 let mut session_watcher = reg_mgr.zk_client().state_watcher();
-                let watcher_local_addr = local_addr;
 
                 session_watcher_handle = Some(tokio::spawn(async move {
                     run_session_watcher(
                         &mut session_watcher,
-                        &watcher_zk_servers,
-                        &watcher_ledger_root,
                         &watcher_bookie_id,
-                        watcher_local_addr,
-                        watcher_state,
                         watcher_shutdown,
                     ).await;
                 }));
@@ -852,11 +844,7 @@ async fn validate_cookie(
 /// - AuthFailed: fatal, exit process.
 async fn run_session_watcher(
     watcher: &mut zookeeper_client::StateWatcher,
-    _zk_servers: &str,
-    _ledger_root: &str,
     bookie_id: &str,
-    _local_addr: SocketAddr,
-    _state: Arc<BookieStateManager>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     use zookeeper_client::SessionState;
@@ -1154,36 +1142,10 @@ fn get_disk_usage_details(path: &str) -> Result<(f64, f64, f64), String> {
         return Err(format!("path does not exist: {path}"));
     }
 
-    #[cfg(unix)]
-    {
-        use std::ffi::CString;
-        let c_path = CString::new(path).map_err(|e| format!("invalid path: {e}"))?;
-        unsafe {
-            let mut stat: libc::statvfs = std::mem::zeroed();
-            if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
-                return Err(format!("statvfs failed for {path}"));
-            }
-            let total = stat.f_blocks as f64 * stat.f_frsize as f64;
-            let available = stat.f_bavail as f64 * stat.f_frsize as f64;
-            if total == 0.0 {
-                return Ok((0.0, 0.0, 0.0));
-            }
-            let used = total - available;
-            let usage = used / total;
-            Ok((usage, used, total))
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        Ok((0.0, 0.0, 1.0))
-    }
+    bookkeeper_common::disk::statvfs_usage(std::path::Path::new(path))
+        .map_err(|e| format!("statvfs failed for {path}: {e}"))
 }
 
-/// Periodic garbage collection loop.
-///
-/// Matches Java's GarbageCollectorThread + ScanAndCompareGarbageCollector:
-/// 1. Get all ledger IDs from metadata store (ZK)
 /// Periodic sync thread — flushes write cache to entry logs and checkpoints.
 ///
 /// Matches Java's SyncThread (BookieImpl.java:480):
@@ -1220,13 +1182,6 @@ async fn run_sync_thread(
     }
 }
 
-/// 2. Compare against local storage
-/// 3. Delete local data for ledgers no longer in metadata
-/// Validate the bookie environment at startup.
-/// Matches Java's `BookieImpl.checkEnvironment()`:
-/// - Ensures all configured directories exist and are accessible
-/// - Validates that journal and ledger dirs are on separate filesystems (warning only)
-/// - Creates `current/` subdirectories if missing
 fn write_cookie_to_dir(dir: &str, cookie_str: &str) -> Result<(), Box<dyn std::error::Error>> {
     let current = std::path::Path::new(dir).join(CURRENT_DIR);
     std::fs::create_dir_all(&current)
@@ -1855,6 +1810,23 @@ where
     });
 
     // Reader loop: decode frames, dispatch for concurrent processing.
+    //
+    // In-flight per-request processing lives in a `FuturesUnordered` that
+    // is polled cooperatively with the socket read on this same task.
+    // Each decoded frame used to be handed to `tokio::spawn`, which costs
+    // a task-struct allocation + Arc clones (of the processor and response
+    // channel) on every request. For a Pulsar-style broker that pins one
+    // connection per bookie and multiplexes thousands of add_entry rps
+    // over it, those allocations dominate the profile.
+    //
+    // The futures borrow `processor` and `resp_tx` directly from this
+    // function's scope — no per-frame Arc clone — and complete in place
+    // without spawning. Response ordering onto the socket is still owned
+    // by `writer_handle` via `resp_tx` (unchanged), so client-observable
+    // pipelining semantics match the previous behavior.
+    use futures::future::BoxFuture;
+    use futures::stream::{FuturesUnordered, StreamExt};
+
     let mut codec = BookieCodec::new(max_frame_size);
     let mut buf = BytesMut::with_capacity(4096);
     let mut is_v3: Option<bool> = None;
@@ -1863,126 +1835,142 @@ where
     // are rejected with EUA until the handshake completes.
     let mut authenticated = !processor.require_auth();
 
-    loop {
-        match codec.decode(&mut buf) {
-            Ok(Some(frame)) => {
-                let frame_bytes = frame.freeze();
-                // Java's `enqueueNanos` — start of the end-to-end `*_REQUEST` timer.
-                let enqueued_at = std::time::Instant::now();
+    let processor_ref: &RequestProcessor = &processor;
+    let resp_tx_ref = &resp_tx;
+    let mut in_flight: FuturesUnordered<BoxFuture<'_, ()>> = FuturesUnordered::new();
 
-                let decoded_v3 = match is_v3 {
-                    Some(true) => crate::v3_processor::try_decode_v3(&frame_bytes),
-                    Some(false) => None,
-                    None => crate::v3_processor::try_decode_v3(&frame_bytes),
-                };
-                let use_v3 = decoded_v3.is_some() || is_v3 == Some(true);
+    'outer: loop {
+        // Decode as many frames as are already buffered, pushing processing
+        // futures into `in_flight` without yielding. Only yield to the
+        // runtime when we need more bytes or when we want to let in-flight
+        // futures make progress.
+        'decode: loop {
+            match codec.decode(&mut buf) {
+                Ok(Some(frame)) => {
+                    let frame_bytes = frame.freeze();
+                    // Java's `enqueueNanos` — start of the end-to-end `*_REQUEST` timer.
+                    let enqueued_at = std::time::Instant::now();
 
-                if use_v3 {
-                    is_v3 = Some(true);
-                    if let Some(v3_req) = decoded_v3 {
-                        // Allow AUTH requests through even if not yet authenticated.
-                        let is_auth_op = v3_req.header.operation == bookkeeper_proto::OperationType::Auth as i32;
+                    let decoded_v3 = match is_v3 {
+                        Some(true) => crate::v3_processor::try_decode_v3(&frame_bytes),
+                        Some(false) => None,
+                        None => crate::v3_processor::try_decode_v3(&frame_bytes),
+                    };
+                    let use_v3 = decoded_v3.is_some() || is_v3 == Some(true);
+
+                    if use_v3 {
+                        is_v3 = Some(true);
+                        let Some(v3_req) = decoded_v3 else { break 'outer };
+                        let is_auth_op = v3_req.header.operation
+                            == bookkeeper_proto::OperationType::Auth as i32;
                         if !authenticated && !is_auth_op {
+                            // Fast synchronous reject path — no processing needed.
                             let txn_id = v3_req.header.txn_id as u64;
                             let operation = v3_req.header.operation;
                             let kind = v3_request_kind(operation);
                             let resp = crate::v3_processor::build_v3_error_response(
-                                txn_id, operation,
+                                txn_id,
+                                operation,
                                 bookkeeper_common::error::BKError::Unauthorized,
                             );
-                            let _ = resp_tx.send(EnqueuedResponse {
+                            let _ = resp_tx_ref.send(EnqueuedResponse {
                                 bytes: Bytes::from(resp),
                                 enqueued_at,
                                 queued_at: std::time::Instant::now(),
                                 kind,
                                 success: false,
                             });
-                            continue;
+                            continue 'decode;
                         }
                         if is_auth_op {
                             authenticated = true;
                         }
                         let kind = v3_request_kind(v3_req.header.operation);
-                        let proc = processor.clone();
-                        let tx = resp_tx.clone();
-                        tokio::spawn(async move {
+                        in_flight.push(Box::pin(async move {
                             let (resp_bytes, success) =
-                                crate::v3_processor::process_v3_request(&proc, v3_req).await;
-                            let _ = tx.send(EnqueuedResponse {
+                                crate::v3_processor::process_v3_request(processor_ref, v3_req)
+                                    .await;
+                            let _ = resp_tx_ref.send(EnqueuedResponse {
                                 bytes: Bytes::from(resp_bytes),
                                 enqueued_at,
                                 queued_at: std::time::Instant::now(),
                                 kind,
                                 success,
                             });
-                        });
+                        }));
                     } else {
-                        break;
-                    }
-                } else {
-                    is_v3 = Some(false);
-                    match decode_request(frame_bytes) {
-                        Ok(req) => {
-                            // Allow AUTH requests through; block others until authenticated.
-                            let is_auth_req = matches!(&req, V2Request::Auth { .. });
-                            if !authenticated && !is_auth_req {
-                                let proc = processor.clone();
-                                let tx = resp_tx.clone();
-                                // Return EUA for the request type. Extract ledger_id/entry_id
-                                // for the error response where available.
-                                tokio::spawn(async move {
-                                    let resp = proc.process_request(V2Request::Auth {
+                        is_v3 = Some(false);
+                        let req = match decode_request(frame_bytes) {
+                            Ok(r) => r,
+                            Err(_) => break 'outer,
+                        };
+                        let is_auth_req = matches!(&req, V2Request::Auth { .. });
+                        if !authenticated && !is_auth_req {
+                            in_flight.push(Box::pin(async move {
+                                let resp = processor_ref
+                                    .process_request(V2Request::Auth {
                                         payload: bytes::Bytes::new(),
-                                    }).await;
-                                    // Send an unauthorized error. For simplicity, we send
-                                    // the auth-disabled response — the client will see EUA.
-                                    let _ = tx.send(EnqueuedResponse {
-                                        bytes: encode_response(&resp).freeze(),
-                                        enqueued_at,
-                                        queued_at: std::time::Instant::now(),
-                                        kind: RequestKind::Other,
-                                        success: false,
-                                    });
-                                });
-                                continue;
-                            }
-                            if is_auth_req {
-                                authenticated = true;
-                            }
-                            let kind = v2_request_kind(&req);
-                            let proc = processor.clone();
-                            let tx = resp_tx.clone();
-                            tokio::spawn(async move {
-                                let resp = proc.process_request(req).await;
-                                let success = v2_response_success(&resp);
-                                let resp_encoded = encode_response(&resp);
-                                let _ = tx.send(EnqueuedResponse {
-                                    bytes: resp_encoded.freeze(),
+                                    })
+                                    .await;
+                                let _ = resp_tx_ref.send(EnqueuedResponse {
+                                    bytes: encode_response(&resp).freeze(),
                                     enqueued_at,
                                     queued_at: std::time::Instant::now(),
-                                    kind,
-                                    success,
+                                    kind: RequestKind::Other,
+                                    success: false,
                                 });
+                            }));
+                            continue 'decode;
+                        }
+                        if is_auth_req {
+                            authenticated = true;
+                        }
+                        let kind = v2_request_kind(&req);
+                        in_flight.push(Box::pin(async move {
+                            let resp = processor_ref.process_request(req).await;
+                            let success = v2_response_success(&resp);
+                            let resp_encoded = encode_response(&resp);
+                            let _ = resp_tx_ref.send(EnqueuedResponse {
+                                bytes: resp_encoded.freeze(),
+                                enqueued_at,
+                                queued_at: std::time::Instant::now(),
+                                kind,
+                                success,
                             });
-                        }
-                        Err(_) => {
-                            break;
-                        }
+                        }));
                     }
                 }
+                Ok(None) => break 'decode,
+                Err(_) => break 'outer,
             }
-            Ok(None) => {
-                match reader.read_buf(&mut buf).await {
+        }
+
+        // Need more bytes from the socket, and meanwhile in_flight futures
+        // are making progress. `select!` over (read, next) lets the runtime
+        // advance whichever is ready first without spawning.
+        tokio::select! {
+            read_result = reader.read_buf(&mut buf) => {
+                match read_result {
                     Ok(0) => break,
-                    Ok(_) => continue,
+                    Ok(_) => {},
                     Err(_) => break,
                 }
             }
-            Err(_) => {
-                break;
+            Some(()) = in_flight.next(), if !in_flight.is_empty() => {
+                // Completed future already enqueued its response; just
+                // loop back to the decoder in case more frames accumulated.
             }
         }
     }
+
+    // Let any still-in-flight processing finish so the writer task can
+    // flush pending responses before we drop the channel. Matches the
+    // previous `tokio::spawn`'d behavior where detached tasks ran to
+    // completion even after the reader exited.
+    while (in_flight.next().await).is_some() {}
+    // Explicit drop releases the `&resp_tx` borrow held by the (now-empty)
+    // futures collection so we can move `resp_tx` below.
+    drop(in_flight);
 
     // Drop the sender so the writer task exits after draining.
     drop(resp_tx);
