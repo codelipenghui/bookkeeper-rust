@@ -36,6 +36,13 @@ pub struct BookieServer {
     sync_handle: Option<tokio::task::JoinHandle<()>>,
     session_watcher_handle: Option<tokio::task::JoinHandle<()>>,
     scrubber_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Dedicated tokio runtime for the ZK client.
+    ///
+    /// Isolating the ZK session/heartbeat tasks from the main runtime
+    /// prevents RPC-load-induced scheduler starvation from expiring the
+    /// ZK session. Populated when ZK is configured; dropped during
+    /// shutdown, which cleanly stops its worker thread.
+    _zk_runtime: Option<tokio::runtime::Runtime>,
     /// Ledger directories — used to create/remove DIRTY files.
     ledger_directories: Vec<String>,
 }
@@ -276,6 +283,16 @@ impl BookieServer {
         let mut worker_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut session_watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // Dedicated tokio runtime for the ZK client. The
+        // `zookeeper-client` crate spawns its session/heartbeat loop via
+        // `tokio::spawn` inside `connect()`; isolating that on a
+        // dedicated runtime prevents RPC load on the main runtime from
+        // starving the heartbeat (which would cause a false
+        // "session expired" under sustained load).
+        //
+        // One worker thread is enough — the ZK client is purely I/O-bound.
+        let mut zk_runtime: Option<tokio::runtime::Runtime> = None;
+
         // Built inside the zk_reg block when either data-integrity flag
         // is set, so the cookie validator's optional pre-boot hook and
         // the later DataIntegrityService share one instance.
@@ -315,12 +332,27 @@ impl BookieServer {
                     }
                 }
             };
-            let reg_mgr = bookkeeper_metadata::zk::registration::ZkRegistrationManager::new(
-                zk_servers,
-                &config.zk_ledger_root,
-            )
-            .await
-            .map_err(|e| format!("ZK connect: {e}"))?;
+            // Build the dedicated ZK runtime now, before the connect call,
+            // so the ZK client's internal session task runs on an isolated
+            // worker. Lives for the bookie's lifetime.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("zk-runtime")
+                .enable_all()
+                .build()
+                .map_err(|e| format!("ZK runtime: {e}"))?;
+            let zk_handle = rt.handle().clone();
+            zk_runtime = Some(rt);
+
+            let reg_mgr =
+                bookkeeper_metadata::zk::registration::ZkRegistrationManager::new_isolated(
+                    zk_servers,
+                    &config.zk_ledger_root,
+                    Some(zk_handle),
+                    None, // use DEFAULT_ZK_SESSION_TIMEOUT (30s)
+                )
+                .await
+                .map_err(|e| format!("ZK connect: {e}"))?;
             data_integ_check =
                 build_data_integrity_check(&config, &bookie_id, storage.clone()).await?;
             run_cookie_validation(
@@ -618,6 +650,7 @@ impl BookieServer {
             sync_handle,
             session_watcher_handle,
             scrubber_handle,
+            _zk_runtime: zk_runtime,
             ledger_directories: config.ledger_directories.clone(),
         })
     }

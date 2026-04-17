@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use zookeeper_client as zk;
@@ -6,6 +8,17 @@ use crate::service_info::BookieServiceInfo;
 use crate::traits::{LedgerLayout, RegistrationManager};
 use crate::zk_path::ZkPaths;
 
+/// Default ZK session timeout used when the bookie connects.
+///
+/// The `zookeeper-client` crate defaults to 6s, which derives a 2.4s
+/// connection idle-timeout (2/5 of session). Under the bookie's steady-state
+/// load (producer + consumer + RPC fan-out), the tokio runtime can starve
+/// the ZK heartbeat task for longer than 2.4s — which caused the session
+/// client to disconnect and ultimately self-expire, triggering a supervisor
+/// restart. Matching Java BK's `zkTimeout=30000ms` default eliminates those
+/// false positives.
+pub const DEFAULT_ZK_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct ZkRegistrationManager {
     client: zk::Client,
     paths: ZkPaths,
@@ -13,9 +26,53 @@ pub struct ZkRegistrationManager {
 }
 
 impl ZkRegistrationManager {
+    /// Connect to ZK on the *current* tokio runtime using the default
+    /// session timeout. Under sustained load the caller should prefer
+    /// `new_isolated` to avoid heartbeat starvation.
     pub async fn new(connect_string: &str, ledger_root: &str) -> Result<Self, MetadataError> {
-        let client = zk::Client::connect(connect_string).await
-            .map_err(|e| MetadataError::ConnectionError(format!("ZK connect: {e}")))?;
+        Self::new_isolated(connect_string, ledger_root, None, None).await
+    }
+
+    /// Connect to ZK with an optional dedicated runtime handle and/or an
+    /// explicit session timeout.
+    ///
+    /// If `runtime` is `Some`, the ZK client is constructed via
+    /// `handle.spawn`, which causes the `zookeeper-client` crate's
+    /// internal session/heartbeat task to run on *that* runtime rather
+    /// than whatever runtime the caller is on. Bookies pass a dedicated
+    /// 1-worker runtime here so RPC load on the main runtime can't
+    /// starve ZK heartbeats.
+    ///
+    /// `session_timeout` defaults to `DEFAULT_ZK_SESSION_TIMEOUT` (30s).
+    pub async fn new_isolated(
+        connect_string: &str,
+        ledger_root: &str,
+        runtime: Option<tokio::runtime::Handle>,
+        session_timeout: Option<Duration>,
+    ) -> Result<Self, MetadataError> {
+        let timeout = session_timeout.unwrap_or(DEFAULT_ZK_SESSION_TIMEOUT);
+        let connect = connect_string.to_string();
+
+        let build_client = async move {
+            zk::Client::connector()
+                .with_session_timeout(timeout)
+                .connect(&connect)
+                .await
+        };
+
+        let client = match runtime {
+            Some(rt) => rt
+                .spawn(build_client)
+                .await
+                .map_err(|e| MetadataError::ConnectionError(
+                    format!("ZK runtime join: {e}"),
+                ))?
+                .map_err(|e| MetadataError::ConnectionError(format!("ZK connect: {e}")))?,
+            None => build_client
+                .await
+                .map_err(|e| MetadataError::ConnectionError(format!("ZK connect: {e}")))?,
+        };
+
         let paths = ZkPaths::new(ledger_root);
         Ok(Self { client, paths, parents_ensured: OnceCell::new() })
     }
