@@ -372,17 +372,39 @@ impl BookieServer {
                 .await
                 .map_err(|e| format!("ZK register: {e}"))?;
 
-            // Start ZK session watcher — monitors for session expiry.
-            // On expiry, exits the process for supervisor restart (matching Java behavior).
+            // Start ZK session watcher — monitors for session changes and
+            // re-registers the bookie's ephemeral znode when the session ID
+            // flips. A session replacement (seen as either a fresh
+            // `SyncConnected` with a new session id, or `Expired` followed
+            // by reconnect) wipes the ephemeral at
+            // `/ledgers/available/<bookie-id>`; without re-registration the
+            // bookie becomes invisible to clients even though the new
+            // session is healthy. This matches Java BookKeeper's
+            // BookieStateManager which re-registers rather than exits.
             {
                 let watcher_bookie_id = bookie_id.clone();
                 let watcher_shutdown = shutdown_rx.clone();
                 let mut session_watcher = reg_mgr.zk_client().state_watcher();
+                let watcher_client = reg_mgr.zk_client().clone();
+                let watcher_reg_path =
+                    reg_mgr.paths().bookie_registration(&bookie_id);
+                let watcher_reg_data =
+                    bookkeeper_metadata::service_info::BookieServiceInfo::new(
+                        &bookie_id,
+                        &advertised_host,
+                        local_addr.port(),
+                    )
+                    .to_protobuf_bytes();
+                let initial_session = reg_mgr.zk_client().session_id();
 
                 session_watcher_handle = Some(tokio::spawn(async move {
                     run_session_watcher(
                         &mut session_watcher,
                         &watcher_bookie_id,
+                        &watcher_client,
+                        &watcher_reg_path,
+                        &watcher_reg_data,
+                        initial_session,
                         watcher_shutdown,
                     ).await;
                 }));
@@ -833,21 +855,43 @@ async fn validate_cookie(
     Ok(())
 }
 
-/// Monitors ZK session state for fatal events.
+/// Monitors ZK session state and re-registers the bookie's ephemeral
+/// registration whenever the session ID changes.
 ///
-/// Matches Java's actual behavior on session expiry:
-/// - Disconnected: log warning, wait for auto-reconnect (ephemeral nodes survive within session)
-/// - Expired: session is dead, ephemeral registration gone, all ZK-dependent components broken.
-///   Java's BookieStateManager attempts re-registration but fails (stale ZK handle), then calls
-///   shutdownHandler.shutdown(ZK_REG_FAIL). We match this by exiting the process so the external
-///   supervisor (systemd, k8s) can restart it with a fresh ZK session.
-/// - AuthFailed: fatal, exit process.
+/// Matches Java BookKeeper's `BookieStateManager` which re-registers on
+/// session loss rather than killing the process. Two distinct failure
+/// modes motivate this:
+///
+/// 1. **Expired**: the session is dead, ephemeral nodes were cleaned up
+///    by the ZK ensemble. The `zookeeper-client` crate's Client tears
+///    down and re-establishes internally, yielding a fresh session id.
+/// 2. **Silent session replacement**: after a `Disconnected` +
+///    `SyncConnected` cycle the crate can hand back a *different*
+///    session id without firing an `Expired` event in between (observed
+///    when the ZK server restarts within the session timeout). In this
+///    case the old session's ephemerals are still gone, but the state
+///    transitions skipped the `Expired` signal.
+///
+/// In both cases we observe `SyncConnected` on a new session id, and
+/// call `re_register` (which uses `create → NodeExists → set_data` and
+/// is therefore idempotent). Previously we hard-exited on `Expired`,
+/// relying on a supervisor to restart the bookie — fine on k8s but
+/// unnecessarily disruptive, and it did nothing for the silent-replace
+/// case which is what actually bit us in practice.
+///
+/// `AuthFailed` remains fatal: the bookie's credentials are wrong and
+/// a restart under a supervisor is appropriate.
 async fn run_session_watcher(
     watcher: &mut zookeeper_client::StateWatcher,
     bookie_id: &str,
+    client: &zookeeper_client::Client,
+    reg_path: &str,
+    reg_data: &[u8],
+    initial_session: zookeeper_client::SessionId,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     use zookeeper_client::SessionState;
+    let mut last_session = initial_session;
 
     loop {
         tokio::select! {
@@ -858,19 +902,42 @@ async fn run_session_watcher(
                             (ephemeral nodes survive within same session)");
                     }
                     SessionState::SyncConnected => {
-                        tracing::info!("ZK session reconnected (same session)");
+                        let current = client.session_id();
+                        if current == last_session {
+                            tracing::info!("ZK session reconnected (same session: {current:?})");
+                        } else {
+                            tracing::warn!(
+                                "ZK session replaced silently: {last_session:?} → {current:?}. \
+                                 Ephemeral registration was dropped; re-registering."
+                            );
+                            if let Err(e) = re_register_ephemeral(
+                                client, reg_path, reg_data,
+                            ).await {
+                                tracing::error!(
+                                    "Re-registration after session replacement failed: {e}. \
+                                     Bookie may be invisible to clients until next session event."
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Bookie {bookie_id} re-registered on session {current:?}"
+                                );
+                            }
+                            last_session = current;
+                        }
                     }
                     SessionState::Expired => {
-                        // Session expired = ephemeral registration gone, all ZK components stale.
-                        // Java: ZooKeeperClient calls Runtime.exit(-1) on reconnect failure;
-                        // BookieStateManager calls shutdownHandler.shutdown(ZK_REG_FAIL).
-                        // Match this by exiting the process for supervisor restart.
-                        tracing::error!(
+                        // The old session is gone; the crate will reconnect
+                        // and surface a fresh `SyncConnected` with a new
+                        // session id. Defer the re-registration to that
+                        // event so we don't race the reconnect. If the
+                        // client never comes back, the bookie simply stays
+                        // unregistered until a supervisor intervenes —
+                        // same outcome as the previous `exit(1)` policy,
+                        // without taking the whole process down.
+                        tracing::warn!(
                             "ZK session expired for bookie {bookie_id}. \
-                             Ephemeral registration lost. All ZK-dependent components are stale. \
-                             Exiting process for supervisor restart (matching Java ZK_REG_FAIL)."
+                             Waiting for reconnect to re-register ephemeral."
                         );
-                        std::process::exit(1);
                     }
                     SessionState::AuthFailed => {
                         tracing::error!(
@@ -891,6 +958,27 @@ async fn run_session_watcher(
                 }
             }
         }
+    }
+}
+
+/// Idempotent create-or-update of the bookie's ephemeral registration
+/// znode. `NodeExists` falls back to `set_data` — the stale ephemeral
+/// from the previous session is swept by the ZK server ~session-timeout
+/// after expiry, so a quick reconnect can legitimately land on an
+/// already-present znode owned by the previous session's inode.
+async fn re_register_ephemeral(
+    client: &zookeeper_client::Client,
+    path: &str,
+    data: &[u8],
+) -> Result<(), zookeeper_client::Error> {
+    let options = zookeeper_client::CreateMode::Ephemeral
+        .with_acls(zookeeper_client::Acls::anyone_all());
+    match client.create(path, data, &options).await {
+        Ok(_) => Ok(()),
+        Err(zookeeper_client::Error::NodeExists) => {
+            client.set_data(path, data, None).await.map(|_| ())
+        }
+        Err(e) => Err(e),
     }
 }
 
