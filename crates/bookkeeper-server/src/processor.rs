@@ -393,22 +393,43 @@ impl RequestProcessor {
         }
 
         // Special case: LAST_ADD_CONFIRMED (-1)
-        // Java client expects the last entry body so it can verify digest and extract LAC+length
+        // Java client expects the last entry body so it can verify the digest
+        // and extract LAC+length. If we return EOK with an empty body, the
+        // client's CRC32CDigestManager tries to validate a digest on 0 bytes
+        // and rejects the response with "Mac mismatch" — which blocks topic
+        // recovery for any ledger that's newly created but has no committed
+        // entries yet (a common state for fresh partitioned topics).
+        //
+        // The correct response for an empty ledger is NoSuchEntry; the client
+        // treats that as "no committed entry, proceed with LAC = -1".
         if entry_id == LAST_ADD_CONFIRMED {
             match self.storage.get_last_add_confirmed(ledger_id) {
                 Ok(lac) => {
-                    // Try to return the actual last entry body for digest verification
-                    let data = if lac >= 0 {
-                        self.storage.get_entry(ledger_id, lac).await.ok()
-                    } else {
-                        None
-                    };
-                    return V2Response::Read {
-                        error_code: V2_EOK,
-                        ledger_id,
-                        entry_id: lac,
-                        data,
-                    };
+                    if lac < 0 {
+                        return self.read_error_response(
+                            BKError::NoEntry, ledger_id, entry_id,
+                        );
+                    }
+                    match self.storage.get_entry(ledger_id, lac).await {
+                        Ok(data) => {
+                            return V2Response::Read {
+                                error_code: V2_EOK,
+                                ledger_id,
+                                entry_id: lac,
+                                data: Some(data),
+                            };
+                        }
+                        Err(e) => {
+                            // LAC advertises an entry we can't actually read
+                            // (deleted / corrupted). Same problem as above:
+                            // an EOK with empty body fails digest validation.
+                            warn!(ledger_id, entry_id, error = ?e,
+                                  "LAC entry body read failed");
+                            return self.read_error_response(
+                                BKError::NoEntry, ledger_id, entry_id,
+                            );
+                        }
+                    }
                 }
                 Err(_) => {
                     return self.read_error_response(BKError::NoLedger, ledger_id, entry_id);
