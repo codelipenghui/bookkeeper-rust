@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use futures::stream::{self, StreamExt};
 use tokio::sync::watch;
 use bytes::Bytes;
 use bookkeeper_client::bookie_connection::BookieConnection;
@@ -27,6 +28,10 @@ use crate::ReplicationError;
 const FAILED_LEDGER_CACHE_MAX: usize = 2000;
 /// Max exponential backoff retries before capping, matching Java's NUM_OF_EXPONENTIAL_BACKOFF_RETRIALS.
 const MAX_BACKOFF_RETRIES: u32 = 5;
+/// Concurrency bound for per-bookie entry probes during `detect_bad_bookies`.
+/// Bookies handle reads cheaply but we don't want to saturate the peer with
+/// a full-ledger fan-out.
+const PROBE_CONCURRENCY: usize = 32;
 
 pub struct ReplicationWorker {
     ur_manager: Arc<ZkUnderreplicationManager>,
@@ -667,42 +672,62 @@ impl ReplicationWorker {
         schedule: &RoundRobinDistributionSchedule,
         master_key: &[u8; MASTER_KEY_LENGTH],
     ) -> Result<HashMap<usize, HashSet<i64>>, ReplicationError> {
+        // Pre-compute which entries land on which bookie so the async tasks
+        // own their data outright (avoids `'static` / `Send` headaches with
+        // borrowed slices inside nested streams).
+        let per_bookie: Vec<(usize, String, Vec<i64>)> = ensemble
+            .iter()
+            .enumerate()
+            .map(|(idx, addr)| {
+                let entries: Vec<i64> = (first_entry_id..=last_entry_id)
+                    .filter(|eid| schedule.write_set(*eid).contains(&idx))
+                    .collect();
+                (idx, addr.clone(), entries)
+            })
+            .collect();
+        let ensemble_len = per_bookie.len().max(1);
+        let master_key = *master_key;
+
+        // Probe every bookie concurrently. Within each bookie, probe entries
+        // concurrently with a bounded fan-out (avoid saturating the peer).
+        // Previously this was a double serial loop; full-ledger probing is
+        // now bounded by `max(ensemble, entries/PROBE_CONCURRENCY)` RTTs.
+        let results: Vec<(usize, HashSet<i64>)> = stream::iter(per_bookie)
+            .map(|(idx, addr, entries)| async move {
+                let conn = match connect_to_bookie(&addr).await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // Bookie unreachable: all its entries count as missing.
+                        return (idx, entries.into_iter().collect::<HashSet<i64>>());
+                    }
+                };
+                let missing: HashSet<i64> = stream::iter(entries)
+                    .map(|eid| {
+                        let conn = Arc::clone(&conn);
+                        async move {
+                            match conn
+                                .send_read_entry(0, ledger_id, eid, Some(master_key))
+                                .await
+                            {
+                                Ok(V2Response::Read { error_code, .. }) if error_code == V2_EOK => None,
+                                _ => Some(eid),
+                            }
+                        }
+                    })
+                    .buffer_unordered(PROBE_CONCURRENCY)
+                    .filter_map(|x| async move { x })
+                    .collect()
+                    .await;
+                (idx, missing)
+            })
+            .buffer_unordered(ensemble_len)
+            .collect()
+            .await;
+
         let mut bad: HashMap<usize, HashSet<i64>> = HashMap::new();
-
-        for (idx, addr) in ensemble.iter().enumerate() {
-            let conn = match connect_to_bookie(addr).await {
-                Ok(c) => c,
-                Err(_) => {
-                    // Bookie unreachable: mark ALL entries on this bookie as missing
-                    let missing: HashSet<i64> = (first_entry_id..=last_entry_id)
-                        .filter(|eid| schedule.write_set(*eid).contains(&idx))
-                        .collect();
-                    if !missing.is_empty() {
-                        bad.insert(idx, missing);
-                    }
-                    continue;
-                }
-            };
-
-            let mut missing_entries: HashSet<i64> = HashSet::new();
-
-            for eid in first_entry_id..=last_entry_id {
-                if !schedule.write_set(eid).contains(&idx) {
-                    continue; // this entry is not on this bookie
-                }
-                match conn
-                    .send_read_entry(0, ledger_id, eid, Some(*master_key))
-                    .await
-                {
-                    Ok(V2Response::Read { error_code, .. }) if error_code == V2_EOK => {}
-                    _ => {
-                        missing_entries.insert(eid);
-                    }
-                }
-            }
-
-            if !missing_entries.is_empty() {
-                bad.insert(idx, missing_entries);
+        for (idx, missing) in results {
+            if !missing.is_empty() {
+                bad.insert(idx, missing);
             }
         }
         Ok(bad)

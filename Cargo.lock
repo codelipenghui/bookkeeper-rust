@@ -642,6 +642,7 @@ dependencies = [
 name = "bookkeeper-common"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "thiserror 2.0.18",
 ]
 
@@ -657,6 +658,7 @@ name = "bookkeeper-metadata"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bookkeeper-common",
  "bookkeeper-proto",
  "futures",
  "prost",
@@ -736,7 +738,6 @@ dependencies = [
  "bytes",
  "futures",
  "lazy_static",
- "libc",
  "parking_lot",
  "pprof",
  "prometheus",

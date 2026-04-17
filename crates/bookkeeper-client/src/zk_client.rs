@@ -805,16 +805,21 @@ fn build_closed_metadata(
 
 /// Update ledger metadata in ZK when an ensemble change occurs.
 /// Reads current metadata, adds the new segment, writes back with CAS.
+///
+/// The additional ensemble-parameter inputs must match the ledger's original
+/// create-time values — they are accepted as a sanity check rather than a
+/// source of truth. All other fields (custom_metadata, ctime, c_token, format
+/// version) are preserved via `from_existing`.
 async fn update_ensemble_metadata(
     lm: &ZkLedgerManager,
     ledger_id: i64,
     first_entry_id: i64,
     new_ensemble: &[String],
-    ensemble_size: i32,
-    write_quorum: i32,
-    ack_quorum: i32,
-    digest_type: MetaDigestType,
-    password: &[u8],
+    _ensemble_size: i32,
+    _write_quorum: i32,
+    _ack_quorum: i32,
+    _digest_type: MetaDigestType,
+    _password: &[u8],
 ) -> Result<(), MetadataError> {
     // CAS retry loop
     for _ in 0..bookkeeper_common::MAX_CAS_RETRIES {
@@ -822,21 +827,8 @@ async fn update_ensemble_metadata(
         let md = versioned.value();
         let version = versioned.version();
 
-        let mut builder = LedgerMetadataBuilder::new()
-            .ledger_id(ledger_id)
-            .metadata_format_version(3)
-            .ensemble_size(ensemble_size)
-            .write_quorum_size(write_quorum)
-            .ack_quorum_size(ack_quorum)
-            .with_digest_type(digest_type)
-            .with_password(password.to_vec());
-
-        // Copy existing segments
-        for (first_entry, ens) in md.all_ensembles() {
-            builder = builder.new_ensemble_entry(*first_entry, ens.clone());
-        }
-        // Add new segment
-        builder = builder.new_ensemble_entry(first_entry_id, new_ensemble.to_vec());
+        let builder = LedgerMetadataBuilder::from_existing(md)
+            .new_ensemble_entry(first_entry_id, new_ensemble.to_vec());
 
         let new_md = builder.build().map_err(|e| {
             MetadataError::SerializationError(format!("build ensemble change metadata: {e}"))

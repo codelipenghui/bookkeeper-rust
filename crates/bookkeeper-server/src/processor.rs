@@ -26,16 +26,7 @@ const DEFAULT_BACKPRESSURE_TIMEOUT_MS: u64 = 0;
 /// Matches Java's `numHighPriorityWorkerThreads` separate pool concept.
 const DEFAULT_MAX_HIGH_PRIORITY_IN_PROGRESS: usize = 10000;
 
-/// Peek the (ledgerId, entryId) from the first 16 bytes of an AddEntry body.
-/// Returns `(0, 0)` if the body is shorter than the metadata header.
-fn peek_entry_ids(entry_data: &[u8]) -> (i64, i64) {
-    if entry_data.len() < 16 {
-        return (0, 0);
-    }
-    let ledger_id = i64::from_be_bytes(entry_data[0..8].try_into().expect("8 bytes"));
-    let entry_id = i64::from_be_bytes(entry_data[8..16].try_into().expect("8 bytes"));
-    (ledger_id, entry_id)
-}
+use bookkeeper_protocol::entry::peek_ids;
 
 pub struct RequestProcessor {
     storage: Arc<dyn LedgerStorage>,
@@ -173,7 +164,7 @@ impl RequestProcessor {
                     Some(p) => p,
                     None => {
                         crate::metrics::ADD_ENTRY_REJECTED.inc();
-                        let (ledger_id, entry_id) = peek_entry_ids(&entry_data);
+                        let (ledger_id, entry_id) = peek_ids(&entry_data).unwrap_or((0, 0));
                         return V2Response::Add { error_code: BKError::TooManyRequests.to_v2_code(), ledger_id, entry_id };
                     }
                 };
@@ -302,7 +293,7 @@ impl RequestProcessor {
         if entry_data.len() < 16 {
             return self.add_error_response(BKError::BadRequest, 0, 0);
         }
-        let (ledger_id, entry_id) = peek_entry_ids(&entry_data);
+        let (ledger_id, entry_id) = peek_ids(&entry_data).unwrap_or((0, 0));
         let is_recovery = flags & FLAG_RECOVERY_ADD != 0;
         let is_high_priority = flags & FLAG_HIGH_PRIORITY != 0;
 
@@ -576,9 +567,12 @@ impl RequestProcessor {
                     }
                     entries.push(data);
                 }
+                Err(bookkeeper_storage::StorageError::EntryNotFound { .. }) => {
+                    // Normal end-of-batch — Pulsar over-requests and relies
+                    // on this sentinel. Not a warning.
+                    break;
+                }
                 Err(e) => {
-                    // Distinguish `EntryNotFound` (the normal end-of-batch
-                    // signal — Pulsar over-requests) from real I/O errors.
                     warn!(
                         ledger_id, entry_id = eid, request_id,
                         returned = entries.len(),
@@ -635,31 +629,8 @@ impl RequestProcessor {
 }
 
 fn get_disk_space() -> (i64, i64) {
-    #[cfg(unix)]
-    {
-        match nix_disk_space("/") {
-            Some((free, total)) => (free, total),
-            None => (0, 0),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        (0, 0)
-    }
-}
-
-#[cfg(unix)]
-fn nix_disk_space(path: &str) -> Option<(i64, i64)> {
-    use std::ffi::CString;
-    let c_path = CString::new(path).ok()?;
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-            let total = (stat.f_blocks as i64) * (stat.f_frsize as i64);
-            let free = (stat.f_bavail as i64) * (stat.f_frsize as i64);
-            Some((free, total))
-        } else {
-            None
-        }
+    match bookkeeper_common::disk::statvfs_bytes(std::path::Path::new("/")) {
+        Ok((total, available)) => (available as i64, total as i64),
+        Err(_) => (0, 0),
     }
 }

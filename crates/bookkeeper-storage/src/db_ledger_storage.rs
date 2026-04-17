@@ -136,8 +136,11 @@ struct LedgerMetaCacheEntry {
 pub struct DbLedgerStorage {
     base_dir: PathBuf,
     unified_cache: Arc<UnifiedCache>,
-    entry_location_index: EntryLocationIndex,
-    ledger_index: LedgerMetadataIndex,
+    // Arc-wrapped so hot-path async methods can clone the handle into
+    // `tokio::task::spawn_blocking` — RocksDB reads/writes are synchronous
+    // and would otherwise block the tokio worker thread.
+    entry_location_index: Arc<EntryLocationIndex>,
+    ledger_index: Arc<LedgerMetadataIndex>,
     entry_log_dir: PathBuf,
     log_state: Mutex<EntryLogState>,
     flush_mutex: tokio::sync::Mutex<()>,
@@ -231,10 +234,12 @@ impl DbLedgerStorage {
         fs::create_dir_all(&locations_dir)?;
         fs::create_dir_all(&ledgers_dir)?;
 
-        let entry_location_index =
-            EntryLocationIndex::open(&locations_dir, entry_location_rocksdb_conf)?;
-        let ledger_index =
-            LedgerMetadataIndex::open(&ledgers_dir, ledger_metadata_rocksdb_conf)?;
+        let entry_location_index = Arc::new(
+            EntryLocationIndex::open(&locations_dir, entry_location_rocksdb_conf)?,
+        );
+        let ledger_index = Arc::new(
+            LedgerMetadataIndex::open(&ledgers_dir, ledger_metadata_rocksdb_conf)?,
+        );
 
         // CRITICAL: scan existing entry log files and start writing into a
         // brand-new file (max_existing + 1). Without this we'd reopen
@@ -444,7 +449,6 @@ impl DbLedgerStorage {
         config: crate::journal::writer::JournalConfig,
         journal_io: std::sync::Arc<dyn crate::io_engine::JournalIo>,
         on_fatal_error: Option<crate::journal::writer::OnFatalError>,
-        #[allow(unused_variables)]
         skip_invalid_record: bool,
     ) -> Result<usize, StorageError> {
         // Read lastMark from the ledger directory. This tells us where
@@ -484,13 +488,6 @@ impl DbLedgerStorage {
         Ok(replayed)
     }
 
-    /// Remove old journal files after successful flush/checkpoint.
-    ///
-    /// Only deletes journal files whose ID is strictly less than the
-    /// current journal file's ID. The current file (and any newer ones)
-    /// are preserved because they may contain entries not yet flushed
-    /// to entry logs. This matches Java's SyncThread cleanup which
-    /// only removes journals older than the lastMark.
     /// Remove old journal files after checkpoint, keeping `max_backup_journals`
     /// files before the current one. Matches Java's `Journal.checkpointComplete()`
     /// which uses `maxBackupJournals` to retain a safety margin of old journals.
@@ -550,7 +547,7 @@ impl DbLedgerStorage {
     }
 
     fn entry_log_path(&self, log_id: u32) -> PathBuf {
-        self.entry_log_dir.join(format!("{:x}.log", log_id))
+        self.entry_log_dir.join(crate::io_engine::entry_log_filename(log_id))
     }
 
     fn ensure_entry_log_exists(&self, log_id: u32) -> Result<(), StorageError> {
@@ -871,14 +868,26 @@ impl LedgerStorage for DbLedgerStorage {
 
         // Ensure ledger exists in index (no-op if validate_for_write already created it).
         // Cache hit means RocksDB already has the row — skip the read entirely.
-        if !self.meta_cache.contains_key(&ledger_id)
-            && self.ledger_index.get(ledger_id)?.is_none()
-        {
-            self.ledger_index.set(ledger_id, false, None, None)?;
-            self.meta_cache.insert(
-                ledger_id,
-                Arc::new(LedgerMetaCacheEntry { fenced: false, master_key: None }),
-            );
+        // On first touch (cache miss), hand the RocksDB read + write off to
+        // a blocking thread so the tokio worker isn't stuck during index init.
+        if !self.meta_cache.contains_key(&ledger_id) {
+            let idx = Arc::clone(&self.ledger_index);
+            let created = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
+                if idx.get(ledger_id)?.is_none() {
+                    idx.set(ledger_id, false, None, None)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
+            .await
+            .map_err(|e| StorageError::RocksDb(format!("spawn_blocking join: {e}")))??;
+            if created {
+                self.meta_cache.insert(
+                    ledger_id,
+                    Arc::new(LedgerMetaCacheEntry { fenced: false, master_key: None }),
+                );
+            }
         }
 
         // Update LAC in memory only (no RocksDB write per entry).
@@ -962,9 +971,15 @@ impl LedgerStorage for DbLedgerStorage {
             storage_metrics::READ_ENTRY.observe(read_start.elapsed().as_secs_f64());
             return Ok(Bytes::from(data));
         }
-        // Check RocksDB index → entry log file
+        // Check RocksDB index → entry log file. Hand off to a blocking
+        // thread so a cache-miss storm doesn't stall the tokio worker.
         let index_start = Instant::now();
-        let location = self.entry_location_index.get(ledger_id, entry_id)?;
+        let location = {
+            let idx = Arc::clone(&self.entry_location_index);
+            tokio::task::spawn_blocking(move || idx.get(ledger_id, entry_id))
+                .await
+                .map_err(|e| StorageError::RocksDb(format!("spawn_blocking join: {e}")))??
+        };
         storage_metrics::READ_LOCATIONS_INDEX_TIME.inc_by(index_start.elapsed().as_nanos() as u64);
 
         if let Some(location) = location {
@@ -1026,13 +1041,11 @@ impl LedgerStorage for DbLedgerStorage {
                         if ahead_data.len() < 16 {
                             break;
                         }
-                        let ahead_ledger =
-                            i64::from_be_bytes(ahead_data[0..8].try_into().unwrap());
+                        let ahead_ledger = Self::extract_ledger_id(&ahead_data);
                         if ahead_ledger != ledger_id {
                             break;
                         }
-                        let ahead_eid =
-                            i64::from_be_bytes(ahead_data[8..16].try_into().unwrap());
+                        let ahead_eid = Self::extract_entry_id(&ahead_data);
 
                         // put_read is a no-op if the entry is already in any
                         // region (write buffer or read ring) — invariant I2.
@@ -1448,8 +1461,8 @@ impl LedgerStorage for DbLedgerStorage {
                             errors += 1;
                             continue;
                         }
-                        let stored_lid = i64::from_be_bytes(data[0..8].try_into().unwrap());
-                        let stored_eid = i64::from_be_bytes(data[8..16].try_into().unwrap());
+                        let stored_lid = Self::extract_ledger_id(&data);
+                        let stored_eid = Self::extract_entry_id(&data);
                         if stored_lid != *ledger_id || stored_eid != *entry_id {
                             tracing::warn!(
                                 "scrub: ID mismatch at log={log_id} pos={pos}: \

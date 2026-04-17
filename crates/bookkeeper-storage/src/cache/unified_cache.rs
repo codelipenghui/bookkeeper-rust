@@ -112,10 +112,10 @@ impl WriteBuffer {
         let aligned = align64(len);
         if aligned > self.max_size { return Err(()); }
         loop {
-            let cur = self.offset.load(Ordering::SeqCst);
+            let cur = self.offset.load(Ordering::Relaxed);
             if cur + aligned > self.max_size { return Err(()); }
-            if self.offset.compare_exchange(
-                cur, cur + aligned, Ordering::SeqCst, Ordering::SeqCst,
+            if self.offset.compare_exchange_weak(
+                cur, cur + aligned, Ordering::Release, Ordering::Relaxed,
             ).is_ok() {
                 return Ok(cur);
             }

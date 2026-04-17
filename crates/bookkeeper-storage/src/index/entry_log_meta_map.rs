@@ -190,7 +190,7 @@ impl EntryLogMetadataMap {
             let (key, _) = item?;
             if key.len() < 4 { continue; }
             let log_id = u32::from_be_bytes(key[..4].try_into().unwrap());
-            let path = entry_log_dir.join(format!("{:x}.log", log_id));
+            let path = entry_log_dir.join(crate::io_engine::entry_log_filename(log_id));
             if !path.exists() {
                 stale.push(log_id);
             }

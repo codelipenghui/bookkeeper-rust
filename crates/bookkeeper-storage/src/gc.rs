@@ -472,7 +472,7 @@ impl GarbageCollector {
     async fn compact_entry_log(
         &self,
         path: &Path,
-        _log_id: u32,
+        log_id: u32,
         active_ledgers: &HashSet<i64>,
     ) -> Result<usize, StorageError> {
         let compact_start = Instant::now();
@@ -551,7 +551,7 @@ impl GarbageCollector {
         // Step 5: Delete old log file AFTER index is updated.
         // If crash between step 4 and 5: old file remains, index points to new locations.
         // Old file will be cleaned up on next GC cycle (safe).
-        self.ledger_io.evict_fd(path.parent().unwrap_or(path), _log_id);
+        self.ledger_io.evict_fd(path.parent().unwrap_or(path), log_id);
         fs::remove_file(path)?;
 
         if count > 0 {

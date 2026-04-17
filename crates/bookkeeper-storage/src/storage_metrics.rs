@@ -175,38 +175,10 @@ lazy_static! {
     )
     .unwrap();
 
-    /// Number of add_entry calls that had to wait for the flush cache swap lock.
-    /// Non-zero values indicate write-path stalls caused by flush contention.
-    pub static ref ADD_ENTRY_BLOCKED_BY_FLUSH: IntCounter = IntCounter::new(
-        "bookie_add_entry_blocked_by_flush",
-        "number of add_entry calls blocked waiting for the write cache flush swap lock",
-    )
-    .unwrap();
-
     // -----------------------------------------------------------------------
     // Cache metrics (moved from bookkeeper-server metrics.rs)
     // Matches Java's DbLedgerStorageStats.java cache counters/gauges
     // -----------------------------------------------------------------------
-
-    /// Write cache hit count. Matches Java's `write-cache-hits`.
-    pub static ref WRITE_CACHE_HITS: IntCounter = IntCounter::new(
-        "bookie_write_cache_hits", "Write cache hit count"
-    ).unwrap();
-
-    /// Write cache miss count. Matches Java's `write-cache-misses`.
-    pub static ref WRITE_CACHE_MISSES: IntCounter = IntCounter::new(
-        "bookie_write_cache_misses", "Write cache miss count"
-    ).unwrap();
-
-    /// Read cache hit count. Matches Java's `read-cache-hits`.
-    pub static ref READ_CACHE_HITS: IntCounter = IntCounter::new(
-        "bookie_read_cache_hits", "Read cache hit count"
-    ).unwrap();
-
-    /// Read cache miss count. Matches Java's `read-cache-misses`.
-    pub static ref READ_CACHE_MISSES: IntCounter = IntCounter::new(
-        "bookie_read_cache_misses", "Read cache miss count"
-    ).unwrap();
 
     /// Write cache current size in bytes. Matches Java's `write-cache-size`.
     pub static ref WRITE_CACHE_SIZE: IntGauge = IntGauge::new(
@@ -306,12 +278,7 @@ pub fn register_storage_metrics(registry: &prometheus::Registry) {
     reg!(IO_URING_BUF_POOL_EXHAUSTED_TOTAL);
     // Flush lock contention
     reg!(FLUSH_CACHE_SWAP);
-    reg!(ADD_ENTRY_BLOCKED_BY_FLUSH);
     // Cache
-    reg!(WRITE_CACHE_HITS);
-    reg!(WRITE_CACHE_MISSES);
-    reg!(READ_CACHE_HITS);
-    reg!(READ_CACHE_MISSES);
     reg!(WRITE_CACHE_SIZE);
     reg!(WRITE_CACHE_COUNT);
     reg!(WRITE_CACHE_FILL_RATIO);

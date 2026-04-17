@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bookkeeper-common = { workspace = true }
 bookkeeper-proto = { workspace = true }
 prost = { workspace = true }
 thiserror = { workspace = true }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// Environment-variable prefix used to override any config property.
 /// Matches the convention baked into Apache BookKeeper's Docker images:
@@ -76,6 +77,44 @@ pub fn parse_bool(raw: &str) -> bool {
         s.to_ascii_lowercase().as_str(),
         "true" | "yes" | "y" | "on" | "1"
     )
+}
+
+/// If `props` contains `key`, parse it as `T` and overwrite `field`.
+/// Silent on parse failure — matches the existing behavior (misconfigured
+/// values fall back to the struct default) and keeps one-liner call sites.
+pub fn load_parsed<T: FromStr>(props: &HashMap<String, String>, key: &str, field: &mut T) {
+    if let Some(v) = props.get(key) {
+        if let Ok(n) = v.parse() {
+            *field = n;
+        }
+    }
+}
+
+/// If `props` contains `key`, parse as a Java-compatible boolean (see
+/// [`parse_bool`]) and overwrite `field`.
+pub fn load_bool(props: &HashMap<String, String>, key: &str, field: &mut bool) {
+    if let Some(v) = props.get(key) {
+        *field = parse_bool(v);
+    }
+}
+
+/// If `props` contains `key`, copy its value into `field`.
+pub fn load_string(props: &HashMap<String, String>, key: &str, field: &mut String) {
+    if let Some(v) = props.get(key) {
+        *field = v.clone();
+    }
+}
+
+/// If `props` contains `key`, wrap its value in `Some` and store it in
+/// `field`. Absent key leaves `field` unchanged (does NOT set to `None`).
+pub fn load_opt_string(
+    props: &HashMap<String, String>,
+    key: &str,
+    field: &mut Option<String>,
+) {
+    if let Some(v) = props.get(key) {
+        *field = Some(v.clone());
+    }
 }
 
 #[cfg(test)]

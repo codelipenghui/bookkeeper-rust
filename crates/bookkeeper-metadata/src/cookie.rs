@@ -183,44 +183,4 @@ fn extract_proto_text_field(line: &str, field_name: &str) -> Option<String> {
     Some(proto_text_unescape(raw))
 }
 
-/// Escape a string value for protobuf text format output.
-/// Matches Java's `TextFormat.escapeBytes()` / `TextFormat.escapeText()` for
-/// the characters that appear in BookKeeper cookie values.
-fn proto_text_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-/// Unescape a protobuf text format string value.
-/// Matches Java's `TextFormat.unescapeText()` for the escape sequences that
-/// appear in BookKeeper cookie values.
-fn proto_text_unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('t') => out.push('\t'),
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('\\') => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some(other) => { out.push('\\'); out.push(other); }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
+use bookkeeper_common::proto_text::{escape as proto_text_escape, unescape as proto_text_unescape};

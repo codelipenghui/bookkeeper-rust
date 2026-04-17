@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::properties::parse_bool;
+use crate::properties::{load_bool, load_opt_string, load_parsed, load_string};
 
 /// Complete bookie server configuration with all parameters from the spec.
 #[derive(Debug, Clone)]
@@ -659,197 +659,205 @@ impl ServerConfig {
 
     pub fn from_properties(props: &HashMap<String, String>) -> Self {
         let mut config = Self::default();
-        if let Some(v) = props.get("bookiePort") { if let Ok(n) = v.parse() { config.bookie_port = n; } }
-        if let Some(v) = props.get("advertisedAddress") { config.advertised_address = Some(v.clone()); }
-        if let Some(v) = props.get("useHostNameAsBookieID") { config.use_hostname_as_bookie_id = parse_bool(v); }
-        if let Some(v) = props.get("useShortHostName") { config.use_short_hostname = parse_bool(v); }
-        if let Some(v) = props.get("listeningInterface") { config.listening_interface = Some(v.clone()); }
-        if let Some(v) = props.get("allowLoopback") { config.allow_loopback = parse_bool(v); }
-        if let Some(v) = props.get("journalDirectory") { config.journal_directory = v.clone(); }
-        if let Some(v) = props.get("journalDirectories") { config.journal_directory = v.split('|').next().unwrap_or("").to_string(); }
-        if let Some(v) = props.get("ledgerDirectories") { config.ledger_directories = v.split(',').map(|s| s.trim().to_string()).collect(); }
-        if let Some(v) = props.get("indexDirectories") { config.index_directories = Some(v.split(',').map(|s| s.trim().to_string()).collect()); }
-        if let Some(v) = props.get("allowStorageExpansion") { config.allow_storage_expansion = parse_bool(v); }
-        if let Some(v) = props.get("journalMaxSizeMB") { if let Ok(n) = v.parse() { config.journal_max_size_mb = n; } }
-        if let Some(v) = props.get("journalMaxBackups") { if let Ok(n) = v.parse() { config.journal_max_backups = n; } }
-        if let Some(v) = props.get("journalWriteData") { config.journal_write_data = parse_bool(v); }
-        if let Some(v) = props.get("journalSyncData") { config.journal_sync_data = parse_bool(v); }
-        if let Some(v) = props.get("journalAdaptiveGroupWrites") { config.journal_adaptive_group_writes = parse_bool(v); }
-        if let Some(v) = props.get("journalMaxGroupWaitMSec") { if let Ok(n) = v.parse() { config.journal_max_group_wait_ms = n; } }
-        if let Some(v) = props.get("journalBufferedWritesThreshold") { if let Ok(n) = v.parse() { config.journal_buffered_writes_threshold = n; } }
-        if let Some(v) = props.get("journalBufferedEntriesThreshold") { if let Ok(n) = v.parse() { config.journal_buffered_entries_threshold = n; } }
-        if let Some(v) = props.get("journalAlignmentSize") { if let Ok(n) = v.parse() { config.journal_alignment_size = n; } }
-        if let Some(v) = props.get("journalFormatVersionToWrite") { if let Ok(n) = v.parse() { config.journal_format_version_to_write = n; } }
-        if let Some(v) = props.get("flushInterval") { if let Ok(n) = v.parse() { config.flush_interval = n; } }
-        if let Some(v) = props.get("logSizeLimit") { if let Ok(n) = v.parse() { config.log_size_limit = n; } }
-        if let Some(v) = props.get("entryLogPerLedgerEnabled") { config.entry_log_per_ledger_enabled = parse_bool(v); }
-        if let Some(v) = props.get("dbStorage_writeCacheMaxSizeMb") { if let Ok(n) = v.parse() { config.db_storage_write_cache_max_size_mb = n; } }
-        if let Some(v) = props.get("dbStorage_readAheadCacheMaxSizeMb") { if let Ok(n) = v.parse() { config.db_storage_read_cache_max_size_mb = n; } }
-        if let Some(v) = props.get("dbStorage_rocksDB_writeBufferSizeMB") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_write_buffer_size_mb = n; } }
-        if let Some(v) = props.get("dbStorage_rocksDB_blockSize") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_block_size = n; } }
-        if let Some(v) = props.get("dbStorage_rocksDB_bloomFilterBitsPerKey") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_bloom_filter_bits_per_key = n; } }
-        if let Some(v) = props.get("dbStorage_rocksDB_blockCacheSize") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_block_cache_size = n; } }
-        if let Some(v) = props.get("dbStorage_rocksDB_sstSizeInMB") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_sst_size_mb = n; } }
-        if let Some(v) = props.get("dbStorage_rocksDB_numLevels") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_num_levels = n; } }
-        if let Some(v) = props.get("dbStorage_rocksDB_numFilesInLevel0") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_num_files_in_level0 = n; } }
-        if let Some(v) = props.get("dbStorage_rocksDB_maxSizeInLevel1MB") { if let Ok(n) = v.parse() { config.db_storage_rocksdb_max_size_in_level1_mb = n; } }
-        if let Some(v) = props.get("entryLocationRocksdbConf") { config.entry_location_rocksdb_conf = Some(v.clone()); }
-        if let Some(v) = props.get("ledgerMetadataRocksdbConf") { config.ledger_metadata_rocksdb_conf = Some(v.clone()); }
-        if let Some(v) = props.get("serverTcpNoDelay") { config.server_tcp_no_delay = parse_bool(v); }
-        if let Some(v) = props.get("serverSockKeepalive") { config.server_sock_keepalive = parse_bool(v); }
-        if let Some(v) = props.get("nettyMaxFrameSizeBytes") { if let Ok(n) = v.parse() { config.max_frame_size = n; } }
-        if let Some(v) = props.get("serverNumIOThreads") { if let Ok(n) = v.parse() { config.server_num_io_threads = n; } }
-        if let Some(v) = props.get("numAddWorkerThreads") { if let Ok(n) = v.parse() { config.num_add_worker_threads = n; } }
-        if let Some(v) = props.get("numReadWorkerThreads") { if let Ok(n) = v.parse() { config.num_read_worker_threads = n; } }
-        if let Some(v) = props.get("tlsCertificatePath") { config.tls_certificate_path = Some(v.clone()); }
-        if let Some(v) = props.get("tlsKeyStore") { config.tls_key_path = Some(v.clone()); }
-        if let Some(v) = props.get("tlsKeyFilePath") { config.tls_key_path = Some(v.clone()); }
-        if let Some(v) = props.get("tlsTrustStore") { config.tls_trust_store_path = Some(v.clone()); }
-        if let Some(v) = props.get("tlsClientAuthentication") { config.tls_client_authentication = parse_bool(v); }
-        if let Some(v) = props.get("tlsKeyStoreType") { config.tls_keystore_type = v.clone(); }
-        if let Some(v) = props.get("tlsEnabledCipherSuites") { config.tls_enabled_cipher_suites = Some(v.clone()); }
-        if let Some(v) = props.get("tlsEnabledProtocols") { config.tls_enabled_protocols = Some(v.clone()); }
-        if let Some(v) = props.get("tlsCertFilesRefreshDurationSeconds") { if let Ok(n) = v.parse() { config.tls_cert_refresh_seconds = n; } }
-        if let Some(v) = props.get("bookieAuthProviderFactoryClass") { config.bookie_auth_provider_factory_class = Some(v.clone()); }
-        if let Some(v) = props.get("diskUsageThreshold") { if let Ok(n) = v.parse() { config.disk_usage_threshold = n; } }
-        if let Some(v) = props.get("diskUsageWarnThreshold") { if let Ok(n) = v.parse() { config.disk_usage_warn_threshold = n; } }
-        if let Some(v) = props.get("diskUsageLwmThreshold") { if let Ok(n) = v.parse() { config.disk_usage_lwm_threshold = n; } }
-        if let Some(v) = props.get("diskCheckInterval") { if let Ok(n) = v.parse() { config.disk_check_interval = n; } }
-        if let Some(v) = props.get("readOnlyModeEnabled") { config.read_only_mode_enabled = parse_bool(v); }
-        if let Some(v) = props.get("minorCompactionInterval") { if let Ok(n) = v.parse() { config.minor_compaction_interval = n; } }
-        if let Some(v) = props.get("minorCompactionThreshold") { if let Ok(n) = v.parse() { config.minor_compaction_threshold = n; } }
-        if let Some(v) = props.get("majorCompactionInterval") { if let Ok(n) = v.parse() { config.major_compaction_interval = n; } }
-        if let Some(v) = props.get("majorCompactionThreshold") { if let Ok(n) = v.parse() { config.major_compaction_threshold = n; } }
-        if let Some(v) = props.get("gcWaitTime") { if let Ok(n) = v.parse() { config.gc_wait_time = n; } }
-        if let Some(v) = props.get("compactionRateByBytes") { if let Ok(n) = v.parse() { config.compaction_rate_bytes_per_sec = n; } }
-        if let Some(v) = props.get("compactionMaxTimeMillis") { if let Ok(n) = v.parse() { config.compaction_max_time_ms = n; } }
-        if let Some(v) = props.get("gcEntryLogMetadataCacheEnabled") { config.gc_entry_log_metadata_cache_enabled = parse_bool(v); }
-        if let Some(v) = props.get("journalMaxMemorySizeMb") { if let Ok(n) = v.parse() { config.journal_max_queue_memory_mb = n; } }
-        if let Some(v) = props.get("journalFlushWhenQueueEmpty") { config.journal_flush_when_queue_empty = parse_bool(v); }
-        if let Some(v) = props.get("journalRemoveFromPageCache") { config.journal_remove_from_page_cache = parse_bool(v); }
+        let c = &mut config;
+        load_parsed(props, "bookiePort", &mut c.bookie_port);
+        load_opt_string(props, "advertisedAddress", &mut c.advertised_address);
+        load_bool(props, "useHostNameAsBookieID", &mut c.use_hostname_as_bookie_id);
+        load_bool(props, "useShortHostName", &mut c.use_short_hostname);
+        load_opt_string(props, "listeningInterface", &mut c.listening_interface);
+        load_bool(props, "allowLoopback", &mut c.allow_loopback);
+        load_string(props, "journalDirectory", &mut c.journal_directory);
+        if let Some(v) = props.get("journalDirectories") {
+            c.journal_directory = v.split('|').next().unwrap_or("").to_string();
+        }
+        if let Some(v) = props.get("ledgerDirectories") {
+            c.ledger_directories = v.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        if let Some(v) = props.get("indexDirectories") {
+            c.index_directories = Some(v.split(',').map(|s| s.trim().to_string()).collect());
+        }
+        load_bool(props, "allowStorageExpansion", &mut c.allow_storage_expansion);
+        load_parsed(props, "journalMaxSizeMB", &mut c.journal_max_size_mb);
+        load_parsed(props, "journalMaxBackups", &mut c.journal_max_backups);
+        load_bool(props, "journalWriteData", &mut c.journal_write_data);
+        load_bool(props, "journalSyncData", &mut c.journal_sync_data);
+        load_bool(props, "journalAdaptiveGroupWrites", &mut c.journal_adaptive_group_writes);
+        load_parsed(props, "journalMaxGroupWaitMSec", &mut c.journal_max_group_wait_ms);
+        load_parsed(props, "journalBufferedWritesThreshold", &mut c.journal_buffered_writes_threshold);
+        load_parsed(props, "journalBufferedEntriesThreshold", &mut c.journal_buffered_entries_threshold);
+        load_parsed(props, "journalAlignmentSize", &mut c.journal_alignment_size);
+        load_parsed(props, "journalFormatVersionToWrite", &mut c.journal_format_version_to_write);
+        load_parsed(props, "flushInterval", &mut c.flush_interval);
+        load_parsed(props, "logSizeLimit", &mut c.log_size_limit);
+        load_bool(props, "entryLogPerLedgerEnabled", &mut c.entry_log_per_ledger_enabled);
+        load_parsed(props, "dbStorage_writeCacheMaxSizeMb", &mut c.db_storage_write_cache_max_size_mb);
+        load_parsed(props, "dbStorage_readAheadCacheMaxSizeMb", &mut c.db_storage_read_cache_max_size_mb);
+        load_parsed(props, "dbStorage_rocksDB_writeBufferSizeMB", &mut c.db_storage_rocksdb_write_buffer_size_mb);
+        load_parsed(props, "dbStorage_rocksDB_blockSize", &mut c.db_storage_rocksdb_block_size);
+        load_parsed(props, "dbStorage_rocksDB_bloomFilterBitsPerKey", &mut c.db_storage_rocksdb_bloom_filter_bits_per_key);
+        load_parsed(props, "dbStorage_rocksDB_blockCacheSize", &mut c.db_storage_rocksdb_block_cache_size);
+        load_parsed(props, "dbStorage_rocksDB_sstSizeInMB", &mut c.db_storage_rocksdb_sst_size_mb);
+        load_parsed(props, "dbStorage_rocksDB_numLevels", &mut c.db_storage_rocksdb_num_levels);
+        load_parsed(props, "dbStorage_rocksDB_numFilesInLevel0", &mut c.db_storage_rocksdb_num_files_in_level0);
+        load_parsed(props, "dbStorage_rocksDB_maxSizeInLevel1MB", &mut c.db_storage_rocksdb_max_size_in_level1_mb);
+        load_opt_string(props, "entryLocationRocksdbConf", &mut c.entry_location_rocksdb_conf);
+        load_opt_string(props, "ledgerMetadataRocksdbConf", &mut c.ledger_metadata_rocksdb_conf);
+        load_bool(props, "serverTcpNoDelay", &mut c.server_tcp_no_delay);
+        load_bool(props, "serverSockKeepalive", &mut c.server_sock_keepalive);
+        load_parsed(props, "nettyMaxFrameSizeBytes", &mut c.max_frame_size);
+        load_parsed(props, "serverNumIOThreads", &mut c.server_num_io_threads);
+        load_parsed(props, "numAddWorkerThreads", &mut c.num_add_worker_threads);
+        load_parsed(props, "numReadWorkerThreads", &mut c.num_read_worker_threads);
+        load_opt_string(props, "tlsCertificatePath", &mut c.tls_certificate_path);
+        // Both Java keys map to the same field; later `load_opt_string` wins.
+        load_opt_string(props, "tlsKeyStore", &mut c.tls_key_path);
+        load_opt_string(props, "tlsKeyFilePath", &mut c.tls_key_path);
+        load_opt_string(props, "tlsTrustStore", &mut c.tls_trust_store_path);
+        load_bool(props, "tlsClientAuthentication", &mut c.tls_client_authentication);
+        load_string(props, "tlsKeyStoreType", &mut c.tls_keystore_type);
+        load_opt_string(props, "tlsEnabledCipherSuites", &mut c.tls_enabled_cipher_suites);
+        load_opt_string(props, "tlsEnabledProtocols", &mut c.tls_enabled_protocols);
+        load_parsed(props, "tlsCertFilesRefreshDurationSeconds", &mut c.tls_cert_refresh_seconds);
+        load_opt_string(props, "bookieAuthProviderFactoryClass", &mut c.bookie_auth_provider_factory_class);
+        load_parsed(props, "diskUsageThreshold", &mut c.disk_usage_threshold);
+        load_parsed(props, "diskUsageWarnThreshold", &mut c.disk_usage_warn_threshold);
+        load_parsed(props, "diskUsageLwmThreshold", &mut c.disk_usage_lwm_threshold);
+        load_parsed(props, "diskCheckInterval", &mut c.disk_check_interval);
+        load_bool(props, "readOnlyModeEnabled", &mut c.read_only_mode_enabled);
+        load_parsed(props, "minorCompactionInterval", &mut c.minor_compaction_interval);
+        load_parsed(props, "minorCompactionThreshold", &mut c.minor_compaction_threshold);
+        load_parsed(props, "majorCompactionInterval", &mut c.major_compaction_interval);
+        load_parsed(props, "majorCompactionThreshold", &mut c.major_compaction_threshold);
+        load_parsed(props, "gcWaitTime", &mut c.gc_wait_time);
+        load_parsed(props, "compactionRateByBytes", &mut c.compaction_rate_bytes_per_sec);
+        load_parsed(props, "compactionMaxTimeMillis", &mut c.compaction_max_time_ms);
+        load_bool(props, "gcEntryLogMetadataCacheEnabled", &mut c.gc_entry_log_metadata_cache_enabled);
+        load_parsed(props, "journalMaxMemorySizeMb", &mut c.journal_max_queue_memory_mb);
+        load_bool(props, "journalFlushWhenQueueEmpty", &mut c.journal_flush_when_queue_empty);
+        load_bool(props, "journalRemoveFromPageCache", &mut c.journal_remove_from_page_cache);
         // GC extended
-        if let Some(v) = props.get("minorCompactionMaxTimeMillis") { if let Ok(n) = v.parse() { config.minor_compaction_max_time_ms = n; } }
-        if let Some(v) = props.get("majorCompactionMaxTimeMillis") { if let Ok(n) = v.parse() { config.major_compaction_max_time_ms = n; } }
-        if let Some(v) = props.get("compactionMaxOutstandingRequests") { if let Ok(n) = v.parse() { config.compaction_max_outstanding_requests = n; } }
-        if let Some(v) = props.get("isForceGCAllowWhenNoSpace") { config.is_force_gc_allow_when_no_space = parse_bool(v); }
+        load_parsed(props, "minorCompactionMaxTimeMillis", &mut c.minor_compaction_max_time_ms);
+        load_parsed(props, "majorCompactionMaxTimeMillis", &mut c.major_compaction_max_time_ms);
+        load_parsed(props, "compactionMaxOutstandingRequests", &mut c.compaction_max_outstanding_requests);
+        load_bool(props, "isForceGCAllowWhenNoSpace", &mut c.is_force_gc_allow_when_no_space);
         // Journal queue + page cache
-        if let Some(v) = props.get("journalQueueSize") { if let Ok(n) = v.parse() { config.journal_queue_size = n; } }
-        if let Some(v) = props.get("journalPageCacheFlushIntervalMSec") { if let Ok(n) = v.parse() { config.journal_page_cache_flush_interval_ms = n; } }
-        if let Some(v) = props.get("numJournalCallbackThreads") { if let Ok(n) = v.parse() { config.num_journal_callback_threads = n; } }
+        load_parsed(props, "journalQueueSize", &mut c.journal_queue_size);
+        load_parsed(props, "journalPageCacheFlushIntervalMSec", &mut c.journal_page_cache_flush_interval_ms);
+        load_parsed(props, "numJournalCallbackThreads", &mut c.num_journal_callback_threads);
         // Request limits
-        if let Some(v) = props.get("maxAddsInProgressLimit") { if let Ok(n) = v.parse() { config.max_adds_in_progress_limit = n; } }
-        if let Some(v) = props.get("maxReadsInProgressLimit") { if let Ok(n) = v.parse() { config.max_reads_in_progress_limit = n; } }
-        if let Some(v) = props.get("maxConnections") { if let Ok(n) = v.parse() { config.max_connections = n; } }
-        if let Some(v) = props.get("closeChannelOnResponseTimeout") { config.close_channel_on_response_timeout = parse_bool(v); }
+        load_parsed(props, "maxAddsInProgressLimit", &mut c.max_adds_in_progress_limit);
+        load_parsed(props, "maxReadsInProgressLimit", &mut c.max_reads_in_progress_limit);
+        load_parsed(props, "maxConnections", &mut c.max_connections);
+        load_bool(props, "closeChannelOnResponseTimeout", &mut c.close_channel_on_response_timeout);
         // Journal extended
-        if let Some(v) = props.get("skipReplayJournalInvalidRecord") { config.skip_replay_journal_invalid_record = parse_bool(v); }
-        if let Some(v) = props.get("verifyStorageOnUncleanShutdown") { config.verify_storage_on_unclean_shutdown = parse_bool(v); }
-        if let Some(v) = props.get("journalPreAllocSizeMB") { if let Ok(n) = v.parse() { config.journal_pre_alloc_size_mb = n; } }
-        if let Some(v) = props.get("journalWriteBufferSizeKB") { if let Ok(n) = v.parse() { config.journal_write_buffer_size_kb = n; } }
-        if let Some(v) = props.get("journalReuseFiles") { config.journal_reuse_files = parse_bool(v); }
+        load_bool(props, "skipReplayJournalInvalidRecord", &mut c.skip_replay_journal_invalid_record);
+        load_bool(props, "verifyStorageOnUncleanShutdown", &mut c.verify_storage_on_unclean_shutdown);
+        load_parsed(props, "journalPreAllocSizeMB", &mut c.journal_pre_alloc_size_mb);
+        load_parsed(props, "journalWriteBufferSizeKB", &mut c.journal_write_buffer_size_kb);
+        load_bool(props, "journalReuseFiles", &mut c.journal_reuse_files);
         // GC extended
-        if let Some(v) = props.get("forceAllowCompaction") { config.force_allow_compaction = parse_bool(v); }
-        if let Some(v) = props.get("isThrottleByBytes") { config.is_throttle_by_bytes = parse_bool(v); }
-        if let Some(v) = props.get("verifyMetadataOnGC") { config.verify_metadata_on_gc = parse_bool(v); }
-        if let Some(v) = props.get("useTransactionalCompaction") { config.use_transactional_compaction = parse_bool(v); }
+        load_bool(props, "forceAllowCompaction", &mut c.force_allow_compaction);
+        load_bool(props, "isThrottleByBytes", &mut c.is_throttle_by_bytes);
+        load_bool(props, "verifyMetadataOnGC", &mut c.verify_metadata_on_gc);
+        load_bool(props, "useTransactionalCompaction", &mut c.use_transactional_compaction);
         // Disk extended
-        if let Some(v) = props.get("forceReadOnlyBookie") { config.force_read_only_bookie = parse_bool(v); }
-        if let Some(v) = props.get("persistBookieStatusEnabled") { config.persist_bookie_status_enabled = parse_bool(v); }
-        if let Some(v) = props.get("readOnlyModeOnAnyDiskFullEnabled") { config.read_only_mode_on_any_disk_full_enabled = parse_bool(v); }
+        load_bool(props, "forceReadOnlyBookie", &mut c.force_read_only_bookie);
+        load_bool(props, "persistBookieStatusEnabled", &mut c.persist_bookie_status_enabled);
+        load_bool(props, "readOnlyModeOnAnyDiskFullEnabled", &mut c.read_only_mode_on_any_disk_full_enabled);
         // Network extended
-        if let Some(v) = props.get("serverWriteBufferLowWaterMark") { if let Ok(n) = v.parse() { config.server_write_buffer_low_water_mark = n; } }
-        if let Some(v) = props.get("serverWriteBufferHighWaterMark") { if let Ok(n) = v.parse() { config.server_write_buffer_high_water_mark = n; } }
-        if let Some(v) = props.get("maxPendingReadRequestsPerThread") { if let Ok(n) = v.parse() { config.max_pending_read_requests_per_thread = n; } }
-        if let Some(v) = props.get("maxPendingAddRequestsPerThread") { if let Ok(n) = v.parse() { config.max_pending_add_requests_per_thread = n; } }
-        if let Some(v) = props.get("numLongPollWorkerThreads") { if let Ok(n) = v.parse() { config.num_long_poll_worker_threads = n; } }
-        if let Some(v) = props.get("numHighPriorityWorkerThreads") { if let Ok(n) = v.parse() { config.num_high_priority_worker_threads = n; } }
+        load_parsed(props, "serverWriteBufferLowWaterMark", &mut c.server_write_buffer_low_water_mark);
+        load_parsed(props, "serverWriteBufferHighWaterMark", &mut c.server_write_buffer_high_water_mark);
+        load_parsed(props, "maxPendingReadRequestsPerThread", &mut c.max_pending_read_requests_per_thread);
+        load_parsed(props, "maxPendingAddRequestsPerThread", &mut c.max_pending_add_requests_per_thread);
+        load_parsed(props, "numLongPollWorkerThreads", &mut c.num_long_poll_worker_threads);
+        load_parsed(props, "numHighPriorityWorkerThreads", &mut c.num_high_priority_worker_threads);
         // DbLedgerStorage extended
-        if let Some(v) = props.get("dbStorage_readAheadCacheBatchSize") { if let Ok(n) = v.parse() { config.db_storage_read_ahead_cache_batch_size = n; } }
-        if let Some(v) = props.get("dbStorage_readAheadCacheBatchBytesSize") { if let Ok(n) = v.parse() { config.db_storage_read_ahead_cache_batch_bytes_size = n; } }
-        if let Some(v) = props.get("dbStorage_maxThrottleTimeMs") { if let Ok(n) = v.parse() { config.db_storage_max_throttle_time_ms = n; } }
-        if let Some(v) = props.get("maxBatchReadSize") { if let Ok(n) = v.parse() { config.max_batch_read_size_bytes = n; } }
-        if let Some(v) = props.get("maxBatchReadCount") { if let Ok(n) = v.parse() { config.max_batch_read_count = n; } }
+        load_parsed(props, "dbStorage_readAheadCacheBatchSize", &mut c.db_storage_read_ahead_cache_batch_size);
+        load_parsed(props, "dbStorage_readAheadCacheBatchBytesSize", &mut c.db_storage_read_ahead_cache_batch_bytes_size);
+        load_parsed(props, "dbStorage_maxThrottleTimeMs", &mut c.db_storage_max_throttle_time_ms);
+        load_parsed(props, "maxBatchReadSize", &mut c.max_batch_read_size_bytes);
+        load_parsed(props, "maxBatchReadCount", &mut c.max_batch_read_count);
         // Replication / Auditor
-        if let Some(v) = props.get("autoRecoveryDaemonEnabled") { config.auto_recovery_daemon_enabled = parse_bool(v); }
-        if let Some(v) = props.get("lostBookieRecoveryDelay") { if let Ok(n) = v.parse() { config.lost_bookie_recovery_delay = n; } }
-        if let Some(v) = props.get("auditorPeriodicCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_check_interval = n; } }
-        if let Some(v) = props.get("auditorPeriodicBookieCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_bookie_check_interval = n; } }
-        if let Some(v) = props.get("auditorPeriodicPlacementPolicyCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_placement_policy_check_interval = n; } }
-        if let Some(v) = props.get("auditorPeriodicReplicasCheckInterval") { if let Ok(n) = v.parse() { config.auditor_periodic_replicas_check_interval = n; } }
-        if let Some(v) = props.get("rwRereplicateBackoffMs") { if let Ok(n) = v.parse() { config.rw_rereplicate_backoff_ms = n; } }
+        load_bool(props, "autoRecoveryDaemonEnabled", &mut c.auto_recovery_daemon_enabled);
+        load_parsed(props, "lostBookieRecoveryDelay", &mut c.lost_bookie_recovery_delay);
+        load_parsed(props, "auditorPeriodicCheckInterval", &mut c.auditor_periodic_check_interval);
+        load_parsed(props, "auditorPeriodicBookieCheckInterval", &mut c.auditor_periodic_bookie_check_interval);
+        load_parsed(props, "auditorPeriodicPlacementPolicyCheckInterval", &mut c.auditor_periodic_placement_policy_check_interval);
+        load_parsed(props, "auditorPeriodicReplicasCheckInterval", &mut c.auditor_periodic_replicas_check_interval);
+        load_parsed(props, "rwRereplicateBackoffMs", &mut c.rw_rereplicate_backoff_ms);
         // ZooKeeper
-        if let Some(v) = props.get("zkServers") { config.zk_servers = Some(v.clone()); }
-        if let Some(v) = props.get("zkLedgersRootPath") { config.zk_ledger_root = v.clone(); }
-        if let Some(v) = props.get("zkTimeout") { if let Ok(n) = v.parse() { config.zk_timeout = n; } }
-        if let Some(v) = props.get("zkRetryBackoffStartMs") { if let Ok(n) = v.parse() { config.zk_retry_backoff_start_ms = n; } }
-        if let Some(v) = props.get("zkRetryBackoffMaxMs") { if let Ok(n) = v.parse() { config.zk_retry_backoff_max_ms = n; } }
+        load_opt_string(props, "zkServers", &mut c.zk_servers);
+        load_string(props, "zkLedgersRootPath", &mut c.zk_ledger_root);
+        load_parsed(props, "zkTimeout", &mut c.zk_timeout);
+        load_parsed(props, "zkRetryBackoffStartMs", &mut c.zk_retry_backoff_start_ms);
+        load_parsed(props, "zkRetryBackoffMaxMs", &mut c.zk_retry_backoff_max_ms);
         // HTTP
-        if let Some(v) = props.get("httpServerEnabled") { config.http_server_enabled = parse_bool(v); }
-        if let Some(v) = props.get("httpServerPort") { if let Ok(n) = v.parse() { config.http_server_port = n; } }
-        if let Some(v) = props.get("httpServerHost") { config.http_server_host = v.clone(); }
+        load_bool(props, "httpServerEnabled", &mut c.http_server_enabled);
+        load_parsed(props, "httpServerPort", &mut c.http_server_port);
+        load_string(props, "httpServerHost", &mut c.http_server_host);
         // Data integrity
-        if let Some(v) = props.get("localScrubInterval") { if let Ok(n) = v.parse() { config.local_scrub_interval = n; } }
-        if let Some(v) = props.get("localScrubRateLimit") { if let Ok(n) = v.parse() { config.local_scrub_rate_limit = n; } }
-        if let Some(v) = props.get("localConsistencyCheckOnStartup") { config.local_consistency_check_on_startup = parse_bool(v); }
-        if let Some(v) = props.get("dataIntegrityChecking") { config.data_integrity_checking = parse_bool(v); }
-        if let Some(v) = props.get("dataIntegrityStampMissingCookies") { config.data_integrity_stamp_missing_cookies = parse_bool(v); }
-        if let Some(v) = props.get("bookieId") { config.bookie_id = Some(v.clone()); }
+        load_parsed(props, "localScrubInterval", &mut c.local_scrub_interval);
+        load_parsed(props, "localScrubRateLimit", &mut c.local_scrub_rate_limit);
+        load_bool(props, "localConsistencyCheckOnStartup", &mut c.local_consistency_check_on_startup);
+        load_bool(props, "dataIntegrityChecking", &mut c.data_integrity_checking);
+        load_bool(props, "dataIntegrityStampMissingCookies", &mut c.data_integrity_stamp_missing_cookies);
+        load_opt_string(props, "bookieId", &mut c.bookie_id);
         // Storage extended
-        if let Some(v) = props.get("openFileLimit") { if let Ok(n) = v.parse() { config.open_file_limit = n; } }
-        if let Some(v) = props.get("minUsableSizeForHighPriorityWrites") { if let Ok(n) = v.parse() { config.min_usable_size_for_high_priority_writes = n; } }
-        if let Some(v) = props.get("minUsableSizeForEntryLogCreation") { if let Ok(n) = v.parse() { config.min_usable_size_for_entry_log_creation = n; } }
+        load_parsed(props, "openFileLimit", &mut c.open_file_limit);
+        load_parsed(props, "minUsableSizeForHighPriorityWrites", &mut c.min_usable_size_for_high_priority_writes);
+        load_parsed(props, "minUsableSizeForEntryLogCreation", &mut c.min_usable_size_for_entry_log_creation);
         // Network extended
-        if let Some(v) = props.get("serverNumAcceptorThreads") { if let Ok(n) = v.parse() { config.server_num_acceptor_threads = n; } }
-        if let Some(v) = props.get("waitTimeoutOnResponseBackpressureMs") { if let Ok(n) = v.parse() { config.wait_timeout_on_response_backpressure_ms = n; } }
-        if let Some(v) = props.get("readWorkerThreadsThrottlingEnabled") { config.read_worker_threads_throttling_enabled = parse_bool(v); }
-        if let Some(v) = props.get("requestTimerTickDurationMs") { if let Ok(n) = v.parse() { config.request_timer_tick_duration_ms = n; } }
-        if let Some(v) = props.get("requestTimerNumTicks") { if let Ok(n) = v.parse() { config.request_timer_num_ticks = n; } }
+        load_parsed(props, "serverNumAcceptorThreads", &mut c.server_num_acceptor_threads);
+        load_parsed(props, "waitTimeoutOnResponseBackpressureMs", &mut c.wait_timeout_on_response_backpressure_ms);
+        load_bool(props, "readWorkerThreadsThrottlingEnabled", &mut c.read_worker_threads_throttling_enabled);
+        load_parsed(props, "requestTimerTickDurationMs", &mut c.request_timer_tick_duration_ms);
+        load_parsed(props, "requestTimerNumTicks", &mut c.request_timer_num_ticks);
         // Auditor extended
-        if let Some(v) = props.get("openLedgerRereplicationGracePeriod") { if let Ok(n) = v.parse() { config.open_ledger_rereplication_grace_period = n; } }
-        if let Some(v) = props.get("lockReleaseOfFailedLedgerGracePeriod") { if let Ok(n) = v.parse() { config.lock_release_of_failed_ledger_grace_period = n; } }
+        load_parsed(props, "openLedgerRereplicationGracePeriod", &mut c.open_ledger_rereplication_grace_period);
+        load_parsed(props, "lockReleaseOfFailedLedgerGracePeriod", &mut c.lock_release_of_failed_ledger_grace_period);
         // HTTP TLS
-        if let Some(v) = props.get("httpServerTlsEnable") { config.http_server_tls_enable = parse_bool(v); }
-        if let Some(v) = props.get("httpServerKeyStorePath") { config.http_server_key_store_path = Some(v.clone()); }
-        if let Some(v) = props.get("httpServerKeyStorePassword") { config.http_server_key_store_password = Some(v.clone()); }
-        if let Some(v) = props.get("httpServerTrustStorePath") { config.http_server_trust_store_path = Some(v.clone()); }
-        if let Some(v) = props.get("httpServerTrustStorePassword") { config.http_server_trust_store_password = Some(v.clone()); }
+        load_bool(props, "httpServerTlsEnable", &mut c.http_server_tls_enable);
+        load_opt_string(props, "httpServerKeyStorePath", &mut c.http_server_key_store_path);
+        load_opt_string(props, "httpServerKeyStorePassword", &mut c.http_server_key_store_password);
+        load_opt_string(props, "httpServerTrustStorePath", &mut c.http_server_trust_store_path);
+        load_opt_string(props, "httpServerTrustStorePassword", &mut c.http_server_trust_store_password);
         // Statistics
-        if let Some(v) = props.get("enableStatistics") { config.enable_statistics = parse_bool(v); }
-        if let Some(v) = props.get("prometheusStatsHttpPort") { if let Ok(n) = v.parse() { config.prometheus_stats_http_port = n; } }
-        if let Some(v) = props.get("statsProviderClass") { config.stats_provider_class = Some(v.clone()); }
+        load_bool(props, "enableStatistics", &mut c.enable_statistics);
+        load_parsed(props, "prometheusStatsHttpPort", &mut c.prometheus_stats_http_port);
+        load_opt_string(props, "statsProviderClass", &mut c.stats_provider_class);
         // Not yet wired
-        if let Some(v) = props.get("pageSize") { if let Ok(n) = v.parse() { config.page_size = n; } }
-        if let Some(v) = props.get("pageLimit") { if let Ok(n) = v.parse() { config.page_limit = n; } }
-        if let Some(v) = props.get("fileInfoCacheInitialCapacity") { if let Ok(n) = v.parse() { config.file_info_cache_initial_capacity = n; } }
-        if let Some(v) = props.get("fileInfoMaxIdleTime") { if let Ok(n) = v.parse() { config.file_info_max_idle_time = n; } }
-        if let Some(v) = props.get("fileInfoFormatVersionToWrite") { if let Ok(n) = v.parse() { config.file_info_format_version_to_write = n; } }
-        if let Some(v) = props.get("sortedLedgerStorageEnabled") { config.sorted_ledger_storage_enabled = parse_bool(v); }
-        if let Some(v) = props.get("skipListSizeLimit") { if let Ok(n) = v.parse() { config.skip_list_size_limit = n; } }
-        if let Some(v) = props.get("skipListArenaChunkSize") { if let Ok(n) = v.parse() { config.skip_list_arena_chunk_size = n; } }
-        if let Some(v) = props.get("skipListArenaMaxAllocSize") { if let Ok(n) = v.parse() { config.skip_list_arena_max_alloc_size = n; } }
-        if let Some(v) = props.get("serverTcpLinger") { if let Ok(n) = v.parse() { config.server_tcp_linger = n; } }
-        if let Some(v) = props.get("allowEphemeralPorts") { config.allow_ephemeral_ports = parse_bool(v); }
-        if let Some(v) = props.get("enableLocalTransport") { config.enable_local_transport = parse_bool(v); }
-        if let Some(v) = props.get("disableServerSocketBind") { config.disable_server_socket_bind = parse_bool(v); }
-        if let Some(v) = props.get("byteBufAllocatorSizeInitial") { if let Ok(n) = v.parse() { config.byte_buf_allocator_size_initial = n; } }
-        if let Some(v) = props.get("byteBufAllocatorSizeMin") { if let Ok(n) = v.parse() { config.byte_buf_allocator_size_min = n; } }
-        if let Some(v) = props.get("byteBufAllocatorSizeMax") { if let Ok(n) = v.parse() { config.byte_buf_allocator_size_max = n; } }
-        if let Some(v) = props.get("extraServerComponents") { config.extra_server_components = Some(v.clone()); }
-        if let Some(v) = props.get("sanityCheckMetricsEnabled") { config.sanity_check_metrics_enabled = parse_bool(v); }
-        if let Some(v) = props.get("enableTaskExecutionStats") { config.enable_task_execution_stats = parse_bool(v); }
-        if let Some(v) = props.get("authorizedRoles") { config.authorized_roles = Some(v.clone()); }
-        if let Some(v) = props.get("readBufferSizeBytes") { if let Ok(n) = v.parse() { config.read_buffer_size_bytes = n; } }
-        if let Some(v) = props.get("writeBufferSizeBytes") { if let Ok(n) = v.parse() { config.write_buffer_size_bytes = n; } }
+        load_parsed(props, "pageSize", &mut c.page_size);
+        load_parsed(props, "pageLimit", &mut c.page_limit);
+        load_parsed(props, "fileInfoCacheInitialCapacity", &mut c.file_info_cache_initial_capacity);
+        load_parsed(props, "fileInfoMaxIdleTime", &mut c.file_info_max_idle_time);
+        load_parsed(props, "fileInfoFormatVersionToWrite", &mut c.file_info_format_version_to_write);
+        load_bool(props, "sortedLedgerStorageEnabled", &mut c.sorted_ledger_storage_enabled);
+        load_parsed(props, "skipListSizeLimit", &mut c.skip_list_size_limit);
+        load_parsed(props, "skipListArenaChunkSize", &mut c.skip_list_arena_chunk_size);
+        load_parsed(props, "skipListArenaMaxAllocSize", &mut c.skip_list_arena_max_alloc_size);
+        load_parsed(props, "serverTcpLinger", &mut c.server_tcp_linger);
+        load_bool(props, "allowEphemeralPorts", &mut c.allow_ephemeral_ports);
+        load_bool(props, "enableLocalTransport", &mut c.enable_local_transport);
+        load_bool(props, "disableServerSocketBind", &mut c.disable_server_socket_bind);
+        load_parsed(props, "byteBufAllocatorSizeInitial", &mut c.byte_buf_allocator_size_initial);
+        load_parsed(props, "byteBufAllocatorSizeMin", &mut c.byte_buf_allocator_size_min);
+        load_parsed(props, "byteBufAllocatorSizeMax", &mut c.byte_buf_allocator_size_max);
+        load_opt_string(props, "extraServerComponents", &mut c.extra_server_components);
+        load_bool(props, "sanityCheckMetricsEnabled", &mut c.sanity_check_metrics_enabled);
+        load_bool(props, "enableTaskExecutionStats", &mut c.enable_task_execution_stats);
+        load_opt_string(props, "authorizedRoles", &mut c.authorized_roles);
+        load_parsed(props, "readBufferSizeBytes", &mut c.read_buffer_size_bytes);
+        load_parsed(props, "writeBufferSizeBytes", &mut c.write_buffer_size_bytes);
         // Missing config options from Java compatibility audit
-        if let Some(v) = props.get("metadataServiceUri") { config.metadata_service_uri = Some(v.clone()); }
-        if let Some(v) = props.get("minNumRacksPerWriteQuorum") { if let Ok(n) = v.parse() { config.min_num_racks_per_write_quorum = n; } }
-        if let Some(v) = props.get("enforceMinNumRacksPerWriteQuorum") { config.enforce_min_num_racks_per_write_quorum = parse_bool(v); }
-        if let Some(v) = props.get("enforceMinNumFaultDomainsForWrite") { config.enforce_min_num_fault_domains_for_write = parse_bool(v); }
-        if let Some(v) = props.get("permittedStartupUsers") { config.permitted_startup_users = Some(v.clone()); }
-        if let Some(v) = props.get("repairedPlacementPolicyNotAdheringBookieEnabled") { config.repaired_placement_policy_not_adhering_bookie_enabled = parse_bool(v); }
-        if let Some(v) = props.get("auditorReplicasCheckInterval") { if let Ok(n) = v.parse() { config.auditor_replicas_check_interval = n; } }
-        if let Some(v) = props.get("auditorMaxNumberOfConcurrentOpenLedgerOperations") { if let Ok(n) = v.parse() { config.auditor_max_concurrent_open_ledger_operations = n; } }
-        if let Some(v) = props.get("bookieDeathWatchInterval") { if let Ok(n) = v.parse() { config.bookie_death_watch_interval = n; } }
+        load_opt_string(props, "metadataServiceUri", &mut c.metadata_service_uri);
+        load_parsed(props, "minNumRacksPerWriteQuorum", &mut c.min_num_racks_per_write_quorum);
+        load_bool(props, "enforceMinNumRacksPerWriteQuorum", &mut c.enforce_min_num_racks_per_write_quorum);
+        load_bool(props, "enforceMinNumFaultDomainsForWrite", &mut c.enforce_min_num_fault_domains_for_write);
+        load_opt_string(props, "permittedStartupUsers", &mut c.permitted_startup_users);
+        load_bool(props, "repairedPlacementPolicyNotAdheringBookieEnabled", &mut c.repaired_placement_policy_not_adhering_bookie_enabled);
+        load_parsed(props, "auditorReplicasCheckInterval", &mut c.auditor_replicas_check_interval);
+        load_parsed(props, "auditorMaxNumberOfConcurrentOpenLedgerOperations", &mut c.auditor_max_concurrent_open_ledger_operations);
+        load_parsed(props, "bookieDeathWatchInterval", &mut c.bookie_death_watch_interval);
         // Also parse metadataServiceUri to extract ZK servers if zkServers not set
         if config.zk_servers.is_none() {
             if let Some(ref uri) = config.metadata_service_uri {

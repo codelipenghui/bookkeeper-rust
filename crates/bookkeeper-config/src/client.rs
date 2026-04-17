@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::properties::parse_bool;
+use crate::properties::{load_bool, load_opt_string, load_parsed, load_string};
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -268,108 +268,109 @@ impl Default for ClientConfig {
 impl ClientConfig {
     pub fn from_properties(props: &HashMap<String, String>) -> Self {
         let mut config = Self::default();
-        if let Some(v) = props.get("metadataServiceUri") { config.metadata_service_uri = Some(v.clone()); }
-        if let Some(v) = props.get("zkTimeout") { if let Ok(n) = v.parse() { config.zk_timeout = n; } }
-        if let Some(v) = props.get("useV2WireProtocol") { config.use_v2_wire_protocol = parse_bool(v); }
+        let c = &mut config;
+        load_opt_string(props, "metadataServiceUri", &mut c.metadata_service_uri);
+        load_parsed(props, "zkTimeout", &mut c.zk_timeout);
+        load_bool(props, "useV2WireProtocol", &mut c.use_v2_wire_protocol);
         // Accept both the Java canonical key names (with "Sec" suffix) and
         // the Rust-native names. Java keys are checked first; the Rust-native
         // keys override if also present, for backwards compat with existing
         // Rust configs.
-        if let Some(v) = props.get("readEntryTimeoutSec") { if let Ok(n) = v.parse() { config.read_timeout = n; } }
-        if let Some(v) = props.get("readTimeout") { if let Ok(n) = v.parse() { config.read_timeout = n; } }
-        if let Some(v) = props.get("addEntryTimeoutSec") { if let Ok(n) = v.parse() { config.add_entry_timeout = n; } }
-        if let Some(v) = props.get("addEntryTimeout") { if let Ok(n) = v.parse() { config.add_entry_timeout = n; } }
-        if let Some(v) = props.get("addEntryQuorumTimeoutSec") { if let Ok(n) = v.parse() { config.add_entry_quorum_timeout = n; } }
-        if let Some(v) = props.get("addEntryQuorumTimeout") { if let Ok(n) = v.parse() { config.add_entry_quorum_timeout = n; } }
-        if let Some(v) = props.get("speculativeReadTimeout") { if let Ok(n) = v.parse() { config.speculative_read_timeout = n; } }
-        if let Some(v) = props.get("firstSpeculativeReadTimeout") { if let Ok(n) = v.parse() { config.first_speculative_read_timeout = n; } }
-        if let Some(v) = props.get("maxSpeculativeReadTimeout") { if let Ok(n) = v.parse() { config.max_speculative_read_timeout = n; } }
-        if let Some(v) = props.get("speculativeReadTimeoutBackoffMultiplier") { if let Ok(n) = v.parse() { config.speculative_read_timeout_backoff_multiplier = n; } }
-        if let Some(v) = props.get("numChannelsPerBookie") { if let Ok(n) = v.parse() { config.num_channels_per_bookie = n; } }
-        if let Some(v) = props.get("enableDigestTypeAutodetection") { config.enable_digest_type_autodetection = parse_bool(v); }
-        if let Some(v) = props.get("explicitLacInterval") { if let Ok(n) = v.parse() { config.explicit_lac_interval_ms = n; } }
-        if let Some(v) = props.get("explicitLacIntervalMs") { if let Ok(n) = v.parse() { config.explicit_lac_interval_ms = n; } }
-        if let Some(v) = props.get("maxNumEnsembleChanges") { if let Ok(n) = v.parse() { config.max_allowed_ensemble_changes = n; } }
-        if let Some(v) = props.get("maxAllowedEnsembleChanges") { if let Ok(n) = v.parse() { config.max_allowed_ensemble_changes = n; } }
-        if let Some(v) = props.get("deferredSync") { config.deferred_sync = parse_bool(v); }
-        if let Some(v) = props.get("batchReadEnabled") { config.batch_read_enabled = parse_bool(v); }
-        if let Some(v) = props.get("requestTimeoutSec") { if let Ok(n) = v.parse() { config.request_timeout_sec = n; } }
-        if let Some(v) = props.get("clientConnectTimeoutMillis") { if let Ok(n) = v.parse() { config.client_connect_timeout_millis = n; } }
+        load_parsed(props, "readEntryTimeoutSec", &mut c.read_timeout);
+        load_parsed(props, "readTimeout", &mut c.read_timeout);
+        load_parsed(props, "addEntryTimeoutSec", &mut c.add_entry_timeout);
+        load_parsed(props, "addEntryTimeout", &mut c.add_entry_timeout);
+        load_parsed(props, "addEntryQuorumTimeoutSec", &mut c.add_entry_quorum_timeout);
+        load_parsed(props, "addEntryQuorumTimeout", &mut c.add_entry_quorum_timeout);
+        load_parsed(props, "speculativeReadTimeout", &mut c.speculative_read_timeout);
+        load_parsed(props, "firstSpeculativeReadTimeout", &mut c.first_speculative_read_timeout);
+        load_parsed(props, "maxSpeculativeReadTimeout", &mut c.max_speculative_read_timeout);
+        load_parsed(props, "speculativeReadTimeoutBackoffMultiplier", &mut c.speculative_read_timeout_backoff_multiplier);
+        load_parsed(props, "numChannelsPerBookie", &mut c.num_channels_per_bookie);
+        load_bool(props, "enableDigestTypeAutodetection", &mut c.enable_digest_type_autodetection);
+        load_parsed(props, "explicitLacInterval", &mut c.explicit_lac_interval_ms);
+        load_parsed(props, "explicitLacIntervalMs", &mut c.explicit_lac_interval_ms);
+        load_parsed(props, "maxNumEnsembleChanges", &mut c.max_allowed_ensemble_changes);
+        load_parsed(props, "maxAllowedEnsembleChanges", &mut c.max_allowed_ensemble_changes);
+        load_bool(props, "deferredSync", &mut c.deferred_sync);
+        load_bool(props, "batchReadEnabled", &mut c.batch_read_enabled);
+        load_parsed(props, "requestTimeoutSec", &mut c.request_timeout_sec);
+        load_parsed(props, "clientConnectTimeoutMillis", &mut c.client_connect_timeout_millis);
         // Speculative LAC
-        if let Some(v) = props.get("firstSpeculativeReadLACTimeout") { if let Ok(n) = v.parse() { config.first_speculative_read_lac_timeout = n; } }
-        if let Some(v) = props.get("maxSpeculativeReadLACTimeout") { if let Ok(n) = v.parse() { config.max_speculative_read_lac_timeout = n; } }
-        if let Some(v) = props.get("speculativeReadLACTimeoutBackoffMultiplier") { if let Ok(n) = v.parse() { config.speculative_read_lac_timeout_backoff_multiplier = n; } }
+        load_parsed(props, "firstSpeculativeReadLACTimeout", &mut c.first_speculative_read_lac_timeout);
+        load_parsed(props, "maxSpeculativeReadLACTimeout", &mut c.max_speculative_read_lac_timeout);
+        load_parsed(props, "speculativeReadLACTimeoutBackoffMultiplier", &mut c.speculative_read_lac_timeout_backoff_multiplier);
         // Connection tuning
-        if let Some(v) = props.get("clientTcpNoDelay") { config.client_tcp_no_delay = parse_bool(v); }
-        if let Some(v) = props.get("clientSockKeepalive") { config.client_sock_keepalive = parse_bool(v); }
-        if let Some(v) = props.get("clientSendBufferSize") { if let Ok(n) = v.parse() { config.client_send_buffer_size = n; } }
-        if let Some(v) = props.get("clientReceiveBufferSize") { if let Ok(n) = v.parse() { config.client_receive_buffer_size = n; } }
+        load_bool(props, "clientTcpNoDelay", &mut c.client_tcp_no_delay);
+        load_bool(props, "clientSockKeepalive", &mut c.client_sock_keepalive);
+        load_parsed(props, "clientSendBufferSize", &mut c.client_send_buffer_size);
+        load_parsed(props, "clientReceiveBufferSize", &mut c.client_receive_buffer_size);
         // Bookie health
-        if let Some(v) = props.get("bookieHealthCheckEnabled") { config.bookie_health_check_enabled = parse_bool(v); }
-        if let Some(v) = props.get("bookieHealthCheckIntervalSeconds") { if let Ok(n) = v.parse() { config.bookie_health_check_interval_seconds = n; } }
-        if let Some(v) = props.get("bookieErrorThresholdPerInterval") { if let Ok(n) = v.parse() { config.bookie_error_threshold_per_interval = n; } }
-        if let Some(v) = props.get("bookieQuarantineTimeSeconds") { if let Ok(n) = v.parse() { config.bookie_quarantine_time_seconds = n; } }
+        load_bool(props, "bookieHealthCheckEnabled", &mut c.bookie_health_check_enabled);
+        load_parsed(props, "bookieHealthCheckIntervalSeconds", &mut c.bookie_health_check_interval_seconds);
+        load_parsed(props, "bookieErrorThresholdPerInterval", &mut c.bookie_error_threshold_per_interval);
+        load_parsed(props, "bookieQuarantineTimeSeconds", &mut c.bookie_quarantine_time_seconds);
         // Placement
-        if let Some(v) = props.get("ensemblePlacementPolicy") { config.ensemble_placement_policy = v.clone(); }
-        if let Some(v) = props.get("reorderReadSequenceEnabled") { config.reorder_read_sequence_enabled = parse_bool(v); }
-        if let Some(v) = props.get("delayEnsembleChange") { config.delay_ensemble_change = parse_bool(v); }
+        load_string(props, "ensemblePlacementPolicy", &mut c.ensemble_placement_policy);
+        load_bool(props, "reorderReadSequenceEnabled", &mut c.reorder_read_sequence_enabled);
+        load_bool(props, "delayEnsembleChange", &mut c.delay_ensemble_change);
         // Read
-        if let Some(v) = props.get("enableParallelRecoveryRead") { config.enable_parallel_recovery_read = parse_bool(v); }
-        if let Some(v) = props.get("recoveryReadBatchSize") { if let Ok(n) = v.parse() { config.recovery_read_batch_size = n; } }
-        if let Some(v) = props.get("stickyReadSEnabled") { config.sticky_reads_enabled = parse_bool(v); }
+        load_bool(props, "enableParallelRecoveryRead", &mut c.enable_parallel_recovery_read);
+        load_parsed(props, "recoveryReadBatchSize", &mut c.recovery_read_batch_size);
+        load_bool(props, "stickyReadSEnabled", &mut c.sticky_reads_enabled);
         // Write
-        if let Some(v) = props.get("throttle") { if let Ok(n) = v.parse() { config.throttle = n; } }
+        load_parsed(props, "throttle", &mut c.throttle);
         // Failure tracking
-        if let Some(v) = props.get("enableBookieFailureTracking") { config.enable_bookie_failure_tracking = parse_bool(v); }
-        if let Some(v) = props.get("bookieFailureHistoryExpirationMSec") { if let Ok(n) = v.parse() { config.bookie_failure_history_expiration_ms = n; } }
+        load_bool(props, "enableBookieFailureTracking", &mut c.enable_bookie_failure_tracking);
+        load_parsed(props, "bookieFailureHistoryExpirationMSec", &mut c.bookie_failure_history_expiration_ms);
         // Timeout extended
-        if let Some(v) = props.get("timeoutMonitorIntervalSec") { if let Ok(n) = v.parse() { config.timeout_monitor_interval_sec = n; } }
-        if let Some(v) = props.get("waitTimeoutOnBackpressureMs") { if let Ok(n) = v.parse() { config.wait_timeout_on_backpressure_ms = n; } }
-        if let Some(v) = props.get("startTLSTimeoutSecs") { if let Ok(n) = v.parse() { config.start_tls_timeout_secs = n; } }
+        load_parsed(props, "timeoutMonitorIntervalSec", &mut c.timeout_monitor_interval_sec);
+        load_parsed(props, "waitTimeoutOnBackpressureMs", &mut c.wait_timeout_on_backpressure_ms);
+        load_parsed(props, "startTLSTimeoutSecs", &mut c.start_tls_timeout_secs);
         // Connection watermarks
-        if let Some(v) = props.get("clientWriteBufferLowWaterMark") { if let Ok(n) = v.parse() { config.client_write_buffer_low_water_mark = n; } }
-        if let Some(v) = props.get("clientWriteBufferHighWaterMark") { if let Ok(n) = v.parse() { config.client_write_buffer_high_water_mark = n; } }
+        load_parsed(props, "clientWriteBufferLowWaterMark", &mut c.client_write_buffer_low_water_mark);
+        load_parsed(props, "clientWriteBufferHighWaterMark", &mut c.client_write_buffer_high_water_mark);
         // Bookie health extended
-        if let Some(v) = props.get("bookieConnectionErrorQuarantineEnabled") { config.bookie_connection_error_quarantine_enabled = parse_bool(v); }
-        if let Some(v) = props.get("getBookieInfoIntervalSeconds") { if let Ok(n) = v.parse() { config.get_bookie_info_interval_seconds = n; } }
-        if let Some(v) = props.get("getBookieInfoRetryIntervalSeconds") { if let Ok(n) = v.parse() { config.get_bookie_info_retry_interval_seconds = n; } }
-        if let Some(v) = props.get("getBookieInfoTimeoutSecs") { if let Ok(n) = v.parse() { config.get_bookie_info_timeout_secs = n; } }
+        load_bool(props, "bookieConnectionErrorQuarantineEnabled", &mut c.bookie_connection_error_quarantine_enabled);
+        load_parsed(props, "getBookieInfoIntervalSeconds", &mut c.get_bookie_info_interval_seconds);
+        load_parsed(props, "getBookieInfoRetryIntervalSeconds", &mut c.get_bookie_info_retry_interval_seconds);
+        load_parsed(props, "getBookieInfoTimeoutSecs", &mut c.get_bookie_info_timeout_secs);
         // Auth
-        if let Some(v) = props.get("clientRole") { config.client_role = v.clone(); }
-        if let Some(v) = props.get("clientAuthProviderFactoryClass") { config.client_auth_provider_factory_class = Some(v.clone()); }
+        load_string(props, "clientRole", &mut c.client_role);
+        load_opt_string(props, "clientAuthProviderFactoryClass", &mut c.client_auth_provider_factory_class);
         // Read extended
-        if let Some(v) = props.get("recoveryBatchReadEnabled") { config.recovery_batch_read_enabled = parse_bool(v); }
+        load_bool(props, "recoveryBatchReadEnabled", &mut c.recovery_batch_read_enabled);
         // Not yet wired
-        if let Some(v) = props.get("numWorkerThreads") { if let Ok(n) = v.parse() { config.num_worker_threads = n; } }
-        if let Some(v) = props.get("numIOThreads") { if let Ok(n) = v.parse() { config.num_io_threads = n; } }
-        if let Some(v) = props.get("pcbcTimeoutTimerTickDurationMs") { if let Ok(n) = v.parse() { config.pcbc_timeout_timer_tick_duration_ms = n; } }
-        if let Some(v) = props.get("pcbcTimeoutTimerNumTicks") { if let Ok(n) = v.parse() { config.pcbc_timeout_timer_num_ticks = n; } }
-        if let Some(v) = props.get("timeoutTimerTickDurationMs") { if let Ok(n) = v.parse() { config.timeout_timer_tick_duration_ms = n; } }
-        if let Some(v) = props.get("timeoutTimerNumTicks") { if let Ok(n) = v.parse() { config.timeout_timer_num_ticks = n; } }
-        if let Some(v) = props.get("bookieQuarantineRatio") { if let Ok(n) = v.parse() { config.bookie_quarantine_ratio = n; } }
-        if let Some(v) = props.get("diskWeightBasedPlacementEnabled") { config.disk_weight_based_placement_enabled = parse_bool(v); }
-        if let Some(v) = props.get("bookieMaxMultipleForWeightBasedPlacement") { if let Ok(n) = v.parse() { config.bookie_max_multiple_for_weighted_placement = n; } }
-        if let Some(v) = props.get("opportunisticStriping") { config.opportunistic_striping = parse_bool(v); }
-        if let Some(v) = props.get("networkTopologyStabilizePeriodSeconds") { if let Ok(n) = v.parse() { config.network_topology_stabilize_period_seconds = n; } }
-        if let Some(v) = props.get("tcpKeepIdle") { if let Ok(n) = v.parse() { config.tcp_keep_idle = n; } }
-        if let Some(v) = props.get("tcpKeepIntvl") { if let Ok(n) = v.parse() { config.tcp_keep_intvl = n; } }
-        if let Some(v) = props.get("tcpKeepCnt") { if let Ok(n) = v.parse() { config.tcp_keep_cnt = n; } }
-        if let Some(v) = props.get("nettyUsePooledBuffers") { config.netty_use_pooled_buffers = parse_bool(v); }
-        if let Some(v) = props.get("storeSystemtimeAsLedgerCreationTime") { config.store_system_time_as_ledger_creation_time = parse_bool(v); }
-        if let Some(v) = props.get("clientConnectBookieUnavailableLogThrottling") { if let Ok(n) = v.parse() { config.client_connect_bookie_unavailable_log_throttling = n; } }
-        if let Some(v) = props.get("disableEnsembleChangeFeatureName") { config.disable_ensemble_change_feature_name = v.clone(); }
-        if let Some(v) = props.get("enableTaskExecutionStats") { config.enable_task_execution_stats = parse_bool(v); }
-        if let Some(v) = props.get("taskExecutionWarnTimeMicros") { if let Ok(n) = v.parse() { config.task_execution_warn_time_micros = n; } }
-        if let Some(v) = props.get("clientTcpUserTimeoutMillis") { if let Ok(n) = v.parse() { config.client_tcp_user_timeout_millis = n; } }
+        load_parsed(props, "numWorkerThreads", &mut c.num_worker_threads);
+        load_parsed(props, "numIOThreads", &mut c.num_io_threads);
+        load_parsed(props, "pcbcTimeoutTimerTickDurationMs", &mut c.pcbc_timeout_timer_tick_duration_ms);
+        load_parsed(props, "pcbcTimeoutTimerNumTicks", &mut c.pcbc_timeout_timer_num_ticks);
+        load_parsed(props, "timeoutTimerTickDurationMs", &mut c.timeout_timer_tick_duration_ms);
+        load_parsed(props, "timeoutTimerNumTicks", &mut c.timeout_timer_num_ticks);
+        load_parsed(props, "bookieQuarantineRatio", &mut c.bookie_quarantine_ratio);
+        load_bool(props, "diskWeightBasedPlacementEnabled", &mut c.disk_weight_based_placement_enabled);
+        load_parsed(props, "bookieMaxMultipleForWeightBasedPlacement", &mut c.bookie_max_multiple_for_weighted_placement);
+        load_bool(props, "opportunisticStriping", &mut c.opportunistic_striping);
+        load_parsed(props, "networkTopologyStabilizePeriodSeconds", &mut c.network_topology_stabilize_period_seconds);
+        load_parsed(props, "tcpKeepIdle", &mut c.tcp_keep_idle);
+        load_parsed(props, "tcpKeepIntvl", &mut c.tcp_keep_intvl);
+        load_parsed(props, "tcpKeepCnt", &mut c.tcp_keep_cnt);
+        load_bool(props, "nettyUsePooledBuffers", &mut c.netty_use_pooled_buffers);
+        load_bool(props, "storeSystemtimeAsLedgerCreationTime", &mut c.store_system_time_as_ledger_creation_time);
+        load_parsed(props, "clientConnectBookieUnavailableLogThrottling", &mut c.client_connect_bookie_unavailable_log_throttling);
+        load_string(props, "disableEnsembleChangeFeatureName", &mut c.disable_ensemble_change_feature_name);
+        load_bool(props, "enableTaskExecutionStats", &mut c.enable_task_execution_stats);
+        load_parsed(props, "taskExecutionWarnTimeMicros", &mut c.task_execution_warn_time_micros);
+        load_parsed(props, "clientTcpUserTimeoutMillis", &mut c.client_tcp_user_timeout_millis);
         // TLS fields
-        if let Some(v) = props.get("tlsProviderFactoryClass") { config.tls_provider_factory_class = Some(v.clone()); }
-        if let Some(v) = props.get("tlsKeyStoreType") { config.tls_keystore_type = v.clone(); }
-        if let Some(v) = props.get("tlsCertificatePath") { config.tls_certificate_path = Some(v.clone()); }
-        if let Some(v) = props.get("tlsKeyStore") { config.tls_key_path = Some(v.clone()); }
-        if let Some(v) = props.get("tlsTrustStore") { config.tls_trust_store_path = Some(v.clone()); }
-        if let Some(v) = props.get("tlsClientAuthentication") { config.tls_client_authentication = parse_bool(v); }
-        if let Some(v) = props.get("tlsEnabledProtocols") { config.tls_enabled_protocols = Some(v.clone()); }
-        if let Some(v) = props.get("tlsHostnameVerificationEnabled") { config.tls_hostname_verification_enabled = parse_bool(v); }
+        load_opt_string(props, "tlsProviderFactoryClass", &mut c.tls_provider_factory_class);
+        load_string(props, "tlsKeyStoreType", &mut c.tls_keystore_type);
+        load_opt_string(props, "tlsCertificatePath", &mut c.tls_certificate_path);
+        load_opt_string(props, "tlsKeyStore", &mut c.tls_key_path);
+        load_opt_string(props, "tlsTrustStore", &mut c.tls_trust_store_path);
+        load_bool(props, "tlsClientAuthentication", &mut c.tls_client_authentication);
+        load_opt_string(props, "tlsEnabledProtocols", &mut c.tls_enabled_protocols);
+        load_bool(props, "tlsHostnameVerificationEnabled", &mut c.tls_hostname_verification_enabled);
         config
     }
 

@@ -265,12 +265,22 @@ impl PendingAdd {
 /// Drop or call `cancel()` to stop the background task.
 pub struct ExplicitLacFlushHandle {
     cancel: Arc<AtomicBool>,
-    _handle: tokio::task::JoinHandle<()>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl ExplicitLacFlushHandle {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ExplicitLacFlushHandle {
+    fn drop(&mut self) {
+        // Signal the loop to stop, then abort in case it's sleeping on the
+        // interval — tokio JoinHandles are detached on drop by default, so
+        // without this the background task runs until the next tick anyway.
+        self.cancel.store(true, Ordering::Relaxed);
+        self.handle.abort();
     }
 }
 
@@ -1097,7 +1107,7 @@ impl WriteHandle {
             }
         });
 
-        ExplicitLacFlushHandle { cancel, _handle: handle }
+        ExplicitLacFlushHandle { cancel, handle }
     }
 
     /// Drain all pending writes and return final (lastEntryId, length).
@@ -1174,7 +1184,10 @@ pub struct WriteHandleAdv {
     inner: WriteHandle,
     /// Tracks entry IDs that have been submitted but not yet confirmed.
     /// Used for duplicate detection (matching Java's `pendingAddOps.contains()`).
-    pending_entry_ids: BTreeSet<i64>,
+    /// Shared with the background task spawned by `append_adv_async` so it
+    /// can remove the ID on completion — otherwise long-running writers
+    /// would leak entries proportional to total appends.
+    pending_entry_ids: Arc<std::sync::Mutex<BTreeSet<i64>>>,
 }
 
 impl WriteHandleAdv {
@@ -1187,7 +1200,7 @@ impl WriteHandleAdv {
     ) -> Self {
         Self {
             inner: WriteHandle::new(ledger_id, ensemble, schedule, digest_manager, master_key),
-            pending_entry_ids: BTreeSet::new(),
+            pending_entry_ids: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -1203,7 +1216,7 @@ impl WriteHandleAdv {
             inner: WriteHandle::with_available_bookies(
                 ledger_id, ensemble, available_bookies, schedule, digest_manager, master_key,
             ),
-            pending_entry_ids: BTreeSet::new(),
+            pending_entry_ids: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -1228,12 +1241,15 @@ impl WriteHandleAdv {
                 "duplicate entry ID {entry_id}: already confirmed (LAC={lac})"
             )));
         }
-        if self.pending_entry_ids.contains(&entry_id) {
-            return Err(ClientError::Protocol(format!(
-                "duplicate entry ID {entry_id}: already pending"
-            )));
+        {
+            let mut pending = self.pending_entry_ids.lock().unwrap();
+            if pending.contains(&entry_id) {
+                return Err(ClientError::Protocol(format!(
+                    "duplicate entry ID {entry_id}: already pending"
+                )));
+            }
+            pending.insert(entry_id);
         }
-        self.pending_entry_ids.insert(entry_id);
 
         // Track last_add_pushed as the maximum entry ID seen,
         // not necessarily sequential. This only matters for the
@@ -1278,6 +1294,7 @@ impl WriteHandleAdv {
         // Register the PendingAdd's signaling slot in LacState up front
         // — see WriteHandle::append_async for the rationale.
         let pending_add = self.inner.lac_state.register(entry_id);
+        let pending_entry_ids = Arc::clone(&self.pending_entry_ids);
 
         tokio::spawn(async move {
             let write_result = tokio::time::timeout(quorum_timeout, async {
@@ -1344,6 +1361,9 @@ impl WriteHandleAdv {
                     );
                 }
             }
+            // Entry is no longer "pending" — drop it from the dedup set so
+            // memory stays bounded at the number of truly in-flight writes.
+            pending_entry_ids.lock().unwrap().remove(&entry_id);
         });
 
         Ok(pending_add)
@@ -1361,8 +1381,6 @@ impl WriteHandleAdv {
         let result = self.append_adv_async(conns, entry_id, payload)?.wait().await;
         crate::client_metrics::PENDING_ADDS.dec();
         crate::client_metrics::ADD_ENTRY.observe(start.elapsed().as_secs_f64());
-        // Remove from pending set on completion
-        self.pending_entry_ids.remove(&entry_id);
         result
     }
 

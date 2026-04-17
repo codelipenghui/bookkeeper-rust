@@ -45,6 +45,29 @@ impl std::ops::Deref for GcStatus {
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
+/// Unpack `(client, paths)` from `HttpState` or early-return
+/// `SERVICE_UNAVAILABLE` with the provided error body. Each Java service we
+/// match returns a different error shape (JSON object, plain string, JSON
+/// array), so the body is passed in per call site.
+macro_rules! require_zk {
+    ($state:expr, $err_body:expr $(,)?) => {
+        match (&$state.zk_client, &$state.zk_paths) {
+            (Some(c), Some(p)) => (c, p),
+            _ => return (StatusCode::SERVICE_UNAVAILABLE, $err_body),
+        }
+    };
+}
+
+/// Convenience form for the common `Json({"error": "ZK not configured"})` case.
+macro_rules! require_zk_json {
+    ($state:expr) => {
+        require_zk!(
+            $state,
+            Json(serde_json::json!({"error": "ZK not configured"}))
+        )
+    };
+}
+
 #[derive(Clone)]
 pub struct HttpState {
     pub state_manager: Arc<BookieStateManager>,
@@ -229,9 +252,9 @@ async fn bookie_info(State(state): State<HttpState>) -> Json<serde_json::Value> 
     let mut free_space: u64 = 0;
 
     for dir in &state.ledger_dirs {
-        if let Ok(stats) = disk_stats(dir) {
-            total_space += stats.0;
-            free_space += stats.1;
+        if let Ok((total, available)) = bookkeeper_common::disk::statvfs_bytes(Path::new(dir)) {
+            total_space += total;
+            free_space += available;
         }
     }
 
@@ -240,26 +263,6 @@ async fn bookie_info(State(state): State<HttpState>) -> Json<serde_json::Value> 
         "freeSpace": free_space,
         "totalSpace": total_space,
     }))
-}
-
-#[cfg(unix)]
-fn disk_stats(path: &str) -> Result<(u64, u64), std::io::Error> {
-    use std::ffi::CString;
-    let c_path = CString::new(path).map_err(|e| std::io::Error::other(e))?;
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-        let free = stat.f_bavail as u64 * stat.f_frsize as u64;
-        Ok((total, free))
-    }
-}
-
-#[cfg(not(unix))]
-fn disk_stats(_path: &str) -> Result<(u64, u64), std::io::Error> {
-    Ok((0, 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -494,12 +497,7 @@ async fn gc_details(State(state): State<HttpState>) -> Json<serde_json::Value> {
 // ---------------------------------------------------------------------------
 
 async fn cluster_info(State(state): State<HttpState>) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     let writable = match client.get_children(paths.available()).await {
         Ok((children, _)) => children.into_iter().filter(|c| c != "readonly").collect::<Vec<_>>(),
@@ -592,12 +590,7 @@ async fn list_bookies_endpoint(
     State(state): State<HttpState>,
     Query(query): Query<ListBookiesQuery>,
 ) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     let show_ro = query.bookie_type.as_deref() == Some("ro");
     let print_hostnames = query.print_hostnames.as_deref() == Some("true");
@@ -668,12 +661,7 @@ async fn delete_ledger_endpoint(
     State(state): State<HttpState>,
     Query(query): Query<DeleteLedgerQuery>,
 ) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     use bookkeeper_metadata::traits::LedgerManager;
     let lm = bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager::new(
@@ -694,10 +682,7 @@ async fn delete_ledger_endpoint(
 // ---------------------------------------------------------------------------
 
 async fn who_is_auditor_endpoint(State(state): State<HttpState>) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, "ZK not configured".to_string()),
-    };
+    let (client, paths) = require_zk!(state, "ZK not configured".to_string());
 
     let election_path = format!("{}/auditorelection", paths.underreplication());
     let (mut children, _) = match client.get_children(&election_path).await {
@@ -738,12 +723,7 @@ async fn who_is_auditor_endpoint(State(state): State<HttpState>) -> impl IntoRes
 // ---------------------------------------------------------------------------
 
 async fn get_autorecovery_status(State(state): State<HttpState>) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     let disable_path = format!("{}/disable", paths.underreplication());
     let enabled = client.check_stat(&disable_path).await.ok().flatten().is_none();
@@ -760,12 +740,7 @@ async fn set_autorecovery_status(
     Query(query): Query<AutorecoveryStatusRequest>,
 ) -> impl IntoResponse {
     let body = query;
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     let disable_path = format!("{}/disable", paths.underreplication());
     if body.enabled {
@@ -795,11 +770,7 @@ async fn set_autorecovery_status(
 // ---------------------------------------------------------------------------
 
 async fn get_recovery_delay(State(state): State<HttpState>) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE,
-            "ZK not configured".to_string()),
-    };
+    let (client, paths) = require_zk!(state, "ZK not configured".to_string());
 
     let delay_path = format!("{}/lostBookieRecoveryDelay", paths.underreplication());
     let delay = match client.get_data(&delay_path).await {
@@ -819,11 +790,7 @@ async fn set_recovery_delay(
     State(state): State<HttpState>,
     Json(body): Json<RecoveryDelayRequest>,
 ) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE,
-            "ZK not configured".to_string()),
-    };
+    let (client, paths) = require_zk!(state, "ZK not configured".to_string());
 
     let delay_path = format!("{}/lostBookieRecoveryDelay", paths.underreplication());
     let data = body.delay_seconds.to_string().into_bytes();
@@ -850,12 +817,7 @@ async fn set_recovery_delay(
 // ---------------------------------------------------------------------------
 
 async fn trigger_audit_endpoint(State(state): State<HttpState>) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     // Pre-check: replication enabled?
     let disable_path = format!("{}/disable", paths.underreplication());
@@ -906,7 +868,6 @@ async fn trigger_audit_endpoint(State(state): State<HttpState>) -> impl IntoResp
 struct ListUnderReplicatedQuery {
     missingreplica: Option<String>,
     excludingmissingreplica: Option<String>,
-    #[allow(dead_code)]
     printmissingreplica: Option<String>,
 }
 
@@ -914,12 +875,10 @@ async fn list_under_replicated_endpoint(
     State(state): State<HttpState>,
     Query(query): Query<ListUnderReplicatedQuery>,
 ) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!([
-            "ZK not configured"
-        ]))),
-    };
+    let (client, paths) = require_zk!(
+        state,
+        Json(serde_json::json!(["ZK not configured"]))
+    );
 
     // Use the full under-replication manager so we can filter by replica
     // identity (missingreplica / excludingmissingreplica), matching
@@ -979,12 +938,7 @@ async fn list_under_replicated_endpoint(
 // URL for a dashboard.
 // ---------------------------------------------------------------------------
 async fn replication_status_endpoint(State(state): State<HttpState>) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     let ur_mgr = match bookkeeper_replication::underreplication::ZkUnderreplicationManager::new(
         client.clone(), paths.clone(), "http-status".into(),
@@ -1084,12 +1038,7 @@ async fn expand_storage_endpoint(State(state): State<HttpState>) -> impl IntoRes
             "error": "no bookie_id"
         }))),
     };
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     // Verify cookie exists in ZK (storage expansion is handled at startup
     // via cookie validation; this endpoint just confirms ZK side is healthy).
@@ -1117,12 +1066,7 @@ async fn list_bookie_info_endpoint(State(state): State<HttpState>) -> impl IntoR
     use bookkeeper_client::bookie_connection::BookieConnection;
     use bookkeeper_protocol::v2::response::V2Response;
 
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     let bookies = match client.get_children(paths.available()).await {
         Ok((c, _)) => c.into_iter().filter(|c| c != "readonly").collect::<Vec<_>>(),
@@ -1178,12 +1122,7 @@ async fn ledger_metadata_endpoint(
 ) -> impl IntoResponse {
     use bookkeeper_metadata::traits::LedgerManager;
 
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     let lm = bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager::new(
         client.clone(), paths.clone(),
@@ -1273,12 +1212,7 @@ async fn recover_bookie_endpoint(
     State(state): State<HttpState>,
     Json(body): Json<RecoverBookieRequest>,
 ) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     // Mark all ledgers on the bookies as under-replicated.
     // Spawn as background task — recovery is asynchronous (auditor/worker
@@ -1342,12 +1276,7 @@ async fn decommission_endpoint(
     State(state): State<HttpState>,
     Json(body): Json<DecommissionRequest>,
 ) -> impl IntoResponse {
-    let (client, paths) = match (&state.zk_client, &state.zk_paths) {
-        (Some(c), Some(p)) => (c, p),
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-            "error": "ZK not configured"
-        }))),
-    };
+    let (client, paths) = require_zk_json!(state);
 
     // Spawn decommission as background task — long-running
     let zk = client.clone();

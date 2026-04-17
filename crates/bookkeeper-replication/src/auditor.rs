@@ -757,35 +757,43 @@ impl Auditor {
 
                 // For each segment walk entries and count replicas. If any
                 // entry has fewer than `write_quorum` replicas confirmed,
-                // mark the ledger.
+                // mark the ledger. Within each entry the per-bookie reads
+                // run in parallel via `join_all` (previously serial, which
+                // cost `ensemble_size` round-trips per entry).
                 let mut under_replicated = false;
                 let mut reason: Vec<String> = Vec::new();
                 'segment_loop: for (seg_first, seg_last, ensemble) in &segments {
                     // Open a connection to every bookie in the ensemble
-                    // exactly once; ignore individual connection errors
-                    // (those bookies will count as "missing the entry").
-                    let mut conns: Vec<Option<Arc<BookieConnection>>> = Vec::with_capacity(ensemble.len());
-                    for addr in ensemble {
+                    // exactly once, in parallel.
+                    let conn_futs = ensemble.iter().map(|addr| async move {
                         let sock: Option<SocketAddr> = addr.parse().ok();
-                        let c = match sock {
+                        match sock {
                             Some(sa) => BookieConnection::connect(sa).await.ok().map(Arc::new),
                             None => None,
-                        };
-                        conns.push(c);
-                    }
+                        }
+                    });
+                    let conns: Vec<Option<Arc<BookieConnection>>> =
+                        futures::future::join_all(conn_futs).await;
 
                     for eid in *seg_first..=*seg_last {
                         let write_set = schedule.write_set(eid);
-                        let mut replicas_present = 0usize;
-                        for &idx in &write_set {
-                            let Some(conn) = conns.get(idx).and_then(|c| c.as_ref()) else { continue };
-                            match conn.send_read_entry(0, ledger_id, eid, Some(master_key)).await {
-                                Ok(V2Response::Read { error_code, .. }) if error_code == V2_EOK => {
-                                    replicas_present += 1;
+                        let read_futs = write_set.iter().map(|&idx| {
+                            let conn = conns.get(idx).and_then(|c| c.as_ref()).cloned();
+                            async move {
+                                match conn {
+                                    Some(c) => matches!(
+                                        c.send_read_entry(0, ledger_id, eid, Some(master_key)).await,
+                                        Ok(V2Response::Read { error_code, .. }) if error_code == V2_EOK
+                                    ),
+                                    None => false,
                                 }
-                                _ => {}
                             }
-                        }
+                        });
+                        let replicas_present = futures::future::join_all(read_futs)
+                            .await
+                            .into_iter()
+                            .filter(|ok| *ok)
+                            .count();
                         if replicas_present < write_quorum {
                             under_replicated = true;
                             reason.push(format!("replicas_check_missing_eid_{eid}"));
@@ -813,12 +821,7 @@ impl Auditor {
     }
 }
 
-fn current_time_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use bookkeeper_common::current_time_millis;
 
 /// Compute how long to wait before the next periodic audit run, given a
 /// previously persisted completion timestamp and the configured interval.

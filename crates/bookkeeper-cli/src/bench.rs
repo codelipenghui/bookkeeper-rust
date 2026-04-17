@@ -10,10 +10,6 @@ use bookkeeper_client::bookie_connection::BookieConnection;
 use bookkeeper_protocol::digest::{DigestManager, DigestType, generate_master_key};
 use bookkeeper_protocol::entry::EntryBuilder;
 
-fn parse_digest(s: &str) -> Result<DigestType, Box<dyn std::error::Error>> {
-    s.parse::<DigestType>().map_err(|e| e.into())
-}
-
 fn random_payload(size: usize) -> Vec<u8> {
     let mut buf = vec![0u8; size];
     rand::fill(&mut buf[..]);
@@ -77,7 +73,7 @@ pub async fn cmd_bench_bookie(
         std::env::set_var("BOOKKEEPER_IO_ENGINE", io_engine);
     }
 
-    let digest_type = parse_digest(digest_str)?;
+    let digest_type = digest_str.parse::<DigestType>()?;
     let addr: SocketAddr = bookie_addr.parse()?;
     let password = b"bench-password";
     let master_key = generate_master_key(password);
@@ -309,7 +305,7 @@ pub async fn cmd_bench_e2e(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bookkeeper_client::zk_client::ZkBookKeeper;
 
-    let digest_type = parse_digest(digest_str)?;
+    let digest_type = digest_str.parse::<DigestType>()?;
     let password = b"bench-e2e-password";
     let payload = random_payload(entry_size);
 

@@ -100,12 +100,7 @@ impl ZkUnderreplicationManager {
 
         let proto = UnderreplicatedLedgerFormat {
             replica: missing_replicas.to_vec(),
-            ctime: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64,
-            ),
+            ctime: Some(bookkeeper_common::current_time_millis()),
         };
         let data = text_format::serialize_underreplicated_ledger(&proto);
 
@@ -138,12 +133,7 @@ impl ZkUnderreplicationManager {
                     // Node was deleted between our check and read — retry creation
                     let proto = UnderreplicatedLedgerFormat {
                         replica: new_replicas.to_vec(),
-                        ctime: Some(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64,
-                        ),
+                        ctime: Some(bookkeeper_common::current_time_millis()),
                     };
                     let data = text_format::serialize_underreplicated_ledger(&proto);
                     let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
@@ -167,12 +157,7 @@ impl ZkUnderreplicationManager {
                 }
             }
             // Update ctime
-            existing.ctime = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64,
-            );
+            existing.ctime = Some(bookkeeper_common::current_time_millis());
 
             let merged_data = text_format::serialize_underreplicated_ledger(&existing);
 
