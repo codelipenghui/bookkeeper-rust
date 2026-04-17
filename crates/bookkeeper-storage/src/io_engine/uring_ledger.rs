@@ -100,13 +100,14 @@ fn try_push_with_backpressure(
 
 /// Size of each buffer in the provided buffer pool (64 KB).
 const BUF_POOL_SIZE: usize = 64 * 1024;
-/// Number of buffers in the pool. Sized to match `LEDGER_SQ_DEPTH` so the
-/// pool can absorb the same peak in-flight read count the SQ allows. With
-/// 64 KB buffers and 4096 slots the pool reserves ~256 MB up front — under
-/// catch-up workloads the alternative was per-PoolRead `ENOBUFS` errors
-/// surfacing to Pulsar as EIO + 15 s subscription retries (see the
-/// `bookie_io_uring_buf_pool_exhausted_total` counter).
-const BUF_POOL_COUNT: u16 = 4096;
+/// Number of buffers in the pool. Sized to absorb bursty catch-up reads —
+/// the gating check `in_flight_pool < BUF_POOL_COUNT` in the dispatch loop
+/// resets per batch, so under sustained load we can submit up to this many
+/// pool reads per poll cycle. When the kernel still returns `-ENOBUFS`
+/// despite the gate (race between submit and completion), the CQE handler
+/// now falls back to a synchronous `pread` instead of surfacing the error.
+/// With 64 KB buffers and 8192 slots the pool reserves ~512 MB up front.
+const BUF_POOL_COUNT: u16 = 8192;
 /// Buffer group ID registered with the kernel.
 const BUF_GROUP_ID: u16 = 0;
 /// CQE flag indicating a provided buffer was consumed (IORING_CQE_F_BUFFER).
@@ -274,6 +275,13 @@ enum PendingOp {
     },
     PoolRead {
         len: usize,
+        // Kept so the ENOBUFS (pool exhausted) branch can fall back to a
+        // synchronous `libc::pread` instead of bubbling a WouldBlock error
+        // up to the bookie client. Without retry data the caller saw EIO
+        // and Pulsar's managed-ledger backed off for 15 s — a hiccup in
+        // the pool should not be client-visible.
+        fd: RawFd,
+        offset: u64,
         reply: oneshot::Sender<io::Result<Vec<u8>>>,
     },
     Write {
@@ -405,7 +413,7 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                             let _ = reply.send(Err(e));
                             continue;
                         }
-                        pending.push(PendingOp::PoolRead { len, reply });
+                        pending.push(PendingOp::PoolRead { len, fd, offset, reply });
                         in_flight_pool += 1;
                     } else {
                         let mut buf = vec![0u8; len];
@@ -495,7 +503,9 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                             let _ = reply.send(Err(e));
                             continue;
                         }
-                        pending.push(PendingOp::PoolRead { len: size, reply });
+                        pending.push(PendingOp::PoolRead {
+                            len: size, fd, offset: data_offset, reply,
+                        });
                         in_flight_pool += 1;
                     } else {
                         let mut buf = vec![0u8; size];
@@ -676,20 +686,36 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                     };
                     let _ = reply.send(result);
                 }
-                PendingOp::PoolRead { len, reply } => {
+                PendingOp::PoolRead { len, fd, offset, reply } => {
                     let has_buffer = cqe_flags & CQE_F_BUFFER != 0;
                     let result = if ret == -(libc::ENOBUFS as i32) {
-                        // Pool exhausted — not a real I/O error, but we still
-                        // surface it to the caller (which currently has no
-                        // retry logic and bubbles it up to the bookie client
-                        // as EIO + a 15-second managed-ledger backoff on
-                        // Pulsar). Increment the counter so operators can
-                        // see when BUF_POOL_COUNT needs raising.
+                        // Pool exhausted — fall back to a synchronous
+                        // `libc::pread` on this thread. The counter is
+                        // still bumped so operators can tell the pool
+                        // is undersized for their workload. Previously
+                        // this path surfaced `WouldBlock` to the bookie
+                        // client, which Pulsar translated into EIO +
+                        // a 15-second managed-ledger backoff.
                         storage_metrics::IO_URING_BUF_POOL_EXHAUSTED_TOTAL.inc();
-                        Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "provided buffer pool exhausted",
-                        ))
+                        let mut buf = vec![0u8; len];
+                        let ret = unsafe {
+                            libc::pread(
+                                fd,
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                len,
+                                offset as libc::off_t,
+                            )
+                        };
+                        if ret < 0 {
+                            Err(io::Error::last_os_error())
+                        } else if (ret as usize) < len {
+                            Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                format!("short read: {} of {} bytes", ret, len),
+                            ))
+                        } else {
+                            Ok(buf)
+                        }
                     } else if ret < 0 {
                         if has_buffer {
                             let buf_id = (cqe_flags >> 16) as u16;
