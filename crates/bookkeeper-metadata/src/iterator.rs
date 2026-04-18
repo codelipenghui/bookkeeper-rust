@@ -111,14 +111,14 @@ mod tests {
             &self,
             _ledger_id: i64,
             _metadata: &LedgerMetadata,
-            _current_version: i32,
+            _current_version: i64,
         ) -> Result<Versioned<LedgerMetadata>, MetadataError> {
             unimplemented!()
         }
         async fn remove_ledger_metadata(
             &self,
             _ledger_id: i64,
-            _version: i32,
+            _version: i64,
         ) -> Result<(), MetadataError> {
             unimplemented!()
         }
@@ -173,11 +173,11 @@ mod tests {
             &self,
             _l: i64,
             _m: &LedgerMetadata,
-            _v: i32,
+            _v: i64,
         ) -> Result<Versioned<LedgerMetadata>, MetadataError> {
             unimplemented!()
         }
-        async fn remove_ledger_metadata(&self, _l: i64, _v: i32) -> Result<(), MetadataError> {
+        async fn remove_ledger_metadata(&self, _l: i64, _v: i64) -> Result<(), MetadataError> {
             unimplemented!()
         }
         async fn get_ledger_ranges(&self) -> Result<Vec<i64>, MetadataError> {

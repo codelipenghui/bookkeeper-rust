@@ -148,10 +148,10 @@ impl RegistrationManager for ZkRegistrationManager {
         }
     }
 
-    async fn read_cookie(&self, bookie_id: &str) -> Result<Option<(Vec<u8>, i32)>, MetadataError> {
+    async fn read_cookie(&self, bookie_id: &str) -> Result<Option<(Vec<u8>, i64)>, MetadataError> {
         let path = self.paths.cookie_path(bookie_id);
         match self.client.get_data(&path).await {
-            Ok((data, stat)) => Ok(Some((data, stat.version))),
+            Ok((data, stat)) => Ok(Some((data, stat.version as i64))),
             Err(zk::Error::NoNode) => Ok(None),
             Err(e) => Err(MetadataError::ConnectionError(format!("read cookie: {e}"))),
         }
@@ -166,16 +166,26 @@ impl RegistrationManager for ZkRegistrationManager {
         Ok(())
     }
 
-    async fn update_cookie(&self, bookie_id: &str, data: &[u8], version: i32) -> Result<(), MetadataError> {
+    async fn update_cookie(&self, bookie_id: &str, data: &[u8], version: i64) -> Result<(), MetadataError> {
+        let zk_version = i32::try_from(version)
+            .map_err(|_| MetadataError::VersionConflict {
+                expected: version,
+                actual: -1,
+            })?;
         let path = self.paths.cookie_path(bookie_id);
-        self.client.set_data(&path, data, Some(version)).await
+        self.client.set_data(&path, data, Some(zk_version)).await
             .map_err(|e| MetadataError::ConnectionError(format!("update cookie: {e}")))?;
         Ok(())
     }
 
-    async fn delete_cookie(&self, bookie_id: &str, version: i32) -> Result<(), MetadataError> {
+    async fn delete_cookie(&self, bookie_id: &str, version: i64) -> Result<(), MetadataError> {
+        let zk_version = i32::try_from(version)
+            .map_err(|_| MetadataError::VersionConflict {
+                expected: version,
+                actual: -1,
+            })?;
         let path = self.paths.cookie_path(bookie_id);
-        self.client.delete(&path, Some(version)).await
+        self.client.delete(&path, Some(zk_version)).await
             .map_err(|e| MetadataError::ConnectionError(format!("delete cookie: {e}")))?;
         Ok(())
     }

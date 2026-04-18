@@ -229,7 +229,7 @@ pub enum MetadataError {
     #[error("ledger already exists: {0}")]
     LedgerExists(i64),
     #[error("version conflict: expected {expected}, got {actual}")]
-    VersionConflict { expected: i32, actual: i32 },
+    VersionConflict { expected: i64, actual: i64 },
     #[error("metadata store connection error: {0}")]
     ConnectionError(String),
     #[error("ZooKeeper error: {0}")]

@@ -44,7 +44,7 @@ impl ZkLedgerManager {
             .map_err(|e| match e {
                 zk::Error::NoNode => MetadataError::NotFound(0),
                 zk::Error::BadVersion => MetadataError::VersionConflict {
-                    expected: version.unwrap_or(-1),
+                    expected: version.unwrap_or(-1) as i64,
                     actual: -1,
                 },
                 other => MetadataError::ZkError(format!("delete {path}: {other}")),
@@ -161,7 +161,7 @@ impl LedgerManager for ZkLedgerManager {
         // Create the znode
         let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
         match self.client.create(&path, &data, &options).await {
-            Ok(_) => Ok(Versioned::new(metadata.clone(), 0)),
+            Ok(_) => Ok(Versioned::new(metadata.clone(), 0i64)),
             Err(zk::Error::NodeExists) => Err(MetadataError::LedgerExists(ledger_id)),
             Err(e) => Err(MetadataError::ZkError(format!(
                 "create ledger {ledger_id}: {e}"
@@ -185,22 +185,27 @@ impl LedgerManager for ZkLedgerManager {
             })?;
 
         let metadata = deserialize_metadata(ledger_id, &data)?;
-        Ok(Versioned::new(metadata, stat.version))
+        Ok(Versioned::new(metadata, stat.version as i64))
     }
 
     async fn write_ledger_metadata(
         &self,
         ledger_id: i64,
         metadata: &LedgerMetadata,
-        current_version: i32,
+        current_version: i64,
     ) -> Result<Versioned<LedgerMetadata>, MetadataError> {
         let path = self.ledger_znode_path(ledger_id);
         let data = serialize_metadata(metadata)?;
 
-        // CAS update with version check
+        let zk_version = i32::try_from(current_version)
+            .map_err(|_| MetadataError::VersionConflict {
+                expected: current_version,
+                actual: -1,
+            })?;
+
         let stat = self
             .client
-            .set_data(&path, &data, Some(current_version))
+            .set_data(&path, &data, Some(zk_version))
             .await
             .map_err(|e| match e {
                 zk::Error::BadVersion => MetadataError::VersionConflict {
@@ -211,16 +216,21 @@ impl LedgerManager for ZkLedgerManager {
                 other => MetadataError::ZkError(format!("write ledger {ledger_id}: {other}")),
             })?;
 
-        Ok(Versioned::new(metadata.clone(), stat.version))
+        Ok(Versioned::new(metadata.clone(), stat.version as i64))
     }
 
     async fn remove_ledger_metadata(
         &self,
         ledger_id: i64,
-        version: i32,
+        version: i64,
     ) -> Result<(), MetadataError> {
         let path = self.ledger_znode_path(ledger_id);
-        self.delete_with_parent_cleanup(&path, Some(version))
+        let zk_version = i32::try_from(version)
+            .map_err(|_| MetadataError::VersionConflict {
+                expected: version,
+                actual: -1,
+            })?;
+        self.delete_with_parent_cleanup(&path, Some(zk_version))
             .await
             .map_err(|e| match e {
                 MetadataError::NotFound(_) => MetadataError::NotFound(ledger_id),

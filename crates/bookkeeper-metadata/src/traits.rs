@@ -25,13 +25,13 @@ pub trait LedgerManager: Send + Sync {
         &self,
         ledger_id: i64,
         metadata: &LedgerMetadata,
-        current_version: i32,
+        current_version: i64,
     ) -> Result<Versioned<LedgerMetadata>, MetadataError>;
 
     async fn remove_ledger_metadata(
         &self,
         ledger_id: i64,
-        version: i32,
+        version: i64,
     ) -> Result<(), MetadataError>;
 
     /// Iterate over all ledger IDs in the metadata store.
@@ -92,10 +92,10 @@ pub trait RegistrationManager: Send + Sync {
     async fn unregister_bookie(&self, bookie_id: &str, read_only: bool) -> Result<(), MetadataError>;
     async fn get_writable_bookies(&self) -> Result<Vec<String>, MetadataError>;
     async fn get_readonly_bookies(&self) -> Result<Vec<String>, MetadataError>;
-    async fn read_cookie(&self, bookie_id: &str) -> Result<Option<(Vec<u8>, i32)>, MetadataError>;
+    async fn read_cookie(&self, bookie_id: &str) -> Result<Option<(Vec<u8>, i64)>, MetadataError>;
     async fn create_cookie(&self, bookie_id: &str, data: &[u8]) -> Result<(), MetadataError>;
-    async fn update_cookie(&self, bookie_id: &str, data: &[u8], version: i32) -> Result<(), MetadataError>;
-    async fn delete_cookie(&self, bookie_id: &str, version: i32) -> Result<(), MetadataError>;
+    async fn update_cookie(&self, bookie_id: &str, data: &[u8], version: i64) -> Result<(), MetadataError>;
+    async fn delete_cookie(&self, bookie_id: &str, version: i64) -> Result<(), MetadataError>;
     async fn get_cluster_instance_id(&self) -> Result<Option<String>, MetadataError>;
     async fn init_new_cluster(&self, layout: &LedgerLayout, instance_id: &str) -> Result<(), MetadataError>;
 }
