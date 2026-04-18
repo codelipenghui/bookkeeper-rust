@@ -99,7 +99,7 @@ impl ZkLedgerManager {
                     if let Some(id_str) = child.strip_prefix('L') {
                         if let Ok(lid) = id_str.parse::<i64>() {
                             // Reconstruct full ledger ID from path + leaf
-                            let full_id = reconstruct_ledger_id(path, self.paths.root(), lid);
+                            let full_id = crate::metadata_paths::reconstruct_ledger_id_from_path(path, self.paths.root(), lid);
                             results.push(full_id);
                         }
                     }
@@ -110,36 +110,6 @@ impl ZkLedgerManager {
     }
 }
 
-/// Reconstruct ledger ID from the hierarchical path components.
-/// Short hierarchy: root/XX/XXXX/L{XXXX} → concatenate XX+XXXX+XXXX = 10-digit ID
-/// Long hierarchy: root/XXX/XXXX/XXXX/XXXX/L{XXXX} → concatenate XXX+XXXX+XXXX+XXXX+XXXX = 19-digit ID
-fn reconstruct_ledger_id(parent_path: &str, root: &str, leaf_id: i64) -> i64 {
-    // Strip root prefix to get the relative path
-    let relative = if parent_path.len() > root.len() {
-        &parent_path[root.len() + 1..]
-    } else {
-        return leaf_id;
-    };
-
-    // Extract all numeric parts from the directory path
-    let mut prefix_digits = String::new();
-    for part in relative.split('/') {
-        for ch in part.chars() {
-            if ch.is_ascii_digit() {
-                prefix_digits.push(ch);
-            }
-        }
-    }
-
-    // Compute the ID: path digits form the high-order part, leaf the low-order
-    // For short: "00/0000" → prefix_digits="000000", leaf "L0001" → leaf_id=1
-    //   Full number = "000000" + "0001" = "0000000001" = 1
-    // For long: "000/0000/0000/0000" → prefix_digits="000000000000000", leaf "L0001" → leaf_id=1
-    //   Full number = "000000000000000" + "0001" = "0000000000000000001" = 1
-    let leaf_str = format!("{:04}", leaf_id);
-    let full_str = format!("{}{}", prefix_digits, leaf_str);
-    full_str.parse::<i64>().unwrap_or(leaf_id)
-}
 
 #[async_trait]
 impl LedgerManager for ZkLedgerManager {
@@ -272,25 +242,26 @@ impl LedgerManager for ZkLedgerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_paths::reconstruct_ledger_id_from_path;
 
     #[test]
     fn test_reconstruct_short_id() {
         // Short: /ledgers/00/0000/L0001 → ID = 1
-        let id = reconstruct_ledger_id("/ledgers/00/0000", "/ledgers", 1);
+        let id = reconstruct_ledger_id_from_path("/ledgers/00/0000", "/ledgers", 1);
         assert_eq!(id, 1);
     }
 
     #[test]
     fn test_reconstruct_short_id_large() {
         // Short: /ledgers/12/3456/L7890 → ID = 1234567890
-        let id = reconstruct_ledger_id("/ledgers/12/3456", "/ledgers", 7890);
+        let id = reconstruct_ledger_id_from_path("/ledgers/12/3456", "/ledgers", 7890);
         assert_eq!(id, 1234567890);
     }
 
     #[test]
     fn test_reconstruct_long_id() {
         // Long: /ledgers/000/0000/0000/0000/L0001 → ID = 1
-        let id = reconstruct_ledger_id("/ledgers/000/0000/0000/0000", "/ledgers", 1);
+        let id = reconstruct_ledger_id_from_path("/ledgers/000/0000/0000/0000", "/ledgers", 1);
         assert_eq!(id, 1);
     }
 
@@ -298,7 +269,7 @@ mod tests {
     fn test_reconstruct_long_id_large() {
         // ID 2147483648 (i32::MAX + 1): format!("{:019}", 2147483648) = "0000000002147483648"
         // Split 3-4-4-4-4: "000/0000/0021/4748/L3648"
-        let id = reconstruct_ledger_id("/ledgers/000/0000/0021/4748", "/ledgers", 3648);
+        let id = reconstruct_ledger_id_from_path("/ledgers/000/0000/0021/4748", "/ledgers", 3648);
         assert_eq!(id, 2147483648);
     }
 
@@ -311,7 +282,7 @@ mod tests {
         // Extract: parent="/ledgers/00/0001", leaf=2345
         let parent = "/ledgers/00/0001";
         let leaf_id = 2345i64;
-        let reconstructed = reconstruct_ledger_id(parent, "/ledgers", leaf_id);
+        let reconstructed = reconstruct_ledger_id_from_path(parent, "/ledgers", leaf_id);
         assert_eq!(reconstructed, 12345);
     }
 
@@ -325,7 +296,7 @@ mod tests {
 
         let parent = "/ledgers/000/0000/0021/4748";
         let leaf_id = 3647i64;
-        let reconstructed = reconstruct_ledger_id(parent, "/ledgers", leaf_id);
+        let reconstructed = reconstruct_ledger_id_from_path(parent, "/ledgers", leaf_id);
         assert_eq!(reconstructed, 2147483647);
     }
 }

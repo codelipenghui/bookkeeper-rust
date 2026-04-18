@@ -46,6 +46,47 @@ pub fn underreplication_lock_path(base: &str, ledger_id: i64) -> String {
     format!("{}/urL{:010}", base, ledger_id)
 }
 
+/// Reconstruct the full ledger ID from the hierarchical path components.
+///
+/// The hierarchical scheme encodes the full ledger ID across multiple
+/// path segments: every directory segment above the leaf contributes
+/// some digits of the ID, and the leaf `L{NNNN}` contributes the last
+/// four digits. Parsing only the leaf produces the wrong ID for any
+/// ledger with `id >= 10000`.
+///
+/// `parent_path` is the full path up to (but not including) the `L{NNNN}`
+/// leaf, e.g. `/ledgers/00/0001`. `root` is the root of the ledger tree,
+/// e.g. `/ledgers`. `leaf_id` is the numeric value of the leaf (the
+/// `NNNN` in `L{NNNN}`).
+///
+/// Both the short (3-level) and long (5-level) hierarchies are handled:
+/// - Short: `{root}/XX/XXXX/L{XXXX}` → concatenate `XX`+`XXXX`+`XXXX` = 10-digit ID.
+/// - Long:  `{root}/XXX/XXXX/XXXX/XXXX/L{XXXX}` → concatenate all five groups = 19-digit ID.
+pub fn reconstruct_ledger_id_from_path(parent_path: &str, root: &str, leaf_id: i64) -> i64 {
+    // Strip root prefix to get the relative path segments.
+    let relative = if parent_path.len() > root.len() {
+        &parent_path[root.len() + 1..]
+    } else {
+        return leaf_id;
+    };
+
+    // Collect all digit characters from the intermediate path segments.
+    let mut prefix_digits = String::new();
+    for part in relative.split('/') {
+        for ch in part.chars() {
+            if ch.is_ascii_digit() {
+                prefix_digits.push(ch);
+            }
+        }
+    }
+
+    // The prefix digits form the high-order part; the leaf (zero-padded to 4
+    // digits) forms the low-order part. Concatenate and parse.
+    let leaf_str = format!("{:04}", leaf_id);
+    let full_str = format!("{}{}", prefix_digits, leaf_str);
+    full_str.parse::<i64>().unwrap_or(leaf_id)
+}
+
 /// Well-known sub-paths below the ledger root. Pure strings — no
 /// backend-specific semantics. Both the ZK and oxia backends use the
 /// same names to stay wire-compatible with Apache Pulsar.

@@ -6,7 +6,7 @@ use liboxia::client::{OxiaClient, PutOption};
 use liboxia::errors::OxiaError;
 
 use super::errors::map_oxia_error;
-use super::paths::child_range;
+use super::paths::descendant_range;
 use crate::ledger_metadata::MetadataError;
 use crate::metadata_paths::LedgerPaths;
 use crate::traits::LedgerIdGenerator;
@@ -106,12 +106,7 @@ impl OxiaLedgerIdGenerator {
     }
 
     async fn list_hobs(&self) -> Result<Vec<i32>, MetadataError> {
-        let (start, _end) = child_range(&self.long_gen_dir);
-        let end = {
-            let mut e = start.clone();
-            e.push('\u{00ff}');
-            e
-        };
+        let (start, end) = descendant_range(&self.long_gen_dir);
         let keys = self
             .client
             .list(start.clone(), end)
@@ -170,8 +165,8 @@ impl OxiaLedgerIdGenerator {
             self.gc_old_hobs(&hobs).await;
             return Ok(((high_bits as i64) << 32) | suffix);
         }
-        Err(MetadataError::ZkError(
-            "long ID generation failed after retries".into(),
+        Err(MetadataError::ConnectionError(
+            "oxia long ID generation failed after retries".into(),
         ))
     }
 }

@@ -118,8 +118,13 @@ async fn ledger_cas_conflict_on_stale_write(backend: &MetadataBackend) {
 }
 
 async fn list_ledger_ids(backend: &MetadataBackend) {
+    // Include IDs that exercise multi-segment path reconstruction:
+    //   1, 7, 13    — small IDs (single path prefix digit group)
+    //   12345       — crosses the 4-digit boundary (path: XX/XXXX/L{NNNN})
+    //   987654321   — large ID near i32::MAX (also short hierarchy)
+    let want: Vec<i64> = vec![1, 7, 13, 12345, 987654321];
     let md = fake_ledger_metadata();
-    for id in [1_i64, 7, 13] {
+    for &id in &want {
         backend
             .ledger_manager
             .create_ledger_metadata(id, &md)
@@ -131,19 +136,19 @@ async fn list_ledger_ids(backend: &MetadataBackend) {
         .get_ledger_ranges()
         .await
         .expect("list_ledger_ids: get_ledger_ranges");
-    ids.retain(|id| [1, 7, 13].contains(id));
+    ids.retain(|id| want.contains(id));
     ids.sort_unstable();
-    assert_eq!(ids, vec![1, 7, 13], "list_ledger_ids: expected [1, 7, 13]");
-    for id in [1_i64, 7, 13] {
+    assert_eq!(ids, want, "list_ledger_ids: unexpected IDs returned");
+    for id in &want {
         let v = backend
             .ledger_manager
-            .read_ledger_metadata(id)
+            .read_ledger_metadata(*id)
             .await
             .expect("list_ledger_ids: read")
             .version();
         backend
             .ledger_manager
-            .remove_ledger_metadata(id, v)
+            .remove_ledger_metadata(*id, v)
             .await
             .ok();
     }

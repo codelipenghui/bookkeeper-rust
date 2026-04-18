@@ -97,15 +97,23 @@ impl RegistrationManager for OxiaRegistrationManager {
     async fn create_cookie(&self, bookie_id: &str, data: &[u8]) -> Result<(), MetadataError> {
         let key = self.paths.cookie_path(bookie_id);
         create_parents(&self.client, &key).await?;
-        self.client
+        match self
+            .client
             .put_with_options(
                 key,
                 data.to_vec(),
                 vec![PutOption::ExpectVersionId(-1)],
             )
             .await
-            .map_err(|e| map_oxia_error(e, None))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            // ExpectVersionId(-1) means "create-only"; a conflict here means
+            // the cookie already exists — surface that clearly.
+            Err(OxiaError::UnexpectedVersionId()) => Err(MetadataError::ConnectionError(
+                format!("create cookie: bookie '{bookie_id}' already has a cookie"),
+            )),
+            Err(e) => Err(map_oxia_error(e, None)),
+        }
     }
 
     async fn update_cookie(

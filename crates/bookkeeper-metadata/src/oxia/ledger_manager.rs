@@ -165,10 +165,19 @@ impl LedgerManager for OxiaLedgerManager {
 
         let mut ids = Vec::new();
         for key in keys {
-            let Some(leaf) = key.rsplit('/').next() else { continue };
-            let Some(num) = leaf.strip_prefix('L') else { continue };
-            let Ok(id) = num.parse::<i64>() else { continue };
-            ids.push(id);
+            // Keys have the form "{root}/XX/XXXX/L{NNNN}" (short) or the
+            // 5-level long form. Split on the last '/' to isolate the leaf.
+            let Some((parent, leaf)) = key.rsplit_once('/') else { continue };
+            let Some(leaf_digits) = leaf.strip_prefix('L') else { continue };
+            let Ok(leaf_id) = leaf_digits.parse::<i64>() else { continue };
+            // Reconstruct the full ID by concatenating prefix digits from the
+            // path segments with the leaf digits — fixes IDs >= 10000.
+            let full_id = crate::metadata_paths::reconstruct_ledger_id_from_path(
+                parent,
+                self.paths.root(),
+                leaf_id,
+            );
+            ids.push(full_id);
         }
         ids.sort_unstable();
         Ok(ids)
