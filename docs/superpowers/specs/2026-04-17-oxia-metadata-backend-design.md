@@ -7,87 +7,84 @@ Date: 2026-04-17
 ## 1. Goal
 
 Add [Oxia](https://github.com/oxia-db/oxia) as a second metadata backend for
-bookkeeper-rust, alongside the existing ZooKeeper backend. Bookies, the CLI,
-the replication worker, and all integration tests must be able to run against
-either backend selected via `metadataServiceUri`.
+bookkeeper-rust, alongside the existing ZooKeeper backend.
+
+**Interop requirement (load-bearing):** keys, values, and CAS semantics
+MUST be wire-compatible with Apache Pulsar's existing
+`pulsar-metadata/bookkeeper` driver (`PulsarRegistrationManager`,
+`PulsarLedgerManager`, `PulsarLedgerIdGenerator`,
+`PulsarLedgerUnderreplicationManager`). A bookkeeper-rust bookie pointed
+at the same oxia namespace as a Pulsar broker managing BK ledgers must
+read and write the same records that Pulsar expects.
+
+Scope:
+
+- Server (bookie), CLI, replication worker, auditor — all talk to oxia
+  via the existing four metadata traits.
+- Bookie registration via ephemeral records with oxia-managed sessions.
+- Ledger ID generation matching Pulsar's HOB scheme bit-for-bit.
 
 Non-goals:
 
-- Client-side (reader/writer) oxia support — the current client already
-  consumes the same trait layer; wiring it through is trivial once the
-  server path works, but it is deferred to a follow-up to keep this change
-  focused.
+- Flattening or "modernising" the Pulsar layout. Interop wins over
+  elegance; oxia's native `SequenceKeyDelta` and flat list APIs are
+  *not* used even though they would be simpler — Pulsar doesn't use
+  them either.
 - ZK → oxia migration tooling.
-- Notification/watch support. The current codebase does not consume ZK
-  watches; `get_ledger_ranges` is polled. Oxia notifications stay unused.
+- Oxia notification/watch support. The current codebase does not consume
+  ZK watches.
+- Client-side oxia support in the Rust client crate. Same factory
+  extends to it later; the server path is landed first.
 
 ## 2. Motivation
 
-- Operational parity with StreamNative-hosted deployments, where Oxia is
-  the default metadata store for Pulsar 4.x and newer.
-- Oxia's sharded design removes the well-known ZK bottleneck on ledger
-  metadata hot paths (tens of thousands of `get_ledger_metadata` calls/s)
-  and the cost of maintaining a separate ZK ensemble.
-- Oxia sessions + server-side sequence generation replace two of the
-  bookie's most fragile ZK patterns (ephemeral znodes on a
-  heartbeat-starved runtime, the two-tier HOB ID generator).
+- Operational parity with StreamNative / Apache Pulsar deployments that
+  already run on oxia (Pulsar 4.x default).
+- A bookkeeper-rust bookie can be dropped into a Pulsar+oxia cluster
+  without standing up a separate ZK ensemble.
+- Oxia's sharded design removes the ZK bottleneck on ledger-metadata hot
+  paths; oxia-managed sessions replace the bookie's fragile
+  heartbeat-isolation workaround (`ZkRegistrationManager::new_isolated`'s
+  dedicated 1-worker runtime).
 
-## 3. Non-requirements we are explicitly not preserving
+## 3. Dependency
 
-- The ZK-specific hierarchical 2-4-4 / 3-4-4-4-4 ledger path layout. Under
-  oxia the layout is flat and range-scannable.
-- The ZK-specific `idgen-long/HOB-XXXXXXXXXX/ID-...` ID scheme. Oxia's
-  built-in sequence keys cover the same need with an i64 counter and no
-  rollover logic.
+`liboxia = "0.0.2"` — the official Rust client from `oxia-db/liboxia`
+(crates.io, Oct 2025, last updated Jan 2026). Surface we rely on:
 
-## 4. Dependency
+- `OxiaClient::new(OxiaClientOptions)`, `put`/`get`/`delete`/`list`/
+  `range_scan`/`delete_range` plus `*_with_options`.
+- `PutOption::ExpectVersionId(i64)`, `ExpectedRecordNotExists()`,
+  `Ephemeral()`.
+- `DeleteOption::ExpectVersionId(i64)`.
+- `OxiaError::{KeyNotFound, UnexpectedVersionId, SessionDoesNotExist,
+  KeyLeaderNotFound, ...}`.
 
-`liboxia = "0.0.2"` — the official Rust client from `oxia-db/liboxia`,
-published on crates.io (Oct 2025, last updated Jan 2026).
+`PutOption::SequenceKeyDelta` is available but **deliberately unused**
+(see §6.4 — we port Pulsar's HOB scheme instead for interop).
 
-Relevant surface we rely on:
+`testcontainers-oxia = "0.0.1"` (dev-dependency) for integration tests.
 
-- `OxiaClient::new(OxiaClientOptions)` / `put`/`get`/`delete`/`list`/
-  `range_scan`/`delete_range` with `*_with_options` variants.
-- `PutOption::ExpectVersionId(i64)` for CAS, `ExpectedRecordNotExists()`
-  for create-only semantics.
-- `PutOption::Ephemeral()` — client-managed session ties the key to the
-  `OxiaClient` lifetime.
-- `PutOption::SequenceKeyDelta(Vec<u64>)` — server-assigned monotonic key
-  suffixes (i64-valued).
-- `OxiaError::{KeyNotFound, UnexpectedVersionId, SessionDoesNotExist, ...}`
-  — mapped to `MetadataError` variants.
+## 4. Trait-layer changes
 
-The oxia-managed session replaces the custom
-`ZkRegistrationManager::new_isolated` dedicated-runtime workaround: the
-client keeps the session alive internally.
+### 4.1 Widen version to `i64`
 
-## 5. Trait-layer changes
-
-The four existing traits in `crates/bookkeeper-metadata/src/traits.rs`
-(`LedgerManager`, `LedgerIdGenerator`, `LayoutManager`,
-`RegistrationManager`) already abstract the right concepts. Two small
-changes are needed:
-
-### 5.1 Widen version to `i64`
-
-Oxia's `version_id` is `i64`. ZK `stat.version` is `i32` and fits
-losslessly. Change:
+Oxia's `version_id` is `i64`. Pulsar's `PulsarRegistrationManager` uses
+`LongVersion` (i64). ZK `stat.version` (i32) fits losslessly.
 
 - `Versioned<T>::version: i32 → i64` (`crates/bookkeeper-metadata/src/versioned.rs`)
-- `LedgerManager::write_ledger_metadata(..., current_version: i32)` → `i64`
-- `RegistrationManager::{read,update,delete}_cookie` version field → `i64`
+- `LedgerManager::write_ledger_metadata(..., current_version: i32 → i64)`
+- `RegistrationManager::{read,update,delete}_cookie` version field
+  → `i64`
 
-This touches ~15 consumer sites (server, http_api, cli, datainteg). The
-change is mechanical: widen the type and remove a couple of `as i64`
-casts. No on-wire format changes — the ZK backend still stores the
-underlying `stat.version: i32` and widens on read.
+Mechanical across ~15 call sites (server, http_api, cli, datainteg,
+tests). No on-wire format changes for ZK — the ZK backend widens
+`stat.version` on read.
 
-### 5.2 New `MetadataBackendFactory`
+### 4.2 `MetadataBackend` factory
 
-Today, server.rs and friends construct `ZkLedgerManager::new(...)`,
-`ZkRegistrationManager::new_isolated(...)`, etc. directly. Replace those
-call sites with a single factory:
+Today, server.rs and friends construct `ZkLedgerManager::new(...)` and
+`ZkRegistrationManager::new_isolated(...)` directly. Replace with:
 
 ```rust
 pub struct MetadataBackend {
@@ -95,96 +92,161 @@ pub struct MetadataBackend {
     pub id_generator: Arc<dyn LedgerIdGenerator>,
     pub layout_manager: Arc<dyn LayoutManager>,
     pub registration_manager: Arc<dyn RegistrationManager>,
-    // For existing ZK call sites that still need the raw client (http_api
-    // stats endpoints, ad-hoc znode reads): exposed only by the ZK impl.
+    // Raw-ZK escape hatch for http_api endpoints that currently reach
+    // into zk::Client directly. None for oxia — those endpoints will
+    // return NotSupported until we abstract them behind traits.
     pub zk_raw: Option<ZkRawHandles>,
+}
+
+pub struct ZkRawHandles {
+    pub client: zookeeper_client::Client,
+    pub paths: ZkPaths,
 }
 
 pub async fn open_metadata_backend(
     metadata_service_uri: &str,
-    // runtime is retained for the ZK heartbeat-isolation optimisation;
-    // oxia ignores it (liboxia has its own internal runtime scheduling).
-    runtime: Option<tokio::runtime::Handle>,
-    // ZK-only; oxia uses liboxia's default.
-    session_timeout: Option<Duration>,
+    runtime: Option<tokio::runtime::Handle>,     // ZK-only
+    session_timeout: Option<Duration>,           // applies to both
 ) -> Result<MetadataBackend, MetadataError>;
 ```
 
-Selection by scheme:
+Selection by URI scheme:
 
 - `zk://...`, `zk+hierarchical://...`, `zk+flat://...` → ZK backend
-- `oxia://...` → Oxia backend
+- `oxia://...`, `metadata-store:oxia://...` (see §5) → oxia backend
 - anything else → `MetadataError::InvalidConfig`
 
-The `zk_raw` escape hatch is there to keep the http_api endpoints that
-currently talk to the ZK client directly working, so that the factory
-migration is mechanical. Follow-up work can fold those endpoints behind
-generic traits so that the escape hatch disappears for oxia deployments
-(they'll return an explicit `NotSupported` error in the meantime — the
-affected endpoints are administrative, not on the hot path).
+## 5. URI scheme
 
-## 6. URI scheme
+Two forms supported, both parsed into the same internal representation:
 
 ```
-oxia://<host1>:<port>[,<host2>:<port>...]/<namespace>[/<root-prefix>]
+oxia://<host1>:<port>[,<host2>:<port>...]/<namespace>[/<ledgersRootPath>]
+metadata-store:oxia://<host>:<port>/<namespace>[/<ledgersRootPath>]
 ```
 
-- `host:port` — oxia gateway address; multiple hosts are comma-separated
-  (matching the oxia Go client convention).
-- `<namespace>` — required; oxia is multi-tenant.
-- `<root-prefix>` — optional key prefix. Defaults to `bookkeeper` so that
-  namespaces shared with other services don't collide. All keys below
-  become `/{root-prefix}/<path>`.
+The `metadata-store:` prefix matches Pulsar's own
+`metadataStoreUrl=metadata-store:oxia://...` form used in Pulsar's broker
+config. We accept both so operators can copy/paste from Pulsar configs
+without translation.
 
-Parser changes in
-`crates/bookkeeper-config/src/server.rs::parse_metadata_service_uri`:
+`<ledgersRootPath>` is the base key for all BK records. It defaults to
+`/ledgers` — the same default Pulsar uses (`PulsarRegistrationManager`
+is constructed with `"/ledgers"`). Must begin with `/`; embedded slashes
+are allowed (so nested namespaces like `/app/bk` work).
 
-- Existing return type (`Option<String>` returning ZK hosts) generalises
-  to an enum `ParsedMetadataUri::{Zk(String), Oxia { hosts, namespace, prefix }}`.
-- Consumers that need "just ZK hosts" continue to work via a helper that
-  returns `None` for non-ZK URIs.
+Parser changes in `crates/bookkeeper-config/src/server.rs`:
 
-## 7. Key layout under oxia
+- `parse_metadata_service_uri` returns an enum
+  `ParsedMetadataUri::{Zk(String), Oxia { service_addr, namespace, ledgers_root }}`.
+- Existing consumers that need "just ZK hosts" keep working via a helper
+  returning `None` for non-ZK URIs.
 
-All keys below assume a `{root}` prefix derived from the URI (e.g.
-`bookkeeper`).
+## 6. Key layout (must match Pulsar exactly)
 
-| Concept                       | Oxia key                                       | Notes                                                    |
-| ----------------------------- | ---------------------------------------------- | -------------------------------------------------------- |
-| Cluster layout                | `{root}/LAYOUT`                                | Same text format as ZK (`{fmtVer}\n{class}:{mgrVer}`).   |
-| Cluster instance ID           | `{root}/INSTANCEID`                            | UUID string.                                             |
-| Ledger metadata               | `{root}/ledgers/{ledger_id:019}`               | Binary protobuf (v3), same codec as ZK backend.          |
-| Cookie                        | `{root}/cookies/{bookie_id}`                   | Raw cookie bytes.                                        |
-| Writable bookie registration  | `{root}/available/{bookie_id}`                 | Ephemeral. Value: `BookieServiceInfo` protobuf.          |
-| Read-only bookie registration | `{root}/available/readonly/{bookie_id}`        | Ephemeral.                                               |
-| Ledger ID generator counter   | `{root}/idgen/seq-`                            | Sequence-key puts; suffix == ledger ID.                  |
+All keys share a `<ledgersRootPath>` prefix (default `/ledgers`). The
+sub-key names and formats below are copied from
+`pulsar-metadata/src/main/java/org/apache/pulsar/metadata/bookkeeper/`
+and `BookKeeperConstants.java`.
 
-Key-choice rationale:
+| Concept                       | Oxia key                                                                      | Source of truth                        |
+| ----------------------------- | ----------------------------------------------------------------------------- | -------------------------------------- |
+| Cluster layout                | `<root>/LAYOUT`                                                               | `PulsarLayoutManager`, `LAYOUT_ZNODE`  |
+| Cluster instance ID           | `<root>/INSTANCEID`                                                           | `BookKeeperConstants.INSTANCEID`       |
+| Ledger metadata               | `<root>/<hierarchical-path>/L{NNNN}` (see §6.1)                               | `LegacyHierarchicalLedgerManager`      |
+| Cookie                        | `<root>/cookies/<bookie_id>`                                                  | `COOKIE_NODE`                          |
+| Writable bookie registration  | `<root>/available/<bookie_id>`                                                | `AVAILABLE_NODE`                       |
+| Read-only bookie registration | `<root>/available/readonly/<bookie_id>`                                       | `AVAILABLE_NODE`/`READONLY`            |
+| Short ID gen                  | `<root>/idgen/ID-{NNNNNNNNNN}`                                                | `PulsarLedgerIdGenerator.IDGEN_SHORT_NODE` |
+| Long ID gen (HOB dirs)        | `<root>/idgen-long/HOB-{NNNNNNNNNN}/ID-{NNNNNNNNNN}`                          | `PulsarLedgerIdGenerator.IDGEN_NODE`   |
 
-- `{ledger_id:019}` — 19 decimal digits = widest i64. Fixed-width zero
-  padding makes the natural string order equal the numeric order, so
-  `list()` / `range_scan()` over `ledgers/` returns IDs in order without
-  an explicit sort.
-- `available/` directly holding regular writable bookies and
-  `available/readonly/` for read-only — matches ZK layout. `list()` over
-  `{root}/available/` with proper end-bound excludes the `readonly/`
-  sub-prefix.
-- Ledger ID counter under its own prefix so sequence-key suffix scans don't
-  mix with ledger data.
+### 6.1 Hierarchical ledger paths
 
-## 8. Semantics mapping
+Same format as Java's `LegacyHierarchicalLedgerManager`, which is what
+our existing `ZkLedgerManager` already produces via
+`crate::zk_path::ledger_path`:
 
-### 8.1 CAS writes
+- ID `< i32::MAX` → `<root>/XX/XXXX/L{XXXX}` (3-level, 10 digits)
+- ID `>= i32::MAX` → `<root>/XXX/XXXX/XXXX/XXXX/L{XXXX}` (5-level, 19 digits)
 
-| Our operation                                          | Oxia                                                 | Error mapping                                          |
-| ------------------------------------------------------ | ---------------------------------------------------- | ------------------------------------------------------ |
-| `create_ledger_metadata` (must not exist)              | `put_with_options(key, value, [ExpectedRecordNotExists])` | `UnexpectedVersionId` → `LedgerExists(id)`         |
-| `write_ledger_metadata(id, v, current_version)`        | `put_with_options(key, value, [ExpectVersionId(current_version)])` | `UnexpectedVersionId` → `VersionConflict`       |
-| `remove_ledger_metadata(id, version)`                  | `delete_with_options(key, [ExpectVersionId(version)])` | `UnexpectedVersionId` → `VersionConflict`, `KeyNotFound` → `NotFound(id)` |
-| `read_ledger_metadata`                                 | `get(key)`                                           | `KeyNotFound` → `NotFound(id)`; version = `GetResult.version.version_id` |
-| Cookie CAS                                             | Same as above with cookie key                        | Same                                                   |
+The `zk_path.rs` helpers (`ledger_path`, `ensure_zk_parents`, etc.) need
+no behavioural change, but they should move into a shared
+`metadata_paths.rs` module since both backends produce identical paths.
+Backend-specific path code that remains in the zk module: only the ZK
+path-ensuring (which uses `zk::CreateMode::Persistent`) — the oxia side
+does its own parent creation via `put(..., IfRecordDoesNotExist)`.
 
-### 8.2 Ephemeral registration
+### 6.2 Parent creation
+
+Oxia has no implicit hierarchy — paths like `<root>/cookies/<id>` are
+flat strings. But Pulsar's `OxiaMetadataStore.createParents` creates
+explicit empty-value records at every intermediate path segment, so that
+`store.getChildren` / listing-by-prefix works. We replicate:
+
+Before `put(<root>/<a>/<b>/<leaf>)`, for each prefix path
+`<root>/<a>`, `<root>/<a>/<b>`: `put(prefix, [], IfRecordDoesNotExist)`
+and swallow `UnexpectedVersionId` (already created).
+
+The `<root>` itself is assumed to exist — `init_new_cluster` creates it
+alongside `LAYOUT` / `INSTANCEID`.
+
+### 6.3 Listing children
+
+To enumerate immediate children of `<path>` (e.g. bookies under
+`<root>/available/`, or ledger directories under `<root>`), use:
+
+```rust
+client.list(format!("{path}/"), format!("{path}/\u{00ff}")).await
+```
+
+matching Pulsar's `getChildrenFromStore(path)` (`{pathWithSlash}/` to
+`{pathWithSlash}//` — we use a higher-codepoint upper bound to be safe
+against keys containing `/`). Then strip the `{path}/` prefix and drop
+entries containing further `/` (those are grand-children — same filter
+Pulsar applies).
+
+### 6.4 Ledger ID generation
+
+Port of `PulsarLedgerIdGenerator`, which matches `ZkLedgerIdGenerator`'s
+two-tier scheme bit-for-bit:
+
+Phase 1 (short, 31-bit):
+1. `put(<root>/idgen, [], IfRecordDoesNotExist)` once (idempotent).
+2. `put(<root>/idgen/ID-, [], Ephemeral + Sequential)` — the oxia
+   "sequential" translation in liboxia should yield a zero-padded
+   10-digit suffix derived from the parent's `modifications_count`.
+3. Delete the created ephemeral record (best-effort).
+4. Parse suffix; if `>= i32::MAX`, create `<root>/idgen-long` and fall
+   through to phase 2.
+
+**Open liboxia question:** at 0.0.2 I have not yet confirmed that
+`liboxia` exposes a `CreateOption.Sequential` equivalent — Pulsar's
+Java client does, but the Rust crate's `PutOption` enum seen in
+§3 does not list it. If missing, we implement the same behaviour
+client-side: read the parent's current `modifications_count` via `get`,
+then `put` the child at `ID-{count:010}` with
+`ExpectedRecordNotExists()`; retry on `UnexpectedVersionId` (another
+bookie raced). Either way the on-wire key is identical to Pulsar's.
+
+Phase 2 (long, 63-bit): identical to our existing
+`ZkLedgerIdGenerator::generate_long_id` — list HOB directories, pick
+max, generate low-bits, combine `(high << 32) | low`, GC old HOB dirs
+keeping 3. The code ports nearly line-for-line from `zk/idgen.rs`;
+only the "create sequential node" primitive differs.
+
+## 7. Semantics mapping
+
+### 7.1 CAS writes
+
+| Operation                                              | Oxia call                                                             | Error mapping                                                            |
+| ------------------------------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `create_ledger_metadata`                               | `put_with_options(key, value, [ExpectedRecordNotExists])`             | `UnexpectedVersionId` → `LedgerExists(id)`                               |
+| `write_ledger_metadata(id, v, current_version)`        | `put_with_options(key, value, [ExpectVersionId(current_version)])`    | `UnexpectedVersionId` → `VersionConflict { expected, actual: -1 }`       |
+| `remove_ledger_metadata(id, version)`                  | `delete_with_options(key, [ExpectVersionId(version)])`                | `UnexpectedVersionId` → `VersionConflict`, `KeyNotFound` → `NotFound(id)`|
+| `read_ledger_metadata`                                 | `get(key)`                                                            | `KeyNotFound` → `NotFound(id)`; version = `GetResult.version.version_id` |
+| Cookie ops                                             | as above with the cookie key                                          | same                                                                     |
+
+### 7.2 Ephemeral registration
 
 ```rust
 client.put_with_options(
@@ -194,147 +256,138 @@ client.put_with_options(
 ).await?;
 ```
 
-`OxiaClient` creates one session per shard and keeps it alive. Session
-timeout is controlled by `OxiaClientOptions::session_timeout`; we default
-to 30s to match the ZK backend's behaviour. When the bookie process dies
-the session expires and every `Ephemeral()` key it owned is removed —
-same guarantee as ZK ephemeral znodes.
+`OxiaClient` creates one session per shard and keeps it alive.
+`OxiaClientOptions::session_timeout` — we default to 30s to match the
+existing ZK behaviour. On bookie process death, every `Ephemeral()` key
+is purged, matching Pulsar's `PulsarRegistrationManager` behaviour (it
+uses `MetadataStoreExtended.registerBookie` which goes through
+`OxiaMetadataStore.doStorePut` with `CreateOption.Ephemeral`).
 
-This **eliminates** the dedicated-runtime workaround documented in
-`ZkRegistrationManager::new_isolated` (the 1-worker runtime that exists
-purely to keep heartbeats unblocked by RPC load). `liboxia` runs its own
-background tasks and does not share the bookie's request-handling
-runtime.
+This **eliminates** the `ZkRegistrationManager::new_isolated` dedicated
+1-worker runtime. `liboxia` runs its own background tasks.
 
-### 8.3 Listing ledgers
+### 7.3 Error mapping
 
-```rust
-client.list(format!("{root}/ledgers/"), format!("{root}/ledgers0")).await
-```
-
-`0` is the next char after `/` in ASCII, so the exclusive upper bound is
-a well-defined lexicographic end of the prefix. The returned keys are
-already sorted, strip the prefix, parse the 19-digit decimal → `i64`.
-No hierarchical recursion, no reconstruction.
-
-### 8.4 Ledger ID generation
-
-```rust
-let res = client.put_with_options(
-    format!("{root}/idgen/seq-"),
-    vec![],
-    vec![PutOption::SequenceKeyDelta(vec![1])],
-).await?;
-// res.key == "{root}/idgen/seq-{XXXXXXXXXXXXXXXXXXXX}" (20-digit suffix)
-let ledger_id: i64 = res.key.rsplit('-').next().unwrap().parse()?;
-```
-
-Oxia's sequence counter is i64; no split-namespace HOB logic needed.
-Monotonic across the cluster by construction.
-
-### 8.5 Error mapping
-
-| `liboxia::OxiaError`                | `bookkeeper_metadata::MetadataError`          |
-| ----------------------------------- | --------------------------------------------- |
-| `KeyNotFound`                       | `NotFound(id)` (when id-contextual) or `NotFound(0)` |
+| `liboxia::OxiaError`                | `bookkeeper_metadata::MetadataError`                                       |
+| ----------------------------------- | -------------------------------------------------------------------------- |
+| `KeyNotFound`                       | `NotFound(id)` (id-contextual) or `NotFound(0)`                            |
 | `UnexpectedVersionId`               | `VersionConflict { expected, actual: -1 }` or `LedgerExists` in create-only context |
-| `SessionDoesNotExist`               | `ConnectionError(...)` — caller should retry after re-registration |
-| `IllegalArgument`                   | `SerializationError(...)` if tied to encoding; else `InvalidConfig` |
-| transport / `KeyLeaderNotFound`     | `ConnectionError(...)` (retriable)            |
-| `UnexpectedStatus`                  | `ConnectionError(...)` with the wrapped code  |
+| `SessionDoesNotExist`               | `ConnectionError(...)` — caller retries after session re-init              |
+| `IllegalArgument` (when tied to encoding) | `SerializationError(...)`                                            |
+| `KeyLeaderNotFound` / transport     | `ConnectionError(...)` — retriable                                         |
+| `UnexpectedStatus(code)`            | `ConnectionError("oxia status {code}")`                                    |
 
-## 9. Module layout
+## 8. Module layout
 
 ```
 crates/bookkeeper-metadata/src/
-├── lib.rs                # pub use both backends behind feature gates
-├── traits.rs             # unchanged (modulo i64 widening)
-├── versioned.rs          # version widened to i64
+├── lib.rs                # pub uses both backends; oxia gated on feature
+├── traits.rs             # i64 widening only
+├── versioned.rs          # version: i64
 ├── ledger_metadata.rs    # unchanged
-├── metadata_serde.rs     # unchanged — protobuf codec is backend-agnostic
+├── metadata_serde.rs     # unchanged — v3 protobuf codec is shared
 ├── service_info.rs       # unchanged
 ├── backend.rs            # NEW — MetadataBackend, open_metadata_backend
-├── zk/                   # unchanged
+├── metadata_paths.rs     # NEW — lifted from zk_path.rs; shared path helpers
+├── zk/                   # unchanged except import paths
+│   ├── mod.rs
+│   ├── ledger_manager.rs
+│   ├── layout.rs
+│   ├── registration.rs
+│   └── idgen.rs
 └── oxia/                 # NEW  (cfg(feature = "oxia"))
     ├── mod.rs
-    ├── paths.rs          # key-building helpers analogous to zk_path.rs
-    ├── client.rs         # OxiaClient wrapper with shared options + lifetime
+    ├── client.rs         # OxiaClient wrapper (shared options, session)
+    ├── paths.rs          # oxia-specific helpers (child listing upper-bound etc.)
+    ├── parents.rs        # createParents equivalent
+    ├── ledger_manager.rs # OxiaLedgerManager
     ├── layout.rs         # OxiaLayoutManager
     ├── registration.rs   # OxiaRegistrationManager
-    ├── ledger_manager.rs # OxiaLedgerManager
-    └── idgen.rs          # OxiaLedgerIdGenerator
+    └── idgen.rs          # OxiaLedgerIdGenerator (ports from zk/idgen.rs)
 ```
 
-Cargo:
+`Cargo.toml`:
 
 ```toml
 [features]
-default = ["oxia"]   # ship with oxia on by default; ZK remains always-on
+default = ["oxia"]
 oxia = ["dep:liboxia"]
 
 [dependencies]
 liboxia = { version = "0.0.2", optional = true }
+
+[dev-dependencies]
+testcontainers-oxia = "0.0.1"
 ```
 
-Rationale for enabling-by-default: users who don't configure `oxia://`
-pay only the compile cost. Build-time gating matters mainly for
-embedded / size-sensitive builds; those can turn the feature off.
+Rationale for enabling-by-default: same shape as the existing
+`zookeeper-client` dependency; users who don't configure `oxia://` pay
+only compile cost.
 
-## 10. Consumer call-site changes
+## 9. Consumer call-site changes (mechanical)
 
-All changes are mechanical:
+1. `server.rs` — replace direct `Zk*Manager::new(...)` with
+   `open_metadata_backend(uri, ...)` and unpack `MetadataBackend`.
+2. `http_api.rs` — same. Endpoints that need `zk::Client` directly
+   access `backend.zk_raw`; on oxia they return `501 Not Supported` for
+   the ZK-specific ones (all administrative — none on the hot path).
+3. `cli/admin.rs`, `cli/main.rs` — same.
+4. `bookkeeper-replication` (auditor, replication worker) — same.
+5. `datainteg/recovery.rs` — i64 widening only.
+6. Tests:
+   - Existing ZK tests untouched.
+   - New `bookkeeper-metadata/tests/oxia_container_test.rs` via
+     `testcontainers-oxia`, mirroring the assertions in
+     `zk_container_test.rs`.
+   - Shared contract harness under `bookkeeper-metadata/tests/common/`
+     that runs the same assertions against both backends.
+   - One end-to-end test under `bookkeeper-server/tests/` booting a
+     bookie against an oxia container and exercising a full ledger.
 
-1. **server.rs** — replace direct `ZkRegistrationManager::new_isolated`
-   and `ZkLedgerManager::new(...)` with `open_metadata_backend(uri, ...)`
-   and unpack `MetadataBackend`.
-2. **http_api.rs** — same.
-3. **cli/admin.rs**, **cli/main.rs** — same.
-4. **bookkeeper-replication** (auditor, replication worker) — same.
-5. **datainteg/recovery.rs** — no code change beyond i64 widening.
-6. **Tests**:
-   - `bookkeeper-metadata/tests/zk_container_test.rs` — unchanged.
-   - New `bookkeeper-metadata/tests/oxia_container_test.rs` — Testcontainers-
-     based, using the `testcontainers-oxia` crate (same author, 0.0.1).
-   - One new end-to-end test under `bookkeeper-server/tests/` that boots
-     a bookie against an oxia container and writes/reads a ledger.
+## 10. Interop verification
 
-## 11. Testing
+Before calling this done:
 
-Two levels:
+1. Start a Pulsar broker (Java) pointed at oxia, create one ledger via
+   Pulsar's managed-ledger path.
+2. Point a bookkeeper-rust bookie at the same `metadataServiceUri`.
+3. The Rust bookie must:
+   - See the `LAYOUT` Pulsar wrote (same format string).
+   - See the same `INSTANCEID`.
+   - Appear in `PulsarRegistrationClient.getWritableBookies()` after
+     registration (so Pulsar accepts it as a peer).
+   - Accept a `read_ledger_metadata` call for the Pulsar-created ledger
+     and return identical bytes to what Pulsar sees.
 
-1. **Contract tests (new)** — a shared test harness in
-   `bookkeeper-metadata/tests/common/` runs the same trait-level
-   assertions against both backends. Covers: CAS conflict, not-found,
-   ephemeral-on-drop, sequence monotonicity, list ordering, layout
-   round-trip. Gated by the `oxia` feature.
-2. **Integration (one new test)** — full bookie boot against oxia, one
-   ledger created and recovered.
+A short integration script (`tests/interop/pulsar_oxia.sh`) codifies
+these checks. Gated behind a test feature because it needs the Pulsar
+broker jar; skipped in CI unless explicitly opted in.
 
-Existing ZK-specific tests remain untouched.
+## 11. Risks and open questions
 
-## 12. Risks and open questions
+- **liboxia `Sequential` equivalent.** §6.4 — if liboxia 0.0.2 exposes
+  no `Sequential` put option, we replicate the behaviour via a
+  get-parent-then-CAS-put pattern. Both produce the exact Pulsar key
+  format; the fallback is one extra RTT on idgen. Need to confirm by
+  reading `liboxia`'s PutOption enum more carefully during
+  implementation.
+- **`liboxia` is at 0.0.2.** Pre-1.0; APIs may churn. We pin `=0.0.2`
+  and re-qualify on upgrade. Surface used is small.
+- **i64 version widening** is cross-crate but mechanical (~15 sites).
+  `cargo check --workspace` catches any missed cast.
+- **Pulsar layout lock-in.** Matching Pulsar exactly means we inherit
+  its quirks (HOB-3-GC race, explicit-parent creation). This is the
+  price of interop and explicitly in scope.
+- **`open_metadata_backend` takes ZK-specific `runtime` /
+  `session_timeout` today.** They're `Option`s and oxia applies the
+  session timeout to `OxiaClientOptions::session_timeout`. Fine.
 
-- **Oxia cluster operational model is different from ZK.** Bookie ops who
-  know ZK cold won't have the same muscle memory for oxia. We mitigate by
-  keeping `zk://` as the documented default in README until oxia support
-  has soaked in at least one dev environment.
-- **`liboxia` is at 0.0.2.** Pre-1.0 APIs may churn. We pin `=0.0.2` and
-  re-qualify on upgrade. The surface we use is small (put/get/delete/list
-  plus three options); breakage risk is localised.
-- **i64 version widening is cross-crate.** Touches datainteg/check.rs,
-  server.rs, http_api.rs, cli — but the change is purely mechanical
-  (type widening, no semantic change). Pre-commit `cargo check --workspace`
-  catches any missed cast.
-- **`open_metadata_backend` signature takes ZK-only params
-  (`runtime`, `session_timeout`).** These become optional and oxia
-  ignores them. If oxia grows equivalent knobs later we add
-  `oxia_session_timeout` symmetrically.
+## 12. Rollout
 
-## 13. Rollout
+Three reviewable slices, each lands independently and keeps CI green:
 
-1. Land trait-level i64 widening (neutral refactor, reviewable standalone).
-2. Land `MetadataBackend` factory + migrate ZK call sites (still ZK-only,
-   neutral refactor).
-3. Land oxia backend + feature flag + tests.
-4. Documentation: a `docs/metadata-backends.md` note covering
-   `metadataServiceUri` syntax for both.
+1. Trait-level `i64` widening. Neutral refactor.
+2. Extract `metadata_paths.rs`; introduce `MetadataBackend` factory;
+   migrate all call sites. Still ZK-only. Neutral refactor.
+3. Oxia backend + feature flag + tests (contract + integration +
+   Pulsar interop). New behaviour only under `oxia://` URIs.
