@@ -650,6 +650,7 @@ dependencies = [
 name = "bookkeeper-config"
 version = "0.1.0"
 dependencies = [
+ "bookkeeper-metadata",
  "tempfile",
 ]
 

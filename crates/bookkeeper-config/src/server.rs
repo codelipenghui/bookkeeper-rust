@@ -861,7 +861,7 @@ impl ServerConfig {
         // Also parse metadataServiceUri to extract ZK servers if zkServers not set
         if config.zk_servers.is_none() {
             if let Some(ref uri) = config.metadata_service_uri {
-                if let Some(zk) = parse_metadata_service_uri(uri) {
+                if let Some(zk) = parse_zk_servers_from_uri(uri) {
                     config.zk_servers = Some(zk);
                 }
             }
@@ -881,27 +881,72 @@ impl ServerConfig {
     }
 }
 
-/// Parse a metadataServiceUri to extract ZK connection string.
-/// Handles formats like:
-/// - `zk+hierarchical://host1:2181,host2:2181/ledgers`
-/// - `zk://host:2181/ledgers`
-/// Returns just the `host:port[,host:port]` part.
-fn parse_metadata_service_uri(uri: &str) -> Option<String> {
-    // Strip scheme prefix (zk+hierarchical://, zk://, zk+flat://)
-    let after_scheme = if let Some(rest) = uri.strip_prefix("zk+hierarchical://") {
-        rest
-    } else if let Some(rest) = uri.strip_prefix("zk+flat://") {
-        rest
-    } else if let Some(rest) = uri.strip_prefix("zk://") {
-        rest
-    } else {
-        return None;
-    };
-    // Take everything before the first /
-    let zk_part = after_scheme.split('/').next().unwrap_or(after_scheme);
-    if zk_part.is_empty() {
-        None
-    } else {
-        Some(zk_part.to_string())
+/// Parse a `metadataServiceUri` into the typed [`ParsedMetadataUri`] enum.
+///
+/// Recognised schemes:
+/// - `zk+hierarchical://`, `zk+flat://`, `zk://`  → [`ParsedMetadataUri::Zk`]
+/// - `oxia://`                                     → [`ParsedMetadataUri::Oxia`]
+/// - `metadata-store:oxia://`                      → [`ParsedMetadataUri::Oxia`]
+///
+/// Returns `None` for unknown or malformed URIs.
+pub fn parse_metadata_service_uri(
+    uri: &str,
+) -> Option<bookkeeper_metadata::metadata_paths::ParsedMetadataUri> {
+    use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
+
+    // Strip the optional "metadata-store:" prefix used by Pulsar.
+    let uri = uri.strip_prefix("metadata-store:").unwrap_or(uri);
+
+    if let Some(rest) = uri
+        .strip_prefix("zk+hierarchical://")
+        .or_else(|| uri.strip_prefix("zk+flat://"))
+        .or_else(|| uri.strip_prefix("zk://"))
+    {
+        // <host:port[,...]>[/ledgers-root]
+        let (servers, ledgers_root) = match rest.split_once('/') {
+            Some((hosts, path)) if !path.is_empty() => {
+                (hosts.to_string(), format!("/{path}"))
+            }
+            Some((hosts, _)) => (hosts.to_string(), "/ledgers".to_string()),
+            None => (rest.to_string(), "/ledgers".to_string()),
+        };
+        if servers.is_empty() {
+            return None;
+        }
+        return Some(ParsedMetadataUri::Zk { servers, ledgers_root });
+    }
+
+    if let Some(rest) = uri.strip_prefix("oxia://") {
+        // <host:port[,...]>/<namespace>[/<ledgers-root>]
+        let (addr, tail) = rest.split_once('/')?;
+        if addr.is_empty() {
+            return None;
+        }
+        let (namespace, ledgers_root) = match tail.split_once('/') {
+            Some((ns, root)) if !ns.is_empty() && !root.is_empty() => {
+                (ns.to_string(), format!("/{root}"))
+            }
+            Some((ns, _)) if !ns.is_empty() => (ns.to_string(), "/ledgers".to_string()),
+            None if !tail.is_empty() => (tail.to_string(), "/ledgers".to_string()),
+            _ => return None,
+        };
+        return Some(ParsedMetadataUri::Oxia {
+            service_addr: addr.to_string(),
+            namespace,
+            ledgers_root,
+        });
+    }
+
+    None
+}
+
+/// Back-compat convenience for call sites that only wanted ZK servers.
+/// Returns `None` for oxia URIs.
+pub fn parse_zk_servers_from_uri(uri: &str) -> Option<String> {
+    match parse_metadata_service_uri(uri)? {
+        bookkeeper_metadata::metadata_paths::ParsedMetadataUri::Zk { servers, .. } => {
+            Some(servers)
+        }
+        _ => None,
     }
 }

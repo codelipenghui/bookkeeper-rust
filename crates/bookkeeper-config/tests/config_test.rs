@@ -1,6 +1,7 @@
 use bookkeeper_config::properties::parse_properties;
 use bookkeeper_config::server::ServerConfig;
 use bookkeeper_config::client::ClientConfig;
+use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
 use std::io::Write;
 
 #[test]
@@ -769,5 +770,64 @@ fn env_overrides_work_for_client_config() {
     assert_eq!(
         config.metadata_service_uri.as_deref(),
         Some("zk+hierarchical://zk1:2181/ledgers")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 2.3: parse_metadata_service_uri returns ParsedMetadataUri
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parses_zk_hierarchical_uri() {
+    let got = bookkeeper_config::parse_metadata_service_uri("zk+hierarchical://host1:2181,host2:2181/ledgers")
+        .expect("recognised");
+    assert_eq!(
+        got,
+        ParsedMetadataUri::Zk {
+            servers: "host1:2181,host2:2181".into(),
+            ledgers_root: "/ledgers".into(),
+        }
+    );
+}
+
+#[test]
+fn parses_plain_oxia_uri_with_default_root() {
+    let got = bookkeeper_config::parse_metadata_service_uri("oxia://host:6648/mynamespace")
+        .expect("recognised");
+    assert_eq!(
+        got,
+        ParsedMetadataUri::Oxia {
+            service_addr: "host:6648".into(),
+            namespace: "mynamespace".into(),
+            ledgers_root: "/ledgers".into(),
+        }
+    );
+}
+
+#[test]
+fn parses_oxia_uri_with_custom_ledgers_root() {
+    let got = bookkeeper_config::parse_metadata_service_uri("oxia://host:6648/ns/app/bk")
+        .expect("recognised");
+    assert_eq!(
+        got,
+        ParsedMetadataUri::Oxia {
+            service_addr: "host:6648".into(),
+            namespace: "ns".into(),
+            ledgers_root: "/app/bk".into(),
+        }
+    );
+}
+
+#[test]
+fn parses_metadata_store_oxia_uri() {
+    let got = bookkeeper_config::parse_metadata_service_uri("metadata-store:oxia://host:6648/ns")
+        .expect("recognised");
+    assert_eq!(
+        got,
+        ParsedMetadataUri::Oxia {
+            service_addr: "host:6648".into(),
+            namespace: "ns".into(),
+            ledgers_root: "/ledgers".into(),
+        }
     );
 }
