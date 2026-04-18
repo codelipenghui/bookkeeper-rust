@@ -148,7 +148,7 @@ impl DataIntegrityCookieValidator {
         )
     }
 
-    async fn read_zk_cookie(&self) -> Result<Option<(Cookie, i32)>, CookieValidationError> {
+    async fn read_zk_cookie(&self) -> Result<Option<(Cookie, i64)>, CookieValidationError> {
         match self.registration.read_cookie(&self.layout.bookie_id).await? {
             None => Ok(None),
             Some((data, version)) => {
@@ -173,7 +173,7 @@ impl DataIntegrityCookieValidator {
     async fn stamp_all(
         &self,
         master: &Cookie,
-        zk_version: Option<i32>,
+        zk_version: Option<i64>,
     ) -> Result<(), CookieValidationError> {
         // ZK first: it's the authoritative copy. If disk writes fail after
         // this, the next boot will see a fresh ZK cookie and re-run the
@@ -230,7 +230,7 @@ mod tests {
 
     struct MockReg {
         instance_id: String,
-        cookie: Mutex<Option<(Vec<u8>, i32)>>,
+        cookie: Mutex<Option<(Vec<u8>, i64)>>,
     }
     impl MockReg {
         fn new(instance_id: &str) -> Arc<Self> {
@@ -239,7 +239,7 @@ mod tests {
                 cookie: Mutex::new(None),
             })
         }
-        fn with_cookie(instance_id: &str, data: &[u8], version: i32) -> Arc<Self> {
+        fn with_cookie(instance_id: &str, data: &[u8], version: i64) -> Arc<Self> {
             Arc::new(Self {
                 instance_id: instance_id.to_string(),
                 cookie: Mutex::new(Some((data.to_vec(), version))),
@@ -266,7 +266,7 @@ mod tests {
         async fn get_readonly_bookies(&self) -> Result<Vec<String>, MetadataError> {
             Ok(vec![])
         }
-        async fn read_cookie(&self, _id: &str) -> Result<Option<(Vec<u8>, i32)>, MetadataError> {
+        async fn read_cookie(&self, _id: &str) -> Result<Option<(Vec<u8>, i64)>, MetadataError> {
             Ok(self.cookie.lock().unwrap().clone())
         }
         async fn create_cookie(&self, _id: &str, data: &[u8]) -> Result<(), MetadataError> {
@@ -277,12 +277,12 @@ mod tests {
             &self,
             _id: &str,
             data: &[u8],
-            version: i32,
+            version: i64,
         ) -> Result<(), MetadataError> {
             *self.cookie.lock().unwrap() = Some((data.to_vec(), version + 1));
             Ok(())
         }
-        async fn delete_cookie(&self, _id: &str, _v: i32) -> Result<(), MetadataError> {
+        async fn delete_cookie(&self, _id: &str, _v: i64) -> Result<(), MetadataError> {
             *self.cookie.lock().unwrap() = None;
             Ok(())
         }

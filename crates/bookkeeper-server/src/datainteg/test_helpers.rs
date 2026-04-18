@@ -54,11 +54,11 @@ impl LedgerManager for EmptyLedgerManager {
         &self,
         _l: i64,
         _m: &LedgerMetadata,
-        _v: i32,
+        _v: i64,
     ) -> Result<Versioned<LedgerMetadata>, MetadataError> {
         unimplemented!()
     }
-    async fn remove_ledger_metadata(&self, _l: i64, _v: i32) -> Result<(), MetadataError> {
+    async fn remove_ledger_metadata(&self, _l: i64, _v: i64) -> Result<(), MetadataError> {
         Ok(())
     }
     async fn get_ledger_ranges(&self) -> Result<Vec<i64>, MetadataError> {
