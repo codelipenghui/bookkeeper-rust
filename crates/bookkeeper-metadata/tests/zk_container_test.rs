@@ -9,6 +9,9 @@
 //! Requires Docker to be available. Tests are skipped gracefully if Docker
 //! can't be reached — they print a warning and return success.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use bookkeeper_metadata::cookie::Cookie;
 use bookkeeper_metadata::ledger_metadata::{LedgerMetadataBuilder, LedgerState, MetadataError};
 use bookkeeper_metadata::service_info::BookieServiceInfo;
@@ -298,4 +301,38 @@ async fn zk_get_ledger_ranges_finds_all_created_ledgers() {
     assert!(found.contains(&1));
     assert!(found.contains(&42));
     assert!(found.contains(&999));
+}
+
+#[tokio::test]
+#[ignore] // container-based; run with `cargo test -- --ignored`
+async fn zk_backend_satisfies_contract() {
+    let Some((_zk, connect)) = start_zk().await else {
+        eprintln!("[SKIP] zk_backend_satisfies_contract: Docker not available");
+        return;
+    };
+
+    let root = "/test_contract";
+    let uri = bookkeeper_metadata::metadata_paths::ParsedMetadataUri::Zk {
+        servers: connect.clone(),
+        ledgers_root: root.to_string(),
+    };
+    let backend = bookkeeper_metadata::backend::open_metadata_backend(&uri, None, None)
+        .await
+        .expect("zk_backend_satisfies_contract: open_metadata_backend failed");
+
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    backend
+        .registration_manager
+        .init_new_cluster(
+            &bookkeeper_metadata::traits::LedgerLayout {
+                manager_factory_class:
+                    "org.apache.bookkeeper.meta.LegacyHierarchicalLedgerManagerFactory".into(),
+                manager_version: 1,
+            },
+            &instance_id,
+        )
+        .await
+        .expect("zk_backend_satisfies_contract: init_new_cluster failed");
+
+    common::contract::run_all(&backend).await;
 }
