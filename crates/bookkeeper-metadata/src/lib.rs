@@ -1,4 +1,5 @@
 pub mod ledger_metadata;
+pub mod metadata_paths;
 pub mod metadata_serde;
 pub mod zk_path;
 pub mod cookie;
