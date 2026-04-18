@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["oxia"]
+oxia = ["dep:liboxia"]
+
 [dependencies]
 bookkeeper-common = { workspace = true }
 bookkeeper-proto = { workspace = true }
@@ -14,7 +18,11 @@ zookeeper-client = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
+liboxia = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 testcontainers = { workspace = true }
+# testcontainers-oxia conflicts with testcontainers v0.27 via bollard-stubs pin;
+# add back once testcontainers-oxia upgrades to >=0.27
+# testcontainers-oxia = { workspace = true }
