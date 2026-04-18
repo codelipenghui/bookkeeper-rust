@@ -4,6 +4,7 @@
 pub mod client;
 pub mod errors;
 pub mod layout;
+pub mod ledger_manager;
 pub mod parents;
 pub mod paths;
 pub mod registration;
