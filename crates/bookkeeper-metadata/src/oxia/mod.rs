@@ -3,5 +3,7 @@
 
 pub mod client;
 pub mod errors;
-pub mod paths;
+pub mod layout;
 pub mod parents;
+pub mod paths;
+pub mod registration;
