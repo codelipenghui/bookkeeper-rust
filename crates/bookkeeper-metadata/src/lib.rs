@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod ledger_metadata;
 pub mod metadata_paths;
 pub mod metadata_serde;

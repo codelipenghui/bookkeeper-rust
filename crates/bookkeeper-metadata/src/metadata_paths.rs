@@ -97,3 +97,20 @@ impl LedgerPaths {
         format!("{}/{}", self.available_readonly, bookie_id)
     }
 }
+
+/// The parsed form of a `metadataServiceUri` — a sum type over the
+/// supported backends. Produced by the parser in the config crate;
+/// consumed by `crate::backend::open_metadata_backend`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedMetadataUri {
+    Zk { servers: String, ledgers_root: String },
+    Oxia { service_addr: String, namespace: String, ledgers_root: String },
+}
+
+impl ParsedMetadataUri {
+    pub fn ledgers_root(&self) -> &str {
+        match self {
+            Self::Zk { ledgers_root, .. } | Self::Oxia { ledgers_root, .. } => ledgers_root,
+        }
+    }
+}
