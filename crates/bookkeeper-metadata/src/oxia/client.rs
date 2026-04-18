@@ -31,14 +31,22 @@ impl OxiaClientHandle {
         session_timeout: Option<Duration>,
     ) -> Result<Self, MetadataError> {
         let identity = format!("bookkeeper-rust-{}", uuid::Uuid::new_v4());
-        let mut options = OxiaClientOptions::default();
-        options.service_address = format!("http://{service_addr}");
-        options.namespace = namespace.to_string();
-        options.identity = identity.clone();
-        options.session_timeout = session_timeout.unwrap_or(Duration::from_secs(30));
+        let options = OxiaClientOptions {
+            service_address: format!("http://{service_addr}"),
+            namespace: namespace.to_string(),
+            identity: identity.clone(),
+            session_timeout: session_timeout.unwrap_or(Duration::from_secs(30)),
+            ..Default::default()
+        };
 
-        let client = OxiaClient::new(options)
+        let connect_timeout = session_timeout.unwrap_or(Duration::from_secs(30));
+        let client = tokio::time::timeout(connect_timeout, OxiaClient::new(options))
             .await
+            .map_err(|_| {
+                MetadataError::ConnectionError(format!(
+                    "oxia connect: timed out after {connect_timeout:?}"
+                ))
+            })?
             .map_err(|e| MetadataError::ConnectionError(format!("oxia connect: {e:?}")))?;
 
         Ok(Self {

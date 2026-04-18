@@ -53,19 +53,15 @@ impl ZkLedgerManager {
         // Clean up empty parents (stop at ledger root)
         let root = self.paths.root();
         let mut current = path.to_string();
-        loop {
-            if let Some(pos) = current.rfind('/') {
-                current.truncate(pos);
-                if current.len() <= root.len() || current == root {
-                    break;
-                }
-                // Try to delete empty parent — ignore failures
-                match self.client.delete(&current, None).await {
-                    Ok(()) => {} // deleted, continue up
-                    Err(_) => break, // not empty or error, stop
-                }
-            } else {
+        while let Some(pos) = current.rfind('/') {
+            current.truncate(pos);
+            if current.len() <= root.len() || current == root {
                 break;
+            }
+            // Try to delete empty parent — ignore failures
+            match self.client.delete(&current, None).await {
+                Ok(()) => {} // deleted, continue up
+                Err(_) => break, // not empty or error, stop
             }
         }
         Ok(())

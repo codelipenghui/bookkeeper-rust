@@ -46,13 +46,47 @@ pub async fn open_metadata_backend(
         ParsedMetadataUri::Zk { servers, ledgers_root } => {
             open_zk_backend(servers, ledgers_root, runtime, session_timeout).await
         }
-        ParsedMetadataUri::Oxia { .. } => {
-            // Filled in by Phase 3.
-            Err(MetadataError::InvalidConfig(
-                "oxia backend not yet compiled in; enable the `oxia` feature".into(),
-            ))
+        ParsedMetadataUri::Oxia { service_addr, namespace, ledgers_root } => {
+            #[cfg(feature = "oxia")]
+            {
+                open_oxia_backend(service_addr, namespace, ledgers_root, session_timeout).await
+            }
+            #[cfg(not(feature = "oxia"))]
+            {
+                let _ = (service_addr, namespace, ledgers_root, session_timeout);
+                Err(MetadataError::InvalidConfig(
+                    "oxia backend requires the `oxia` cargo feature".into(),
+                ))
+            }
         }
     }
+}
+
+#[cfg(feature = "oxia")]
+async fn open_oxia_backend(
+    service_addr: &str,
+    namespace: &str,
+    ledgers_root: &str,
+    session_timeout: Option<Duration>,
+) -> Result<MetadataBackend, MetadataError> {
+    use crate::oxia::{
+        client::OxiaClientHandle, idgen::OxiaLedgerIdGenerator,
+        layout::OxiaLayoutManager, ledger_manager::OxiaLedgerManager,
+        registration::OxiaRegistrationManager,
+    };
+
+    let handle = OxiaClientHandle::connect(service_addr, namespace, ledgers_root, session_timeout)
+        .await?;
+    let paths = handle.paths.clone();
+
+    Ok(MetadataBackend {
+        ledger_manager: Arc::new(OxiaLedgerManager::new(handle.client.clone(), paths.clone())),
+        id_generator: Arc::new(OxiaLedgerIdGenerator::new(handle.client.clone(), &paths)),
+        layout_manager: Arc::new(OxiaLayoutManager::new(handle.client.clone(), paths.clone())),
+        registration_manager: Arc::new(OxiaRegistrationManager::new(handle.client, paths.clone())),
+        paths,
+        zk_raw: None,
+    })
 }
 
 async fn open_zk_backend(

@@ -24,7 +24,7 @@ impl Cookie {
             journal_dirs: journal_dirs.to_string(),
             ledger_dirs: encode_dir_paths(ledger_dirs),
             instance_id: instance_id.map(|s| s.to_string()),
-            index_dirs: index_dirs.map(|dirs| encode_dir_paths(dirs)),
+            index_dirs: index_dirs.map(encode_dir_paths),
         }
     }
 

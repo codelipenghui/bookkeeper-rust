@@ -179,7 +179,7 @@ impl LedgerMetadataBuilder {
         if self.ensembles.is_empty() {
             return Err(MetadataError::InvalidConfig("at least one ensemble segment required".into()));
         }
-        for (_, ensemble) in &self.ensembles {
+        for ensemble in self.ensembles.values() {
             if ensemble.len() != self.ensemble_size as usize {
                 return Err(MetadataError::InvalidConfig(
                     format!("ensemble has {} members but ensemble_size is {}",

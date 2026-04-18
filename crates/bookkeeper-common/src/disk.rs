@@ -24,8 +24,8 @@ pub fn statvfs_bytes(path: &Path) -> io::Result<(u64, u64)> {
         if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
             return Err(io::Error::last_os_error());
         }
-        let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-        let available = stat.f_bavail as u64 * stat.f_frsize as u64;
+        let total = stat.f_blocks as u64 * stat.f_frsize;
+        let available = stat.f_bavail as u64 * stat.f_frsize;
         Ok((total, available))
     }
 }
