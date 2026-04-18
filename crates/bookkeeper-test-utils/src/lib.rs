@@ -7,7 +7,7 @@
 //!
 //! Typical usage from an integration test:
 //!
-//! ```ignore
+//! ```text
 //! use bookkeeper_test_utils::{shared_zk, bootstrap_cluster, spawn_bookie};
 //!
 //! #[tokio::test]
@@ -100,8 +100,12 @@ static SHARED_ZK: OnceCell<Option<Arc<ZkFixture>>> = OnceCell::const_new();
 /// subsequent call. Returns `None` if Docker is unavailable — callers
 /// should early-return in that case (graceful skip pattern):
 ///
-/// ```ignore
+/// ```no_run
+/// # async fn _doc() {
+/// use bookkeeper_test_utils::shared_zk;
 /// let Some(connect) = shared_zk().await else { return; };
+/// # drop(connect);
+/// # }
 /// ```
 pub async fn shared_zk() -> Option<String> {
     let fixture = SHARED_ZK
