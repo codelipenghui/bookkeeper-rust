@@ -10,6 +10,8 @@ default = []
 # the `/debug/pprof/flamegraph` HTTP admin endpoint. Off by default so the
 # production binary doesn't even compile pprof.
 profiling = ["dep:pprof"]
+# Enables oxia metadata backend support. Required for the oxia_e2e_test.
+oxia = ["bookkeeper-metadata/oxia"]
 
 [dependencies]
 bookkeeper-proto = { workspace = true }
