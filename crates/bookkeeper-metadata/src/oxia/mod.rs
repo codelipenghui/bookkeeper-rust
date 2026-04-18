@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod errors;
+pub mod idgen;
 pub mod layout;
 pub mod ledger_manager;
 pub mod parents;
