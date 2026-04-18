@@ -42,7 +42,7 @@ pub struct BookieServer {
     local_addr: SocketAddr,
     http_addr: Option<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
-    accept_handle: tokio::task::JoinHandle<()>,
+    accept_handle: Option<tokio::task::JoinHandle<()>>,
     storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
     state: Arc<BookieStateManager>,
     zk_reg: Option<(bookkeeper_metadata::backend::MetadataBackend, String)>,
@@ -57,9 +57,11 @@ pub struct BookieServer {
     ///
     /// Isolating the ZK session/heartbeat tasks from the main runtime
     /// prevents RPC-load-induced scheduler starvation from expiring the
-    /// ZK session. Populated when ZK is configured; dropped during
-    /// shutdown, which cleanly stops its worker thread.
-    _zk_runtime: Option<tokio::runtime::Runtime>,
+    /// ZK session. Populated when ZK is configured; stopped via
+    /// `shutdown_background()` on drop so that the enclosing async
+    /// runtime is never blocked (important both in production and in
+    /// `#[tokio::test]` contexts).
+    zk_runtime: Option<tokio::runtime::Runtime>,
     /// Ledger directories — used to create/remove DIRTY files.
     ledger_directories: Vec<String>,
 }
@@ -682,7 +684,7 @@ impl BookieServer {
             local_addr,
             http_addr,
             shutdown_tx,
-            accept_handle,
+            accept_handle: Some(accept_handle),
             storage: storage_for_shutdown,
             state,
             zk_reg,
@@ -693,7 +695,7 @@ impl BookieServer {
             sync_handle,
             session_watcher_handle,
             scrubber_handle,
-            _zk_runtime: zk_runtime,
+            zk_runtime,
             ledger_directories: config.ledger_directories.clone(),
         })
     }
@@ -716,7 +718,7 @@ impl BookieServer {
     ///
     /// Java order: lock → forceToReadOnly → SyncThread.shutdown → Journal.shutdown
     ///             → LedgerStorage.shutdown → DiskMonitor.shutdown → StateManager.close (ZK)
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         tracing::info!("Graceful shutdown starting...");
 
         // Step 1: Transition to READ_ONLY to reject new writes immediately.
@@ -731,31 +733,33 @@ impl BookieServer {
         // Step 3: Stop background tasks BEFORE flush (matching Java's order:
         // SyncThread → Journal → Storage → DiskMonitor).
         // GC and replication must stop before flushing to avoid concurrent modifications.
-        if let Some(h) = self.auditor_handle {
+        if let Some(h) = self.auditor_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
-        if let Some(h) = self.worker_handle {
+        if let Some(h) = self.worker_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
-        if let Some(h) = self.gc_handle {
+        if let Some(h) = self.gc_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
-        if let Some(h) = self.disk_monitor_handle {
+        if let Some(h) = self.disk_monitor_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), h).await;
         }
-        if let Some(h) = self.sync_handle {
+        if let Some(h) = self.sync_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
-        if let Some(h) = self.session_watcher_handle {
+        if let Some(h) = self.session_watcher_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), h).await;
         }
-        if let Some(h) = self.scrubber_handle {
+        if let Some(h) = self.scrubber_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
         tracing::info!("Background tasks stopped.");
 
-        // Step 4: Wait for accept loop to finish (drains in-flight connections)
-        let _ = self.accept_handle.await;
+        // Step 4: Wait for accept loop to finish (drains in-flight connections).
+        if let Some(h) = self.accept_handle.take() {
+            h.await.ok();
+        }
         tracing::info!("Accept loop stopped.");
 
         // Step 5: Flush storage — persist write cache to entry logs + checkpoint.
@@ -780,12 +784,34 @@ impl BookieServer {
 
         // Step 8: Unregister from metadata store LAST.
         // Matches Java's StateManager.close() as the final step.
-        if let Some((backend, bookie_id)) = self.zk_reg {
+        if let Some((backend, bookie_id)) = self.zk_reg.take() {
             let _ = backend.registration_manager.unregister_bookie(&bookie_id, false).await;
             tracing::info!("Unregistered from metadata store.");
         }
 
+        // Step 9: Stop the dedicated ZK runtime via shutdown_background so the
+        // enclosing runtime is never blocked. The Drop impl also does this as a
+        // safety net; shutdown_background is idempotent (the take() makes it a no-op
+        // on the subsequent Drop).
+        if let Some(rt) = self.zk_runtime.take() {
+            rt.shutdown_background();
+        }
+
         tracing::info!("Graceful shutdown complete.");
+    }
+}
+
+impl Drop for BookieServer {
+    /// Stop the dedicated ZK runtime without blocking the current thread.
+    ///
+    /// Tokio's `Runtime::drop` performs a *blocking* shutdown, which panics
+    /// when called from within an async context (e.g. `#[tokio::test]`).
+    /// `shutdown_background()` schedules cleanup on a background thread
+    /// instead, satisfying the no-blocking-in-async-context constraint.
+    fn drop(&mut self) {
+        if let Some(rt) = self.zk_runtime.take() {
+            rt.shutdown_background();
+        }
     }
 }
 
