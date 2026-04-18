@@ -55,8 +55,13 @@ pub struct ZkBookKeeper {
 impl ZkBookKeeper {
     /// Create a new BookKeeper client connected to ZooKeeper.
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # async fn _doc() -> Result<(), Box<dyn std::error::Error>> {
+    /// use bookkeeper_client::zk_client::ZkBookKeeper;
     /// let bk = ZkBookKeeper::new("localhost:2181", "/ledgers").await?;
+    /// # drop(bk);
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn new(zk_connect: &str, ledger_root: &str) -> Result<Self, ClientError> {
         let uri = ParsedMetadataUri::Zk {
