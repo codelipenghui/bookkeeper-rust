@@ -1,8 +1,11 @@
-/// Build the (start, end) key bounds for listing immediate children
-/// of `parent`. Matches the convention in Pulsar's
-/// `OxiaMetadataStore.getChildrenFromStore`: `{parent}/` to
-/// `{parent}/\u{00ff}`. We use a high-codepoint upper bound to avoid
-/// false ends on keys containing `/`.
+/// Build the (start, end) key bounds for listing **immediate children**
+/// of `parent`. This uses a sentinel byte (`\u{ff}`) as the terminal
+/// character of the leaf segment. It works for direct children because
+/// the final path segment contains no `/`, so the comparison degrades
+/// to a plain byte comparison where `\u{ff}` is the maximum byte.
+///
+/// This does NOT work for listing all descendants of a path — see
+/// `descendant_range` for that.
 pub fn child_range(parent: &str) -> (String, String) {
     let mut start = parent.to_string();
     if !start.ends_with('/') {
@@ -11,6 +14,45 @@ pub fn child_range(parent: &str) -> (String, String) {
     let mut end = start.clone();
     end.push('\u{00ff}');
     (start, end)
+}
+
+/// Build the (start, end) key bounds for listing **all descendants**
+/// (children, grandchildren, …) of `parent` under oxia's segment-wise
+/// key-ordering (CompareWithSlash).
+///
+/// Oxia's CompareWithSlash comparison splits keys on `/` and compares
+/// segment by segment. A key `P/A/B/C` is considered "greater than"
+/// `P/Z` (no trailing slash) when `A < Z` in the final segment but the
+/// key has more path components — making `child_range` unusable for
+/// deep trees.
+///
+/// The correct upper bound is produced by incrementing the last byte of
+/// `parent` (so the second path segment changes from, e.g., `ledgers`
+/// to `ledgert`) and appending `/`. This ensures every `/parent/...`
+/// key sorts before the upper bound in segment-wise comparison.
+pub fn descendant_range(parent: &str) -> (String, String) {
+    let start = format!("{parent}/");
+    let end = match increment_last_byte(parent) {
+        Some(e) => format!("{e}/"),
+        // If parent is all-\xff bytes, use an empty end (open range).
+        // In practice this path never occurs for BK ledger roots.
+        None => String::new(),
+    };
+    (start, end)
+}
+
+/// Increment the last byte of `s` that is less than `0xff`, returning
+/// `None` if all bytes are `0xff` (overflow).
+fn increment_last_byte(s: &str) -> Option<String> {
+    let mut bytes = s.as_bytes().to_vec();
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] < 0xff {
+            bytes[i] += 1;
+            bytes.truncate(i + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
 }
 
 /// Split a full key into (parent, leaf) on the last '/'. Returns
@@ -75,5 +117,19 @@ mod tests {
         assert_eq!(split_parent("/a/b/c"), Some(("/a/b", "c")));
         assert_eq!(split_parent("/a"), Some(("", "a")));
         assert_eq!(split_parent("a"), None);
+    }
+
+    #[test]
+    fn descendant_range_increments_last_byte() {
+        let (lo, hi) = descendant_range("/ledgers");
+        assert_eq!(lo, "/ledgers/");
+        assert_eq!(hi, "/ledgert/");
+    }
+
+    #[test]
+    fn descendant_range_nested_path() {
+        let (lo, hi) = descendant_range("/ledgers/available");
+        assert_eq!(lo, "/ledgers/available/");
+        assert_eq!(hi, "/ledgers/availablf/");
     }
 }

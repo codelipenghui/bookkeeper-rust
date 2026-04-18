@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use liboxia::client::{DeleteOption, OxiaClient, PutOption};
+use liboxia::client::{DeleteOption, GetOption, OxiaClient, PutOption};
 use liboxia::errors::OxiaError;
 
 use super::errors::map_oxia_error;
 use super::parents::create_parents;
-use super::paths::{ancestors_of, child_range};
+use super::paths::{ancestors_of, descendant_range};
 use crate::ledger_metadata::{LedgerMetadata, MetadataError};
 use crate::metadata_paths::{ledger_path, LedgerPaths};
 use crate::metadata_serde::{deserialize_metadata, serialize_metadata};
@@ -60,7 +60,11 @@ impl LedgerManager for OxiaLedgerManager {
         ledger_id: i64,
     ) -> Result<Versioned<LedgerMetadata>, MetadataError> {
         let key = self.key(ledger_id);
-        match self.client.get(key).await {
+        match self
+            .client
+            .get_with_options(key, vec![GetOption::IncludeValue()])
+            .await
+        {
             Ok(res) => {
                 let bytes = res.value.ok_or(MetadataError::NotFound(ledger_id))?;
                 let md = deserialize_metadata(ledger_id, &bytes)?;
@@ -119,7 +123,13 @@ impl LedgerManager for OxiaLedgerManager {
                     if anc == self.paths.root() || !anc.starts_with(self.paths.root()) {
                         break;
                     }
-                    let (start, end) = child_range(&anc);
+                    // Use descendant_range (not child_range) because oxia's
+                    // segment-wise ordering requires the upper bound to be
+                    // derived by incrementing the last byte of the parent
+                    // segment, not by appending a sentinel byte within the
+                    // same segment — otherwise deep paths sort outside the
+                    // child_range window.
+                    let (start, end) = descendant_range(&anc);
                     let has_children = matches!(
                         self.client.list(start, end).await,
                         Ok(r) if !r.keys.is_empty()
@@ -141,9 +151,11 @@ impl LedgerManager for OxiaLedgerManager {
     }
 
     async fn get_ledger_ranges(&self) -> Result<Vec<i64>, MetadataError> {
-        // Range-scan over the entire ledger root and parse leaf names of
-        // the form "L{NNNN}".
-        let (start, end) = child_range(self.paths.root());
+        // Range-scan over all descendants of the ledger root and filter
+        // for leaf keys of the form "L{NNNN}". We must use descendant_range
+        // (not child_range) because oxia's segment-wise key ordering
+        // places nested paths outside a child_range window — see paths.rs.
+        let (start, end) = descendant_range(self.paths.root());
         let keys = self
             .client
             .list(start, end)

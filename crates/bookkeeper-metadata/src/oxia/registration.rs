@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use liboxia::client::{DeleteOption, OxiaClient, PutOption};
+use liboxia::client::{DeleteOption, GetOption, OxiaClient, PutOption};
 use liboxia::errors::OxiaError;
 
 use super::errors::map_oxia_error;
@@ -80,7 +80,11 @@ impl RegistrationManager for OxiaRegistrationManager {
         bookie_id: &str,
     ) -> Result<Option<(Vec<u8>, i64)>, MetadataError> {
         let key = self.paths.cookie_path(bookie_id);
-        match self.client.get(key).await {
+        match self
+            .client
+            .get_with_options(key, vec![GetOption::IncludeValue()])
+            .await
+        {
             Ok(res) => {
                 let Some(bytes) = res.value else { return Ok(None) };
                 Ok(Some((bytes, res.version.version_id)))
@@ -132,7 +136,14 @@ impl RegistrationManager for OxiaRegistrationManager {
     }
 
     async fn get_cluster_instance_id(&self) -> Result<Option<String>, MetadataError> {
-        match self.client.get(self.paths.instance_id().to_string()).await {
+        match self
+            .client
+            .get_with_options(
+                self.paths.instance_id().to_string(),
+                vec![GetOption::IncludeValue()],
+            )
+            .await
+        {
             Ok(res) => {
                 let Some(bytes) = res.value else { return Ok(None) };
                 Ok(Some(String::from_utf8(bytes).map_err(|e| {
@@ -149,7 +160,8 @@ impl RegistrationManager for OxiaRegistrationManager {
         layout: &LedgerLayout,
         instance_id: &str,
     ) -> Result<(), MetadataError> {
-        // Create-or-fail — matches ZK impl.
+        // Create-or-fail — matches ZK impl. We only need key existence,
+        // not the value, so IncludeValue is intentionally omitted here.
         match self.client.get(self.paths.layout().to_string()).await {
             Ok(_) => {
                 return Err(MetadataError::InvalidConfig(

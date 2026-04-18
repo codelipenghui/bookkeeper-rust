@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use liboxia::client::OxiaClient;
+use liboxia::client::{GetOption, OxiaClient};
 use liboxia::errors::OxiaError;
 
 use super::errors::map_oxia_error;
@@ -24,7 +24,14 @@ impl OxiaLayoutManager {
 #[async_trait]
 impl LayoutManager for OxiaLayoutManager {
     async fn read_ledger_layout(&self) -> Result<Option<LedgerLayout>, MetadataError> {
-        match self.client.get(self.paths.layout().to_string()).await {
+        match self
+            .client
+            .get_with_options(
+                self.paths.layout().to_string(),
+                vec![GetOption::IncludeValue()],
+            )
+            .await
+        {
             Ok(res) => {
                 let Some(bytes) = res.value else { return Ok(None) };
                 let text = String::from_utf8(bytes)
