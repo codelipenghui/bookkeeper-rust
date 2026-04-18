@@ -123,11 +123,11 @@ const EXPECTED_COUNTER_AND_GAUGE_METRICS: &[&str] = &[
     // Bookie storage byte counters
     "bookie_WRITE_BYTES",
     "bookie_READ_BYTES",
-    // Cache counters and gauges
-    "bookie_write_cache_hits",
-    "bookie_write_cache_misses",
-    "bookie_read_cache_hits",
-    "bookie_read_cache_misses",
+    // Cache gauges. Hit/miss counters (bookie_{write,read}_cache_{hits,misses})
+    // exist in Java BookKeeper but are not yet instrumented in the Rust port —
+    // UnifiedCache::get has no hit/miss tracking. Add them here once the
+    // counters are registered in storage_metrics.rs and incremented from
+    // the cache layer.
     "bookie_write_cache_size",
     "bookie_write_cache_count",
     "bookie_read_cache_size",
