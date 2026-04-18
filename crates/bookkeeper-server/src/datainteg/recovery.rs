@@ -10,7 +10,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bookkeeper_client::zk_client::ZkBookKeeper;
 use bookkeeper_metadata::ledger_metadata::LedgerMetadata;
-use bookkeeper_metadata::traits::LedgerManager;
 use bookkeeper_protocol::digest::DigestType;
 use tokio::sync::Mutex;
 

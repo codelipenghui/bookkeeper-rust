@@ -6,9 +6,8 @@ use zookeeper_client as zk;
 use bookkeeper_metadata::ledger_metadata::{
     DigestType as MetaDigestType, LedgerMetadataBuilder, LedgerState, MetadataError,
 };
+use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
 use bookkeeper_metadata::traits::{LedgerIdGenerator, LedgerManager};
-use bookkeeper_metadata::zk::idgen::ZkLedgerIdGenerator;
-use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
 use bookkeeper_metadata::zk_path::ZkPaths;
 use bookkeeper_protocol::digest::{DigestManager, DigestType, generate_master_key};
 
@@ -28,8 +27,8 @@ use crate::write_handle::WriteHandle;
 pub struct ZkBookKeeper {
     zk_client: zk::Client,
     paths: ZkPaths,
-    ledger_manager: Arc<ZkLedgerManager>,
-    id_generator: ZkLedgerIdGenerator,
+    ledger_manager: Arc<dyn LedgerManager>,
+    id_generator: Arc<dyn LedgerIdGenerator>,
     /// Cached writable bookie list, shared with the background watcher task.
     /// Matches Java's `BookieWatcherImpl` which maintains `writableBookies`
     /// updated reactively via persistent ZK watches.
@@ -60,17 +59,21 @@ impl ZkBookKeeper {
     /// let bk = ZkBookKeeper::new("localhost:2181", "/ledgers").await?;
     /// ```
     pub async fn new(zk_connect: &str, ledger_root: &str) -> Result<Self, ClientError> {
-        let zk_client = zk::Client::connect(zk_connect)
-            .await
-            .map_err(|e| ClientError::Protocol(format!("ZK connect: {e}")))?;
+        let uri = ParsedMetadataUri::Zk {
+            servers: zk_connect.to_string(),
+            ledgers_root: ledger_root.to_string(),
+        };
+        let backend =
+            bookkeeper_metadata::backend::open_metadata_backend(&uri, None, None)
+                .await
+                .map_err(|e| ClientError::Protocol(format!("open metadata backend: {e}")))?;
 
+        let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
+        let zk_client = zk_raw.client;
         let paths = ZkPaths::new(ledger_root);
 
-        let ledger_manager = Arc::new(ZkLedgerManager::new(zk_client.clone(), paths.clone()));
-
-        let id_generator = ZkLedgerIdGenerator::new(zk_client.clone(), &paths)
-            .await
-            .map_err(|e| ClientError::Protocol(format!("init idgen: {e}")))?;
+        let ledger_manager = backend.ledger_manager;
+        let id_generator = backend.id_generator;
 
         let bookie_addrs = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
@@ -369,7 +372,7 @@ impl ZkBookKeeper {
             let err_slot = error_slot.clone();
             tokio::spawn(async move {
                 if let Err(e) = update_ensemble_metadata(
-                    &lm, ledger_id, first_entry_id, &ensemble_owned, ensemble_size,
+                    lm.as_ref(), ledger_id, first_entry_id, &ensemble_owned, ensemble_size,
                     write_quorum, ack_quorum, meta_dt, &pw,
                 )
                 .await
@@ -695,7 +698,7 @@ impl ZkBookKeeper {
         self.tcp_config = config;
     }
 
-    pub fn ledger_manager(&self) -> &Arc<ZkLedgerManager> {
+    pub fn ledger_manager(&self) -> &Arc<dyn LedgerManager> {
         &self.ledger_manager
     }
 
@@ -811,7 +814,7 @@ fn build_closed_metadata(
 /// source of truth. All other fields (custom_metadata, ctime, c_token, format
 /// version) are preserved via `from_existing`.
 async fn update_ensemble_metadata(
-    lm: &ZkLedgerManager,
+    lm: &dyn LedgerManager,
     ledger_id: i64,
     first_entry_id: i64,
     new_ensemble: &[String],

@@ -573,11 +573,17 @@ fn main() {
 }
 
 async fn cmd_initnewcluster(zk: &str, ledger_root: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
-    use bookkeeper_metadata::traits::{LedgerLayout, RegistrationManager};
+    use bookkeeper_metadata::backend::open_metadata_backend;
+    use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
+    use bookkeeper_metadata::traits::LedgerLayout;
 
     println!("Initializing new cluster at {zk}{ledger_root}...");
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let uri = ParsedMetadataUri::Zk {
+        servers: zk.to_string(),
+        ledgers_root: ledger_root.to_string(),
+    };
+    let backend = open_metadata_backend(&uri, None, None).await?;
+    let mgr = backend.registration_manager;
     let layout = LedgerLayout {
         manager_factory_class: "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"
             .to_string(),
@@ -598,10 +604,15 @@ async fn cmd_listbookies(
     ro: bool,
     all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
-    use bookkeeper_metadata::traits::RegistrationManager;
+    use bookkeeper_metadata::backend::open_metadata_backend;
+    use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
 
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let uri = ParsedMetadataUri::Zk {
+        servers: zk.to_string(),
+        ledgers_root: ledger_root.to_string(),
+    };
+    let backend = open_metadata_backend(&uri, None, None).await?;
+    let mgr = backend.registration_manager;
     let show_rw = rw || all || (!rw && !ro);
     let show_ro = ro || all;
 

@@ -7,13 +7,26 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bookkeeper_client::bookie_connection::BookieConnection;
-use bookkeeper_metadata::traits::{LedgerManager, RegistrationManager};
-use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
-use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
+use bookkeeper_metadata::backend::{MetadataBackend, open_metadata_backend};
+use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
+use bookkeeper_metadata::traits::LedgerManager;
 use bookkeeper_metadata::zk_path::ZkPaths;
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::digest::{DigestManager, DigestType as ProtoDigestType};
 use bookkeeper_protocol::entry::parse_entry;
+
+/// Build a ZK-flavoured URI from raw `--zk` / `--ledger-root` CLI args
+/// and open the metadata backend. Returns the fully-initialised backend.
+async fn open_zk_backend(
+    zk: &str,
+    ledger_root: &str,
+) -> Result<MetadataBackend, Box<dyn std::error::Error>> {
+    let uri = ParsedMetadataUri::Zk {
+        servers: zk.to_string(),
+        ledgers_root: ledger_root.to_string(),
+    };
+    Ok(open_metadata_backend(&uri, None, None).await?)
+}
 
 fn convert_digest_type(
     dt: Option<bookkeeper_metadata::ledger_metadata::DigestType>,
@@ -35,9 +48,8 @@ pub async fn cmd_listledgers(
     show_meta: bool,
     bookie_id_filter: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
-    let paths = ZkPaths::new(ledger_root);
-    let lm = ZkLedgerManager::new(client, paths);
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let lm = backend.ledger_manager;
 
     let ledgers = lm.get_ledger_ranges().await?;
 
@@ -97,9 +109,8 @@ pub async fn cmd_ledgerinfo(
     ledger_root: &str,
     ledger_id: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
-    let paths = ZkPaths::new(ledger_root);
-    let lm = ZkLedgerManager::new(client, paths);
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let lm = backend.ledger_manager;
 
     let versioned = lm.read_ledger_metadata(ledger_id).await?;
     let md = versioned.value();
@@ -133,7 +144,9 @@ pub async fn cmd_listunderreplicated(
     print_missing: bool,
     count_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
+    let client = zk_raw.client;
     let paths = ZkPaths::new(ledger_root);
 
     let ur_path = format!("{}/ledgers", paths.underreplication());
@@ -216,7 +229,9 @@ pub async fn cmd_whoisauditor(
     zk: &str,
     ledger_root: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
+    let client = zk_raw.client;
     let paths = ZkPaths::new(ledger_root);
 
     let election_path = format!("{}/auditorelection", paths.underreplication());
@@ -245,7 +260,9 @@ pub async fn cmd_toggle_recovery(
     ledger_root: &str,
     enable: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
+    let client = zk_raw.client;
     let paths = ZkPaths::new(ledger_root);
     let disable_path = format!("{}/disable", paths.underreplication());
 
@@ -274,7 +291,9 @@ pub async fn cmd_clusterinfo(
     zk: &str,
     ledger_root: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let mgr = backend.registration_manager;
+    let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
 
     let writable = mgr.get_writable_bookies().await?;
     let readonly = mgr.get_readonly_bookies().await?;
@@ -289,8 +308,8 @@ pub async fn cmd_clusterinfo(
         println!("    {b}");
     }
 
-    let zk_client = mgr.zk_client();
-    let paths = mgr.paths();
+    let zk_client = &zk_raw.client;
+    let paths = &zk_raw.paths;
 
     // Auto-recovery status
     let disable_path = format!("{}/disable", paths.underreplication());
@@ -365,9 +384,8 @@ pub async fn cmd_deleteledger(
     ledger_id: i64,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
-    let paths = ZkPaths::new(ledger_root);
-    let lm = ZkLedgerManager::new(client, paths);
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let lm = backend.ledger_manager;
 
     // Read metadata first to show what we're deleting
     let versioned = lm.read_ledger_metadata(ledger_id).await?;
@@ -398,9 +416,8 @@ pub async fn cmd_readledger(
     last_entry: Option<i64>,
     bookie_addr: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
-    let paths = ZkPaths::new(ledger_root);
-    let lm = ZkLedgerManager::new(client, paths);
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let lm = backend.ledger_manager;
 
     let versioned = lm.read_ledger_metadata(ledger_id).await?;
     let md = versioned.value();
@@ -509,7 +526,8 @@ pub async fn cmd_cookie_get(
     ledger_root: &str,
     bookie_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let mgr = backend.registration_manager;
     match mgr.read_cookie(bookie_id).await? {
         Some((data, version)) => {
             let text = String::from_utf8_lossy(&data);
@@ -531,7 +549,8 @@ pub async fn cmd_cookie_delete(
     bookie_id: &str,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let mgr = backend.registration_manager;
     match mgr.read_cookie(bookie_id).await? {
         Some((data, version)) => {
             if !force {
@@ -577,9 +596,9 @@ async fn cmd_recover_bookie(
     bookie_src: &str,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
-    let paths = ZkPaths::new(ledger_root);
-    let lm = ZkLedgerManager::new(client.clone(), paths.clone());
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let lm = backend.ledger_manager;
+    let reg = backend.registration_manager;
 
     let all_ledgers = lm.get_ledger_ranges().await?;
     println!("Scanning {} ledgers for bookie {bookie_src}...", all_ledgers.len());
@@ -610,14 +629,13 @@ async fn cmd_recover_bookie(
     }
 
     // Get available bookies for replacement
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
-    let available = mgr.get_writable_bookies().await?;
+    let available = reg.get_writable_bookies().await?;
 
     let mut recovered = 0;
     let mut errors = 0;
 
     for lid in &affected {
-        match recover_ledger_fragments(&lm, *lid, bookie_src, &available).await {
+        match recover_ledger_fragments(lm.as_ref(), *lid, bookie_src, &available).await {
             Ok(()) => {
                 println!("  Ledger {lid}: recovered");
                 recovered += 1;
@@ -636,7 +654,7 @@ async fn cmd_recover_bookie(
 /// Recover a single ledger by finding fragments on a bad bookie, copying to replacements,
 /// and updating ensemble metadata. Works for both open and closed ledgers.
 async fn recover_ledger_fragments(
-    lm: &ZkLedgerManager,
+    lm: &dyn LedgerManager,
     ledger_id: i64,
     bad_bookie: &str,
     available: &[String],
@@ -815,9 +833,8 @@ async fn cmd_recover_ledger(
     use bookkeeper_client::distribution::RoundRobinDistributionSchedule;
     use bookkeeper_client::recovery::RecoveryHandle;
 
-    let client = zookeeper_client::Client::connect(zk).await?;
-    let paths = ZkPaths::new(ledger_root);
-    let lm = ZkLedgerManager::new(client, paths);
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let lm = backend.ledger_manager;
 
     let versioned = lm.read_ledger_metadata(ledger_id).await?;
     let md = versioned.value();
@@ -893,7 +910,10 @@ pub async fn cmd_decommissionbookie(
     ledger_root: &str,
     bookie_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let mgr = backend.registration_manager;
+    let lm = backend.ledger_manager;
+    let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
 
     // Step 1: Verify the bookie is not still registered (must be shut down first)
     let writable = mgr.get_writable_bookies().await?;
@@ -907,21 +927,18 @@ pub async fn cmd_decommissionbookie(
 
     // Step 2: Trigger audit to kick the auditor (matches Java's decommission flow)
     {
-        let trigger_client = zookeeper_client::Client::connect(zk).await?;
-        let trigger_paths = ZkPaths::new(ledger_root);
-        let delay_path = format!("{}/lostBookieRecoveryDelay", trigger_paths.underreplication());
-        let current = match trigger_client.get_data(&delay_path).await {
+        let delay_path = format!("{}/lostBookieRecoveryDelay", zk_raw.paths.underreplication());
+        let current = match zk_raw.client.get_data(&delay_path).await {
             Ok((data, _)) => data,
             Err(_) => b"0".to_vec(),
         };
-        let _ = trigger_client.set_data(&delay_path, &current, None).await;
+        let _ = zk_raw.client.set_data(&delay_path, &current, None).await;
         println!("Triggered audit.");
     }
 
     // Step 3: Find all ledgers that have this bookie in their ensemble
-    let zk_client = mgr.zk_client().clone();
-    let paths = ZkPaths::new(ledger_root);
-    let lm = ZkLedgerManager::new(zk_client.clone(), paths.clone());
+    let zk_client = zk_raw.client;
+    let paths = zk_raw.paths;
 
     let all_ledgers = lm.get_ledger_ranges().await?;
     let mut affected_ledgers: Vec<i64> = Vec::new();
@@ -1009,6 +1026,8 @@ pub async fn cmd_decommissionbookie(
     }
 
     println!("Bookie {bookie_id} decommissioned successfully.");
+    // Keep zk_client alive until end of function
+    drop(zk_client);
     Ok(())
 }
 
@@ -1136,9 +1155,10 @@ pub async fn cmd_lostbookierecoverydelay(
     ledger_root: &str,
     set_value: Option<i32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
-    let paths = ZkPaths::new(ledger_root);
-    let delay_path = format!("{}/lostBookieRecoveryDelay", paths.underreplication());
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
+    let client = zk_raw.client;
+    let delay_path = format!("{}/lostBookieRecoveryDelay", zk_raw.paths.underreplication());
 
     match set_value {
         Some(seconds) => {
@@ -1180,8 +1200,10 @@ pub async fn cmd_triggeraudit(
     zk: &str,
     ledger_root: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = zookeeper_client::Client::connect(zk).await?;
-    let paths = ZkPaths::new(ledger_root);
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
+    let client = zk_raw.client;
+    let paths = zk_raw.paths;
 
     // Pre-check 1: Verify auto-recovery is enabled
     let disable_path = format!("{}/disable", paths.underreplication());
@@ -1235,14 +1257,17 @@ pub async fn cmd_metaformat(
         return Ok(());
     }
 
-    let client = zookeeper_client::Client::connect(zk).await?;
-
-    // Step 1: Recursively delete all children under ledger_root
-    delete_zk_recursive(&client, ledger_root).await?;
-    println!("Old metadata deleted.");
+    {
+        // Step 1: Recursively delete all children under ledger_root using a
+        // temporary direct ZK connection (before re-init via backend).
+        let client = zookeeper_client::Client::connect(zk).await?;
+        delete_zk_recursive(&client, ledger_root).await?;
+        println!("Old metadata deleted.");
+    }
 
     // Step 2: Reinitialize the cluster structure (like Java's format)
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let mgr = backend.registration_manager;
     let layout = bookkeeper_metadata::traits::LedgerLayout {
         manager_factory_class: "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"
             .to_string(),
@@ -1511,7 +1536,9 @@ pub async fn cmd_updatebookieinledger(
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Pre-check: verify old bookie is NOT still registered (matches Java)
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let mgr = backend.registration_manager;
+    let lm = backend.ledger_manager;
     let writable = mgr.get_writable_bookies().await?;
     let readonly = mgr.get_readonly_bookies().await?;
     if writable.contains(&old_bookie.to_string()) || readonly.contains(&old_bookie.to_string()) {
@@ -1519,10 +1546,6 @@ pub async fn cmd_updatebookieinledger(
             "Bookie {old_bookie} is still registered. Shut it down before updating ledger metadata."
         ).into());
     }
-
-    let zk_client = mgr.zk_client().clone();
-    let paths = ZkPaths::new(ledger_root);
-    let lm = ZkLedgerManager::new(zk_client, paths);
 
     let all_ledgers = lm.get_ledger_ranges().await?;
     println!("Scanning {} ledgers for bookie {old_bookie}...", all_ledgers.len());
@@ -1613,7 +1636,8 @@ pub async fn cmd_whatisinstanceid(
     zk: &str,
     ledger_root: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let mgr = backend.registration_manager;
     match mgr.get_cluster_instance_id().await? {
         Some(id) => println!("Instance ID: {id}"),
         None => println!("No instance ID set."),
@@ -1695,7 +1719,10 @@ pub async fn cmd_nukeexistingcluster(
         return Err("Specify either --force or --instanceid, not both.".into());
     }
 
-    let mgr = ZkRegistrationManager::new(zk, ledger_root).await?;
+    let backend = open_zk_backend(zk, ledger_root).await?;
+    let mgr = backend.registration_manager;
+    let zk_raw = backend.zk_raw.expect("ZK backend must have raw handles");
+
     let actual_instance_id = mgr.get_cluster_instance_id().await?;
 
     // Validate instance ID if provided
@@ -1728,8 +1755,7 @@ pub async fn cmd_nukeexistingcluster(
     }
 
     // Wipe metadata
-    let client = zookeeper_client::Client::connect(zk).await?;
-    delete_zk_recursive(&client, ledger_root).await?;
+    delete_zk_recursive(&zk_raw.client, ledger_root).await?;
     println!("Cluster metadata at {ledger_root} nuked successfully.");
     Ok(())
 }
