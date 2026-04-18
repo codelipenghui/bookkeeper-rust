@@ -13,13 +13,30 @@ use bookkeeper_protocol::v2::request::{decode_request, V2Request};
 use bookkeeper_protocol::v2::response::{encode_response, V2Response};
 use bookkeeper_storage::db_ledger_storage::{DbLedgerStorage, CURRENT_DIR};
 
-use bookkeeper_metadata::traits::RegistrationManager;
-
 use bookkeeper_config::server::ServerConfig;
 use crate::http_api;
 use crate::processor::RequestProcessor;
 use crate::state::{BookieState, BookieStateManager};
 use crate::unclean_shutdown::UncleanShutdownDetection;
+
+/// Prefer `config.metadata_service_uri` if set; otherwise synthesise a
+/// ZK URI from `config.zk_servers` + `config.zk_ledger_root`.
+fn resolve_metadata_uri(
+    config: &bookkeeper_config::server::ServerConfig,
+) -> Result<bookkeeper_metadata::metadata_paths::ParsedMetadataUri, String> {
+    use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
+    if let Some(ref uri) = config.metadata_service_uri {
+        return bookkeeper_config::parse_metadata_service_uri(uri)
+            .ok_or_else(|| format!("unrecognised metadataServiceUri: {uri}"));
+    }
+    let Some(ref zk_servers) = config.zk_servers else {
+        return Err("metadataServiceUri or zkServers required".into());
+    };
+    Ok(ParsedMetadataUri::Zk {
+        servers: zk_servers.clone(),
+        ledgers_root: config.zk_ledger_root.clone(),
+    })
+}
 
 pub struct BookieServer {
     local_addr: SocketAddr,
@@ -28,7 +45,7 @@ pub struct BookieServer {
     accept_handle: tokio::task::JoinHandle<()>,
     storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
     state: Arc<BookieStateManager>,
-    zk_reg: Option<(bookkeeper_metadata::zk::registration::ZkRegistrationManager, String)>,
+    zk_reg: Option<(bookkeeper_metadata::backend::MetadataBackend, String)>,
     auditor_handle: Option<tokio::task::JoinHandle<()>>,
     worker_handle: Option<tokio::task::JoinHandle<()>>,
     gc_handle: Option<tokio::task::JoinHandle<()>>,
@@ -299,12 +316,11 @@ impl BookieServer {
         let mut data_integ_check:
             Option<Arc<crate::datainteg::check::DataIntegrityCheck>> = None;
 
-        let zk_reg = if let Some(ref zk_servers) = config.zk_servers {
-            // The host to publish in ZK. When `advertisedAddress` is set it
-            // wins (important for docker-compose style deployments where the
-            // bind address is 0.0.0.0 but peers reach us via a DNS name
-            // from the overlay network). Otherwise fall back to the actual
-            // bind address.
+        let zk_reg = if config.zk_servers.is_some() || config.metadata_service_uri.is_some() {
+            // The host to publish in the metadata store. When `advertisedAddress`
+            // is set it wins (important for docker-compose style deployments where
+            // the bind address is 0.0.0.0 but peers reach us via a DNS name from
+            // the overlay network). Otherwise fall back to the actual bind address.
             // Bookie identity resolution order (matching Java):
             // 1. Explicit bookieId config (highest priority)
             // 2. advertisedAddress config
@@ -332,31 +348,38 @@ impl BookieServer {
                     }
                 }
             };
-            // Build the dedicated ZK runtime now, before the connect call,
-            // so the ZK client's internal session task runs on an isolated
-            // worker. Lives for the bookie's lifetime.
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("zk-runtime")
-                .enable_all()
-                .build()
-                .map_err(|e| format!("ZK runtime: {e}"))?;
-            let zk_handle = rt.handle().clone();
-            zk_runtime = Some(rt);
 
-            let reg_mgr =
-                bookkeeper_metadata::zk::registration::ZkRegistrationManager::new_isolated(
-                    zk_servers,
-                    &config.zk_ledger_root,
-                    Some(zk_handle),
-                    None, // use DEFAULT_ZK_SESSION_TIMEOUT (30s)
-                )
-                .await
-                .map_err(|e| format!("ZK connect: {e}"))?;
+            let uri = resolve_metadata_uri(&config)
+                .map_err(|e| format!("metadata URI: {e}"))?;
+
+            // Dedicated ZK runtime — only for the ZK backend. Phase 3 oxia skips this.
+            let zk_handle = match &uri {
+                bookkeeper_metadata::metadata_paths::ParsedMetadataUri::Zk { .. } => {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .thread_name("zk-runtime")
+                        .enable_all()
+                        .build()
+                        .map_err(|e| format!("ZK runtime: {e}"))?;
+                    let h = rt.handle().clone();
+                    zk_runtime = Some(rt);
+                    Some(h)
+                }
+                _ => None,
+            };
+
+            let backend = bookkeeper_metadata::backend::open_metadata_backend(
+                &uri,
+                zk_handle,
+                None,
+            )
+            .await
+            .map_err(|e| format!("metadata connect: {e}"))?;
+
             data_integ_check =
                 build_data_integrity_check(&config, &bookie_id, storage.clone()).await?;
             run_cookie_validation(
-                &reg_mgr,
+                backend.registration_manager.as_ref(),
                 &bookie_id,
                 &config,
                 data_integ_check.clone(),
@@ -367,10 +390,10 @@ impl BookieServer {
                 &advertised_host,
                 local_addr.port(),
             );
-            reg_mgr
+            backend.registration_manager
                 .register_bookie(&bookie_id, false, &info)
                 .await
-                .map_err(|e| format!("ZK register: {e}"))?;
+                .map_err(|e| format!("metadata register: {e}"))?;
 
             // Start ZK session watcher — monitors for session changes and
             // re-registers the bookie's ephemeral znode when the session ID
@@ -381,13 +404,13 @@ impl BookieServer {
             // bookie becomes invisible to clients even though the new
             // session is healthy. This matches Java BookKeeper's
             // BookieStateManager which re-registers rather than exits.
-            {
+            if let Some(ref raw) = backend.zk_raw {
                 let watcher_bookie_id = bookie_id.clone();
                 let watcher_shutdown = shutdown_rx.clone();
-                let mut session_watcher = reg_mgr.zk_client().state_watcher();
-                let watcher_client = reg_mgr.zk_client().clone();
+                let mut session_watcher = raw.client.state_watcher();
+                let watcher_client = raw.client.clone();
                 let watcher_reg_path =
-                    reg_mgr.paths().bookie_registration(&bookie_id);
+                    raw.paths.bookie_registration(&bookie_id);
                 let watcher_reg_data =
                     bookkeeper_metadata::service_info::BookieServiceInfo::new(
                         &bookie_id,
@@ -395,7 +418,7 @@ impl BookieServer {
                         local_addr.port(),
                     )
                     .to_protobuf_bytes();
-                let initial_session = reg_mgr.zk_client().session_id();
+                let initial_session = raw.client.session_id();
 
                 session_watcher_handle = Some(tokio::spawn(async move {
                     run_session_watcher(
@@ -412,23 +435,26 @@ impl BookieServer {
 
             // Start auto-recovery daemon if enabled
             if config.auto_recovery_daemon_enabled {
-                let (ah, wh) = start_auto_recovery(
-                    reg_mgr.zk_client().clone(),
-                    reg_mgr.paths().clone(),
-                    &bookie_id,
-                    config.lost_bookie_recovery_delay as u64,
-                    config.rw_rereplicate_backoff_ms as u64,
-                    config.auditor_periodic_check_interval as u64,
-                    config.auditor_periodic_placement_policy_check_interval as u64,
-                    config.auditor_periodic_replicas_check_interval as u64,
-                    shutdown_rx.clone(),
-                )
-                .await?;
-                auditor_handle = Some(ah);
-                worker_handle = Some(wh);
+                if let Some(ref raw) = backend.zk_raw {
+                    let (ah, wh) = start_auto_recovery(
+                        raw.client.clone(),
+                        raw.paths.clone(),
+                        backend.ledger_manager.clone(),
+                        &bookie_id,
+                        config.lost_bookie_recovery_delay as u64,
+                        config.rw_rereplicate_backoff_ms as u64,
+                        config.auditor_periodic_check_interval as u64,
+                        config.auditor_periodic_placement_policy_check_interval as u64,
+                        config.auditor_periodic_replicas_check_interval as u64,
+                        shutdown_rx.clone(),
+                    )
+                    .await?;
+                    auditor_handle = Some(ah);
+                    worker_handle = Some(wh);
+                }
             }
 
-            Some((reg_mgr, bookie_id))
+            Some((backend, bookie_id))
         } else {
             None
         };
@@ -439,12 +465,11 @@ impl BookieServer {
         let gc_force_major = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let gc_force_minor = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Start GC thread if ZK is available
+        // Start GC thread if metadata backend is available
         let gc_handle = if zk_reg.is_some() {
             let gc_storage = storage.clone();
             let gc_ledger_io = io_engines.ledger.clone();
-            let gc_zk = zk_reg.as_ref().unwrap().0.zk_client().clone();
-            let gc_paths = zk_reg.as_ref().unwrap().0.paths().clone();
+            let gc_ledger_manager = zk_reg.as_ref().unwrap().0.ledger_manager.clone();
             let gc_wait_ms = config.gc_wait_time as u64;
             let gc_config = bookkeeper_storage::gc::GcConfig {
                 minor_compaction_threshold: config.minor_compaction_threshold,
@@ -473,7 +498,7 @@ impl BookieServer {
 
             Some(tokio::spawn(async move {
                 run_gc_loop(
-                    gc_storage, gc_ledger_io, gc_zk, gc_paths, gc_wait_ms,
+                    gc_storage, gc_ledger_io, gc_ledger_manager, gc_wait_ms,
                     gc_config, metadata_cache_dir, gc_shutdown,
                     gc_suspend_major_c, gc_suspend_minor_c,
                     gc_force_major_c, gc_force_minor_c,
@@ -497,8 +522,10 @@ impl BookieServer {
             let monitor_interval_ms = config.disk_check_interval as u64;
             let monitor_shutdown = shutdown_rx.clone();
             // Pass ZK registration info for updating registration on state change
-            let monitor_zk_reg = zk_reg.as_ref().map(|(reg, bid)| {
-                (reg.zk_client().clone(), reg.paths().clone(), bid.clone())
+            let monitor_zk_reg = zk_reg.as_ref().and_then(|(backend, bid)| {
+                backend.zk_raw.as_ref().map(|raw| {
+                    (raw.client.clone(), raw.paths.clone(), bid.clone())
+                })
             });
 
             let monitor_hp_flag = processor.high_priority_writes_flag();
@@ -525,13 +552,14 @@ impl BookieServer {
         // Optionally start HTTP admin API server
         let http_addr = if config.http_server_enabled {
             let http_port = config.http_server_port as u16;
-            let (zk_client, zk_paths, http_bookie_id) = match &zk_reg {
-                Some((reg, bid)) => (
-                    Some(reg.zk_client().clone()),
-                    Some(reg.paths().clone()),
+            let (zk_client, zk_paths, http_bookie_id, http_ledger_manager) = match &zk_reg {
+                Some((backend, bid)) => (
+                    backend.zk_raw.as_ref().map(|r| r.client.clone()),
+                    backend.zk_raw.as_ref().map(|r| r.paths.clone()),
                     Some(bid.clone()),
+                    Some(backend.ledger_manager.clone()),
                 ),
-                None => (None, None, None),
+                None => (None, None, None, None),
             };
             let http_state = http_api::HttpState {
                 state_manager: state.clone(),
@@ -541,6 +569,7 @@ impl BookieServer {
                 zk_client,
                 zk_paths,
                 bookie_id: http_bookie_id,
+                ledger_manager: http_ledger_manager,
                 gc_suspend_major: gc_suspend_major.clone(),
                 gc_suspend_minor: gc_suspend_minor.clone(),
                 gc_force_major: gc_force_major.clone(),
@@ -749,11 +778,11 @@ impl BookieServer {
         // Step 7: Transition to ShuttingDown
         self.state.transition_to(BookieState::ShuttingDown);
 
-        // Step 8: Unregister from ZooKeeper LAST.
+        // Step 8: Unregister from metadata store LAST.
         // Matches Java's StateManager.close() as the final step.
-        if let Some((reg_mgr, bookie_id)) = self.zk_reg {
-            let _ = reg_mgr.unregister_bookie(&bookie_id, false).await;
-            tracing::info!("Unregistered from ZooKeeper.");
+        if let Some((backend, bookie_id)) = self.zk_reg {
+            let _ = backend.registration_manager.unregister_bookie(&bookie_id, false).await;
+            tracing::info!("Unregistered from metadata store.");
         }
 
         tracing::info!("Graceful shutdown complete.");
@@ -1346,8 +1375,7 @@ fn check_environment(config: &ServerConfig) -> Result<(), Box<dyn std::error::Er
 async fn run_gc_loop(
     storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
     ledger_io: Arc<dyn bookkeeper_storage::io_engine::LedgerIo>,
-    zk_client: zookeeper_client::Client,
-    paths: bookkeeper_metadata::zk_path::ZkPaths,
+    ledger_manager: Arc<dyn bookkeeper_metadata::traits::LedgerManager>,
     gc_wait_ms: u64,
     gc_config: bookkeeper_storage::gc::GcConfig,
     metadata_cache_dir: Option<std::path::PathBuf>,
@@ -1357,8 +1385,6 @@ async fn run_gc_loop(
     force_major: Arc<std::sync::atomic::AtomicBool>,
     force_minor: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
-    use bookkeeper_metadata::traits::LedgerManager;
     use bookkeeper_storage::gc::GarbageCollector;
     use bookkeeper_storage::index::entry_log_meta_map::EntryLogMetadataMap;
     use std::collections::HashSet;
@@ -1376,8 +1402,6 @@ async fn run_gc_loop(
             }
         }
     });
-
-    let ledger_manager = ZkLedgerManager::new(zk_client, paths);
     let minor_interval_secs = gc_config.minor_compaction_interval;
     let major_interval_secs = gc_config.major_compaction_interval;
     let gc = GarbageCollector::with_config(storage, ledger_io, gc_config, meta_map);
@@ -1464,6 +1488,7 @@ async fn run_gc_loop(
 async fn start_auto_recovery(
     zk_client: zookeeper_client::Client,
     paths: bookkeeper_metadata::zk_path::ZkPaths,
+    ledger_manager: Arc<dyn bookkeeper_metadata::traits::LedgerManager>,
     bookie_id: &str,
     lost_bookie_recovery_delay_secs: u64,
     rw_rereplicate_backoff_ms: u64,
@@ -1472,13 +1497,9 @@ async fn start_auto_recovery(
     auditor_periodic_replicas_check_interval: u64,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
-    use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
     use bookkeeper_replication::auditor_election::AuditorElector;
     use bookkeeper_replication::underreplication::ZkUnderreplicationManager;
     use bookkeeper_replication::worker::ReplicationWorker;
-
-    // Create shared components
-    let ledger_manager = Arc::new(ZkLedgerManager::new(zk_client.clone(), paths.clone()));
 
     let ur_manager = Arc::new(
         ZkUnderreplicationManager::new(zk_client.clone(), paths.clone(), bookie_id.to_string())
@@ -2090,15 +2111,15 @@ async fn build_data_integrity_check(
     use crate::datainteg::entry_copier::EntryCopier;
     use crate::datainteg::recovery::ZkRecoveryClient;
     use bookkeeper_client::zk_client::ZkBookKeeper;
-    use bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager;
-    use bookkeeper_metadata::zk_path::ZkPaths;
 
-    let zk_client = zookeeper_client::Client::connect(zk_servers)
+    let uri = bookkeeper_metadata::metadata_paths::ParsedMetadataUri::Zk {
+        servers: zk_servers.to_string(),
+        ledgers_root: config.zk_ledger_root.clone(),
+    };
+    let backend = bookkeeper_metadata::backend::open_metadata_backend(&uri, None, None)
         .await
-        .map_err(|e| format!("data-integ: ZK connect: {e}"))?;
-    let paths = ZkPaths::new(&config.zk_ledger_root);
-    let ledger_manager: Arc<dyn bookkeeper_metadata::traits::LedgerManager> =
-        Arc::new(ZkLedgerManager::new(zk_client, paths));
+        .map_err(|e| format!("data-integ: metadata connect: {e}"))?;
+    let ledger_manager = backend.ledger_manager;
 
     let bk_client = ZkBookKeeper::new(zk_servers, &config.zk_ledger_root)
         .await
@@ -2131,27 +2152,23 @@ fn spawn_data_integrity_service(
 /// is enabled, uses the DataIntegrityCookieValidator path (stamp-on-mismatch).
 /// Otherwise falls through to the existing strict `validate_cookie` flow.
 async fn run_cookie_validation(
-    zk_reg: &bookkeeper_metadata::zk::registration::ZkRegistrationManager,
+    reg: &dyn bookkeeper_metadata::traits::RegistrationManager,
     bookie_id: &str,
     config: &ServerConfig,
     check: Option<Arc<crate::datainteg::check::DataIntegrityCheck>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !config.data_integrity_stamp_missing_cookies {
-        return validate_cookie(zk_reg, bookie_id, config).await;
+        return validate_cookie(reg, bookie_id, config).await;
     }
     use crate::datainteg::cookie_validator::{CookieLayout, DataIntegrityCookieValidator};
-    // Build a fresh RegistrationManager for the validator so we don't need to
-    // clone/share the bookie's primary handle. An extra ZK connection is minor.
-    let zk_servers = config
-        .zk_servers
-        .as_deref()
-        .ok_or("data-integ cookie validation requires zkServers")?;
-    let reg = bookkeeper_metadata::zk::registration::ZkRegistrationManager::new(
-        zk_servers,
-        &config.zk_ledger_root,
-    )
-    .await
-    .map_err(|e| format!("data-integ: ZK connect: {e}"))?;
+    // Build a fresh RegistrationManager for the validator via the factory so we
+    // don't need to clone/share the bookie's primary handle. An extra connection
+    // is minor.
+    let uri = resolve_metadata_uri(config)
+        .map_err(|e| format!("data-integ cookie validation: {e}"))?;
+    let secondary = bookkeeper_metadata::backend::open_metadata_backend(&uri, None, None)
+        .await
+        .map_err(|e| format!("data-integ: metadata connect: {e}"))?;
     let layout = CookieLayout {
         bookie_id: bookie_id.to_string(),
         journal_dir: std::path::PathBuf::from(&config.journal_directory),
@@ -2172,7 +2189,7 @@ async fn run_cookie_validation(
     // Matches Java's `DataIntegrityCookieValidation.checkCookies`.
     let validator = DataIntegrityCookieValidator::new(
         layout,
-        Arc::new(reg),
+        secondary.registration_manager,
         check,
         config.data_integrity_stamp_missing_cookies,
     );

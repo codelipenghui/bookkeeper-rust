@@ -77,6 +77,8 @@ pub struct HttpState {
     pub zk_client: Option<zookeeper_client::Client>,
     pub zk_paths: Option<bookkeeper_metadata::zk_path::ZkPaths>,
     pub bookie_id: Option<String>,
+    /// Shared ledger manager — backend-agnostic, used by admin endpoints.
+    pub ledger_manager: Option<Arc<dyn bookkeeper_metadata::traits::LedgerManager>>,
     /// Shared GC suspension flags (shared with the GC loop in server.rs).
     pub gc_suspend_major: Arc<std::sync::atomic::AtomicBool>,
     pub gc_suspend_minor: Arc<std::sync::atomic::AtomicBool>,
@@ -661,12 +663,10 @@ async fn delete_ledger_endpoint(
     State(state): State<HttpState>,
     Query(query): Query<DeleteLedgerQuery>,
 ) -> impl IntoResponse {
-    let (client, paths) = require_zk_json!(state);
-
-    use bookkeeper_metadata::traits::LedgerManager;
-    let lm = bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager::new(
-        client.clone(), paths.clone(),
-    );
+    let lm = match &state.ledger_manager {
+        Some(lm) => lm.clone(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "metadata backend not configured"}))),
+    };
 
     match lm.remove_ledger_metadata(query.ledger_id, -1).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))),
@@ -1120,13 +1120,10 @@ async fn ledger_metadata_endpoint(
     State(state): State<HttpState>,
     Query(query): Query<LedgerIdQuery>,
 ) -> impl IntoResponse {
-    use bookkeeper_metadata::traits::LedgerManager;
-
-    let (client, paths) = require_zk_json!(state);
-
-    let lm = bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager::new(
-        client.clone(), paths.clone(),
-    );
+    let lm = match &state.ledger_manager {
+        Some(lm) => lm.clone(),
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "metadata backend not configured"}))),
+    };
 
     match lm.read_ledger_metadata(query.ledger_id).await {
         Ok(versioned) => {
@@ -1221,9 +1218,12 @@ async fn recover_bookie_endpoint(
     let p = paths.clone();
     let bookies = body.bookie_src.clone();
     let delete_cookie = body.delete_cookie;
+    let lm_for_task = state.ledger_manager.clone();
     tokio::spawn(async move {
-        use bookkeeper_metadata::traits::LedgerManager;
-        let lm = bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager::new(zk.clone(), p.clone());
+        let lm = match lm_for_task {
+            Some(lm) => lm,
+            None => return,
+        };
         let ur_mgr = bookkeeper_replication::underreplication::ZkUnderreplicationManager::new(
             zk.clone(), p.clone(), "http-api".to_string(),
         ).await;
@@ -1283,9 +1283,12 @@ async fn decommission_endpoint(
     let p = paths.clone();
     let bookie = body.bookie_src.clone();
     let delete_cookie = body.delete_cookie;
+    let lm_for_task = state.ledger_manager.clone();
     tokio::spawn(async move {
-        use bookkeeper_metadata::traits::LedgerManager;
-        let lm = bookkeeper_metadata::zk::ledger_manager::ZkLedgerManager::new(zk.clone(), p.clone());
+        let lm = match lm_for_task {
+            Some(lm) => lm,
+            None => return,
+        };
         let ur_mgr = bookkeeper_replication::underreplication::ZkUnderreplicationManager::new(
             zk.clone(), p.clone(), "http-api-decommission".to_string(),
         ).await;
