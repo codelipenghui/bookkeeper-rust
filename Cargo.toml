@@ -64,7 +64,13 @@ tokio = { version = "1", features = [
 ] }
 tokio-util = { version = "0.7", features = ["codec"] }
 zookeeper-client = { version = "0.11", features = ["tokio"] }
-liboxia = { version = "=0.0.2", default-features = false }
+# liboxia 0.0.2 has a critical bug in its session keep-alive loop:
+# `tokio::select! { _ = cancelled() => ..., else => keep_alive() }`
+# never fires the `else` branch while `cancelled()` is pending, so
+# heartbeats are never sent and sessions die at `session_timeout`.
+# Upstream main fixes this with a proper `tokio::time::interval` ticker.
+# Pin to the fixed commit until a new crates.io release includes it.
+liboxia = { git = "https://github.com/oxia-db/liboxia", rev = "5987d6ea8eea5c9c273164875549fa3e587d4089", default-features = false }
 testcontainers-oxia = "0.0.1"
 uuid = { version = "1", features = ["v4"] }
 axum = "0.8"

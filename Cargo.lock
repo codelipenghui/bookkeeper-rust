@@ -2309,12 +2309,10 @@ dependencies = [
 [[package]]
 name = "liboxia"
 version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84df8a9c06175032ad3ea5e7bafebfe29e6b165b7249c6a9c884ed313bcbf7c8"
+source = "git+https://github.com/oxia-db/liboxia?rev=5987d6ea8eea5c9c273164875549fa3e587d4089#5987d6ea8eea5c9c273164875549fa3e587d4089"
 dependencies = [
  "backoff",
  "dashmap",
- "futures",
  "log",
  "prost 0.13.5",
  "thiserror 2.0.18",

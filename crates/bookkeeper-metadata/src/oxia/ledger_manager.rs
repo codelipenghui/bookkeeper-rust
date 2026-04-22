@@ -62,7 +62,7 @@ impl LedgerManager for OxiaLedgerManager {
         let key = self.key(ledger_id);
         match self
             .client
-            .get_with_options(key, vec![GetOption::IncludeValue()])
+            .get_with_options(key, vec![GetOption::IncludeValue(true)])
             .await
         {
             Ok(res) => {

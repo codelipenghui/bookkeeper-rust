@@ -28,7 +28,7 @@ impl LayoutManager for OxiaLayoutManager {
             .client
             .get_with_options(
                 self.paths.layout().to_string(),
-                vec![GetOption::IncludeValue()],
+                vec![GetOption::IncludeValue(true)],
             )
             .await
         {

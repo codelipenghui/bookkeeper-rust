@@ -82,7 +82,7 @@ impl RegistrationManager for OxiaRegistrationManager {
         let key = self.paths.cookie_path(bookie_id);
         match self
             .client
-            .get_with_options(key, vec![GetOption::IncludeValue()])
+            .get_with_options(key, vec![GetOption::IncludeValue(true)])
             .await
         {
             Ok(res) => {
@@ -148,7 +148,7 @@ impl RegistrationManager for OxiaRegistrationManager {
             .client
             .get_with_options(
                 self.paths.instance_id().to_string(),
-                vec![GetOption::IncludeValue()],
+                vec![GetOption::IncludeValue(true)],
             )
             .await
         {
