@@ -12,23 +12,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new BookKeeper cluster in ZooKeeper
+    /// Initialize a new BookKeeper cluster
     Initnewcluster {
-        /// ZooKeeper connection string
+        /// ZooKeeper connection string (ignored if --metadata-service-uri is set)
         #[arg(long, default_value = "localhost:2181")]
         zk: String,
-        /// ZooKeeper ledger root path
+        /// ZooKeeper ledger root path (ignored if --metadata-service-uri is set)
         #[arg(long, default_value = "/ledgers")]
         ledger_root: String,
+        /// Full metadata-service URI (e.g. `oxia://host:6648/default/ledgers`,
+        /// `zk+hierarchical://host:2181/ledgers`). Takes precedence over
+        /// `--zk` + `--ledger-root` when set.
+        #[arg(long)]
+        metadata_service_uri: Option<String>,
     },
     /// List registered bookies
     Listbookies {
-        /// ZooKeeper connection string
+        /// ZooKeeper connection string (ignored if --metadata-service-uri is set)
         #[arg(long, default_value = "localhost:2181")]
         zk: String,
-        /// ZooKeeper ledger root path
+        /// ZooKeeper ledger root path (ignored if --metadata-service-uri is set)
         #[arg(long, default_value = "/ledgers")]
         ledger_root: String,
+        /// Full metadata-service URI (e.g. `oxia://host:6648/default/ledgers`).
+        /// Takes precedence over `--zk` + `--ledger-root` when set.
+        #[arg(long)]
+        metadata_service_uri: Option<String>,
         /// List writable bookies
         #[arg(long)]
         rw: bool,
@@ -470,11 +479,11 @@ fn main() {
 
     rt.block_on(async {
     let result = match cli.command {
-        Commands::Initnewcluster { zk, ledger_root } => {
-            cmd_initnewcluster(&zk, &ledger_root).await
+        Commands::Initnewcluster { zk, ledger_root, metadata_service_uri } => {
+            cmd_initnewcluster(&zk, &ledger_root, metadata_service_uri.as_deref()).await
         }
-        Commands::Listbookies { zk, ledger_root, rw, ro, all } => {
-            cmd_listbookies(&zk, &ledger_root, rw, ro, all).await
+        Commands::Listbookies { zk, ledger_root, metadata_service_uri, rw, ro, all } => {
+            cmd_listbookies(&zk, &ledger_root, metadata_service_uri.as_deref(), rw, ro, all).await
         }
         Commands::Serve { conf, port, data_dir, zk, ledger_root, advertised_address } => {
             cmd_serve(conf, port, data_dir, zk, ledger_root, advertised_address).await
@@ -572,16 +581,43 @@ fn main() {
     }); // rt.block_on
 }
 
-async fn cmd_initnewcluster(zk: &str, ledger_root: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Resolve a metadata-service URI from either an explicit
+/// `--metadata-service-uri` or the ZK-style `--zk` + `--ledger-root`
+/// fallback. Returns the parsed enum + a human-readable source
+/// description for logging.
+fn resolve_init_uri(
+    zk: &str,
+    ledger_root: &str,
+    metadata_service_uri: Option<&str>,
+) -> Result<
+    (bookkeeper_metadata::metadata_paths::ParsedMetadataUri, String),
+    Box<dyn std::error::Error>,
+> {
+    if let Some(uri) = metadata_service_uri {
+        let parsed = bookkeeper_config::parse_metadata_service_uri(uri)
+            .ok_or_else(|| format!("unrecognised metadataServiceUri: {uri}"))?;
+        Ok((parsed, uri.to_string()))
+    } else {
+        Ok((
+            bookkeeper_metadata::metadata_paths::ParsedMetadataUri::Zk {
+                servers: zk.to_string(),
+                ledgers_root: ledger_root.to_string(),
+            },
+            format!("zk+hierarchical://{zk}{ledger_root}"),
+        ))
+    }
+}
+
+async fn cmd_initnewcluster(
+    zk: &str,
+    ledger_root: &str,
+    metadata_service_uri: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use bookkeeper_metadata::backend::open_metadata_backend;
-    use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
     use bookkeeper_metadata::traits::LedgerLayout;
 
-    println!("Initializing new cluster at {zk}{ledger_root}...");
-    let uri = ParsedMetadataUri::Zk {
-        servers: zk.to_string(),
-        ledgers_root: ledger_root.to_string(),
-    };
+    let (uri, display) = resolve_init_uri(zk, ledger_root, metadata_service_uri)?;
+    println!("Initializing new cluster at {display}...");
     let backend = open_metadata_backend(&uri, None, None).await?;
     let mgr = backend.registration_manager;
     let layout = LedgerLayout {
@@ -600,17 +636,14 @@ async fn cmd_initnewcluster(zk: &str, ledger_root: &str) -> Result<(), Box<dyn s
 async fn cmd_listbookies(
     zk: &str,
     ledger_root: &str,
+    metadata_service_uri: Option<&str>,
     rw: bool,
     ro: bool,
     all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use bookkeeper_metadata::backend::open_metadata_backend;
-    use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
 
-    let uri = ParsedMetadataUri::Zk {
-        servers: zk.to_string(),
-        ledgers_root: ledger_root.to_string(),
-    };
+    let (uri, _display) = resolve_init_uri(zk, ledger_root, metadata_service_uri)?;
     let backend = open_metadata_backend(&uri, None, None).await?;
     let mgr = backend.registration_manager;
     let show_rw = rw || all || (!rw && !ro);

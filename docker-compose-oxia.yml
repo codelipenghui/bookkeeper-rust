@@ -1,0 +1,265 @@
+# Docker Compose playground for the Rust BookKeeper implementation —
+# Oxia-backed variant.
+#
+# Mirrors `docker-compose.yml` (ZK variant) but substitutes Apache Oxia
+# as the metadata store, and reconfigures the Pulsar broker to use oxia
+# via the `metadata-store:oxia://...` URI. Bookies use the same on-wire
+# key layout Pulsar's pulsar-metadata/bookkeeper driver produces, so the
+# Pulsar broker and Rust bookies agree on metadata without translation.
+#
+# Stack:
+#   oxia          — standalone oxia metadata node
+#   bk-init       — one-shot: `bk initnewcluster --metadata-service-uri oxia://...`
+#   rust-bookie-{1,2} — 2-node bookie cluster (E=2/W=2/A=2)
+#   pulsar-init   — one-shot: `pulsar initialize-cluster-metadata`
+#   pulsar-broker — Apache Pulsar broker, metadata-store:oxia://
+#
+# Usage:
+#   docker compose -f docker-compose-oxia.yml up             # first run builds
+#   docker compose -f docker-compose-oxia.yml up -d          # detached
+#   docker compose -f docker-compose-oxia.yml logs -f rust-bookie-1
+#   docker compose -f docker-compose-oxia.yml logs -f pulsar-broker
+#   docker compose -f docker-compose-oxia.yml down           # stop, keep volumes
+#   docker compose -f docker-compose-oxia.yml down -v        # stop + nuke data
+#
+# Once up, exercise Pulsar:
+#   bin/pulsar-client produce persistent://public/default/demo --messages "hi"
+#   bin/pulsar-client consume persistent://public/default/demo -s s1 --num-messages 0
+# or hit the admin HTTP API at http://localhost:8080
+
+services:
+  # ---------------------------------------------------------------------------
+  # Oxia — single-node standalone metadata store (shared by BK + Pulsar)
+  # ---------------------------------------------------------------------------
+  oxia:
+    image: streamnative/oxia:main
+    container_name: rustbk-oxia
+    hostname: oxia
+    restart: unless-stopped
+    command: ["oxia", "standalone"]
+    # Only reached from services on the compose network; no host port
+    # published. Use `docker compose exec oxia oxia-cli ...` for ad-hoc
+    # debugging.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+    healthcheck:
+      # Oxia's gRPC port is 6648; a TCP connect is enough to prove the
+      # process is up.
+      test: ["CMD-SHELL", "nc -z localhost 6648 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - oxia_data:/data
+
+  # ---------------------------------------------------------------------------
+  # One-shot: initialize BookKeeper cluster metadata in oxia (idempotent)
+  # ---------------------------------------------------------------------------
+  bk-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rust-bookie:latest
+    container_name: rustbk-bk-init
+    depends_on:
+      oxia:
+        condition: service_healthy
+    # Idempotent: re-running is safe — the init command errors with
+    # "cluster already initialized" which we treat as success.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        echo "[bk-init] running bk initnewcluster against oxia..."
+        if output=$$(bk initnewcluster --metadata-service-uri oxia://oxia:6648/default/ledgers 2>&1); then
+          echo "[bk-init] $$output"
+          echo "[bk-init] done"
+        elif echo "$$output" | grep -qi "already initialized"; then
+          echo "[bk-init] cluster already initialized — skipping"
+        else
+          echo "[bk-init] ERROR: $$output"
+          exit 1
+        fi
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Rust bookies — 2-node cluster with E=2/W=2/A=2.
+  # Each mounts `docker/bk_server_oxia.conf` over the image's baked-in
+  # (ZK-flavoured) config so no image rebuild is needed to switch
+  # metadata backends.
+  # ---------------------------------------------------------------------------
+  rust-bookie-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rust-bookie:latest
+    container_name: rustbk-rust-bookie-1
+    hostname: rust-bookie-1
+    restart: unless-stopped
+    depends_on:
+      oxia:
+        condition: service_healthy
+      bk-init:
+        condition: service_completed_successfully
+    ports:
+      - "8081:8080"
+    environment:
+      RUST_LOG: info
+      BOOKKEEPER_IO_ENGINE: auto
+    command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-1"]
+    volumes:
+      - ./docker/bk_server_oxia.conf:/etc/bookkeeper/bk_server.conf:ro
+      - bk1_data:/bk/data
+      - bk1_journal:/bk/journal
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  rust-bookie-2:
+    image: rust-bookie:latest
+    container_name: rustbk-rust-bookie-2
+    hostname: rust-bookie-2
+    restart: unless-stopped
+    depends_on:
+      oxia:
+        condition: service_healthy
+      bk-init:
+        condition: service_completed_successfully
+      rust-bookie-1:
+        condition: service_started
+    ports:
+      - "8082:8080"
+    environment:
+      RUST_LOG: info
+      BOOKKEEPER_IO_ENGINE: auto
+    command: ["serve", "--conf", "/etc/bookkeeper/bk_server.conf", "--advertised-address", "rust-bookie-2"]
+    volumes:
+      - ./docker/bk_server_oxia.conf:/etc/bookkeeper/bk_server.conf:ro
+      - bk2_data:/bk/data
+      - bk2_journal:/bk/journal
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/v1/bookie/is_ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # One-shot: initialize Pulsar cluster metadata in oxia (idempotent)
+  # ---------------------------------------------------------------------------
+  pulsar-init:
+    image: apachepulsar/pulsar:4.2.0
+    container_name: rustbk-pulsar-init
+    depends_on:
+      oxia:
+        condition: service_healthy
+      bk-init:
+        condition: service_completed_successfully
+    # The PulsarClusterMetadataSetup CLI in Pulsar 4.2.0 does NOT
+    # auto-register pluggable MetadataStoreProviders the way the broker
+    # does — it falls back to ZK for unknown URL schemes. Force-register
+    # the oxia provider via the system property the factory honours.
+    environment:
+      PULSAR_EXTRA_OPTS: "-Dpulsar.metadatastore.providers=org.apache.pulsar.metadata.impl.oxia.OxiaMetadataStoreProvider"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        echo "[pulsar-init] running pulsar initialize-cluster-metadata against oxia..."
+        # Re-run is safe — Pulsar's init helper is idempotent and exits
+        # cleanly if the cluster already exists.
+        bin/pulsar initialize-cluster-metadata \
+          --cluster cluster-a \
+          --metadata-store oxia://oxia:6648/default \
+          --configuration-metadata-store oxia://oxia:6648/default \
+          --web-service-url http://pulsar-broker:8080 \
+          --broker-service-url pulsar://pulsar-broker:6650 \
+          || echo "[pulsar-init] initialize returned non-zero (often means already initialized); continuing"
+        echo "[pulsar-init] done"
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Pulsar broker — uses Rust bookies for managed-ledger storage; metadata
+  # store is oxia for both the broker and the BK metadata driver.
+  # ---------------------------------------------------------------------------
+  pulsar-broker:
+    image: apachepulsar/pulsar:4.2.0
+    container_name: rustbk-pulsar-broker
+    hostname: pulsar-broker
+    restart: unless-stopped
+    depends_on:
+      pulsar-init:
+        condition: service_completed_successfully
+      rust-bookie-1:
+        condition: service_healthy
+      rust-bookie-2:
+        condition: service_healthy
+    ports:
+      - "6650:6650"  # Pulsar native (binary) protocol
+      - "8080:8080"  # Pulsar admin HTTP API
+    environment:
+      PULSAR_PREFIX_clusterName: cluster-a
+      # Pulsar's broker metadata and BK's metadata both live in the same
+      # oxia namespace. The two URIs differ only in that the BK one
+      # appends `/ledgers` so our metadata_paths.rs helpers produce keys
+      # under `/ledgers/...` (matching Pulsar's pulsar-metadata driver
+      # default).
+      PULSAR_PREFIX_metadataStoreUrl: "oxia://oxia:6648/default"
+      PULSAR_PREFIX_configurationMetadataStoreUrl: "oxia://oxia:6648/default"
+      # BK's URI must be parseable by Pulsar's OxiaMetadataStoreProvider,
+      # which requires exactly `oxia://host:port/namespace` — no extra
+      # path segments. The ledgers-root defaults to /ledgers (set in the
+      # bookie's bk_server_oxia.conf via zkLedgersRootPath implicitly).
+      PULSAR_PREFIX_bookkeeperMetadataServiceUri: "metadata-store:oxia://oxia:6648/default"
+      PULSAR_PREFIX_brokerServicePort: "6650"
+      PULSAR_PREFIX_webServicePort: "8080"
+      PULSAR_PREFIX_advertisedAddress: pulsar-broker
+      # Ensemble=2 / write=2 / ack=2 against the 2-bookie cluster.
+      PULSAR_PREFIX_managedLedgerDefaultEnsembleSize: "2"
+      PULSAR_PREFIX_managedLedgerDefaultWriteQuorum: "2"
+      PULSAR_PREFIX_managedLedgerDefaultAckQuorum: "2"
+      # Expose BK client metrics for cross-checking with bookie
+      # counters (add_entry, read_entry, channel_write, etc.)
+      PULSAR_PREFIX_bookkeeperClientExposeStatsToPrometheus: "true"
+      # Keep memory usage reasonable for a laptop
+      PULSAR_MEM: "-Xms512m -Xmx1g -XX:MaxDirectMemorySize=512m"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+    command: >
+      /bin/bash -c "
+      bin/apply-config-from-env.py conf/broker.conf &&
+      bin/pulsar broker
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/admin/v2/brokers/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  oxia_data:
+  bk1_data:
+  bk1_journal:
+  bk2_data:
+  bk2_journal:
