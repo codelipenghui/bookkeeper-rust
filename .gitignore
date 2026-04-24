@@ -1,2 +1,43 @@
+# Rust build artifacts
 /target/
 tests/java-compat/target/
+**/*.rs.bk
+
+# Cargo.lock is intentionally committed — this repo ships binaries.
+
+# Platform-specific
+.DS_Store
+._*
+Thumbs.db
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.nvim/
+.zed/
+
+# Local tool state (Claude Code, Codex, other agents)
+.claude/
+.codex/
+.conductor/
+.qoder/
+.history/
+
+# Logs written by docker-compose / bookies
+*.log
+logs/
+
+# Local env and secrets
+.env
+.env.local
+*.local.toml
+
+# OS / network scratch
+*.pid
+*.seed
+*.pid.lock
