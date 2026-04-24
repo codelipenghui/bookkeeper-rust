@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -6,20 +7,26 @@ use liboxia::client::{OxiaClient, PutOption};
 use liboxia::errors::OxiaError;
 
 use super::errors::map_oxia_error;
-use super::paths::descendant_range;
+use super::paths::child_range;
 use crate::ledger_metadata::MetadataError;
-use crate::metadata_paths::LedgerPaths;
+use crate::metadata_paths::{HOB_GC_KEEP, HOB_PREFIX, LedgerPaths, SHORT_ID_PREFIX};
 use crate::traits::LedgerIdGenerator;
 
-const SHORT_ID_PREFIX: &str = "ID-";
-const HOB_PREFIX: &str = "HOB-";
-const HOB_GC_KEEP: usize = 3;
+/// How many times `generate_long` retries on HOB overflow before giving
+/// up. Matches the ZK implementation; a real cluster should never need
+/// more than 2 (`suffix == i32::MAX` in HOB_N → create HOB_{N+1}, retry).
+const LONG_ID_MAX_RETRIES: usize = 5;
 
 pub struct OxiaLedgerIdGenerator {
     client: Arc<OxiaClient>,
     short_gen_dir: String,   // "{root}/idgen"
     long_gen_dir: String,    // "{root}/idgen-long"
     long_path_known: Mutex<Option<bool>>,
+    /// Once the short-id directory has been ensured once on the server,
+    /// every subsequent ledger create can skip the ensure put RPC. The
+    /// cache only ratchets to true; if the server were reset the cluster
+    /// wouldn't survive anyway.
+    short_gen_dir_ensured: AtomicBool,
 }
 
 impl OxiaLedgerIdGenerator {
@@ -29,6 +36,7 @@ impl OxiaLedgerIdGenerator {
             short_gen_dir: paths.idgen().to_string(),
             long_gen_dir: paths.idgen_long().to_string(),
             long_path_known: Mutex::new(None),
+            short_gen_dir_ensured: AtomicBool::new(false),
         }
     }
 
@@ -47,6 +55,10 @@ impl OxiaLedgerIdGenerator {
             Ok(_) | Err(OxiaError::UnexpectedVersionId()) => Ok(()),
             Err(e) => Err(map_oxia_error(e, None)),
         }
+    }
+
+    fn hob_path(&self, hob: i32) -> String {
+        format!("{}/{}{:010}", self.long_gen_dir, HOB_PREFIX, hob)
     }
 
     async fn is_long_present(&self) -> Result<bool, MetadataError> {
@@ -95,7 +107,10 @@ impl OxiaLedgerIdGenerator {
     }
 
     async fn generate_short(&self) -> Result<i64, MetadataError> {
-        self.ensure_path(&self.short_gen_dir).await?;
+        if !self.short_gen_dir_ensured.load(Ordering::Acquire) {
+            self.ensure_path(&self.short_gen_dir).await?;
+            self.short_gen_dir_ensured.store(true, Ordering::Release);
+        }
         let prefix = format!("{}/{}", self.short_gen_dir, SHORT_ID_PREFIX);
         let key = self.seq_create(&self.short_gen_dir, &prefix).await?;
         let suffix = &key[prefix.len()..];
@@ -105,8 +120,12 @@ impl OxiaLedgerIdGenerator {
         Ok(id)
     }
 
+    /// List the immediate HOB children of `idgen-long`. We deliberately
+    /// use `child_range` (not `descendant_range`): HOB dirs are direct
+    /// children, and constraining the range this way avoids downloading
+    /// the `ID-*` grandchildren that accumulate inside each HOB.
     async fn list_hobs(&self) -> Result<Vec<i32>, MetadataError> {
-        let (start, end) = descendant_range(&self.long_gen_dir);
+        let (start, end) = child_range(&self.long_gen_dir);
         let keys = self
             .client
             .list(start.clone(), end)
@@ -125,7 +144,7 @@ impl OxiaLedgerIdGenerator {
     }
 
     async fn create_hob(&self, hob: i32) -> Result<String, MetadataError> {
-        let path = format!("{}/{}{:010}", self.long_gen_dir, HOB_PREFIX, hob);
+        let path = self.hob_path(hob);
         self.ensure_path(&path).await?;
         Ok(path)
     }
@@ -135,13 +154,12 @@ impl OxiaLedgerIdGenerator {
             return;
         }
         for &hob in &hobs[..hobs.len() - HOB_GC_KEEP] {
-            let path = format!("{}/{}{:010}", self.long_gen_dir, HOB_PREFIX, hob);
-            let _ = self.client.delete(path).await;
+            let _ = self.client.delete(self.hob_path(hob)).await;
         }
     }
 
     async fn generate_long(&self) -> Result<i64, MetadataError> {
-        for _ in 0..5 {
+        for _ in 0..LONG_ID_MAX_RETRIES {
             let mut hobs = self.list_hobs().await?;
             let high_bits = match hobs.last() {
                 Some(&m) => m,
@@ -151,7 +169,7 @@ impl OxiaLedgerIdGenerator {
                     1
                 }
             };
-            let hob_path = format!("{}/{}{:010}", self.long_gen_dir, HOB_PREFIX, high_bits);
+            let hob_path = self.hob_path(high_bits);
             let prefix = format!("{hob_path}/{}", SHORT_ID_PREFIX);
             let key = self.seq_create(&hob_path, &prefix).await?;
             let suffix: i64 = key[prefix.len()..]

@@ -20,22 +20,18 @@ use crate::state::{BookieState, BookieStateManager};
 use crate::unclean_shutdown::UncleanShutdownDetection;
 
 /// Prefer `config.metadata_service_uri` if set; otherwise synthesise a
-/// ZK URI from `config.zk_servers` + `config.zk_ledger_root`.
+/// ZK URI from `config.zk_servers` + `config.zk_ledger_root`. Delegates
+/// to the shared helper so CLI and server agree on precedence.
 fn resolve_metadata_uri(
     config: &bookkeeper_config::server::ServerConfig,
 ) -> Result<bookkeeper_metadata::metadata_paths::ParsedMetadataUri, String> {
-    use bookkeeper_metadata::metadata_paths::ParsedMetadataUri;
-    if let Some(ref uri) = config.metadata_service_uri {
-        return bookkeeper_config::parse_metadata_service_uri(uri)
-            .ok_or_else(|| format!("unrecognised metadataServiceUri: {uri}"));
-    }
-    let Some(ref zk_servers) = config.zk_servers else {
-        return Err("metadataServiceUri or zkServers required".into());
-    };
-    Ok(ParsedMetadataUri::Zk {
-        servers: zk_servers.clone(),
-        ledgers_root: config.zk_ledger_root.clone(),
-    })
+    bookkeeper_metadata::metadata_paths::resolve_metadata_uri(
+        config.metadata_service_uri.as_deref(),
+        config.zk_servers.as_deref(),
+        &config.zk_ledger_root,
+        bookkeeper_config::parse_metadata_service_uri,
+    )
+    .map(|(uri, _display)| uri)
 }
 
 pub struct BookieServer {

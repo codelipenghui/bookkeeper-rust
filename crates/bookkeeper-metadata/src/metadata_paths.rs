@@ -155,3 +155,62 @@ impl ParsedMetadataUri {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Ledger-ID generator constants
+//
+// Shared between the ZK and oxia idgen implementations. Both ports match
+// Java BookKeeper's `LongZkLedgerIdGenerator` / Apache Pulsar's
+// `PulsarLedgerIdGenerator` — the constants below are what both Java
+// implementations write to the metadata store.
+// ---------------------------------------------------------------------------
+
+/// Prefix for sequential child records under `idgen` and
+/// `idgen-long/HOB-*`.
+pub const SHORT_ID_PREFIX: &str = "ID-";
+
+/// Prefix for high-order-bits directories under `idgen-long`.
+pub const HOB_PREFIX: &str = "HOB-";
+
+/// Number of most-recent HOB directories to keep during GC.
+pub const HOB_GC_KEEP: usize = 3;
+
+// ---------------------------------------------------------------------------
+// URI resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a metadata-service URI from either an explicit
+/// `metadataServiceUri` or the legacy `--zk` + ledger-root pair.
+///
+/// Used by both the bookie server and the admin CLI so the precedence
+/// rules stay in one place:
+///
+/// - `metadata_service_uri` wins when set — parsed via
+///   `bookkeeper-config::parse_metadata_service_uri`.
+/// - Otherwise, `zk_servers` + `ledgers_root` synthesise a
+///   `ParsedMetadataUri::Zk`.
+/// - If neither is set, returns an error.
+///
+/// The returned tuple's second element is a human-readable URI for
+/// logs (`oxia://...` or `zk+hierarchical://...`).
+pub fn resolve_metadata_uri(
+    metadata_service_uri: Option<&str>,
+    zk_servers: Option<&str>,
+    ledgers_root: &str,
+    parse: impl FnOnce(&str) -> Option<ParsedMetadataUri>,
+) -> Result<(ParsedMetadataUri, String), String> {
+    if let Some(uri) = metadata_service_uri {
+        let parsed = parse(uri).ok_or_else(|| format!("unrecognised metadataServiceUri: {uri}"))?;
+        return Ok((parsed, uri.to_string()));
+    }
+    let Some(servers) = zk_servers else {
+        return Err("metadataServiceUri or zkServers required".into());
+    };
+    Ok((
+        ParsedMetadataUri::Zk {
+            servers: servers.to_string(),
+            ledgers_root: ledgers_root.to_string(),
+        },
+        format!("zk+hierarchical://{servers}{ledgers_root}"),
+    ))
+}

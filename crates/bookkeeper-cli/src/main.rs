@@ -581,10 +581,9 @@ fn main() {
     }); // rt.block_on
 }
 
-/// Resolve a metadata-service URI from either an explicit
-/// `--metadata-service-uri` or the ZK-style `--zk` + `--ledger-root`
-/// fallback. Returns the parsed enum + a human-readable source
-/// description for logging.
+/// Resolve the CLI's `--metadata-service-uri` / `--zk` / `--ledger-root`
+/// triple into a `ParsedMetadataUri`, delegating to the shared helper
+/// in `bookkeeper-metadata` so server and CLI stay in lockstep.
 fn resolve_init_uri(
     zk: &str,
     ledger_root: &str,
@@ -593,20 +592,18 @@ fn resolve_init_uri(
     (bookkeeper_metadata::metadata_paths::ParsedMetadataUri, String),
     Box<dyn std::error::Error>,
 > {
-    if let Some(uri) = metadata_service_uri {
-        let parsed = bookkeeper_config::parse_metadata_service_uri(uri)
-            .ok_or_else(|| format!("unrecognised metadataServiceUri: {uri}"))?;
-        Ok((parsed, uri.to_string()))
-    } else {
-        Ok((
-            bookkeeper_metadata::metadata_paths::ParsedMetadataUri::Zk {
-                servers: zk.to_string(),
-                ledgers_root: ledger_root.to_string(),
-            },
-            format!("zk+hierarchical://{zk}{ledger_root}"),
-        ))
-    }
+    bookkeeper_metadata::metadata_paths::resolve_metadata_uri(
+        metadata_service_uri,
+        Some(zk),
+        ledger_root,
+        bookkeeper_config::parse_metadata_service_uri,
+    )
+    .map_err(Into::into)
 }
+
+const LEDGER_MANAGER_FACTORY_CLASS: &str =
+    "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory";
+const LEDGER_MANAGER_FACTORY_VERSION: i32 = 1;
 
 async fn cmd_initnewcluster(
     zk: &str,
@@ -619,17 +616,20 @@ async fn cmd_initnewcluster(
     let (uri, display) = resolve_init_uri(zk, ledger_root, metadata_service_uri)?;
     println!("Initializing new cluster at {display}...");
     let backend = open_metadata_backend(&uri, None, None).await?;
-    let mgr = backend.registration_manager;
     let layout = LedgerLayout {
-        manager_factory_class: "org.apache.bookkeeper.meta.HierarchicalLedgerManagerFactory"
-            .to_string(),
-        manager_version: 1,
+        manager_factory_class: LEDGER_MANAGER_FACTORY_CLASS.to_string(),
+        manager_version: LEDGER_MANAGER_FACTORY_VERSION,
     };
     let instance_id = uuid::Uuid::new_v4().to_string();
-    mgr.init_new_cluster(&layout, &instance_id).await?;
+    backend
+        .registration_manager
+        .init_new_cluster(&layout, &instance_id)
+        .await?;
     println!("Cluster initialized successfully.");
     println!("  Instance ID: {instance_id}");
-    println!("  Layout: HierarchicalLedgerManagerFactory v2");
+    println!(
+        "  Layout: HierarchicalLedgerManagerFactory v{LEDGER_MANAGER_FACTORY_VERSION}"
+    );
     Ok(())
 }
 

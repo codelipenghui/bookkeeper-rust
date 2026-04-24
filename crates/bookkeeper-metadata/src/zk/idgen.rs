@@ -6,10 +6,7 @@ use crate::ledger_metadata::MetadataError;
 use crate::traits::LedgerIdGenerator;
 use crate::zk_path::ZkPaths;
 
-const LEDGER_ID_GEN_PREFIX: &str = "ID-";
-const HOB_PREFIX: &str = "HOB-";
-/// Keep this many most-recent HOB directories during garbage collection.
-const HOB_GC_KEEP: usize = 3;
+use crate::metadata_paths::{HOB_GC_KEEP, HOB_PREFIX, SHORT_ID_PREFIX as LEDGER_ID_GEN_PREFIX};
 
 /// Status of the long ledger ID generation path in ZK.
 /// Matches Java's HighOrderLedgerIdGenPathStatus.
