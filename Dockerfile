@@ -39,6 +39,17 @@ RUN apt-get update && \
         clang \
         protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
+
+# Optional corporate / proxy CA bundles. If you're building behind a
+# TLS-inspection proxy (Zscaler, mitmproxy, etc.) that breaks cargo's
+# outbound HTTPS to crates.io, drop the proxy's root cert(s) as *.crt
+# files into `docker/extra-ca-certs/` on your working copy — this step
+# merges them into the builder's trust store. The directory is tracked
+# via .gitkeep so this COPY always succeeds; actual certs are
+# gitignored. No-op if the directory only contains .gitkeep.
+COPY docker/extra-ca-certs/ /usr/local/share/ca-certificates/extra/
+RUN update-ca-certificates
+
 RUN cargo install cargo-chef --locked
 
 # ----------------------------------------------------------------------------

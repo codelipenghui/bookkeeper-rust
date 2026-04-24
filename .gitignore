@@ -37,6 +37,13 @@ logs/
 .env.local
 *.local.toml
 
+# Optional corporate / proxy CA bundles for Docker builds behind a
+# TLS-inspection proxy (Zscaler, mitmproxy, etc.). Drop *.crt files in
+# `docker/extra-ca-certs/` and the Dockerfile's chef stage will merge
+# them into the build image's trust store. The directory itself is
+# tracked via .gitkeep so the Dockerfile COPY always succeeds.
+docker/extra-ca-certs/*.crt
+
 # OS / network scratch
 *.pid
 *.seed
