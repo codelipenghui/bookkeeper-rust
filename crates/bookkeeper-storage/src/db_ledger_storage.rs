@@ -248,7 +248,22 @@ impl DbLedgerStorage {
         // existing entry-location index would then get garbage bytes back
         // and fail digest verification. Matches Java's EntryLogger which
         // also rolls forward on startup.
-        let initial_log_id = Self::next_entry_log_id(&entry_log_dir)?;
+        //
+        // Take max(persisted_last_log_id, dir_scan_max) + 1 so that GC
+        // deleting the highest log_id between runs doesn't cause us to
+        // recycle an id the persisted entry-location index still
+        // references — that would silently overwrite the bytes those
+        // index entries point at.
+        let dir_scan = Self::next_entry_log_id(&entry_log_dir)?;
+        let initial_log_id = match ledger_index.get_last_entry_log_id()? {
+            // We previously used at least `persisted` — start strictly
+            // above it so a GC-then-restart can't recycle that id.
+            Some(persisted) => std::cmp::max(dir_scan, persisted.saturating_add(1)),
+            // First ever open: the dir scan is the source of truth.
+            // Persisting only on actual use (rotation / flush) keeps
+            // the "fresh storage starts at 0" invariant.
+            None => dir_scan,
+        };
 
         Ok(Self {
             base_dir: base_dir.to_path_buf(),
@@ -751,6 +766,9 @@ impl DbLedgerStorage {
 
                         log_state.log_id += 1;
                         log_state.offset = LOGFILE_HEADER_SIZE as u64;
+                        // Persist the new high-water mark so a restart
+                        // after GC deletion can't recycle this id.
+                        let _ = self.ledger_index.set_last_entry_log_id(log_state.log_id);
                         self.ensure_entry_log_exists(log_state.log_id)?;
                         let new_path = self.entry_log_path(log_state.log_id);
                         let file = fs::OpenOptions::new().read(true).write(true).open(&new_path)
@@ -853,6 +871,16 @@ impl DbLedgerStorage {
             .collect();
         if let Err(e) = self.ledger_index.batch_update_lac(&lac_entries) {
             tracing::warn!("batch LAC update failed during flush: {e}");
+        }
+
+        // Persist the current high-water mark for entry-log id so that a
+        // GC-then-restart can't recycle this id even if no rotation has
+        // happened in this run. The rotation paths also persist on each
+        // bump; this site catches the case where a single log file was
+        // written and flushed without rotating.
+        let current_log_id = self.log_state.lock().unwrap().log_id;
+        if let Err(e) = self.ledger_index.set_last_entry_log_id(current_log_id) {
+            tracing::warn!("set_last_entry_log_id failed during flush: {e}");
         }
 
         let ledger_start = Instant::now();
@@ -1263,6 +1291,9 @@ impl LedgerStorage for DbLedgerStorage {
                 log_state.file = None;
                 log_state.log_id += 1;
                 log_state.offset = LOGFILE_HEADER_SIZE as u64;
+                // Persist the new high-water mark so a restart after GC
+                // deletion can't recycle this id.
+                let _ = self.ledger_index.set_last_entry_log_id(log_state.log_id);
             }
 
             if log_state.file.is_none() {

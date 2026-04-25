@@ -603,6 +603,75 @@ async fn empty_master_key_is_replaced_by_real_key_on_check() {
     assert!(storage.check_master_key(42, b"other-pw").is_err());
 }
 
+/// `next_entry_log_id` derives the next log_id from a directory scan
+/// (max existing + 1). After GC deletes the file at the highest log_id,
+/// the dir-scan max regresses — and on restart the storage would
+/// re-mint a log_id that the persisted entry-location index still
+/// references, then later overwrite the bytes the index points at.
+///
+/// Persist the highest log_id ever used in RocksDB and take
+/// `max(persisted_last_log_id, dir_scan_max) + 1` on open. This test
+/// drives storage to roll into several log files, drops the storage,
+/// deletes the trailing log files (simulating a GC pass), reopens, and
+/// asserts the new initial log_id is strictly greater than any
+/// previously-used id.
+#[tokio::test]
+async fn next_entry_log_id_does_not_regress_after_gc_deletion() {
+    use bookkeeper_storage::db_ledger_storage::StorageConfig;
+
+    let dir = TempDir::new().unwrap();
+    let mut config = StorageConfig::default();
+    config.max_entry_log_size = 4096;
+
+    let last_used: u32;
+    {
+        let storage = DbLedgerStorage::open_full(
+            dir.path(), default_ledger_io(), None, None, config.clone()
+        ).unwrap();
+        let storage_dyn: &dyn LedgerStorage = &storage;
+
+        storage_dyn.validate_for_write(1, b"k").unwrap();
+
+        // Write enough entries to roll through several log files.
+        // Each entry: ~256 bytes; max_entry_log_size 4096 - header 1024
+        // = 3072 usable, so ~12 entries per file. 100 entries → ~9 files.
+        for eid in 0..100i64 {
+            let entry = make_entry(1, eid, eid - 1, &vec![b'x'; 200]);
+            storage_dyn.add_entry(&entry).await.unwrap();
+        }
+        storage_dyn.flush().await.unwrap();
+
+        last_used = storage_dyn
+            .current_log_id()
+            .expect("storage should report a current log id after writes");
+        assert!(
+            last_used >= 4,
+            "test setup expected several rotations; got last_used={last_used}",
+        );
+    }
+
+    // Simulate a GC pass that deleted the trailing log files.
+    let entry_log_dir = dir.path().join("current");
+    for id in (last_used.saturating_sub(2))..=last_used {
+        let path = entry_log_dir.join(format!("{:x}.log", id));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    let storage = DbLedgerStorage::open_full(
+        dir.path(), default_ledger_io(), None, None, config
+    ).unwrap();
+    let new_log_id = storage
+        .current_log_id()
+        .expect("storage should report a current log id after reopen");
+    assert!(
+        new_log_id > last_used,
+        "post-restart current_log_id ({new_log_id}) must be strictly \
+         greater than any previously-used id ({last_used}). The \
+         previous max log_id must be persisted across restart so we \
+         don't recycle ids the entry-location index still references.",
+    );
+}
+
 /// LAC must never go backwards in our in-memory tracking. A buggy or
 /// stale caller (a stale replay of a journal entry, or a client WriteLac
 /// that violates the per-ledger monotonicity invariant) must not demote

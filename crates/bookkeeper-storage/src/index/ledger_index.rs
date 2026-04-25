@@ -9,6 +9,13 @@ use crate::StorageError;
 /// On-disk compatible with Java's `LedgerMetadataIndex.STORAGE_FLAGS` constant.
 const STORAGE_FLAGS_KEY: i64 = -0xeefd;
 
+/// Reserved RocksDB key used to store the highest entry-log id ever
+/// allocated by this storage. Read on startup so the new initial log_id
+/// is `max(persisted, dir-scan-max) + 1`, preventing GC-deleted-then-
+/// recycled ids from overwriting bytes the persisted entry-location
+/// index still references.
+const LAST_ENTRY_LOG_ID_KEY: i64 = -0xeefc;
+
 /// Ledger metadata stored in the bookie's RocksDB.
 #[derive(Debug, Clone)]
 pub struct LedgerData {
@@ -134,7 +141,7 @@ impl LedgerMetadataIndex {
             let (key, value) = item?;
             if key.len() == 8 {
                 let ledger_id = i64::from_be_bytes(key[..8].try_into().unwrap());
-                if ledger_id == STORAGE_FLAGS_KEY {
+                if ledger_id == STORAGE_FLAGS_KEY || ledger_id == LAST_ENTRY_LOG_ID_KEY {
                     continue;
                 }
                 // Only include ledgers that actually exist
@@ -177,6 +184,32 @@ impl LedgerMetadataIndex {
     pub fn delete(&self, ledger_id: i64) -> Result<(), StorageError> {
         let key = ledger_id.to_be_bytes();
         self.db.delete(&key).map_err(StorageError::from)
+    }
+
+    /// Highest entry-log id ever allocated by this storage instance, as
+    /// recorded by `set_last_entry_log_id`. Returns `None` if never set.
+    pub fn get_last_entry_log_id(&self) -> Result<Option<u32>, StorageError> {
+        let key = LAST_ENTRY_LOG_ID_KEY.to_be_bytes();
+        match self.db.get(&key)? {
+            Some(v) if v.len() >= 4 => {
+                Ok(Some(u32::from_be_bytes(v[..4].try_into().unwrap())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Persist the highest entry-log id allocated so far. Called from the
+    /// rotation paths (drain_flushing and write_entry_to_log) every time
+    /// the storage's `log_state.log_id` advances. Only writes when the
+    /// new value is greater than what's already stored — small key, but
+    /// no point churning RocksDB on a regression.
+    pub fn set_last_entry_log_id(&self, log_id: u32) -> Result<(), StorageError> {
+        let key = LAST_ENTRY_LOG_ID_KEY.to_be_bytes();
+        let current = self.get_last_entry_log_id()?.unwrap_or(0);
+        if log_id <= current {
+            return Ok(());
+        }
+        self.db.put(&key, &log_id.to_be_bytes()).map_err(StorageError::from)
     }
 
     /// Read the whole-storage state flags bitmask. Returns 0 if unset.
