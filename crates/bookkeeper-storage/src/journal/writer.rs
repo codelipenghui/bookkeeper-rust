@@ -443,6 +443,71 @@ fn journal_uring_loop(
         }
     }
 
+    // Helper: if no fsync is currently in flight but there are entries
+    // already written to the page cache that no submitted fsync covers
+    // (`awaiting_*`), promote them to the syncing slot and submit a fresh
+    // fsync. The fresh FSYNC's mark is `state.position` at submit time,
+    // so the kernel's vfs_fsync_range — which runs at or after submit —
+    // is guaranteed to cover those bytes.
+    //
+    // This is the chained half of the J-1 fix (see docs/code-review-2026-04.md):
+    // an in-flight fsync only durably covers entries written before its SQE
+    // was submitted, so any entries written after it must wait for a *new*
+    // fsync that the loop submits as soon as the previous one drains.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn chain_fresh_fsync_if_awaiting(
+        ring: &mut IoUring,
+        state: &JournalFileState,
+        syncing_acks: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+        syncing_oldest_enqueue: &mut Option<Instant>,
+        syncing_fw_count: &mut u64,
+        awaiting_acks: &mut Vec<tokio::sync::oneshot::Sender<()>>,
+        awaiting_oldest_enqueue: &mut Option<Instant>,
+        awaiting_fw_count: &mut u64,
+        fsync_in_flight: &mut bool,
+        fsync_start: &mut Option<Instant>,
+        syncing_mark: &mut Option<(u64, u64)>,
+    ) {
+        if *fsync_in_flight || awaiting_acks.is_empty() {
+            return;
+        }
+        debug_assert!(syncing_acks.is_empty(),
+            "syncing_acks should be empty after CQE drain");
+        std::mem::swap(syncing_acks, awaiting_acks);
+        *syncing_oldest_enqueue = awaiting_oldest_enqueue.take();
+        *syncing_fw_count = std::mem::take(awaiting_fw_count);
+
+        let Some(file) = state.file.as_ref() else {
+            // Should be unreachable: awaiting acks imply a previous
+            // successful write_all, which requires an open file.
+            tracing::error!(
+                "journal-uring: awaiting acks but no open file; dropping {} acks",
+                syncing_acks.len()
+            );
+            syncing_acks.clear();
+            *syncing_oldest_enqueue = None;
+            *syncing_fw_count = 0;
+            return;
+        };
+
+        let fd = file.as_raw_fd();
+        let fsync_sqe = opcode::Fsync::new(types::Fd(fd))
+            .build()
+            .user_data(1);
+        unsafe {
+            if ring.submission().push(&fsync_sqe).is_err() {
+                tracing::error!("journal-uring: SQ full");
+            }
+        }
+        if let Err(e) = ring.submit() {
+            tracing::error!("journal-uring: submit failed: {e}");
+        }
+        *fsync_in_flight = true;
+        *fsync_start = Some(Instant::now());
+        *syncing_mark = Some((state.log_id, state.position));
+    }
+
     fs::create_dir_all(&config.journal_dir).ok();
 
     let mut ring = match IoUring::<io_uring::squeue::Entry>::new(64) {
@@ -463,7 +528,9 @@ fn journal_uring_loop(
     // Track the oldest enqueue time of pending (not-yet-syncing) entries.
     let mut pending_oldest_enqueue: Option<Instant> = None;
 
-    // Acks waiting for the in-flight fsync to complete.
+    // Acks waiting for the in-flight fsync to complete. These belong to
+    // entries whose bytes were written *before* the in-flight fsync's SQE
+    // was submitted, so its CQE durably covers them.
     let mut syncing_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
     let mut syncing_oldest_enqueue: Option<Instant> = None;
     let mut syncing_fw_count: u64 = 0; // force-write requests grouped in current fsync
@@ -472,6 +539,17 @@ fn journal_uring_loop(
     // Durable (log_id, offset) snapshot captured when the in-flight fsync
     // was submitted. Applied to shared_last_mark only on CQE success.
     let mut syncing_mark: Option<(u64, u64)> = None;
+
+    // Acks for entries written to the page cache *after* the in-flight
+    // fsync's SQE was submitted. They must NOT be drained by the in-flight
+    // fsync — io_uring fsync only guarantees coverage of bytes already
+    // dirty when vfs_fsync_range runs, and the kernel may execute the
+    // fsync inline at submit time, before these later writes. Once the
+    // in-flight fsync drains, these are promoted to syncing_* and a fresh
+    // fsync is submitted that durably covers them.
+    let mut awaiting_acks: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+    let mut awaiting_oldest_enqueue: Option<Instant> = None;
+    let mut awaiting_fw_count: u64 = 0;
 
     loop {
         // If fsync is in flight, don't block -- poll for entries and CQE.
@@ -487,6 +565,12 @@ fn journal_uring_loop(
                         &on_fatal_error,
                         &mut syncing_mark, &shared_last_mark,
                     );
+                    chain_fresh_fsync_if_awaiting(
+                        &mut ring, &state,
+                        &mut syncing_acks, &mut syncing_oldest_enqueue, &mut syncing_fw_count,
+                        &mut awaiting_acks, &mut awaiting_oldest_enqueue, &mut awaiting_fw_count,
+                        &mut fsync_in_flight, &mut fsync_start, &mut syncing_mark,
+                    );
                     // If fsync still in flight and no entries, do a short wait
                     if fsync_in_flight {
                         match rx.recv_timeout(Duration::from_micros(100)) {
@@ -499,6 +583,12 @@ fn journal_uring_loop(
                                     &on_fatal_error,
                                     &mut syncing_mark, &shared_last_mark,
                                 );
+                                chain_fresh_fsync_if_awaiting(
+                                    &mut ring, &state,
+                                    &mut syncing_acks, &mut syncing_oldest_enqueue, &mut syncing_fw_count,
+                                    &mut awaiting_acks, &mut awaiting_oldest_enqueue, &mut awaiting_fw_count,
+                                    &mut fsync_in_flight, &mut fsync_start, &mut syncing_mark,
+                                );
                                 continue;
                             }
                         }
@@ -507,7 +597,25 @@ fn journal_uring_loop(
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    // Channel closed -- wait for in-flight fsync then exit
+                    // Channel closed -- wait for in-flight fsync, then for any
+                    // entries that were written but not yet covered by a fsync.
+                    if fsync_in_flight {
+                        ring.submit_and_wait(1).ok();
+                        try_complete_fsync(
+                            &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
+                            &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
+                            &on_fatal_error,
+                            &mut syncing_mark, &shared_last_mark,
+                        );
+                    }
+                    // Promote any awaiting acks and submit a fresh fsync so
+                    // their callers see durability before the thread exits.
+                    chain_fresh_fsync_if_awaiting(
+                        &mut ring, &state,
+                        &mut syncing_acks, &mut syncing_oldest_enqueue, &mut syncing_fw_count,
+                        &mut awaiting_acks, &mut awaiting_oldest_enqueue, &mut awaiting_fw_count,
+                        &mut fsync_in_flight, &mut fsync_start, &mut syncing_mark,
+                    );
                     if fsync_in_flight {
                         ring.submit_and_wait(1).ok();
                         try_complete_fsync(
@@ -682,7 +790,9 @@ fn journal_uring_loop(
                     advise_dontneed(file.as_raw_fd(), write_start_pos as i64, written_len as i64);
                 }
 
-                // If a previous fsync completed, check CQE
+                // If a previous fsync completed, drain its CQE first so we
+                // can possibly submit a fresh fsync that durably covers the
+                // bytes we just wrote.
                 if fsync_in_flight {
                     try_complete_fsync(
                         &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
@@ -692,27 +802,58 @@ fn journal_uring_loop(
                     );
                 }
 
-                // Move pending acks to syncing (they'll be ACK'd when fsync completes)
-                syncing_acks.append(&mut pending_acks);
-                if syncing_oldest_enqueue.is_none() {
-                    syncing_oldest_enqueue = pending_oldest_enqueue.take();
+                // Record JOURNAL_PROCESS_TIME_LATENCY
+                metrics::JOURNAL_PROCESS_TIME_LATENCY.observe(process_start.elapsed().as_secs_f64());
+
+                if fsync_in_flight {
+                    // A previous fsync is still in flight. Its SQE was
+                    // submitted before this batch's bytes were written, so
+                    // it does NOT durably cover them — io_uring fsync only
+                    // covers pages dirty when vfs_fsync_range runs, and the
+                    // kernel may execute fsync inline at submit time. Park
+                    // these acks in `awaiting_*`; a fresh fsync covering
+                    // them will be submitted as soon as the in-flight one
+                    // drains (see chain_fresh_fsync_if_awaiting and the
+                    // !fsync_in_flight branch below).
+                    awaiting_acks.append(&mut pending_acks);
+                    if awaiting_oldest_enqueue.is_none() {
+                        awaiting_oldest_enqueue = pending_oldest_enqueue.take();
+                    } else if let Some(pe) = pending_oldest_enqueue.take() {
+                        if let Some(ref ae) = awaiting_oldest_enqueue {
+                            if pe < *ae {
+                                awaiting_oldest_enqueue = Some(pe);
+                            }
+                        }
+                    }
+                    awaiting_fw_count += 1;
                 } else {
-                    // Keep the older of the two
-                    if let Some(pe) = pending_oldest_enqueue.take() {
+                    // No fsync in flight. The fresh fsync we are about to
+                    // submit will cover everything dirty for this fd: this
+                    // batch's bytes plus any earlier batch whose acks were
+                    // parked in `awaiting_*` while the previous fsync ran.
+                    // Promote both into the syncing slot.
+                    syncing_acks.append(&mut awaiting_acks);
+                    syncing_acks.append(&mut pending_acks);
+                    if syncing_oldest_enqueue.is_none() {
+                        syncing_oldest_enqueue = awaiting_oldest_enqueue.take();
+                    } else if let Some(ae) = awaiting_oldest_enqueue.take() {
+                        if let Some(ref se) = syncing_oldest_enqueue {
+                            if ae < *se {
+                                syncing_oldest_enqueue = Some(ae);
+                            }
+                        }
+                    }
+                    if syncing_oldest_enqueue.is_none() {
+                        syncing_oldest_enqueue = pending_oldest_enqueue.take();
+                    } else if let Some(pe) = pending_oldest_enqueue.take() {
                         if let Some(ref se) = syncing_oldest_enqueue {
                             if pe < *se {
                                 syncing_oldest_enqueue = Some(pe);
                             }
                         }
                     }
-                }
-                syncing_fw_count += 1;
+                    syncing_fw_count += std::mem::take(&mut awaiting_fw_count) + 1;
 
-                // Record JOURNAL_PROCESS_TIME_LATENCY
-                metrics::JOURNAL_PROCESS_TIME_LATENCY.observe(process_start.elapsed().as_secs_f64());
-
-                // Submit FSYNC if no fsync is in flight
-                if !fsync_in_flight {
                     let fd = file.as_raw_fd();
                     let fsync_sqe = opcode::Fsync::new(types::Fd(fd))
                         .build()
