@@ -66,10 +66,10 @@ pub struct JournalConfig {
     /// Test-only: invoked from the force-write thread (Mode 2) once for
     /// every successful fsync, with the journal log_id whose data was
     /// just durably synced. Lets integration tests verify that every
-    /// log_id touched by the writer thread is fsynced — catching the
-    /// J-2 class of bug where rotation-spanning groups would skip
-    /// older log_ids. Default `None`. Production code should leave it
-    /// unset; the closure runs on the force-write thread's hot path.
+    /// log_id touched by the writer thread is fsynced — catching bugs
+    /// where rotation-spanning groups would skip older log_ids.
+    /// Default `None`. Production code should leave it unset; the
+    /// closure runs on the force-write thread's hot path.
     #[doc(hidden)]
     pub fsync_observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
@@ -390,8 +390,8 @@ struct ForceWriteRequest {
     /// as the grouping key in `force_write_loop`: requests with the same
     /// log_id target the same journal file and can share an fsync; a
     /// change in log_id signals a rotation, so the prior file must be
-    /// fsynced before continuing (otherwise its writes would be acked
-    /// without ever reaching disk — see J-2 in docs/code-review-2026-04.md).
+    /// fsynced before continuing — otherwise its writes would be acked
+    /// without ever reaching disk.
     log_id: u64,
     /// Journal file position immediately after the bytes just written —
     /// becomes `lastLogMark.offset` after the fsync succeeds.
@@ -479,10 +479,10 @@ fn journal_uring_loop(
     // so the kernel's vfs_fsync_range — which runs at or after submit —
     // is guaranteed to cover those bytes.
     //
-    // This is the chained half of the J-1 fix (see docs/code-review-2026-04.md):
-    // an in-flight fsync only durably covers entries written before its SQE
-    // was submitted, so any entries written after it must wait for a *new*
-    // fsync that the loop submits as soon as the previous one drains.
+    // An in-flight fsync only durably covers entries written before its
+    // SQE was submitted, so any entries written after it must wait for
+    // a *new* fsync that the loop submits as soon as the previous one
+    // drains.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     fn chain_fresh_fsync_if_awaiting(
@@ -775,10 +775,10 @@ fn journal_uring_loop(
         let batch_bytes = write_buf.len() as u64;
         let batch_entries = pending_acks.len();
         if state.position > 0 && state.position + batch_bytes > config.max_file_size {
-            // J-3: rotation must not abandon batches whose bytes are on
-            // the file we are about to drop. (1) Drain any in-flight
-            // FSYNC — io_uring resolves the fd at execution time, so a
-            // FSYNC submitted for the old fd would return EBADF after
+            // Rotation must not abandon batches whose bytes are on the
+            // file we are about to drop. (1) Drain any in-flight FSYNC —
+            // io_uring resolves the fd at execution time, so a FSYNC
+            // submitted for the old fd would return EBADF after
             // state.rotate() closes it. (2) If acks are still parked
             // waiting for an fsync covering this file, submit a fresh
             // FSYNC on the *current* file before rotating, so those
@@ -1208,7 +1208,7 @@ fn flush_write_buf(
                 // writer thread's next `state.rotate()` (which drops
                 // `state.file` and closes the writer's fd). Without this,
                 // the force-write thread can race rotation and fsync a
-                // closed-or-reused fd (J-2).
+                // closed-or-reused fd.
                 let dup_file = match file.try_clone() {
                     Ok(f) => f,
                     Err(e) => {
@@ -1327,7 +1327,7 @@ fn force_write_loop(
         // Build groups in submission order. Requests targeting the same
         // log_id share an fsync; a log_id change marks a journal rotation
         // and forces a new group so the prior file's writes are durably
-        // synced before its acks fire (J-2).
+        // synced before its acks fire.
         let mut groups: Vec<FsyncGroup> = vec![FsyncGroup::from_request(first)];
         while let Ok(req) = rx.try_recv() {
             metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
