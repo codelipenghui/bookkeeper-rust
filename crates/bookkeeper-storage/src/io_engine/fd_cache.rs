@@ -53,10 +53,29 @@ impl FdCache {
             self.evict_lru();
         }
 
+        // If every entry is pinned, evict_lru is a no-op and
+        // free_indices stays empty. We MUST refuse the insert in that
+        // case: silently reusing slot 0 would alias the new fd onto an
+        // existing log_id's fixed-file slot, and any in-flight SQE
+        // referencing that slot would read from the wrong file. Surface
+        // a transient-busy error so the caller can fail or retry the
+        // request rather than corrupt data.
+        if self.free_indices.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "fd cache exhausted (capacity={}, all entries pinned)",
+                    self.capacity
+                ),
+            ));
+        }
+
         let path = entry_log_dir.join(super::entry_log_filename(log_id));
         let file = File::open(&path)?;
         let fd = file.as_raw_fd();
-        let fixed_index = self.free_indices.pop().unwrap_or(0);
+        let fixed_index = self.free_indices
+            .pop()
+            .expect("free_indices non-empty (checked above)");
 
         self.entries.insert(
             log_id,

@@ -244,6 +244,53 @@ mod fd_cache_tests {
         let (_, _, is_new) = cache.get_or_open(dir.path(), 0).unwrap();
         assert!(!is_new, "second access should be cached");
     }
+
+    /// When every cached entry is pinned by an in-flight SQE, evict_lru
+    /// can free nothing. The cache must surface this as an error rather
+    /// than silently aliasing the new entry onto an already-in-use fixed
+    /// file slot — that aliasing would let an in-flight SQE read from
+    /// the wrong file.
+    #[test]
+    fn refuses_insert_when_all_entries_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..4u32 {
+            std::fs::write(dir.path().join(format!("{:x}.log", i)), b"x").unwrap();
+        }
+
+        let mut cache = FdCache::new(2);
+        let (_, idx0, _) = cache.get_or_open(dir.path(), 0).unwrap();
+        let (_, idx1, _) = cache.get_or_open(dir.path(), 1).unwrap();
+        // Pin both entries to simulate having outstanding SQEs against
+        // each one. The next insert can neither evict nor allocate a
+        // free slot.
+        cache.pin(0);
+        cache.pin(1);
+
+        let err = cache
+            .get_or_open(dir.path(), 2)
+            .expect_err("get_or_open must fail when every slot is pinned");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        // Crucially, the existing slots must remain unchanged — no
+        // collision. Reissuing get_or_open for the cached log_ids
+        // returns the same fixed indices.
+        let (_, idx0_again, was_new) = cache.get_or_open(dir.path(), 0).unwrap();
+        assert!(!was_new);
+        assert_eq!(idx0_again, idx0);
+        let (_, idx1_again, was_new) = cache.get_or_open(dir.path(), 1).unwrap();
+        assert!(!was_new);
+        assert_eq!(idx1_again, idx1);
+        assert_ne!(idx0, idx1, "distinct entries must hold distinct slots");
+
+        // Once SQEs complete and unpin runs, the next insert succeeds.
+        cache.unpin_all();
+        let (_, idx2, was_new) = cache.get_or_open(dir.path(), 2).unwrap();
+        assert!(was_new);
+        // The newly-allocated slot reuses one of the freed indices —
+        // it must not collide with whatever entry remains cached.
+        assert!(idx2 != idx0 || !cache.contains(0));
+        assert!(idx2 != idx1 || !cache.contains(1));
+    }
 }
 
 // ---------------------------------------------------------------------------
