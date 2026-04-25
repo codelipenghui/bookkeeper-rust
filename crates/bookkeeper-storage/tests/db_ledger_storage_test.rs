@@ -602,3 +602,36 @@ async fn empty_master_key_is_replaced_by_real_key_on_check() {
     // A different key is rejected.
     assert!(storage.check_master_key(42, b"other-pw").is_err());
 }
+
+/// LAC must never go backwards in our in-memory tracking. A buggy or
+/// stale caller (a stale replay of a journal entry, or a client WriteLac
+/// that violates the per-ledger monotonicity invariant) must not demote
+/// a previously-cached higher LAC. The fix uses an entry().and_modify
+/// (max).or_insert pattern at every site that writes lac_cache.
+///
+/// `get_last_add_confirmed` first consults `unified_cache.last_entry_id`
+/// (a lower bound from cache content), so to exercise the lac_cache
+/// path we don't add real entries — we drive the LAC strictly via
+/// set_explicit_lac, which is the public knob clients use.
+#[tokio::test]
+async fn lac_cache_stays_monotonic_against_lower_set_explicit_lac() {
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    storage.validate_for_write(1, b"k").unwrap();
+
+    // Establish a high LAC via the explicit path; lac_cache(1) = 10.
+    storage.set_explicit_lac(1, 10).unwrap();
+    let after_high = storage.get_last_add_confirmed(1).unwrap();
+    assert_eq!(after_high, 10, "set_explicit_lac(10) should advance LAC to 10");
+
+    // A stale or buggy caller tries to set lac=5. The cache must not
+    // accept this demotion.
+    storage.set_explicit_lac(1, 5).unwrap();
+    let after_low = storage.get_last_add_confirmed(1).unwrap();
+    assert_eq!(
+        after_low, 10,
+        "in-memory LAC was demoted from 10 to {after_low}; LAC must be \
+         monotonic against stale or out-of-order writers",
+    );
+}

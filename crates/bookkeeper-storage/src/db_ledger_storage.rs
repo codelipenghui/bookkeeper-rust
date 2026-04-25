@@ -469,7 +469,14 @@ impl DbLedgerStorage {
                     let _ = self.ledger_index.set(ledger_id, false, None, None);
                 }
                 if lac >= 0 {
-                    self.lac_cache.insert(ledger_id, lac);
+                    // Monotonic merge — a stale replayed entry whose lac
+                    // is below the current cached value must NOT demote
+                    // it. Once the bookie has acked an LAC of N for a
+                    // ledger, recovery must preserve at least N.
+                    self.lac_cache
+                        .entry(ledger_id)
+                        .and_modify(|v| *v = (*v).max(lac))
+                        .or_insert(lac);
                 }
                 let _ = self.unified_cache.put_write(ledger_id, entry_id, entry_data);
             }
@@ -477,8 +484,11 @@ impl DbLedgerStorage {
 
         if replayed > 0 {
             tracing::info!("Journal: replayed {} entries from crash recovery", replayed);
-            // Flush replayed entries to entry logs
-            let _ = self.flush().await;
+            // Flush replayed entries to entry logs. Propagate any error:
+            // a swallowed flush failure leaves the bookie advertising
+            // entries it can't actually serve (LAC advanced via cache,
+            // but the bytes never made it to the entry log).
+            self.flush().await?;
         }
 
         // Start journal writer
@@ -891,9 +901,14 @@ impl LedgerStorage for DbLedgerStorage {
         }
 
         // Update LAC in memory only (no RocksDB write per entry).
-        // Persisted to RocksDB during flush/checkpoint.
+        // Persisted to RocksDB during flush/checkpoint. Monotonic merge:
+        // out-of-order processing of two adds for the same ledger must
+        // not demote a higher LAC that a later add already published.
         if lac >= 0 {
-            self.lac_cache.insert(ledger_id, lac);
+            self.lac_cache
+                .entry(ledger_id)
+                .and_modify(|v| *v = (*v).max(lac))
+                .or_insert(lac);
         }
 
         // Notify long poll watchers that LAC has advanced.
@@ -1179,7 +1194,17 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn set_explicit_lac(&self, ledger_id: i64, lac: i64) -> Result<(), StorageError> {
-        self.lac_cache.insert(ledger_id, lac);
+        // Monotonic merge — a buggy or stale caller must not demote an
+        // LAC that's already been published. Apache BookKeeper's WriteLac
+        // request is a client-side advertisement of the LAC the writer
+        // believes it has confirmed; if the bookie has already cached a
+        // higher value (e.g., from a recent add_entry), accepting the
+        // smaller value would violate the per-ledger monotonicity
+        // invariant that readers rely on.
+        self.lac_cache
+            .entry(ledger_id)
+            .and_modify(|v| *v = (*v).max(lac))
+            .or_insert(lac);
         Ok(())
     }
 
