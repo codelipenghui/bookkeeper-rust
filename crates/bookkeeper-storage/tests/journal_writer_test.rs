@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use bookkeeper_storage::io_engine::std_engine::StdEngine;
 use bookkeeper_storage::io_engine::JournalIo;
+use bookkeeper_storage::journal::format::LastMark;
 use bookkeeper_storage::journal::writer::{Journal, JournalConfig, replay_journal};
 
 fn default_journal_io() -> Arc<dyn JournalIo> {
@@ -433,15 +434,21 @@ async fn force_write_groups_across_rotation_with_mode2() {
         "no journal fatal-errors expected during graceful Mode 2 run"
     );
 
-    // Collect log_ids of every journal file the writer produced (parsed
-    // from the `<hex>.txn` filename).
+    // Collect log_ids of every journal file with at least one entry
+    // beyond the header. A file may legitimately exist with only a
+    // header if `ensure_open` ran but the very first batch was big
+    // enough to trigger immediate rotation — that file never gets a
+    // ForceWriteRequest, so the J-2 invariant doesn't apply. The
+    // header is 512 B for format_version >= 5 (SECTOR_SIZE).
     let on_disk_log_ids: HashSet<u64> = std::fs::read_dir(tmp.path())
         .unwrap()
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            name.strip_suffix(".txn")
-                .and_then(|s| u64::from_str_radix(s, 16).ok())
+            let log_id = name.strip_suffix(".txn")
+                .and_then(|s| u64::from_str_radix(s, 16).ok())?;
+            let size = e.metadata().ok()?.len();
+            if size > 512 { Some(log_id) } else { None }
         })
         .collect();
 
@@ -449,7 +456,7 @@ async fn force_write_groups_across_rotation_with_mode2() {
     // can't trigger and the test would prove nothing.
     assert!(
         on_disk_log_ids.len() >= 4,
-        "expected many rotated .txn files, got {} (J-2 path not exercised)",
+        "expected many rotated .txn files with entries, got {} (J-2 path not exercised)",
         on_disk_log_ids.len()
     );
 
@@ -478,4 +485,133 @@ async fn force_write_groups_across_rotation_with_mode2() {
         count, num_entries,
         "replay missed entries: rotation-spanning grouping lost data"
     );
+}
+
+/// J-3 regression: in the io_uring journal loop (Mode 1), `state.rotate()`
+/// can run while a FSYNC for the previous file is still in flight. On
+/// recent Linux kernels io_uring resolves the SQE's fd at execution
+/// time — so closing the fd in user-space (via `state.rotate()`'s
+/// `state.file = None`) before the kernel processes the FSYNC SQE
+/// returns EBADF. That fires the journal's fatal-error callback,
+/// drops `syncing_acks` without signalling, and the writer task's
+/// callers see `journal ack lost`. Even when EBADF doesn't fire (older
+/// kernels), the J-1 fix's chained FSYNC submits on the *new* file
+/// after rotation, leaving the old file's awaiting batches unsynced;
+/// `shared_last_mark` advances past the old log_id and replay skips it.
+///
+/// Detection: drive concurrent writers fast enough that the writer
+/// thread emits multiple flushes spanning a rotation while the previous
+/// file's FSYNC is still in flight. With the J-3 bug, every
+/// `log_add_entry().await.unwrap()` will panic with `journal ack lost`
+/// on this kernel. With the fix (rotation drains in-flight FSYNC and
+/// flushes awaiting before closing the old fd), no fatal errors and
+/// every entry's ack fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotation_during_inflight_fsync_replays_correctly_mode1() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = make_config(tmp.path().to_path_buf());
+    // Mode 1 (uring) is the default on Linux+io_uring; this test
+    // intentionally does NOT set force_std_engine_mode so it exercises
+    // the io_uring journal loop where J-3 lives.
+    cfg.max_file_size = 4 * 1024;
+    cfg.max_group_wait_ms = 1;
+    cfg.alignment_size = 0;
+    cfg.buffered_writes_threshold = 256;
+
+    let fatal_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let fc = fatal_count.clone();
+    let on_fatal: bookkeeper_storage::journal::writer::OnFatalError =
+        Box::new(move |e| {
+            fc.fetch_add(1, Ordering::SeqCst);
+            eprintln!("journal fatal during J-3 test: {e}");
+        });
+    let journal = std::sync::Arc::new(Journal::start(
+        cfg,
+        default_journal_io(),
+        Some(on_fatal),
+    ));
+
+    // Concurrent writers keep the journal queue populated *during* an
+    // in-flight FSYNC, so the writer thread emits multiple flushes per
+    // FSYNC window. With max_file_size = 4 KiB and 200 B entries, we
+    // get ~18 entries per file → many rotations, including some that
+    // fall inside the FSYNC window (which is exactly what J-3 needs).
+    let num_tasks = 64;
+    let entries_per_task = 30;
+    let num_entries = num_tasks * entries_per_task;
+    let mut handles = Vec::with_capacity(num_tasks);
+    for tid in 0..num_tasks {
+        let j = journal.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..entries_per_task {
+                let mut buf = Vec::with_capacity(256);
+                buf.extend_from_slice(&(tid as i64).to_be_bytes());
+                buf.extend_from_slice(&(i as i64).to_be_bytes());
+                buf.extend_from_slice(&(i as i64 - 1).to_be_bytes());
+                buf.extend_from_slice(&200i64.to_be_bytes());
+                buf.extend_from_slice(&[b'x'; 200]);
+                // Pre-fix: this panics with "journal ack lost" once
+                // the FSYNC-vs-rotate EBADF clears syncing_acks.
+                j.log_add_entry(&buf).await.unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // The mark must be valid (rotation cycled through many log_ids) and
+    // no fatal error should have fired during the run.
+    let mark = journal.current_mark();
+
+    drop(journal);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    assert_eq!(
+        fatal_count.load(Ordering::SeqCst),
+        0,
+        "journal fired fatal-error during graceful Mode 1 run \
+         (likely EBADF from rotation closing fd of in-flight FSYNC)"
+    );
+
+    let on_disk_log_ids: std::collections::HashSet<u64> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".txn")
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+        })
+        .collect();
+    assert!(
+        on_disk_log_ids.len() >= 4,
+        "expected many rotated .txn files, got {} (J-3 path not exercised)",
+        on_disk_log_ids.len()
+    );
+
+    // Sanity check the mark stays within the on-disk log_ids and at a
+    // sane offset — pre-fix it could be `None` if every fsync failed.
+    let mark = mark.expect("current_mark must be Some after a successful run");
+    assert!(
+        on_disk_log_ids.contains(&mark.0),
+        "current_mark log_id {:x} not in on-disk files {:x?}",
+        mark.0, on_disk_log_ids
+    );
+
+    // Replay (without a mark) recovers every acked entry across every
+    // rotated file. This verifies no data ended up unrecoverable.
+    let mut count = 0;
+    replay_journal(tmp.path(), None, |_| count += 1).unwrap();
+    assert_eq!(
+        count, num_entries,
+        "replay missed entries: rotation during in-flight FSYNC \
+         lost data (final mark={:x?}, on_disk_log_ids={:x?})",
+        mark, on_disk_log_ids,
+    );
+
+    // Suppress the LastMark unused warning when this is the only J-3
+    // assertion. The type is still used by the import for clarity.
+    let _ = LastMark::new(0, 0);
 }

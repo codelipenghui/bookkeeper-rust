@@ -775,6 +775,40 @@ fn journal_uring_loop(
         let batch_bytes = write_buf.len() as u64;
         let batch_entries = pending_acks.len();
         if state.position > 0 && state.position + batch_bytes > config.max_file_size {
+            // J-3: rotation must not abandon batches whose bytes are on
+            // the file we are about to drop. (1) Drain any in-flight
+            // FSYNC — io_uring resolves the fd at execution time, so a
+            // FSYNC submitted for the old fd would return EBADF after
+            // state.rotate() closes it. (2) If acks are still parked
+            // waiting for an fsync covering this file, submit a fresh
+            // FSYNC on the *current* file before rotating, so those
+            // bytes are durable before the fd disappears. Without this,
+            // shared_last_mark advances past the old log_id and replay
+            // skips it on restart.
+            if fsync_in_flight {
+                let _ = ring.submit_and_wait(1);
+                try_complete_fsync(
+                    &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
+                    &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
+                    &on_fatal_error,
+                    &mut syncing_mark, &shared_last_mark,
+                );
+            }
+            chain_fresh_fsync_if_awaiting(
+                &mut ring, &state,
+                &mut syncing_acks, &mut syncing_oldest_enqueue, &mut syncing_fw_count,
+                &mut awaiting_acks, &mut awaiting_oldest_enqueue, &mut awaiting_fw_count,
+                &mut fsync_in_flight, &mut fsync_start, &mut syncing_mark,
+            );
+            if fsync_in_flight {
+                let _ = ring.submit_and_wait(1);
+                try_complete_fsync(
+                    &mut ring, &mut syncing_acks, &mut syncing_oldest_enqueue,
+                    &mut syncing_fw_count, &mut fsync_start, &mut fsync_in_flight,
+                    &on_fatal_error,
+                    &mut syncing_mark, &shared_last_mark,
+                );
+            }
             if let Err(e) = state.rotate(&config) {
                 tracing::warn!("Journal rotation error: {e}");
             }
