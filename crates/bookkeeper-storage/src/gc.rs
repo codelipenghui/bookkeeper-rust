@@ -211,8 +211,16 @@ impl GarbageCollector {
                 Err(_) => continue,
             };
 
-            if current_log_id == Some(log_id) {
-                continue;
+            // Skip the active log AND any log_id above the snapshot taken
+            // at the start of this GC pass. Those higher ids are either
+            // the active log we're about to write to or files produced
+            // by a rotation that raced with our snapshot — both must
+            // not be examined here. They'll be eligible on the next
+            // pass once the writer has settled them.
+            if let Some(skip_floor) = current_log_id {
+                if log_id >= skip_floor {
+                    continue;
+                }
             }
 
             // Get metadata — prefer persistent cache, fall back to file read
@@ -312,8 +320,13 @@ impl GarbageCollector {
             let Some(name_str) = name.to_str() else { continue };
             let Some(stem) = name_str.strip_suffix(".log") else { continue };
             let Ok(log_id) = u32::from_str_radix(stem, 16) else { continue };
-            if current_log_id == Some(log_id) {
-                continue;
+            // Same skip-floor rule as `gc_and_compact_entry_logs`: don't
+            // probe the active log nor any log_id above the snapshot,
+            // since those may still be receiving writes.
+            if let Some(skip_floor) = current_log_id {
+                if log_id >= skip_floor {
+                    continue;
+                }
             }
             if mm.contains(log_id)? {
                 continue;

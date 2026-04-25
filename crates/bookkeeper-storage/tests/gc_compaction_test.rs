@@ -90,6 +90,18 @@ fn entry_log_dir_for(storage: &DbLedgerStorage) -> &Path {
     storage.entry_log_dir().expect("entry_log_dir is set")
 }
 
+/// Layout helper: synthetic test files must live at log_ids strictly
+/// below the storage's `current_log_id` so GC's skip-floor doesn't treat
+/// them as products of an in-flight rotation. Pre-create the entry-log
+/// directory and the synthetic files there before the storage opens —
+/// `DbLedgerStorage::open` runs `next_entry_log_id` which discovers them
+/// and starts the storage's own log_id strictly above them.
+fn pre_create_entry_log_dir(dir: &TempDir) -> std::path::PathBuf {
+    let entry_log_dir = dir.path().join("current");
+    std::fs::create_dir_all(&entry_log_dir).unwrap();
+    entry_log_dir
+}
+
 // ---------------------------------------------------------------------------
 // Empty file deletion
 // ---------------------------------------------------------------------------
@@ -97,15 +109,15 @@ fn entry_log_dir_for(storage: &DbLedgerStorage) -> &Path {
 #[tokio::test]
 async fn gc_deletes_entry_log_file_when_all_ledgers_are_dead() {
     let dir = TempDir::new().unwrap();
-    let storage = open_storage(&dir);
-
-    // Manually create a non-current log file containing entries for ledger
-    // 999, which the storage's index has never heard of.
+    let entry_log_dir = pre_create_entry_log_dir(&dir);
+    // Pre-create the synthetic file BEFORE open so `next_entry_log_id`
+    // sees it and starts current_log_id strictly above 5.
     let log_path = write_entry_log_file(
-        entry_log_dir_for(&storage),
+        &entry_log_dir,
         5,
         &[(999, 0), (999, 1), (999, 2)],
     );
+    let storage = open_storage(&dir);
     assert!(log_path.exists());
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
@@ -121,18 +133,15 @@ async fn gc_deletes_entry_log_file_when_all_ledgers_are_dead() {
 #[tokio::test]
 async fn gc_deletes_only_files_with_no_active_ledgers() {
     let dir = TempDir::new().unwrap();
+    let entry_log_dir = pre_create_entry_log_dir(&dir);
+    // Pre-create both synthetic files so the storage's first log_id
+    // is at least 7 — past the GC skip-floor for 5 and 6.
+    let dead_path = write_entry_log_file(&entry_log_dir, 5, &[(999, 0), (999, 1)]);
+    let live_path = write_entry_log_file(&entry_log_dir, 6, &[(100, 0), (100, 1)]);
     let storage = open_storage(&dir);
 
     // Make ledger 100 active in the storage's local index
     storage.validate_for_write(100, b"k").unwrap();
-
-    let entry_log_dir = entry_log_dir_for(&storage).to_path_buf();
-
-    // File 5: only ledger 999 (dead) → must be deleted
-    let dead_path = write_entry_log_file(&entry_log_dir, 5, &[(999, 0), (999, 1)]);
-
-    // File 6: only ledger 100 (active) → must be preserved
-    let live_path = write_entry_log_file(&entry_log_dir, 6, &[(100, 0), (100, 1)]);
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
@@ -152,20 +161,9 @@ async fn gc_deletes_only_files_with_no_active_ledgers() {
 #[tokio::test]
 async fn gc_compacts_low_usage_log_file_and_relocates_live_entries() {
     let dir = TempDir::new().unwrap();
-    let storage = open_storage(&dir);
-
-    // Make ledger 100 active in the local index so the GC sees it as live.
-    storage.validate_for_write(100, b"k").unwrap();
-
-    let entry_log_dir = entry_log_dir_for(&storage).to_path_buf();
-
-    // Build a log file where 1 entry is for ledger 100 (live) and 9 are for
-    // ledger 999 (dead). Usage = 1/10 = 10%, well below the major threshold
-    // of 80%, so the GC should compact this file:
-    //   - read each entry, find ledger 100 entry 42 is live
-    //   - call storage.write_entry_to_log → new location in current log (0)
-    //   - call storage.update_entry_locations → index now points to new loc
-    //   - delete old file 5
+    let entry_log_dir = pre_create_entry_log_dir(&dir);
+    // Pre-create the synthetic file so storage opens at log_id > 5 and
+    // GC's skip-floor doesn't shield log_id=5.
     let log_path = write_entry_log_file(
         &entry_log_dir,
         5,
@@ -183,7 +181,17 @@ async fn gc_compacts_low_usage_log_file_and_relocates_live_entries() {
         ],
     );
 
-    let current_path = entry_log_path(&entry_log_dir, 0);
+    let storage = open_storage(&dir);
+    // Make ledger 100 active in the local index so the GC sees it as live.
+    storage.validate_for_write(100, b"k").unwrap();
+    let entry_log_dir = entry_log_dir.clone();
+
+    // Storage will rotate into log_id `6` for compaction relocations
+    // (one past the highest pre-existing file).
+    let current_log_id = storage
+        .current_log_id()
+        .expect("storage should know its current log_id after open");
+    let current_path = entry_log_path(&entry_log_dir, current_log_id);
     let current_size_before = fs::metadata(&current_path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -351,13 +359,10 @@ async fn gc_never_deletes_or_compacts_the_current_log_file() {
 #[tokio::test]
 async fn gc_processes_multiple_log_files_in_single_pass() {
     let dir = TempDir::new().unwrap();
-    let storage = open_storage(&dir);
+    let entry_log_dir = pre_create_entry_log_dir(&dir);
 
-    // Active local ledger 100
-    storage.validate_for_write(100, b"k").unwrap();
-
-    let entry_log_dir = entry_log_dir_for(&storage).to_path_buf();
-
+    // Pre-create synthetic files at log_ids 5, 6, 7 so storage opens at
+    // log_id 8 (one past the max), keeping them below GC's skip-floor.
     // File 5: all dead → delete
     let dead_path = write_entry_log_file(&entry_log_dir, 5, &[(999, 0), (999, 1)]);
     // File 6: 100% live → keep
@@ -379,6 +384,10 @@ async fn gc_processes_multiple_log_files_in_single_pass() {
             (999, 8),
         ],
     );
+
+    let storage = open_storage(&dir);
+    // Active local ledger 100
+    storage.validate_for_write(100, b"k").unwrap();
 
     let gc = GarbageCollector::new(storage.clone() as Arc<dyn LedgerStorage>, Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>);
     let active = HashSet::from([100]);
