@@ -603,6 +603,115 @@ async fn empty_master_key_is_replaced_by_real_key_on_check() {
     assert!(storage.check_master_key(42, b"other-pw").is_err());
 }
 
+/// `checkpoint()` calls `Checkpoint::complete(&base_dir)` to write
+/// `current/lastMark` and then runs `cleanup_journals()` to remove old
+/// `.txn` files outside the backup window. If `complete()` fails (e.g.,
+/// the lastMark file can't be written because the path is unwritable),
+/// the persisted lastMark stays at its prior value — but the old
+/// journals must NOT be deleted. Otherwise, on a subsequent crash, the
+/// recovery path looks for journals that no longer exist and silently
+/// loses entries written between the previous lastMark and the
+/// (failed) new one.
+///
+/// Reproduce the failure deterministically: replace `current/lastMark`
+/// with a directory before calling `checkpoint()` so `File::create`
+/// returns `IsADirectory`. With the original code the warn is logged
+/// and `cleanup_journals` runs anyway. With the fix `checkpoint()`
+/// surfaces the error and skips `cleanup_journals`.
+#[tokio::test]
+async fn checkpoint_does_not_cleanup_journals_when_complete_fails() {
+    use bookkeeper_storage::journal::writer::JournalConfig;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+
+    // current/ is created lazily inside the storage. Pre-create it now
+    // so we can put a "blocking" directory at the lastMark path.
+    let current_dir = dir.path().join("current");
+    std::fs::create_dir_all(&current_dir).unwrap();
+
+    // Replace `current/lastMark` with a directory: File::create on a
+    // path that is itself a directory fails with EISDIR.
+    let last_mark_path = current_dir.join("lastMark");
+    std::fs::create_dir(&last_mark_path).unwrap();
+
+    let mut storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+
+    // Bring up the journal so checkpoint actually has marks to persist
+    // and cleanup_journals has something to consider.
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let cfg = JournalConfig {
+        journal_dir: journal_dir.clone(),
+        max_file_size: 4 * 1024,
+        sync_data: true,
+        max_group_wait_ms: 1,
+        buffered_writes_threshold: 256,
+        buffered_entries_threshold: 0,
+        alignment_size: 0,
+        format_version: 6,
+        max_queue_memory: 0,
+        flush_when_queue_empty: false,
+        remove_from_page_cache: false,
+        reuse_files: false,
+        max_backup_journals: 0, // aggressive cleanup so the bug is observable
+        force_std_engine_mode: false,
+        fsync_observer: None,
+    };
+    let journal_io: Arc<dyn bookkeeper_storage::io_engine::JournalIo> =
+        Arc::new(StdEngine::new());
+    storage.init_journal(&journal_dir, cfg, journal_io, None, false).await.unwrap();
+    storage.set_max_backup_journals(0);
+
+    // Drive the journal directly so several .txn files exist.
+    // db_ledger_storage's add_entry doesn't journal — the server
+    // processor normally calls journal.log_add_entry alongside it.
+    storage.validate_for_write(1, b"k").unwrap();
+    let journal = storage.journal().expect("journal initialized above");
+    for eid in 0..50i64 {
+        let entry = make_entry(1, eid, eid - 1, &vec![b'x'; 200]);
+        journal.log_add_entry(&entry).await.unwrap();
+        storage.add_entry(&entry).await.unwrap();
+    }
+    storage.flush().await.unwrap();
+    // Force a journal rotation by writing more so the journal hits
+    // max_file_size = 4 KiB. Each journal entry adds ~200 B + framing,
+    // so 50 entries × 200 B + headers comfortably crosses 4 KiB.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let txn_count_before: usize = std::fs::read_dir(&journal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".txn"))
+        .count();
+    assert!(
+        txn_count_before >= 2,
+        "test setup should have produced multiple .txn files; got {txn_count_before}",
+    );
+
+    // checkpoint() must surface the lastMark write failure rather than
+    // silently logging it. With the failure surfaced, cleanup_journals
+    // must NOT run — otherwise old journals are deleted while lastMark
+    // still points at an older safepoint, losing recovery data.
+    let result = storage.checkpoint().await;
+    assert!(
+        result.is_err(),
+        "checkpoint should return Err when Checkpoint::complete fails",
+    );
+
+    let txn_count_after: usize = std::fs::read_dir(&journal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".txn"))
+        .count();
+    assert_eq!(
+        txn_count_after, txn_count_before,
+        "old journals were deleted despite lastMark write failing; \
+         crash recovery between this checkpoint and the next would \
+         find a missing journal",
+    );
+}
+
 /// `next_entry_log_id` derives the next log_id from a directory scan
 /// (max existing + 1). After GC deletes the file at the highest log_id,
 /// the dir-scan max regresses — and on restart the storage would

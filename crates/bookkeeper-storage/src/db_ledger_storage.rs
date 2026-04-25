@@ -1392,12 +1392,14 @@ impl LedgerStorage for DbLedgerStorage {
         // Phase 2: Flush everything (routes through dedicated worker when installed)
         self.flush_via_dispatcher().await?;
 
-        // Phase 3: Persist lastMark only after successful flush.
-        // Matches Java's `journal.checkpointComplete(cp, true)`.
+        // Phase 3: Persist lastMark. cleanup_journals MUST be gated on
+        // this succeeding — otherwise we'd delete journal files older
+        // than the (failed) new mark, while the on-disk lastMark still
+        // points at an even-older safepoint. Recovery would then look
+        // for journals that no longer exist and silently lose every
+        // entry written between the old and intended marks.
         if let Some(cp) = cp {
-            if let Err(e) = cp.complete(&self.base_dir) {
-                tracing::warn!("Failed to write lastMark: {e}");
-            }
+            cp.complete(&self.base_dir)?;
         }
 
         self.cleanup_journals();
