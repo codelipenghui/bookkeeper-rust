@@ -357,12 +357,22 @@ impl Journal {
 // ---------------------------------------------------------------------------
 
 struct ForceWriteRequest {
-    fd: RawFd,
+    /// Owned (dup'd) file handle for the journal file these acks belong to.
+    /// Carrying ownership keeps the underlying fd alive across the writer
+    /// thread's `state.rotate()` (which drops its own `File` and would
+    /// otherwise close the fd before the force-write thread can fsync it).
+    /// Each request holds its own fd via `File::try_clone()`.
+    file: fs::File,
     acks: Vec<tokio::sync::oneshot::Sender<()>>,
     /// Earliest enqueue time among entries in this batch (for e2e latency).
     oldest_enqueue_time: Instant,
     /// Journal file log_id for this batch — advances the durable lastMark
-    /// after fsync. Matches Java's `ForceWriteRequest.logId`.
+    /// after fsync. Matches Java's `ForceWriteRequest.logId`. Also serves
+    /// as the grouping key in `force_write_loop`: requests with the same
+    /// log_id target the same journal file and can share an fsync; a
+    /// change in log_id signals a rotation, so the prior file must be
+    /// fsynced before continuing (otherwise its writes would be acked
+    /// without ever reaching disk — see J-2 in docs/code-review-2026-04.md).
     log_id: u64,
     /// Journal file position immediately after the bytes just written —
     /// becomes `lastLogMark.offset` after the fsync succeeds.
@@ -1140,10 +1150,32 @@ fn flush_write_buf(
             metrics::JOURNAL_PROCESS_TIME_LATENCY.observe(process_start.elapsed().as_secs_f64());
 
             if let Some(ref tx) = fw_tx {
-                // Mode 2: forward to force-write thread for sync
+                // Mode 2: forward to force-write thread for sync. Dup the
+                // fd so the request owns a handle that survives the
+                // writer thread's next `state.rotate()` (which drops
+                // `state.file` and closes the writer's fd). Without this,
+                // the force-write thread can race rotation and fsync a
+                // closed-or-reused fd (J-2).
+                let dup_file = match file.try_clone() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("FATAL: journal file dup failed: {e}");
+                        if let Some(ref callback) = on_fatal_error {
+                            callback(io::Error::new(
+                                e.kind(),
+                                format!("journal dup: {e}"),
+                            ));
+                        }
+                        // Drop acks without sending — callers will see
+                        // RecvError ("journal ack lost") and surface
+                        // an I/O error rather than a false-durability ack.
+                        write_buf.clear();
+                        return;
+                    }
+                };
                 metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.inc();
                 if tx.send(ForceWriteRequest {
-                    fd,
+                    file: dup_file,
                     acks,
                     oldest_enqueue_time: oldest_enqueue,
                     log_id: state.log_id,
@@ -1186,6 +1218,46 @@ fn flush_write_buf(
 // Force-write thread (StdEngine only)
 // ---------------------------------------------------------------------------
 
+/// A run of force-write requests that all target the same journal file
+/// (same `log_id`) and can therefore share a single fsync. The owned
+/// `file` keeps the underlying fd alive for the duration of the fsync,
+/// even if the writer thread has since rotated to a new journal file.
+struct FsyncGroup {
+    file: fs::File,
+    log_id: u64,
+    last_position: u64,
+    acks: Vec<tokio::sync::oneshot::Sender<()>>,
+    oldest_enqueue: Instant,
+    request_count: u64,
+}
+
+impl FsyncGroup {
+    fn from_request(req: ForceWriteRequest) -> Self {
+        Self {
+            file: req.file,
+            log_id: req.log_id,
+            last_position: req.last_flushed_position,
+            acks: req.acks,
+            oldest_enqueue: req.oldest_enqueue_time,
+            request_count: 1,
+        }
+    }
+
+    fn merge(&mut self, req: ForceWriteRequest) {
+        // The dup'd file from the merged request is redundant — both
+        // dups point at the same open file description, so dropping it
+        // (closing one of the two fds) is safe. Keep `self.file`.
+        drop(req.file);
+        self.acks.extend(req.acks);
+        if req.oldest_enqueue_time < self.oldest_enqueue {
+            self.oldest_enqueue = req.oldest_enqueue_time;
+        }
+        // Latest grouped request carries the furthest write position.
+        self.last_position = req.last_flushed_position;
+        self.request_count += 1;
+    }
+}
+
 fn force_write_loop(
     rx: mpsc::Receiver<ForceWriteRequest>,
     on_fatal_error: Option<Arc<dyn Fn(io::Error) + Send + Sync>>,
@@ -1198,61 +1270,75 @@ fn force_write_loop(
         };
         metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
 
-        let mut all_acks = first.acks;
-        let mut last_fd = first.fd;
-        let mut oldest_enqueue = first.oldest_enqueue_time;
-        let mut grouped_count: u64 = 1; // count of ForceWriteRequests grouped
-        // Track the last (log_id, position) across grouped requests.
-        let mut last_log_id = first.log_id;
-        let mut last_position = first.last_flushed_position;
-
+        // Build groups in submission order. Requests targeting the same
+        // log_id share an fsync; a log_id change marks a journal rotation
+        // and forces a new group so the prior file's writes are durably
+        // synced before its acks fire (J-2).
+        let mut groups: Vec<FsyncGroup> = vec![FsyncGroup::from_request(first)];
         while let Ok(req) = rx.try_recv() {
             metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
-            all_acks.extend(req.acks);
-            last_fd = req.fd;
-            // Keep the oldest enqueue time across all grouped requests
-            if req.oldest_enqueue_time < oldest_enqueue {
-                oldest_enqueue = req.oldest_enqueue_time;
+            // Safe to unwrap: groups starts non-empty and never shrinks.
+            let last = groups.last_mut().unwrap();
+            if last.log_id == req.log_id {
+                last.merge(req);
+            } else {
+                groups.push(FsyncGroup::from_request(req));
             }
-            // The last-grouped request carries the furthest write position.
-            // Matches Java's `ForceWriteThread.syncJournal(lastRequest)`.
-            last_log_id = req.log_id;
-            last_position = req.last_flushed_position;
-            grouped_count += 1;
         }
 
-        let sync_start = Instant::now();
-        if let Err(e) = sync_fd(last_fd) {
-            tracing::error!("FATAL: journal fsync failed: {e}");
+        // Process each group in submission order. Stop on first failure
+        // so we don't ack subsequent groups whose data is no longer
+        // protected by a successful fsync chain.
+        let mut fatal: Option<io::Error> = None;
+        for group in groups {
+            if fatal.is_some() {
+                // Earlier group failed — drop this group's acks too.
+                drop(group);
+                continue;
+            }
+            let sync_start = Instant::now();
+            if let Err(e) = group.file.sync_data() {
+                tracing::error!(
+                    "FATAL: journal fsync failed (log_id={:x}): {e}",
+                    group.log_id
+                );
+                fatal = Some(io::Error::new(e.kind(), format!("journal fsync: {e}")));
+                continue;
+            }
+            let sync_elapsed = sync_start.elapsed();
+
+            // fsync succeeded: advance the durable lastMark for this
+            // file. Submission order is monotonic, so a later group's
+            // (log_id, position) > earlier's; the `>` guard preserves
+            // that invariant against rare reorderings.
+            {
+                let mut guard = shared_last_mark.lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let new_mark = (group.log_id, group.last_position);
+                if new_mark > *guard {
+                    *guard = new_mark;
+                }
+            }
+
+            metrics::JOURNAL_SYNC.observe(sync_elapsed.as_secs_f64());
+            metrics::JOURNAL_ADD_ENTRY.observe(group.oldest_enqueue.elapsed().as_secs_f64());
+            metrics::JOURNAL_FORCE_WRITE_GROUPING_COUNT
+                .observe(group.request_count as f64);
+
+            for ack in group.acks {
+                let _ = ack.send(());
+            }
+        }
+
+        if let Some(e) = fatal {
             if let Some(ref cb) = on_fatal_error {
-                cb(io::Error::new(e.kind(), format!("journal fsync: {e}")));
+                cb(e);
             }
-            // Drop all pending acks without sending — callers will get
-            // a RecvError ("journal ack lost") which surfaces as an I/O
-            // error. Do NOT ack entries that were not durably synced.
-            continue;
-        }
-        let sync_elapsed = sync_start.elapsed();
-
-        // fsync succeeded: advance the durable lastMark.
-        // Matches Java's `lastLogMark.setCurLogMark(lastRequest.logId,
-        // lastRequest.lastFlushedPosition)` in `ForceWriteThread.syncJournal`.
-        {
-            let mut guard = shared_last_mark.lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let new_mark = (last_log_id, last_position);
-            if new_mark > *guard {
-                *guard = new_mark;
-            }
-        }
-
-        // Record metrics
-        metrics::JOURNAL_SYNC.observe(sync_elapsed.as_secs_f64());
-        metrics::JOURNAL_ADD_ENTRY.observe(oldest_enqueue.elapsed().as_secs_f64());
-        metrics::JOURNAL_FORCE_WRITE_GROUPING_COUNT.observe(grouped_count as f64);
-
-        for ack in all_acks {
-            let _ = ack.send(());
+            // Continue draining the queue rather than exiting — the
+            // writer thread may keep pushing requests until the bookie
+            // transitions to read-only and shuts the channel down. Acks
+            // for those will be dropped by the next iteration's
+            // failure-propagation, surfacing as "journal ack lost".
         }
     }
 }
@@ -1268,20 +1354,6 @@ fn advise_dontneed(fd: RawFd, offset: i64, len: i64) {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (fd, offset, len);
-    }
-}
-
-fn sync_fd(fd: RawFd) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::FromRawFd;
-        let file = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) });
-        file.sync_data()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = fd;
-        Ok(())
     }
 }
 
