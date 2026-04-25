@@ -91,6 +91,59 @@ fn write_buffer_reset_clears_offset_and_entries() {
     assert!(buf.take_entries().is_empty());
 }
 
+/// Concurrent writes to disjoint reserved ranges must not corrupt each
+/// other and must not exhibit aliasing UB. The original implementation
+/// went through `(*self.data.get()).as_mut_ptr()` — `*self.data.get()`
+/// is a place expression, so the auto-ref to `as_mut_ptr` (an `&mut self`
+/// method on Vec) constructed an `&mut Vec<u8>` from each thread.
+/// Two threads racing on `write_at` formed simultaneous `&mut Vec`
+/// aliases, which is UB under Stacked / Tree Borrows even though no
+/// real codegen miscompiles today. The fix caches a `*mut u8` at
+/// construction; writes/reads go through that pointer and never
+/// materialize a `&mut Vec` afterwards.
+///
+/// This stress test runs many threads writing to disjoint chunks. With
+/// the fix it is also clean under Miri's borrow tracker.
+#[test]
+fn write_buffer_concurrent_writes_to_disjoint_ranges_round_trip() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let buf = Arc::new(WriteBuffer::new(64 * 1024));
+    let num_threads = 16;
+    let writes_per_thread = 64;
+    let chunk_size = 32;
+
+    let mut handles = Vec::with_capacity(num_threads);
+    for tid in 0..num_threads {
+        let buf = buf.clone();
+        handles.push(thread::spawn(move || {
+            let mut placed = Vec::with_capacity(writes_per_thread);
+            for i in 0..writes_per_thread {
+                let off = buf.reserve(chunk_size).expect("buffer big enough");
+                let pattern: Vec<u8> = (0..chunk_size as u8)
+                    .map(|b| ((tid * 1000 + i) as u8).wrapping_add(b))
+                    .collect();
+                unsafe { buf.write_at(off, &pattern); }
+                placed.push((off, pattern));
+            }
+            placed
+        }));
+    }
+
+    for h in handles {
+        let placed = h.join().unwrap();
+        for (off, expected) in placed {
+            let read = unsafe { buf.read_at(off, expected.len()) };
+            assert_eq!(
+                read, expected,
+                "round-trip mismatch at offset {off}; concurrent writers \
+                 must not race on disjoint reserved ranges",
+            );
+        }
+    }
+}
+
 use bookkeeper_storage::StorageError;
 
 #[test]

@@ -69,7 +69,20 @@ fn align64(n: usize) -> usize { (n + ALIGNMENT - 1) & !(ALIGNMENT - 1) }
 /// tracks (ledger, entry) pairs stored here so drain/rotation can
 /// enumerate them without scanning the unified index.
 pub struct WriteBuffer {
+    /// Backing storage. Held in an `UnsafeCell` purely so the compiler
+    /// won't insert noalias annotations on `&self.data`. All reads and
+    /// writes go through the cached `data_ptr` below; we never form an
+    /// `&mut Vec<u8>` from this field after construction.
     data: UnsafeCell<Vec<u8>>,
+    /// Cached pointer to the heap allocation backing `data`. Captured
+    /// once at construction. The `Vec` is allocated at fixed capacity
+    /// and never resized, so this pointer stays valid for the lifetime
+    /// of the `WriteBuffer`. Going through this pointer (rather than
+    /// `(*self.data.get()).as_mut_ptr()`) avoids materializing a
+    /// transient `&mut Vec<u8>` on each write — concurrent writers
+    /// would otherwise alias that mutable reference, which is UB under
+    /// Stacked / Tree Borrows.
+    data_ptr: *mut u8,
     offset: AtomicUsize,
     max_size: usize,
     entries: Mutex<Vec<(i64, i64)>>,
@@ -77,15 +90,9 @@ pub struct WriteBuffer {
 
 // SAFETY:
 // - Concurrent appends receive disjoint byte ranges via the CAS in `reserve`.
-//   Writes proceed through `(*self.data.get()).as_mut_ptr()`, which calls
-//   `Vec::as_mut_ptr(&mut self)` via method syntax; the compiler's autoref
-//   thus creates a transient `&mut Vec<u8>` just long enough for pointer
-//   extraction. Under strict Stacked Borrows this is technically UB when
-//   two threads materialize the autoref simultaneously, but LLVM erases
-//   the reference before codegen and no real miscompilation is known on
-//   any platform we target. A future refactor may cache the data pointer
-//   at construction time (storing `data_ptr: *mut u8` alongside an
-//   `UnsafeCell<Box<[u8]>>`) to eliminate the autoref entirely.
+//   Writes proceed through the cached `data_ptr` (a `*mut u8`); no
+//   `&mut Vec<u8>` is ever formed across writers, so there is no
+//   aliasing of mutable references.
 // - Reads against already-written regions are safe because no writer
 //   overwrites a region until the unified index's entry pointing into
 //   it has been removed (invariant I3 — see the design spec); callers
@@ -97,8 +104,16 @@ unsafe impl Sync for WriteBuffer {}
 impl WriteBuffer {
     pub fn new(max_size: usize) -> Self {
         let aligned = align64(max_size);
+        let mut data: Vec<u8> = vec![0u8; aligned];
+        // Capture the heap pointer BEFORE moving the Vec into the
+        // UnsafeCell. `Vec::as_mut_ptr` returns a pointer to the heap
+        // allocation, and that allocation does not move when the Vec's
+        // metadata is moved into the cell. Since we never resize the
+        // Vec, the pointer remains valid for the buffer's entire life.
+        let data_ptr = data.as_mut_ptr();
         Self {
-            data: UnsafeCell::new(vec![0u8; aligned]),
+            data: UnsafeCell::new(data),
+            data_ptr,
             offset: AtomicUsize::new(0),
             max_size: aligned,
             entries: Mutex::new(Vec::new()),
@@ -125,11 +140,11 @@ impl WriteBuffer {
     /// # Safety
     /// Caller must hold a reserved range `[offset, offset + data.len())` obtained
     /// from [`reserve`] and not have written there yet. Concurrent writes to
-    /// disjoint ranges are safe because no mutable reference to the backing
-    /// `Vec<u8>` is materialized — writes proceed through a raw pointer to the
-    /// unique byte range reserved by the CAS.
+    /// disjoint ranges are safe because writes proceed through the cached
+    /// `data_ptr` — no mutable reference to the backing `Vec<u8>` is ever
+    /// materialized.
     pub unsafe fn write_at(&self, offset: usize, data: &[u8]) {
-        let dst = (*self.data.get()).as_mut_ptr().add(offset);
+        let dst = self.data_ptr.add(offset);
         std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
 
@@ -143,7 +158,7 @@ impl WriteBuffer {
     /// `buf` inside this function is locally owned and exclusive, so the
     /// `buf.as_mut_ptr()` call carries no aliasing implications.
     pub unsafe fn read_at(&self, offset: usize, size: usize) -> Vec<u8> {
-        let src = (*self.data.get()).as_ptr().add(offset);
+        let src: *const u8 = self.data_ptr.add(offset);
         let mut buf = Vec::with_capacity(size);
         std::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), size);
         buf.set_len(size);
