@@ -56,6 +56,22 @@ pub struct JournalConfig {
     /// Max number of old journal files to keep in the reuse pool.
     /// Matches Java's `maxBackupJournals`.
     pub max_backup_journals: usize,
+    /// Test-only: force the std-engine + force-write-thread mode (Mode 2)
+    /// even on Linux where io_uring is available. Production code should
+    /// leave this `false`; flipping it lets integration tests exercise
+    /// the force-write thread's grouping/fsync invariants on hosts where
+    /// io_uring would otherwise be selected.
+    #[doc(hidden)]
+    pub force_std_engine_mode: bool,
+    /// Test-only: invoked from the force-write thread (Mode 2) once for
+    /// every successful fsync, with the journal log_id whose data was
+    /// just durably synced. Lets integration tests verify that every
+    /// log_id touched by the writer thread is fsynced — catching the
+    /// J-2 class of bug where rotation-spanning groups would skip
+    /// older log_ids. Default `None`. Production code should leave it
+    /// unset; the closure runs on the force-write thread's hot path.
+    #[doc(hidden)]
+    pub fsync_observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 /// The journal — write-ahead log for crash recovery.
@@ -115,7 +131,9 @@ impl Journal {
         let mut threads = Vec::new();
 
         #[cfg(target_os = "linux")]
-        let use_uring = config.sync_data && crate::io_engine::uring_available();
+        let use_uring = config.sync_data
+            && !config.force_std_engine_mode
+            && crate::io_engine::uring_available();
         #[cfg(not(target_os = "linux"))]
         let use_uring = false;
 
@@ -143,10 +161,11 @@ impl Journal {
                 on_fatal_error.map(|cb| Arc::from(cb) as Arc<dyn Fn(io::Error) + Send + Sync>);
             let fw_cb = shared_cb.clone();
             let fw_last_mark = shared_last_mark.clone();
+            let fw_observer = config.fsync_observer.clone();
 
             let sync_thread = std::thread::Builder::new()
                 .name("journal-sync".into())
-                .spawn(move || force_write_loop(fw_rx, fw_cb, fw_last_mark))
+                .spawn(move || force_write_loop(fw_rx, fw_cb, fw_last_mark, fw_observer))
                 .expect("failed to spawn journal-sync thread");
             threads.push(sync_thread);
 
@@ -1262,6 +1281,7 @@ fn force_write_loop(
     rx: mpsc::Receiver<ForceWriteRequest>,
     on_fatal_error: Option<Arc<dyn Fn(io::Error) + Send + Sync>>,
     shared_last_mark: Arc<std::sync::Mutex<(u64, u64)>>,
+    fsync_observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 ) {
     loop {
         let first = match rx.recv() {
@@ -1324,6 +1344,10 @@ fn force_write_loop(
             metrics::JOURNAL_ADD_ENTRY.observe(group.oldest_enqueue.elapsed().as_secs_f64());
             metrics::JOURNAL_FORCE_WRITE_GROUPING_COUNT
                 .observe(group.request_count as f64);
+
+            if let Some(ref obs) = fsync_observer {
+                obs(group.log_id);
+            }
 
             for ack in group.acks {
                 let _ = ack.send(());

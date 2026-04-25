@@ -171,6 +171,8 @@ impl BookieServer {
                 remove_from_page_cache: config.journal_remove_from_page_cache,
                 reuse_files: config.journal_reuse_files,
                 max_backup_journals: config.journal_max_backups as usize,
+                force_std_engine_mode: false,
+                fsync_observer: None,
             };
 
             let fatal_state = state.clone();

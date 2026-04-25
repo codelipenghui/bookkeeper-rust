@@ -64,6 +64,8 @@ fn open_storage_with_journal(dir: &Path) -> DbLedgerStorage {
         remove_from_page_cache: false,
         reuse_files: false,
         max_backup_journals: 5,
+        force_std_engine_mode: false,
+        fsync_observer: None,
     };
     rt.block_on(storage.init_journal(&journal_dir, config, journal_io, None, false))
         .unwrap();
@@ -95,6 +97,8 @@ fn open_storage_journal_no_sync(dir: &Path) -> DbLedgerStorage {
         remove_from_page_cache: false,
         reuse_files: false,
         max_backup_journals: 5,
+        force_std_engine_mode: false,
+        fsync_observer: None,
     };
     rt.block_on(storage.init_journal(&journal_dir, config, journal_io, None, false))
         .unwrap();

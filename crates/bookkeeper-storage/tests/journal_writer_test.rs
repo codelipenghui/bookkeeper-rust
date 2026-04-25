@@ -28,6 +28,8 @@ fn make_config(dir: PathBuf) -> JournalConfig {
         remove_from_page_cache: false,
         reuse_files: false,
         max_backup_journals: 5,
+        force_std_engine_mode: false,
+        fsync_observer: None,
     }
 }
 
@@ -333,4 +335,147 @@ async fn sync_data_false_still_replays() {
     let mut count = 0;
     replay_journal(tmp.path(), None, |_| count += 1).unwrap();
     assert_eq!(count, 20);
+}
+
+/// J-2 regression: in std-engine + sync mode (Mode 2), the force-write
+/// thread groups multiple `ForceWriteRequest`s via `try_recv`. When a
+/// journal rotation happens between two grouped requests, every unique
+/// `log_id` in the group must be fsynced before its acks fire. The
+/// pre-fix code only fsynced the *last* request's fd, silently leaving
+/// older rotated files unfsynced — their acks fired anyway, so a crash
+/// before the kernel's background writeback would silently lose data.
+///
+/// Detection strategy: graceful shutdown can't catch the corruption
+/// directly because the OS writeback path eventually flushes dirty
+/// pages of unfsynced files anyway. So instead we instrument
+/// `force_write_loop` with `fsync_observer`, which is invoked once per
+/// successful fsync with the `log_id` synced. After the run we compare
+/// the set of fsynced log_ids against the set of `.txn` files actually
+/// on disk: every produced file must have been fsynced. The pre-fix
+/// "skip older fds in group" behavior leaves rotated-out log_ids out
+/// of the fsynced set, failing this assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn force_write_groups_across_rotation_with_mode2() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = make_config(tmp.path().to_path_buf());
+    cfg.force_std_engine_mode = true;
+    // Tiny file size + small group-wait so rotations and force-write
+    // grouping interleave on the hot path.
+    cfg.max_file_size = 4 * 1024;
+    cfg.max_group_wait_ms = 1;
+    cfg.alignment_size = 0;
+    cfg.buffered_writes_threshold = 256;
+
+    let fsynced_log_ids: std::sync::Arc<Mutex<HashSet<u64>>> =
+        std::sync::Arc::new(Mutex::new(HashSet::new()));
+    {
+        let dest = fsynced_log_ids.clone();
+        cfg.fsync_observer = Some(std::sync::Arc::new(move |log_id: u64| {
+            dest.lock().unwrap().insert(log_id);
+        }));
+    }
+
+    let fatal_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let fc = fatal_count.clone();
+    let on_fatal: bookkeeper_storage::journal::writer::OnFatalError =
+        Box::new(move |e| {
+            fc.fetch_add(1, Ordering::SeqCst);
+            eprintln!("journal fatal during J-2 regression test: {e}");
+        });
+
+    let journal = std::sync::Arc::new(Journal::start(
+        cfg,
+        default_journal_io(),
+        Some(on_fatal),
+    ));
+
+    // Many concurrent writers waiting on per-entry acks: keeps the
+    // journal queue populated *while* the force-write thread is fsync'ing.
+    // During that fsync window the writer thread emits multiple flushes
+    // — and with rotations every ~18 entries, those flushes span log_ids.
+    // The force-write thread's next `try_recv` then collects a group
+    // whose first/last log_ids differ: the rotation-spanning case J-2
+    // mishandles. Each writer batches its own awaits to amortize spawn
+    // cost; the global pool is multi-thread for real parallelism.
+    let num_tasks = 64;
+    let entries_per_task = 30;
+    let num_entries = num_tasks * entries_per_task;
+    let mut handles = Vec::with_capacity(num_tasks);
+    for tid in 0..num_tasks {
+        let j = journal.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..entries_per_task {
+                let mut buf = Vec::with_capacity(256);
+                buf.extend_from_slice(&(tid as i64).to_be_bytes());
+                buf.extend_from_slice(&(i as i64).to_be_bytes());
+                buf.extend_from_slice(&(i as i64 - 1).to_be_bytes());
+                buf.extend_from_slice(&200i64.to_be_bytes());
+                buf.extend_from_slice(&[b'x'; 200]);
+                j.log_add_entry(&buf).await.unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    drop(journal);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // No fatal errors should have fired during normal operation.
+    assert_eq!(
+        fatal_count.load(Ordering::SeqCst),
+        0,
+        "no journal fatal-errors expected during graceful Mode 2 run"
+    );
+
+    // Collect log_ids of every journal file the writer produced (parsed
+    // from the `<hex>.txn` filename).
+    let on_disk_log_ids: HashSet<u64> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".txn")
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+        })
+        .collect();
+
+    // Sanity check: rotation actually happened. Without rotation J-2
+    // can't trigger and the test would prove nothing.
+    assert!(
+        on_disk_log_ids.len() >= 4,
+        "expected many rotated .txn files, got {} (J-2 path not exercised)",
+        on_disk_log_ids.len()
+    );
+
+    // J-2 invariant: every log_id with bytes on disk must have been
+    // fsynced via the force-write thread before its acks fired. Pre-fix,
+    // older log_ids in a rotation-spanning group were skipped here.
+    let fsynced = fsynced_log_ids.lock().unwrap().clone();
+    let missing: Vec<u64> = on_disk_log_ids
+        .difference(&fsynced)
+        .copied()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "log_ids written but never fsynced (J-2 regression): {:x?}\n\
+         fsynced={:x?}\n\
+         on_disk={:x?}",
+        missing,
+        fsynced,
+        on_disk_log_ids,
+    );
+
+    // Replay must recover every acked entry across every rotated file.
+    let mut count = 0;
+    replay_journal(tmp.path(), None, |_| count += 1).unwrap();
+    assert_eq!(
+        count, num_entries,
+        "replay missed entries: rotation-spanning grouping lost data"
+    );
 }
