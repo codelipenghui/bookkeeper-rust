@@ -304,8 +304,20 @@ impl UnifiedCache {
     /// the same buffer — causing `drain` to be called twice on the same
     /// buffer and silently losing the flushed entries.
     pub fn start_flush(&self) -> FlushGuard {
+        // CAS rather than load+store: with a load+store, two callers
+        // without the flush mutex can both read the same `old`, both
+        // store `old ^ 1`, and both receive a `FlushGuard` for the same
+        // buffer — silently losing the entries in the other buffer when
+        // both callers run drain. With CAS, a concurrent rotation makes
+        // the second caller's compare_exchange fail loudly. The contract
+        // (caller holds flush_mutex) is documented above.
         let old = self.active_write.load(Ordering::Acquire);
-        self.active_write.store(old ^ 1, Ordering::Release);
+        self.active_write
+            .compare_exchange(old, old ^ 1, Ordering::AcqRel, Ordering::Acquire)
+            .expect(
+                "start_flush raced: caller must hold the storage-level \
+                 flush mutex for the entire start_flush → drain sequence",
+            );
         FlushGuard { flushing_idx: old }
     }
 

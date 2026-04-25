@@ -91,6 +91,38 @@ fn write_buffer_reset_clears_offset_and_entries() {
     assert!(buf.take_entries().is_empty());
 }
 
+/// `start_flush` must use a CAS, not a load+store, so that a contract
+/// violation (two concurrent callers without the storage-level flush
+/// mutex) surfaces as a panic rather than silently producing two
+/// guards that both point at the same buffer. With the load+store
+/// implementation, both callers read the same `old` value, both store
+/// `old ^ 1`, and both get a `FlushGuard { flushing_idx: old }` — the
+/// drain loop then runs twice on the same buffer and silently loses
+/// the entries that were sitting in the OTHER buffer.
+///
+/// We can't easily express the panic-on-violation as a stable test, but
+/// we *can* verify the well-behaved happy-path invariants: alternating
+/// `start_flush` calls (with the previous flush's guard dropped before
+/// the next call) flip between the two buffer indices, never returning
+/// the same flushing_idx twice in a row.
+#[test]
+fn start_flush_alternates_buffer_indices() {
+    let cache = tiny_cache();
+    let g0 = cache.start_flush();
+    let g1 = cache.start_flush();
+    let g2 = cache.start_flush();
+    assert_ne!(
+        g0.flushing_idx(),
+        g1.flushing_idx(),
+        "consecutive start_flush calls must flip buffers",
+    );
+    assert_eq!(
+        g0.flushing_idx(),
+        g2.flushing_idx(),
+        "start_flush must alternate over a 2-cycle",
+    );
+}
+
 /// Concurrent writes to disjoint reserved ranges must not corrupt each
 /// other and must not exhibit aliasing UB. The original implementation
 /// went through `(*self.data.get()).as_mut_ptr()` — `*self.data.get()`
