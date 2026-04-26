@@ -496,13 +496,26 @@ impl BookieServer {
             let gc_force_major_c = gc_force_major.clone();
             let gc_force_minor_c = gc_force_minor.clone();
 
+            let gc_shutdown_tx = shutdown_tx.clone();
             Some(tokio::spawn(async move {
-                run_gc_loop(
+                use futures::future::FutureExt;
+                let fut = std::panic::AssertUnwindSafe(run_gc_loop(
                     gc_storage, gc_ledger_io, gc_ledger_manager, gc_wait_ms,
                     gc_config, metadata_cache_dir, gc_shutdown,
                     gc_suspend_major_c, gc_suspend_minor_c,
                     gc_force_major_c, gc_force_minor_c,
-                ).await;
+                )).catch_unwind().await;
+                if let Err(e) = fut {
+                    let msg = match e.downcast_ref::<&'static str>() {
+                        Some(s) => s.to_string(),
+                        None => match e.downcast_ref::<String>() {
+                            Some(s) => s.clone(),
+                            None => "(non-string panic payload)".into(),
+                        },
+                    };
+                    tracing::error!(panic = %msg, "GC loop panicked — initiating bookie shutdown");
+                    let _ = gc_shutdown_tx.send(true);
+                }
             }))
         } else {
             None
@@ -596,8 +609,25 @@ impl BookieServer {
         let sync_storage = storage.clone();
         let sync_shutdown = shutdown_rx.clone();
         let flush_interval_ms = config.flush_interval as u64;
+        let sync_shutdown_tx = shutdown_tx.clone();
         let sync_handle = Some(tokio::spawn(async move {
-            run_sync_thread(sync_storage, flush_interval_ms, sync_shutdown).await;
+            use futures::future::FutureExt;
+            let fut = std::panic::AssertUnwindSafe(
+                run_sync_thread(sync_storage, flush_interval_ms, sync_shutdown),
+            )
+            .catch_unwind()
+            .await;
+            if let Err(e) = fut {
+                let msg = match e.downcast_ref::<&'static str>() {
+                    Some(s) => s.to_string(),
+                    None => match e.downcast_ref::<String>() {
+                        Some(s) => s.clone(),
+                        None => "(non-string panic payload)".into(),
+                    },
+                };
+                tracing::error!(panic = %msg, "sync thread panicked — initiating bookie shutdown");
+                let _ = sync_shutdown_tx.send(true);
+            }
         }));
 
         // Sample write-cache gauges once per second. Kept off the add-entry
