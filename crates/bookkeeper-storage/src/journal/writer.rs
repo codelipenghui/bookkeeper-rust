@@ -533,13 +533,29 @@ fn journal_uring_loop(
         let fsync_sqe = opcode::Fsync::new(types::Fd(fd))
             .build()
             .user_data(1);
-        unsafe {
-            if ring.submission().push(&fsync_sqe).is_err() {
-                tracing::error!("journal-uring: SQ full");
-            }
+        // Only mark fsync as in-flight if BOTH the push AND the submit
+        // succeeded. Pre-fix, a push or submit failure left
+        // `fsync_in_flight = true` while no CQE would ever arrive — the
+        // writer thread blocked forever on `ring.submit_and_wait(1)` and
+        // the bookie wedged silently. Surface the failure as dropped
+        // acks (callers see the oneshot recv_error and report I/O).
+        let push_ok = unsafe { ring.submission().push(&fsync_sqe).is_ok() };
+        if !push_ok {
+            tracing::error!("journal-uring: SQ full — dropping {} acks", syncing_acks.len());
+            syncing_acks.clear();
+            *syncing_oldest_enqueue = None;
+            *syncing_fw_count = 0;
+            return;
         }
         if let Err(e) = ring.submit() {
-            tracing::error!("journal-uring: submit failed: {e}");
+            tracing::error!(
+                "journal-uring: submit failed: {e} — dropping {} acks",
+                syncing_acks.len()
+            );
+            syncing_acks.clear();
+            *syncing_oldest_enqueue = None;
+            *syncing_fw_count = 0;
+            return;
         }
         *fsync_in_flight = true;
         *fsync_start = Some(Instant::now());
