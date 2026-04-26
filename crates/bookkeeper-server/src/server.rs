@@ -1662,17 +1662,29 @@ async fn accept_loop(
                             let _ = sock.set_tcp_keepalive(&socket2::TcpKeepalive::new());
                         }
                         let proc = processor.clone();
+                        // RAII guard so the connection counter decrements
+                        // on every exit path: success, error, panic, or
+                        // abort. Pre-fix, a panic in the connection task
+                        // left the counter stuck and a long-lived bookie
+                        // would eventually wedge at max_connections.
+                        struct ConnCounterGuard(Arc<std::sync::atomic::AtomicUsize>);
+                        impl Drop for ConnCounterGuard {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        let guard = ConnCounterGuard(conn_count);
                         if let Some(ref tls) = tls_acceptor {
                             let tls = tls.clone();
                             tokio::spawn(async move {
+                                let _guard = guard;
                                 let acceptor = tls.acceptor().await;
                                 handle_starttls_connection(stream, proc, max_frame_size, acceptor).await;
-                                conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             });
                         } else {
                             tokio::spawn(async move {
+                                let _guard = guard;
                                 handle_connection(stream, proc, max_frame_size).await;
-                                conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                             });
                         }
                     }
