@@ -350,6 +350,18 @@ impl RequestProcessor {
                         }
                     }
                 }
+                // Fence-then-add re-check. validate_for_write returned the
+                // fence flag at the entry of this function, but the BK
+                // protocol's "no add confirmed after a fence ack" invariant
+                // requires that any fence which landed between that check
+                // and the moment of ack reject this add. Recovery adds are
+                // exempt — they are the mechanism that closes a fenced
+                // ledger.
+                if !is_recovery {
+                    if let Ok(true) = self.storage.is_fenced(ledger_id) {
+                        return self.add_error_response(BKError::Fenced, ledger_id, entry_id);
+                    }
+                }
                 V2Response::Add { error_code: V2_EOK, ledger_id, entry_id }
             }
             Err(e) => self.add_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id),

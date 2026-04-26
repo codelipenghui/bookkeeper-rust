@@ -237,3 +237,123 @@ async fn fencing_with_wrong_key_rejected() {
         _ => panic!("expected Add response"),
     }
 }
+
+/// Fence-then-add TOCTOU: handle_add_entry's pre-write
+/// `validate_for_write` returns the fence flag, then the actual write
+/// lands later (`storage.add_entry` + `journal.log_add_entry`). A
+/// concurrent fence between the check and the journal ack lets a NEW
+/// add be journaled and acked even though the BK protocol guarantees
+/// "after a fence ack, no add for this ledger may be confirmed".
+///
+/// Reproduce by giving handle_add_entry a real await window: bring up
+/// a journal with sync_data=true and a non-trivial group_wait_ms so
+/// `journal.log_add_entry().await` suspends. While it's suspended,
+/// fence the ledger directly via the storage trait (which is what a
+/// concurrent ReadEntry{FENCE_LEDGER} would have done). After the
+/// journal ack returns, the add_entry path must re-check `is_fenced`
+/// and respond with Fenced rather than EOK.
+#[tokio::test]
+async fn add_entry_rejects_when_fence_lands_during_journal_await() {
+    use bookkeeper_storage::journal::writer::JournalConfig;
+    use bookkeeper_storage::ledger_storage::LedgerStorage;
+    use std::time::Duration;
+
+    let dir = TempDir::new().unwrap();
+    let mut storage = DbLedgerStorage::open(
+        dir.path(),
+        Arc::new(StdEngine::new()) as Arc<dyn bookkeeper_storage::io_engine::LedgerIo>,
+    )
+    .unwrap();
+    let journal_dir = dir.path().join("journal");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let cfg = JournalConfig {
+        journal_dir: journal_dir.clone(),
+        max_file_size: 64 * 1024 * 1024,
+        sync_data: true,
+        // Longer group wait makes log_add_entry deterministically suspend
+        // for at least `max_group_wait_ms`, giving the test a window to
+        // run the fence between validate_for_write and the post-write
+        // recheck.
+        max_group_wait_ms: 50,
+        buffered_writes_threshold: 1024 * 1024, // big — wait drives the timing
+        buffered_entries_threshold: 1024,
+        alignment_size: 0,
+        format_version: 6,
+        max_queue_memory: 0,
+        flush_when_queue_empty: false,
+        remove_from_page_cache: false,
+        reuse_files: false,
+        max_backup_journals: 0,
+        force_std_engine_mode: false,
+        fsync_observer: None,
+    };
+    let journal_io: Arc<dyn bookkeeper_storage::io_engine::JournalIo> =
+        Arc::new(StdEngine::new());
+    storage
+        .init_journal(&journal_dir, cfg, journal_io, None, false)
+        .await
+        .unwrap();
+    let storage = Arc::new(storage);
+    let state = Arc::new(BookieStateManager::new());
+    state.transition_to(bookkeeper_server::state::BookieState::Running);
+
+    let processor = Arc::new(RequestProcessor::new(
+        storage.clone() as Arc<dyn LedgerStorage>,
+        state.clone(),
+    ));
+
+    // Initialize ledger 1 cleanly first so subsequent adds skip the
+    // ledger-creation path.
+    let init = make_entry(1, 0, -1, b"init");
+    let resp = processor
+        .process_request(V2Request::AddEntry {
+            flags: 0,
+            master_key: [0u8; 20],
+            entry_data: Bytes::from(init),
+            deferred_sync: false,
+        })
+        .await;
+    match resp {
+        V2Response::Add { error_code, .. } => assert_eq!(error_code, V2_EOK),
+        other => panic!("init add failed: {other:?}"),
+    }
+
+    // Kick off a NEW add. handle_add_entry will run validate_for_write
+    // (returns fenced=false), then storage.add_entry (cache, fast),
+    // then journal.log_add_entry which suspends for ≥ 50 ms.
+    let processor2 = processor.clone();
+    let add_task = tokio::spawn(async move {
+        let entry = make_entry(1, 1, 0, b"racing");
+        processor2
+            .process_request(V2Request::AddEntry {
+                flags: 0,
+                master_key: [0u8; 20],
+                entry_data: Bytes::from(entry),
+                deferred_sync: false,
+            })
+            .await
+    });
+
+    // Yield once so the spawned task has a chance to start, then fence
+    // the ledger directly via the storage trait. With max_group_wait_ms=50
+    // the spawned task is guaranteed to still be in journal.log_add_entry
+    // for many milliseconds after this fence call returns.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let storage_dyn: &dyn LedgerStorage = storage.as_ref();
+    storage_dyn.set_fenced(1).expect("set_fenced");
+
+    let resp = add_task.await.expect("task did not panic");
+    match resp {
+        V2Response::Add { error_code, .. } => {
+            assert_eq!(
+                error_code,
+                bookkeeper_common::error::BKError::Fenced.to_v2_code(),
+                "add_entry returned EOK ({}) despite a fence landing during \
+                 the journal await; this is the V-1 race that lets adds slip \
+                 past a fence ack",
+                error_code,
+            );
+        }
+        other => panic!("expected Add response, got {other:?}"),
+    }
+}
