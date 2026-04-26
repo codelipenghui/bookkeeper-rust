@@ -764,18 +764,41 @@ impl BookieServer {
         // Matches Java's SyncThread.shutdown() which waits up to 5 minutes.
         // Journal cleanup happens inside checkpoint().
         tracing::info!("Flushing storage...");
-        match tokio::time::timeout(
+        let checkpoint_clean = match tokio::time::timeout(
             tokio::time::Duration::from_secs(300),
             self.storage.checkpoint(),
         ).await {
-            Ok(Ok(())) => tracing::info!("Storage flushed."),
-            Ok(Err(e)) => tracing::warn!("WARNING: checkpoint failed during shutdown: {e}"),
-            Err(_) => tracing::warn!("WARNING: storage flush timed out after 5 minutes"),
-        }
+            Ok(Ok(())) => {
+                tracing::info!("Storage flushed.");
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("WARNING: checkpoint failed during shutdown: {e}");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("WARNING: storage flush timed out after 5 minutes");
+                false
+            }
+        };
 
         // Step 6: Remove DIRTY files — clean shutdown confirmed.
-        // Matches Java: deleted AFTER bookie.shutdown() completes (all flushed).
-        UncleanShutdownDetection::new(&self.ledger_directories).register_clean_shutdown();
+        // ONLY remove the markers if the checkpoint actually succeeded.
+        // If the flush failed or timed out, the in-memory state may not
+        // be on disk; leaving the DIRTY markers in place tells the next
+        // boot the previous shutdown was unclean and triggers the
+        // recovery path that surfaces any partial-flush corruption.
+        // Matches Java's behavior of deleting DIRTY only AFTER
+        // bookie.shutdown() completes successfully.
+        if checkpoint_clean {
+            UncleanShutdownDetection::new(&self.ledger_directories).register_clean_shutdown();
+        } else {
+            tracing::warn!(
+                "Leaving DIRTY markers in place because storage flush did \
+                 not complete cleanly; next boot will run unclean-shutdown \
+                 recovery."
+            );
+        }
 
         // Step 7: Transition to ShuttingDown
         self.state.transition_to(BookieState::ShuttingDown);
