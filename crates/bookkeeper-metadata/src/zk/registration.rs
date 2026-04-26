@@ -107,10 +107,20 @@ impl RegistrationManager for ZkRegistrationManager {
         match self.client.create(&path, &data, &options).await {
             Ok(_) => Ok(()),
             Err(zk::Error::NodeExists) => {
-                // Already registered — update data
-                self.client.set_data(&path, &data, None).await
-                    .map_err(|e| MetadataError::ConnectionError(format!("update registration: {e}")))?;
-                Ok(())
+                // Existing ephemeral registration. CAS-update on the
+                // observed stat version so a concurrent change (or a
+                // stale registration we shouldn't overwrite) surfaces
+                // as a VersionConflict instead of silently clobbering.
+                let (_existing, stat) = self.client.get_data(&path).await
+                    .map_err(|e| MetadataError::ConnectionError(format!("re-register get: {e}")))?;
+                match self.client.set_data(&path, &data, Some(stat.version)).await {
+                    Ok(_) => Ok(()),
+                    Err(zk::Error::BadVersion) => Err(MetadataError::VersionConflict {
+                        expected: stat.version as i64,
+                        actual: -1,
+                    }),
+                    Err(e) => Err(MetadataError::ConnectionError(format!("update registration: {e}"))),
+                }
             }
             Err(e) => Err(MetadataError::ConnectionError(format!("register bookie: {e}"))),
         }

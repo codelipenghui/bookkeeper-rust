@@ -326,6 +326,61 @@ async fn idgen_resists_parent_delete_collision() {
     raw.shutdown().await.ok();
 }
 
+/// `register_bookie` must refuse to overwrite an existing registration
+/// owned by another session — a wrong-data bookie putting on top of a
+/// legitimate registration would silently replace it.
+#[tokio::test]
+#[ignore]
+async fn register_bookie_refuses_to_overwrite_existing_registration() {
+    if !is_docker_available() {
+        eprintln!("[SKIP] docker not available");
+        return;
+    }
+
+    let container = OxiaContainer::start().expect("start oxia container");
+    let uri = oxia_uri(container.port);
+
+    let backend1 = open_metadata_backend(&uri, None, Some(Duration::from_secs(30)))
+        .await
+        .expect("open backend 1");
+    backend1
+        .registration_manager
+        .init_new_cluster(
+            &LedgerLayout {
+                manager_factory_class: "LegacyHierarchicalLedgerManagerFactory".into(),
+                manager_version: 1,
+            },
+            "register-conflict-test",
+        )
+        .await
+        .expect("init_new_cluster");
+
+    let info_a = BookieServiceInfo::new("bookie-conflict:3181", "host-a", 3181);
+    backend1
+        .registration_manager
+        .register_bookie("bookie-conflict:3181", false, &info_a)
+        .await
+        .expect("first register");
+
+    // Open a second backend (separate session) and try to register the
+    // same bookie id with different info. Pre-fix this silently
+    // overwrote backend1's registration; post-fix it surfaces an error.
+    let backend2 = open_metadata_backend(&uri, None, Some(Duration::from_secs(30)))
+        .await
+        .expect("open backend 2");
+    let info_b = BookieServiceInfo::new("bookie-conflict:3181", "host-b-impostor", 3181);
+    let result = backend2
+        .registration_manager
+        .register_bookie("bookie-conflict:3181", false, &info_b)
+        .await;
+    assert!(
+        result.is_err(),
+        "register_bookie returned Ok despite an existing registration from \
+         another session — a wrong-data bookie could overwrite a legitimate \
+         registration",
+    );
+}
+
 /// HOB GC must not delete a HOB that still holds child markers — an
 /// in-flight `seq_create` against an old HOB can have its ephemeral
 /// marker swept along with the HOB, breaking the marker semantics

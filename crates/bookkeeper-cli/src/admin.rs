@@ -925,14 +925,16 @@ pub async fn cmd_decommissionbookie(
     }
     println!("Bookie {bookie_id} is not registered (good — it's shut down).");
 
-    // Step 2: Trigger audit to kick the auditor (matches Java's decommission flow)
+    // Step 2: Trigger audit to kick the auditor (matches Java's decommission flow).
+    // CAS on the stat version we just read so a concurrent admin's value isn't
+    // overwritten by our re-write of stale data. BadVersion means someone else
+    // modified the node — that itself triggers the watcher we wanted to fire,
+    // so we treat the result as best-effort either way.
     {
         let delay_path = format!("{}/lostBookieRecoveryDelay", zk_raw.paths.underreplication());
-        let current = match zk_raw.client.get_data(&delay_path).await {
-            Ok((data, _)) => data,
-            Err(_) => b"0".to_vec(),
-        };
-        let _ = zk_raw.client.set_data(&delay_path, &current, None).await;
+        if let Ok((data, stat)) = zk_raw.client.get_data(&delay_path).await {
+            let _ = zk_raw.client.set_data(&delay_path, &data, Some(stat.version)).await;
+        }
         println!("Triggered audit.");
     }
 
@@ -1165,16 +1167,28 @@ pub async fn cmd_lostbookierecoverydelay(
             let data = seconds.to_string().into_bytes();
             let options = zookeeper_client::CreateMode::Persistent
                 .with_acls(zookeeper_client::Acls::anyone_all());
-            match client.set_data(&delay_path, &data, None).await {
-                Ok(_) => {
-                    println!("LostBookieRecoveryDelay set to {seconds} seconds.");
+            // CAS-update on the stat version so two admins changing
+            // the value concurrently surface a clear conflict instead
+            // of silently overwriting each other.
+            match client.get_data(&delay_path).await {
+                Ok((_, stat)) => {
+                    match client.set_data(&delay_path, &data, Some(stat.version)).await {
+                        Ok(_) => println!("LostBookieRecoveryDelay set to {seconds} seconds."),
+                        Err(zookeeper_client::Error::BadVersion) => {
+                            return Err(format!(
+                                "concurrent change to lostBookieRecoveryDelay (expected version {}); \
+                                 retry once the other admin completes",
+                                stat.version
+                            ).into());
+                        }
+                        Err(e) => return Err(format!("Failed to set: {e}").into()),
+                    }
                 }
                 Err(zookeeper_client::Error::NoNode) => {
-                    // Create the node
                     client.create(&delay_path, &data, &options).await?;
                     println!("LostBookieRecoveryDelay set to {seconds} seconds.");
                 }
-                Err(e) => return Err(format!("Failed to set: {e}").into()),
+                Err(e) => return Err(format!("Failed to read current value: {e}").into()),
             }
         }
         None => {
@@ -1221,23 +1235,29 @@ pub async fn cmd_triggeraudit(
         return Err("No auditor is currently elected. Cannot trigger audit.".into());
     }
 
-    // Read current value, then re-set it to trigger an immediate audit
+    // Read current value (with stat) then CAS-rewrite it to trigger an
+    // immediate audit. CAS prevents this read-modify-write from clobbering
+    // a concurrent admin's update. BadVersion means another writer already
+    // bumped the node — that itself fires the watcher we wanted to trigger,
+    // so we accept it.
     let delay_path = format!("{}/lostBookieRecoveryDelay", paths.underreplication());
-    let current = match client.get_data(&delay_path).await {
-        Ok((data, _)) => data,
-        Err(zookeeper_client::Error::NoNode) => b"0".to_vec(),
-        Err(e) => return Err(format!("Failed to read recovery delay: {e}").into()),
-    };
-
-    match client.set_data(&delay_path, &current, None).await {
-        Ok(_) => println!("Audit triggered (reset lostBookieRecoveryDelay)."),
+    match client.get_data(&delay_path).await {
+        Ok((current, stat)) => {
+            match client.set_data(&delay_path, &current, Some(stat.version)).await {
+                Ok(_) => println!("Audit triggered (reset lostBookieRecoveryDelay)."),
+                Err(zookeeper_client::Error::BadVersion) => {
+                    println!("Audit triggered (concurrent update fired watcher).");
+                }
+                Err(e) => return Err(format!("Failed to trigger audit: {e}").into()),
+            }
+        }
         Err(zookeeper_client::Error::NoNode) => {
             let options = zookeeper_client::CreateMode::Persistent
                 .with_acls(zookeeper_client::Acls::anyone_all());
-            client.create(&delay_path, &current, &options).await?;
+            client.create(&delay_path, b"0", &options).await?;
             println!("Audit triggered (created lostBookieRecoveryDelay).");
         }
-        Err(e) => return Err(format!("Failed to trigger audit: {e}").into()),
+        Err(e) => return Err(format!("Failed to read recovery delay: {e}").into()),
     }
     Ok(())
 }

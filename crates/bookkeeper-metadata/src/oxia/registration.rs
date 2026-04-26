@@ -37,15 +37,26 @@ impl RegistrationManager for OxiaRegistrationManager {
             self.paths.bookie_registration(bookie_id)
         };
         create_parents(&self.client, &key).await?;
-        self.client
+        // Refuse to overwrite an existing registration. Ephemeral keys
+        // are tied to their owning session, so "key exists" means
+        // another session still holds the registration — silently
+        // putting on top would let a wrong-data bookie clobber a
+        // legitimate one.
+        match self
+            .client
             .put_with_options(
                 key,
                 info.to_protobuf_bytes(),
-                vec![PutOption::Ephemeral()],
+                vec![PutOption::Ephemeral(), PutOption::ExpectVersionId(-1)],
             )
             .await
-            .map_err(|e| map_oxia_error(e, None))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(OxiaError::UnexpectedVersionId()) => Err(MetadataError::ConnectionError(
+                format!("register bookie '{bookie_id}': already registered"),
+            )),
+            Err(e) => Err(map_oxia_error(e, None)),
+        }
     }
 
     async fn unregister_bookie(
