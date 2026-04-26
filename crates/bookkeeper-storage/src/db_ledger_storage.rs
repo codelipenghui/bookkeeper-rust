@@ -1229,10 +1229,17 @@ impl LedgerStorage for DbLedgerStorage {
         // higher value (e.g., from a recent add_entry), accepting the
         // smaller value would violate the per-ledger monotonicity
         // invariant that readers rely on.
-        self.lac_cache
+        let promoted = self
+            .lac_cache
             .entry(ledger_id)
             .and_modify(|v| *v = (*v).max(lac))
             .or_insert(lac);
+        let new_lac = *promoted;
+        drop(promoted);
+        // Persist via the ledger index so the LAC survives restart —
+        // pre-fix only the in-memory cache was updated, so the
+        // explicit LAC was silently dropped on bookie restart.
+        self.ledger_index.update_lac(ledger_id, new_lac)?;
         Ok(())
     }
 
