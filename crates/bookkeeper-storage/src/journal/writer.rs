@@ -1482,6 +1482,15 @@ impl JournalFileState {
         file.write_all(&header_bytes)?;
         file.flush()?;
 
+        // POSIX: fsync(dir_fd) is required for the new dirent to be
+        // durably observable. Without it, a power loss between the
+        // create() and an unrelated fsync(file_fd) could leave the
+        // file's contents on disk but the dirent missing — so the
+        // journal record we just wrote would be unreachable on reboot.
+        if let Ok(dir) = fs::File::open(&config.journal_dir) {
+            let _ = dir.sync_all();
+        }
+
         self.position = header_bytes.len() as u64;
         self.file = Some(file);
         metrics::JOURNAL_CREATION_LATENCY.observe(creation_start.elapsed().as_secs_f64());
@@ -1508,6 +1517,13 @@ impl JournalFileState {
                 if fs::rename(&old_path, &new_path).is_ok() {
                     // Truncate the file — ensure_open will write the header
                     let _ = fs::OpenOptions::new().write(true).truncate(true).open(&new_path);
+                    // fsync the directory so the rename is durably
+                    // observable; without it, a crash between the
+                    // rename and the next data fsync could leave the
+                    // old name on disk and the new one missing.
+                    if let Ok(dir) = fs::File::open(&config.journal_dir) {
+                        let _ = dir.sync_all();
+                    }
                 }
             }
         }
