@@ -304,8 +304,11 @@ impl Journal {
         if cache.contains(&ledger_id) {
             return Ok(());
         }
-        cache.insert(ledger_id);
-        drop(cache);
+        // Insert into cache *after* a successful send. If we marked the
+        // ledger as journaled before the send and the send then failed,
+        // every subsequent add for this ledger would skip the journal
+        // step too — silently leaving the ledger without its master-key
+        // record across crash recovery.
 
         let entry_len = 8 + 8 + 4 + master_key.len();
         let mut entry = Vec::with_capacity(entry_len);
@@ -315,12 +318,18 @@ impl Journal {
         entry.extend_from_slice(master_key);
 
         metrics::JOURNAL_QUEUE_SIZE.inc();
-        let _ = self.tx.send(JournalEntry {
+        if let Err(e) = self.tx.send(JournalEntry {
             data: entry,
             ack_tx: None,
             enqueue_time: Instant::now(),
-        });
-
+        }) {
+            metrics::JOURNAL_QUEUE_SIZE.dec();
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("journal master-key send: {e}"),
+            )));
+        }
+        cache.insert(ledger_id);
         Ok(())
     }
 

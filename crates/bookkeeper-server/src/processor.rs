@@ -334,8 +334,16 @@ impl RequestProcessor {
         match self.storage.add_entry(&entry_data).await {
             Ok(()) => {
                 if let Some(journal) = self.storage.journal() {
-                    // Journal master key BEFORE data entry (matching Java's ordering)
-                    let _ = journal.maybe_journal_master_key(ledger_id, master_key);
+                    // Journal master key BEFORE data entry (matching Java's
+                    // ordering). A send failure here means the channel to
+                    // the writer thread is broken — the data entry that
+                    // follows would land but the master-key record would
+                    // be missing on recovery, leaving the ledger without
+                    // its password binding. Surface the error to the
+                    // client rather than acking a half-journaled add.
+                    if let Err(_e) = journal.maybe_journal_master_key(ledger_id, master_key) {
+                        return self.add_error_response(BKError::Io, ledger_id, entry_id);
+                    }
                     if deferred_sync {
                         // DEFERRED_SYNC: enqueue to journal without waiting for fsync.
                         // Durability guaranteed by the next ForceLedger call.
