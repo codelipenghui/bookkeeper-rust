@@ -114,6 +114,17 @@ impl RequestProcessor {
         Arc::clone(&self.available_for_high_priority_writes)
     }
 
+    /// Whether the bookie state machine is currently accepting writes.
+    pub fn is_writable(&self) -> bool {
+        self.state.is_writable()
+    }
+
+    /// Whether high-priority writes are accepted while the bookie is
+    /// in a read-only state (controlled by the disk monitor).
+    pub fn high_priority_writes_enabled(&self) -> bool {
+        self.available_for_high_priority_writes.load(Ordering::Acquire)
+    }
+
     /// Acquire a semaphore permit with optional backpressure.
     /// Fast path: try_acquire (no timer overhead). Slow path: timeout + acquire.
     async fn acquire_permit<'a>(
@@ -264,6 +275,19 @@ impl RequestProcessor {
                 // which calls fenceLedger() first when the flag is set.
                 if flags & FLAG_DO_FENCING != 0 {
                     if let Some(key) = master_key {
+                        // BatchRead-with-fencing also journals a fence entry —
+                        // same read-only gate as the regular fence path.
+                        if !self.state.is_writable()
+                            && !self.available_for_high_priority_writes.load(Ordering::Acquire)
+                        {
+                            return V2Response::BatchRead {
+                                error_code: BKError::ReadOnly.to_v2_code(),
+                                ledger_id,
+                                entry_id: start_entry_id,
+                                request_id,
+                                entries: Vec::new(),
+                            };
+                        }
                         if let Err(e) = self.storage.check_master_key(ledger_id, &key) {
                             return V2Response::BatchRead {
                                 error_code: self.storage_error_to_bk(&e).to_v2_code(),
@@ -387,6 +411,14 @@ impl RequestProcessor {
         // journal entry and only completes the future after fsync, ensuring durability.
         if flags & FLAG_DO_FENCING != 0 {
             if let Some(key) = master_key {
+                // Fencing journals a metadata entry — refuse when the
+                // bookie is read-only unless high-priority writes are
+                // enabled (matches Java's ReadEntryProcessorV3 fence path).
+                if !self.state.is_writable()
+                    && !self.available_for_high_priority_writes.load(Ordering::Acquire)
+                {
+                    return self.read_error_response(BKError::ReadOnly, ledger_id, entry_id);
+                }
                 // Validate master key before fencing
                 if let Err(e) = self.storage.check_master_key(ledger_id, &key) {
                     return self.read_error_response(self.storage_error_to_bk(&e), ledger_id, entry_id);
@@ -467,6 +499,18 @@ impl RequestProcessor {
     }
 
     async fn handle_write_lac(&self, ledger_id: i64, lac: i64, body: Bytes) -> V2Response {
+        // WriteLac journals a metadata entry, so it's a write — Java's
+        // WriteLacProcessorV3 returns EREADONLY when the bookie isn't
+        // writable and high-priority writes aren't enabled. Match that.
+        if !self.state.is_writable()
+            && !self.available_for_high_priority_writes.load(Ordering::Acquire)
+        {
+            return V2Response::WriteLac {
+                error_code: BKError::ReadOnly.to_v2_code(),
+                ledger_id,
+                entry_id: 0,
+            };
+        }
         // Store LAC value
         if let Err(e) = self.storage.set_explicit_lac(ledger_id, lac) {
             return V2Response::WriteLac {

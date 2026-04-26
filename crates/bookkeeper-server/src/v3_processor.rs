@@ -201,6 +201,16 @@ pub async fn process_v3_request(
         }
         op if op == bookkeeper_proto::OperationType::ForceLedger as i32 => {
             if let Some(fl) = req.force_ledger_request {
+                // ForceLedger fsyncs the journal — refuse on a read-only
+                // bookie unless high-priority writes are enabled.
+                if !processor.is_writable()
+                    && !processor.high_priority_writes_enabled()
+                {
+                    return (
+                        build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::ReadOnly),
+                        false,
+                    );
+                }
                 // `FORCE_LEDGER_REQUEST` is recorded end-to-end by the writer task
                 // once the response is flushed (matches Java's
                 // PacketProcessorBaseV3.sendResponse → enqueueNanos semantics).
