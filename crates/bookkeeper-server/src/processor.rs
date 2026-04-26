@@ -621,6 +621,12 @@ impl RequestProcessor {
         } else {
             self.max_batch_read_size_bytes
         };
+        // Distinguish "ran into a real I/O error" from "natural end of batch
+        // (NoEntry)" so the response can carry the right status. Pulsar
+        // treats NoEntry as end-of-batch; coercing a transient I/O error
+        // into NoEntry would let the client cap its reader at the failure
+        // point as if the ledger were short.
+        let mut io_error: Option<BKError> = None;
         for i in 0..capped_count as i64 {
             let eid = start_entry_id + i;
             match self.storage.get_entry(ledger_id, eid).await {
@@ -643,16 +649,17 @@ impl RequestProcessor {
                         error = ?e,
                         "batch_read entry failed (loop terminates)",
                     );
+                    io_error = Some(self.storage_error_to_bk(&e));
                     break;
                 }
             }
         }
 
         V2Response::BatchRead {
-            error_code: if entries.is_empty() {
-                BKError::NoEntry.to_v2_code()
-            } else {
-                V2_EOK
+            error_code: match (io_error, entries.is_empty()) {
+                (Some(err), _) => err.to_v2_code(),
+                (None, true) => BKError::NoEntry.to_v2_code(),
+                (None, false) => V2_EOK,
             },
             ledger_id,
             entry_id: start_entry_id,
