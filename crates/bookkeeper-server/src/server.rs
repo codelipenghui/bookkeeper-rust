@@ -530,6 +530,7 @@ impl BookieServer {
 
             let monitor_hp_flag = processor.high_priority_writes_flag();
             let monitor_min_hp_size = config.min_usable_size_for_high_priority_writes;
+            let monitor_shutdown_tx = shutdown_tx.clone();
 
             Some(tokio::spawn(async move {
                 run_disk_monitor(
@@ -543,6 +544,7 @@ impl BookieServer {
                     monitor_shutdown,
                     monitor_hp_flag,
                     monitor_min_hp_size,
+                    monitor_shutdown_tx,
                 ).await;
             }))
         } else {
@@ -1131,6 +1133,7 @@ async fn run_disk_monitor(
     mut shutdown_rx: watch::Receiver<bool>,
     high_priority_writes_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     min_usable_size_for_high_priority_writes: i64,
+    shutdown_tx: watch::Sender<bool>,
 ) {
     let interval = tokio::time::Duration::from_millis(interval_ms);
 
@@ -1243,6 +1246,12 @@ async fn run_disk_monitor(
                     DiskMonitorAction::Shutdown => {
                         tracing::error!("Disk monitor: fatal disk I/O error detected, initiating shutdown");
                         state.transition_to(BookieState::ShuttingDown);
+                        // Tell the rest of the bookie to wind down. Without
+                        // this, the listener accept-loop and processor tasks
+                        // would carry on accepting connections while the
+                        // state machine sits in ShuttingDown — defeating
+                        // the whole point of the fatal-disk action.
+                        let _ = shutdown_tx.send(true);
                         break;
                     }
                     DiskMonitorAction::Stay => {}
