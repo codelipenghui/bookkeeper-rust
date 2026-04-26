@@ -58,13 +58,15 @@ impl EntryLocationIndex {
         // Keys are 16 bytes: ledgerId(8 BE) + entryId(8 BE).
         // Start: ledgerId with entryId = all-zeros (smallest byte sequence).
         // End: (ledgerId+1) with entryId = all-zeros (exclusive upper bound).
+        // Use wrapping_add for the upper-bound: at i64::MAX the wrap to
+        // i64::MIN produces the correct big-endian "next" byte sequence
+        // (`0x80…00 > 0x7F…FF` lexicographically) and the unchecked add
+        // would otherwise panic in debug builds.
         let mut start = [0u8; 16];
         start[0..8].copy_from_slice(&ledger_id.to_be_bytes());
-        // start[8..16] stays all-zeros — smallest possible entryId byte sequence
 
         let mut end = [0u8; 16];
-        end[0..8].copy_from_slice(&(ledger_id + 1).to_be_bytes());
-        // end[8..16] stays all-zeros
+        end[0..8].copy_from_slice(&ledger_id.wrapping_add(1).to_be_bytes());
 
         let mut batch = WriteBatch::default();
         batch.delete_range(&start, &end);
@@ -83,7 +85,8 @@ impl EntryLocationIndex {
         start[0..8].copy_from_slice(&ledger_id.to_be_bytes());
 
         let mut end = [0u8; 16];
-        end[0..8].copy_from_slice(&(ledger_id + 1).to_be_bytes());
+        // wrapping_add: see delete_ledger comment.
+        end[0..8].copy_from_slice(&ledger_id.wrapping_add(1).to_be_bytes());
 
         let mut results = Vec::new();
         let iter = self.db.iterator(rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward));

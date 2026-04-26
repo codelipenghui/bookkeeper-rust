@@ -210,3 +210,45 @@ fn batch_update_lac_empty_is_noop() {
     let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
     index.batch_update_lac(&[]).unwrap();
 }
+
+/// `delete_ledger` and `iter_ledger_entries` build their range bounds
+/// as `(ledger_id + 1).to_be_bytes()`. With `ledger_id == i64::MAX`
+/// the addition overflows: in debug builds it panics; in release it
+/// wraps to `i64::MIN` and the ensuing byte sequence accidentally
+/// happens to be a correct exclusive upper bound (because
+/// `0x80...00 > 0x7F...FF` lexicographically). The debug-time panic
+/// still aborts the bookie. Use a non-panicking byte computation.
+#[test]
+fn entry_location_delete_ledger_handles_i64_max() {
+    let dir = TempDir::new().unwrap();
+    let index = EntryLocationIndex::open(dir.path(), None).unwrap();
+
+    index.put(i64::MAX, 0, 1234).unwrap();
+    index.put(i64::MAX, 1, 5678).unwrap();
+    index.put(i64::MAX - 1, 0, 9999).unwrap();
+
+    // Pre-fix this panics in debug with "attempt to add with overflow".
+    index.delete_ledger(i64::MAX).unwrap();
+
+    // The targeted ledger is gone.
+    assert!(index.get(i64::MAX, 0).unwrap().is_none());
+    assert!(index.get(i64::MAX, 1).unwrap().is_none());
+    // The neighbour ledger is intact.
+    assert_eq!(index.get(i64::MAX - 1, 0).unwrap(), Some(9999));
+}
+
+/// Same overflow check for `iter_ledger_entries`.
+#[test]
+fn entry_location_iter_ledger_entries_handles_i64_max() {
+    let dir = TempDir::new().unwrap();
+    let index = EntryLocationIndex::open(dir.path(), None).unwrap();
+
+    index.put(i64::MAX, 0, 1).unwrap();
+    index.put(i64::MAX, 1, 2).unwrap();
+    index.put(i64::MAX, 2, 3).unwrap();
+
+    let entries = index.iter_ledger_entries(i64::MAX).unwrap();
+    let mut entry_ids: Vec<i64> = entries.iter().map(|(eid, _)| *eid).collect();
+    entry_ids.sort();
+    assert_eq!(entry_ids, vec![0, 1, 2]);
+}
