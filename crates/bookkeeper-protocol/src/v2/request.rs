@@ -155,7 +155,13 @@ pub fn decode_request(data: Bytes) -> Result<V2Request, RequestDecodeError> {
             if buf.remaining() < 16 { return Err(RequestDecodeError::TooShort); }
             let ledger_id = buf.get_i64();
             let entry_id = buf.get_i64();
-            let master_key = if header.has_flag(FLAG_DO_FENCING) && buf.remaining() >= MASTER_KEY_LENGTH {
+            let master_key = if header.has_flag(FLAG_DO_FENCING) {
+                // FLAG_DO_FENCING demands the masterKey for authorization.
+                // Silently dropping it on a short buffer would let the
+                // read bypass the fence check entirely.
+                if buf.remaining() < MASTER_KEY_LENGTH {
+                    return Err(RequestDecodeError::TooShort);
+                }
                 let mut key = [0u8; MASTER_KEY_LENGTH];
                 buf.copy_to_slice(&mut key);
                 Some(key)
@@ -202,7 +208,12 @@ pub fn decode_request(data: Bytes) -> Result<V2Request, RequestDecodeError> {
             let max_size = buf.get_i64();
             // When FLAG_DO_FENCING is set, Java appends the 20-byte masterKey.
             // Matches Java's BookieProtoEncoding for a fenced batch read.
-            let master_key = if header.has_flag(FLAG_DO_FENCING) && buf.remaining() >= MASTER_KEY_LENGTH {
+            // The key is mandatory: silently dropping it on a short buffer
+            // would let the read bypass the fence check.
+            let master_key = if header.has_flag(FLAG_DO_FENCING) {
+                if buf.remaining() < MASTER_KEY_LENGTH {
+                    return Err(RequestDecodeError::TooShort);
+                }
                 let mut key = [0u8; MASTER_KEY_LENGTH];
                 buf.copy_to_slice(&mut key);
                 Some(key)

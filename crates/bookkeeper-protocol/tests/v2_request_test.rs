@@ -144,3 +144,59 @@ fn auth_response_java_compatible_format() {
         _ => panic!("expected Auth response"),
     }
 }
+
+/// A `ReadEntry` request that advertises FLAG_DO_FENCING but whose
+/// payload is truncated before the 20-byte masterKey must be rejected
+/// by the decoder. The previous decoder silently swallowed the
+/// truncation, returning `master_key: None`, which the handler treats
+/// as "no fencing required" — letting the read through *unauthorized*.
+#[test]
+fn read_entry_with_fencing_flag_but_no_master_key_is_rejected() {
+    use bookkeeper_protocol::constants::{FLAG_DO_FENCING, OP_READ_ENTRY};
+    use bookkeeper_protocol::v2::header::PacketHeader;
+    use bookkeeper_protocol::v2::request::{decode_request, RequestDecodeError};
+    use bytes::BufMut;
+
+    // Build a ReadEntry with FLAG_DO_FENCING set but no master_key bytes
+    // appended after ledger_id + entry_id.
+    let header = PacketHeader::new(2, OP_READ_ENTRY, FLAG_DO_FENCING);
+    let mut buf = bytes::BytesMut::new();
+    buf.put_u32(header.to_u32());
+    buf.put_i64(123); // ledger_id
+    buf.put_i64(0);   // entry_id
+    // (no master_key)
+
+    let result = decode_request(buf.freeze());
+    assert!(
+        matches!(result, Err(RequestDecodeError::TooShort)),
+        "FLAG_DO_FENCING with no master_key bytes must error \
+         with TooShort, got {result:?} — silently accepting it would \
+         let the read bypass the fencing check",
+    );
+}
+
+/// Same invariant for `BatchReadEntry`.
+#[test]
+fn batch_read_with_fencing_flag_but_no_master_key_is_rejected() {
+    use bookkeeper_protocol::constants::{FLAG_DO_FENCING, OP_BATCH_READ_ENTRY};
+    use bookkeeper_protocol::v2::header::PacketHeader;
+    use bookkeeper_protocol::v2::request::{decode_request, RequestDecodeError};
+    use bytes::BufMut;
+
+    let header = PacketHeader::new(2, OP_BATCH_READ_ENTRY, FLAG_DO_FENCING);
+    let mut buf = bytes::BytesMut::new();
+    buf.put_u32(header.to_u32());
+    buf.put_i64(7);     // ledger_id
+    buf.put_i64(0);     // start_entry_id
+    buf.put_i64(0);     // request_id
+    buf.put_i32(10);    // max_count
+    buf.put_i64(65536); // max_size
+    // (no master_key)
+
+    let result = decode_request(buf.freeze());
+    assert!(
+        matches!(result, Err(RequestDecodeError::TooShort)),
+        "FLAG_DO_FENCING with no master_key bytes must error \
+         with TooShort, got {result:?}",
+    );
+}
