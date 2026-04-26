@@ -766,7 +766,18 @@ impl Auditor {
                     // Open a connection to every bookie in the ensemble
                     // exactly once, in parallel.
                     let conn_futs = ensemble.iter().map(|addr| async move {
-                        let sock: Option<SocketAddr> = addr.parse().ok();
+                        // SocketAddr::parse rejects "host:port" forms, so a
+                        // hostname-based bookie id used to silently produce
+                        // None here and the audit became a no-op for the
+                        // entire ensemble. Fall back to tokio::net's
+                        // hostname resolver when direct parsing fails.
+                        let sock: Option<SocketAddr> = match addr.parse::<SocketAddr>() {
+                            Ok(sa) => Some(sa),
+                            Err(_) => tokio::net::lookup_host(addr.as_str())
+                                .await
+                                .ok()
+                                .and_then(|mut iter| iter.next()),
+                        };
                         match sock {
                             Some(sa) => BookieConnection::connect(sa).await.ok().map(Arc::new),
                             None => None,
