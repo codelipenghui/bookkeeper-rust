@@ -631,7 +631,28 @@ impl WriteHandle {
         let pending_add = self.lac_state.register(entry_id);
         let quorum_timeout = self.add_entry_quorum_timeout;
 
+        // RAII guard so the in-flight registry is cleared even if the
+        // spawned ack-collector panics or is dropped mid-await. Without
+        // this, in_flight_entries would grow unbounded under any panic
+        // path inside the quorum-collection task.
+        struct InFlightGuard {
+            ensemble_info: Arc<EnsembleInfo>,
+            entry_id: i64,
+        }
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.ensemble_info.remove_in_flight(self.entry_id);
+            }
+        }
+        let in_flight_guard = InFlightGuard {
+            ensemble_info: Arc::clone(&ensemble_info),
+            entry_id,
+        };
+
         let handle = tokio::spawn(async move {
+            // Move the guard into the task so its Drop runs on every exit
+            // path: success, error, panic, or future cancellation.
+            let _in_flight_guard = in_flight_guard;
             // Wrap the entire quorum collection in a timeout.
             // Matches Java's addEntryQuorumTimeoutNanos monitoring.
             let write_result = tokio::time::timeout(quorum_timeout, async {
@@ -734,8 +755,8 @@ impl WriteHandle {
                 }
             }).await;
 
-            // Remove from in-flight registry now that the entry is resolved.
-            ensemble_info.remove_in_flight(entry_id);
+            // (in_flight removal is handled by the RAII guard above —
+            // running on every exit path including panic / cancellation.)
 
             // Signal the PendingAdd.  Success path goes through LacState
             // which fires callbacks in LAC-advancement order (matching
