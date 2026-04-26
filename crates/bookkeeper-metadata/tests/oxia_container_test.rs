@@ -325,3 +325,70 @@ async fn idgen_resists_parent_delete_collision() {
     }
     raw.shutdown().await.ok();
 }
+
+/// HOB GC must not delete a HOB that still holds child markers — an
+/// in-flight `seq_create` against an old HOB can have its ephemeral
+/// marker swept along with the HOB, breaking the marker semantics
+/// and leaving the slow generator pointing at a path the server has
+/// forgotten.
+///
+/// We seed `idgen-long` with HOBs 1..=5 (more than the GC-keep count
+/// of 3), drop a child marker into HOB-1, then drive `gc_old_hobs`.
+/// Pre-fix HOB-1 is gone; post-fix the empty-check skips it.
+#[tokio::test]
+#[ignore]
+async fn hob_gc_skips_non_empty_hobs() {
+    use bookkeeper_metadata::metadata_paths::LedgerPaths;
+    use bookkeeper_metadata::oxia::idgen::OxiaLedgerIdGenerator;
+    use liboxia::client::OxiaClient;
+    use liboxia::client_options::OxiaClientOptions;
+    use std::sync::Arc;
+
+    if !is_docker_available() {
+        eprintln!("[SKIP] docker not available");
+        return;
+    }
+
+    let container = OxiaContainer::start().expect("start oxia container");
+    let raw = OxiaClient::new(OxiaClientOptions {
+        service_address: format!("http://127.0.0.1:{}", container.port),
+        namespace: "default".to_string(),
+        identity: format!("test-gc-{}", uuid::Uuid::new_v4()),
+        session_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .await
+    .expect("raw oxia client");
+
+    let paths = LedgerPaths::new("/ledgers");
+    let client = Arc::new(raw.clone());
+    let gen = OxiaLedgerIdGenerator::new(client, &paths);
+
+    // Seed HOB-1..=HOB-5 directly so we have more than HOB_GC_KEEP=3.
+    for hob in 1..=5 {
+        let hob_path = format!("/ledgers/idgen-long/HOB-{:010}", hob);
+        raw.put(hob_path, Vec::new()).await.expect("seed HOB");
+    }
+
+    // Drop a stale marker into HOB-1 to simulate an in-flight seq_create.
+    let marker = "/ledgers/idgen-long/HOB-0000000001/ID-9999999999".to_string();
+    raw.put(marker.clone(), Vec::new()).await.expect("seed marker");
+
+    // Run GC over the seeded HOBs. The function deletes everything
+    // beyond the most recent HOB_GC_KEEP=3, i.e. HOB-1 and HOB-2.
+    gen.gc_old_hobs(&[1, 2, 3, 4, 5]).await;
+
+    // Post-fix: HOB-1 is preserved because of its child marker; HOB-2
+    // (no children) is deleted as before. Pre-fix: both deleted.
+    let hob1_alive = raw
+        .get("/ledgers/idgen-long/HOB-0000000001".to_string())
+        .await
+        .is_ok();
+    assert!(
+        hob1_alive,
+        "HOB-1 was deleted despite holding a child marker — \
+         GC must skip non-empty HOBs",
+    );
+
+    raw.shutdown().await.ok();
+}

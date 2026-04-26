@@ -211,12 +211,27 @@ impl OxiaLedgerIdGenerator {
         Ok(path)
     }
 
-    async fn gc_old_hobs(&self, hobs: &[i32]) {
+    pub async fn gc_old_hobs(&self, hobs: &[i32]) {
         if hobs.len() <= HOB_GC_KEEP {
             return;
         }
         for &hob in &hobs[..hobs.len() - HOB_GC_KEEP] {
-            let _ = self.client.delete(self.hob_path(hob)).await;
+            let hob_path = self.hob_path(hob);
+            // Skip HOBs that still hold transient child markers (e.g. an
+            // in-flight seq_create on this HOB hasn't finished its
+            // ephemeral create+delete yet). Deleting such a HOB drops
+            // the ephemeral child along with it, breaking the marker
+            // semantics and leaving the slow generator pointing at a
+            // path the server has forgotten.
+            let (start, end) = child_range(&hob_path);
+            let has_children = matches!(
+                self.client.list(start, end).await,
+                Ok(r) if !r.keys.is_empty()
+            );
+            if has_children {
+                continue;
+            }
+            let _ = self.client.delete(hob_path).await;
         }
     }
 
