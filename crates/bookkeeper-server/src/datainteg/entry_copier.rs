@@ -144,7 +144,16 @@ impl EntryCopier {
     ) -> Result<Batch, EntryCopyError> {
         if !self.storage.ledger_exists(ledger_id)? {
             let pw = metadata.password().unwrap_or(&[]);
-            self.storage.set_master_key(ledger_id, pw)?;
+            // Stamp the SHA-1-derived master key, NOT the raw password.
+            // Pre-fix the raw password was stored, but the bookie's
+            // check_master_key compares against the master_key clients
+            // wire over (generate_master_key(password) = SHA-1). The
+            // stored bytes never matched, so the first client touching
+            // this ledger would silently overwrite the master key with
+            // their own value — letting any actor who handed the bookie
+            // the right password establish themselves as the writer.
+            let master_key = bookkeeper_protocol::digest::generate_master_key(pw);
+            self.storage.set_master_key(ledger_id, &master_key)?;
         }
         Ok(Batch {
             ledger_id,
