@@ -161,10 +161,13 @@ impl RecoveryHandle {
             .saturating_sub(self.schedule.ack_quorum_size())
             + 1;
 
+        let ack_quorum = self.schedule.ack_quorum_size();
+
         loop {
             let write_set = self.schedule.write_set(entry_id);
-            let mut found = false;
             let mut missing_count: usize = 0;
+            let mut ok_count: usize = 0;
+            let mut entry_max_length: Option<i64> = None;
 
             for &bookie_idx in &write_set {
                 if bookie_idx >= conns.len() {
@@ -176,10 +179,22 @@ impl RecoveryHandle {
                             BKError::Ok => {
                                 if let Some(entry_data) = data {
                                     if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
-                                        self.total_length = entry.length;
-                                        last_entry = entry_id;
-                                        found = true;
-                                        break;
+                                        ok_count += 1;
+                                        entry_max_length = Some(match entry_max_length {
+                                            Some(m) => m.max(entry.length),
+                                            None => entry.length,
+                                        });
+                                        // Continue scanning until we've reached
+                                        // ack-quorum OKs so the cumulative
+                                        // length is taken as the MAX across the
+                                        // ack quorum, not whichever bookie
+                                        // answered first. Pre-fix the first
+                                        // OK won, which let a stale replica's
+                                        // shorter length stand in for the
+                                        // committed value.
+                                        if ok_count >= ack_quorum {
+                                            break;
+                                        }
                                     }
                                 }
                                 // EOK with missing/unparseable data: don't
@@ -202,7 +217,9 @@ impl RecoveryHandle {
                 }
             }
 
-            if found {
+            if let Some(length) = entry_max_length {
+                self.total_length = length;
+                last_entry = entry_id;
                 entry_id += 1;
                 continue;
             }
