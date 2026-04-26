@@ -132,7 +132,10 @@ pub struct ServerConfig {
     pub max_adds_in_progress_limit: usize,
     /// Max concurrent read requests. 0 = use default (10000).
     pub max_reads_in_progress_limit: usize,
-    /// Max concurrent connections. 0 = unlimited.
+    /// Max concurrent connections. 0 = unlimited (UNSAFE: combined with
+    /// `max_frame_size` this is a per-connection × N memory amplifier).
+    /// Default is a generous-but-finite cap; operators with private
+    /// network deployments can still raise it.
     pub max_connections: usize,
     /// When the server times out sending a response (see
     /// `waitTimeoutOnResponseBackpressureMs`): close the channel and
@@ -467,7 +470,7 @@ impl Default for ServerConfig {
             journal_remove_from_page_cache: true,
             max_adds_in_progress_limit: 0,
             max_reads_in_progress_limit: 10000,
-            max_connections: 0,
+            max_connections: 65_535,
             close_channel_on_response_timeout: false,
             skip_replay_journal_invalid_record: false,
             verify_storage_on_unclean_shutdown: false,

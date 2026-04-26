@@ -111,7 +111,15 @@ pub struct EngineSet {
 /// - "auto" or unset: auto-detect based on platform and kernel capabilities
 pub fn select_engine() -> EngineSet {
     let override_val = std::env::var("BOOKKEEPER_IO_ENGINE").unwrap_or_default();
-    match override_val.as_str() {
+    select_engine_with_override(&override_val)
+}
+
+/// Like `select_engine()` but takes the override string explicitly.
+/// Use this from contexts that want to pick an engine without mutating
+/// process-wide environment (e.g. from a Tokio task — `set_var` on
+/// already-spawned threads is unsound in Rust 2024).
+pub fn select_engine_with_override(override_val: &str) -> EngineSet {
+    match override_val {
         "std" => {
             tracing::info!("BOOKKEEPER_IO_ENGINE=std — forcing StdEngine");
             let engine = Arc::new(std_engine::StdEngine::new());

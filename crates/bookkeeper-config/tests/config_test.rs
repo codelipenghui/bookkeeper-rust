@@ -122,7 +122,9 @@ fn server_config_new_fields_defaults() {
     // Request limits
     assert_eq!(config.max_adds_in_progress_limit, 0);
     assert_eq!(config.max_reads_in_progress_limit, 10000);
-    assert_eq!(config.max_connections, 0);
+    // The default cap is finite — historically 0 (unlimited) but that
+    // multiplied per-connection allocations into an OOM amplifier.
+    assert_eq!(config.max_connections, 65_535);
     // Journal extended
     assert!(!config.skip_replay_journal_invalid_record);
     assert_eq!(config.journal_pre_alloc_size_mb, 16);

@@ -69,17 +69,40 @@ pub async fn cmd_bench_bookie(
     read_pct: u8,
     io_engine: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // bench is a *client* benchmark — the io-engine selection is server-side
+    // and has no effect here, so we only log what was requested.
+    // (Mutating the process env from a running async task is unsound in
+    // Rust 2024 anyway, hence the change away from std::env::set_var.)
     if io_engine != "auto" {
-        std::env::set_var("BOOKKEEPER_IO_ENGINE", io_engine);
+        eprintln!(
+            "note: --io-engine={io_engine} is informational; bench-bookie is a client \
+             and does not start a local bookie"
+        );
     }
 
     let digest_type = digest_str.parse::<DigestType>()?;
     let addr: SocketAddr = bookie_addr.parse()?;
-    let password = b"bench-password";
-    let master_key = generate_master_key(password);
-    let dm = DigestManager::new(digest_type).with_password(password);
+    // Use a bench-specific ledger and password so the bench cannot collide
+    // with a real ledger if pointed at a production bookie. The ledger id
+    // is sourced from the current process id + a fixed bench-only marker
+    // so two concurrent bench runs against the same target use distinct
+    // ledger ids and don't trash each other's data.
+    let password: Vec<u8> = format!(
+        "bench-password-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ).into_bytes();
+    let master_key = generate_master_key(&password);
+    let dm = DigestManager::new(digest_type).with_password(&password);
     let payload = random_payload(entry_size);
-    let ledger_id: i64 = 999_999;
+    // Reserved bench-id band: i64::MIN .. i64::MIN + 2^32 — far away from
+    // every legitimate ledger id space and never returned by the
+    // production id generator. Pick a ledger id within that band.
+    let ledger_id: i64 = i64::MIN
+        + ((std::process::id() as i64) & 0xFFFF_FFFF);
 
     println!("=== Bookie Benchmark ===");
     println!("  Target:     {bookie_addr}");
