@@ -269,3 +269,61 @@ async fn forward_read_does_not_truncate_when_quorum_unreachable() {
 
     for b in bookies { b.shutdown().await; }
 }
+
+/// Re-replication during recovery must not silently skip entries it cannot
+/// re-read. forward_read already established that an entry exists somewhere
+/// in the ensemble, but if the bookies that hold it become unreachable
+/// before re-replication, we cannot fabricate the missing data — the only
+/// safe option is to surface the failure so the caller does not close the
+/// ledger with a hole punched in it.
+///
+/// Repro: with E=3, W=2, A=2, write 5 entries, fence and forward_read with
+/// all bookies alive (so last_entry=4 is established), then kill bookies 0
+/// and 1. Entries whose write_set is [0,1] (entry 0 and entry 3 in our
+/// 5-entry set) are now unreadable. Pre-fix `replicate_range` skipped
+/// silently and returned Ok(()), allowing `recover()` to close the ledger
+/// at last_entry=4 with entries 0 and 3 missing from re-replication.
+#[tokio::test]
+async fn recover_errors_when_re_replication_cannot_read_entry() {
+    let (mut bookies, _dirs, addrs) = spawn_bookies(3).await;
+
+    {
+        let mut client = BookKeeperClient::new(addrs.clone());
+        let mut wh = client.create_ledger(8, 3, 2, 2, DigestType::Crc32c, b"").await.unwrap();
+        for i in 0..5 {
+            wh.append(client.connections(), format!("e{i}").as_bytes()).await.unwrap();
+        }
+    }
+
+    let conns = connect_all(&addrs).await;
+
+    let schedule = RoundRobinDistributionSchedule::new(3, 2, 2);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = generate_master_key(b"");
+    let mut recovery = RecoveryHandle::new(8, addrs.clone(), schedule, dm, master_key);
+
+    // Phase 1 + 2 with all bookies alive — establishes last_entry = 4.
+    recovery.fence(&conns, 0).await.unwrap();
+    let last_entry = recovery.forward_read(&conns, recovery.recovery_lac()).await.unwrap();
+    assert_eq!(last_entry, 4);
+
+    // Now kill bookies 0 and 1. write_set(0) = [0, 1] becomes unreachable.
+    let dead0 = bookies.remove(0);
+    let dead1 = bookies.remove(0);
+    dead0.shutdown().await;
+    dead1.shutdown().await;
+
+    // Phase 3 (re-replication) must surface the unreadable entry as an error
+    // rather than silently skipping it.
+    let result = recovery.replicate_range(&conns, 0, last_entry).await;
+    match result {
+        Ok(()) => panic!(
+            "replicate_range returned Ok(()) even though entries 0 and 3 \
+             could not be re-read from any bookie — recover() would close the \
+             ledger with re-replication holes",
+        ),
+        Err(_) => { /* expected */ }
+    }
+
+    for b in bookies { b.shutdown().await; }
+}

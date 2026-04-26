@@ -345,24 +345,21 @@ impl RecoveryHandle {
         Ok((last_entry_id, self.total_length))
     }
 
-    /// Run the complete recovery protocol: fence → forward read → re-replicate → close.
-    /// Returns (lastEntryId, totalLength) for metadata update.
-    pub async fn recover(
-        &mut self,
+    /// Phase 3: Re-replicate entries `[from..=to]` to ensure write quorum.
+    /// For each entry, reads it from any bookie in the write set and writes
+    /// it back with FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY.
+    ///
+    /// Any entry that cannot be re-read from at least one write-set bookie
+    /// is surfaced as an error. Skipping silently would close the ledger
+    /// with a re-replication hole — readers would later see that entry
+    /// missing despite metadata claiming it was committed.
+    pub async fn replicate_range(
+        &self,
         conns: &[Arc<BookieConnection>],
-        last_ensemble_entry_id: i64,
-    ) -> Result<(i64, i64), ClientError> {
-        // Phase 1: Fence (also extracts total_length from fencing response data)
-        let recovery_lac = self.fence(conns, last_ensemble_entry_id).await?;
-
-        // Phase 2: Forward read to find true last entry
-        let last_entry = self.forward_read(conns, recovery_lac).await?;
-
-        // Phase 3: Re-replicate entries from recovery_lac+1 to last_entry.
-        // forward_read already verified these entries exist; now re-read and re-replicate
-        // to ensure write quorum on all bookies.
-        for eid in (recovery_lac + 1)..=last_entry {
-            // Read the entry from any bookie in the write set
+        from: i64,
+        to: i64,
+    ) -> Result<(), ClientError> {
+        for eid in from..=to {
             let write_set = self.schedule.write_set(eid);
             let mut entry_data: Option<Bytes> = None;
             for &bookie_idx in &write_set {
@@ -380,11 +377,35 @@ impl RecoveryHandle {
                 }
             }
 
-            if let Some(data) = entry_data {
-                // Re-replicate with FLAG_RECOVERY_ADD | FLAG_HIGH_PRIORITY
-                self.recovery_add_raw(conns, eid, data).await?;
+            match entry_data {
+                Some(data) => self.recovery_add_raw(conns, eid, data).await?,
+                None => return Err(ClientError::Protocol(format!(
+                    "recovery: cannot re-read entry {eid} for ledger {} from any \
+                     bookie in its write set; re-replication aborted to avoid \
+                     closing the ledger with a hole",
+                    self.ledger_id,
+                ))),
             }
         }
+        Ok(())
+    }
+
+    /// Run the complete recovery protocol: fence → forward read → re-replicate → close.
+    /// Returns (lastEntryId, totalLength) for metadata update.
+    pub async fn recover(
+        &mut self,
+        conns: &[Arc<BookieConnection>],
+        last_ensemble_entry_id: i64,
+    ) -> Result<(i64, i64), ClientError> {
+        // Phase 1: Fence (also extracts total_length from fencing response data)
+        let recovery_lac = self.fence(conns, last_ensemble_entry_id).await?;
+
+        // Phase 2: Forward read to find true last entry
+        let last_entry = self.forward_read(conns, recovery_lac).await?;
+
+        // Phase 3: Re-replicate. forward_read already verified these entries
+        // exist somewhere in the ensemble.
+        self.replicate_range(conns, recovery_lac + 1, last_entry).await?;
 
         // Phase 4: Close
         Ok((last_entry, self.total_length))
