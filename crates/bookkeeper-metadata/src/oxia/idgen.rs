@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use liboxia::client::{OxiaClient, PutOption};
+use liboxia::client::{GetOption, OxiaClient, PutOption};
 use liboxia::errors::OxiaError;
 
 use super::errors::map_oxia_error;
@@ -61,6 +61,70 @@ impl OxiaLedgerIdGenerator {
         format!("{}/{}{:010}", self.long_gen_dir, HOB_PREFIX, hob)
     }
 
+    /// Counter key for the short-id generator. Stored as a sibling of
+    /// `idgen` so the counter outlives any deletion / recreation of
+    /// the `idgen` record itself (which would otherwise reset the
+    /// suffix back to its initial value and reissue ledger IDs).
+    fn short_counter_key(&self) -> String {
+        format!("{}-counter", self.short_gen_dir)
+    }
+
+    /// Counter key for a long-id HOB. Stored next to (not inside) the
+    /// HOB record so HOB GC's delete leaves the counter intact —
+    /// ensuring that any future generator that reuses this HOB never
+    /// reissues a previously-allocated suffix.
+    ///
+    /// `list_hobs`'s leaf parser strips `HOB-` then parses the
+    /// remainder as an `i32`, so the trailing `.counter` segment of
+    /// these counter keys is automatically filtered out and never
+    /// mistaken for a real HOB.
+    fn hob_counter_key(&self, hob: i32) -> String {
+        format!("{}/{}{:010}.counter", self.long_gen_dir, HOB_PREFIX, hob)
+    }
+
+    /// Atomically increment the i64 value stored at `key` and return
+    /// the new value. Independent of the record's
+    /// `modifications_count` so unrelated writers (or a delete that
+    /// resets that counter) cannot influence the suffix.
+    ///
+    /// CAS-retries on `UnexpectedVersionId`, matching the standard
+    /// optimistic-locking idiom.
+    async fn cas_increment_counter(&self, key: &str) -> Result<i64, MetadataError> {
+        loop {
+            let (current, expected_version) = match self
+                .client
+                .get_with_options(key.to_string(), vec![GetOption::IncludeValue(true)])
+                .await
+            {
+                Ok(rec) => {
+                    let val = rec
+                        .value
+                        .as_deref()
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(0);
+                    (val, rec.version.version_id)
+                }
+                Err(OxiaError::KeyNotFound()) => (0, -1),
+                Err(e) => return Err(map_oxia_error(e, None)),
+            };
+            let next = current + 1;
+            let result = self
+                .client
+                .put_with_options(
+                    key.to_string(),
+                    next.to_string().into_bytes(),
+                    vec![PutOption::ExpectVersionId(expected_version)],
+                )
+                .await;
+            match result {
+                Ok(_) => return Ok(next),
+                Err(OxiaError::UnexpectedVersionId()) => continue,
+                Err(e) => return Err(map_oxia_error(e, None)),
+            }
+        }
+    }
+
     async fn is_long_present(&self) -> Result<bool, MetadataError> {
         if let Some(v) = *self.long_path_known.lock().unwrap() {
             return Ok(v);
@@ -74,23 +138,20 @@ impl OxiaLedgerIdGenerator {
         Ok(exists)
     }
 
-    /// Do one sequential-create under `parent`: put an empty value on
-    /// `parent` itself, read the resulting `modifications_count`, and
-    /// use it as the suffix on `child_prefix`. Returns the fabricated
-    /// child key. For Pulsar parity we also create+delete the ephemeral
-    /// child record so that any observer walking children sees them
-    /// transiently.
+    /// Issue the next sequential suffix from a dedicated counter at
+    /// `counter_key`, then run the Pulsar-style ephemeral child marker
+    /// (create+delete) at `child_prefix{NNN}` and return that key.
+    ///
+    /// The suffix is taken from the counter's stored i64 value, not
+    /// the parent record's `modifications_count`, so unrelated writes
+    /// to the parent (or a delete-then-recreate by GC) cannot reissue
+    /// a previously-allocated id.
     async fn seq_create(
         &self,
-        parent: &str,
+        counter_key: &str,
         child_prefix: &str,
     ) -> Result<String, MetadataError> {
-        let res = self
-            .client
-            .put(parent.to_string(), Vec::new())
-            .await
-            .map_err(|e| map_oxia_error(e, None))?;
-        let suffix = res.version.modifications_count;
+        let suffix = self.cas_increment_counter(counter_key).await?;
         let key = format!("{child_prefix}{:010}", suffix);
         // Parity with Pulsar: create+delete the child as an ephemeral
         // marker. Both operations are best-effort.
@@ -112,7 +173,8 @@ impl OxiaLedgerIdGenerator {
             self.short_gen_dir_ensured.store(true, Ordering::Release);
         }
         let prefix = format!("{}/{}", self.short_gen_dir, SHORT_ID_PREFIX);
-        let key = self.seq_create(&self.short_gen_dir, &prefix).await?;
+        let counter_key = self.short_counter_key();
+        let key = self.seq_create(&counter_key, &prefix).await?;
         let suffix = &key[prefix.len()..];
         let id: i64 = suffix
             .parse()
@@ -171,7 +233,8 @@ impl OxiaLedgerIdGenerator {
             };
             let hob_path = self.hob_path(high_bits);
             let prefix = format!("{hob_path}/{}", SHORT_ID_PREFIX);
-            let key = self.seq_create(&hob_path, &prefix).await?;
+            let counter_key = self.hob_counter_key(high_bits);
+            let key = self.seq_create(&counter_key, &prefix).await?;
             let suffix: i64 = key[prefix.len()..]
                 .parse()
                 .map_err(|e| MetadataError::SerializationError(format!("idgen parse: {e}")))?;

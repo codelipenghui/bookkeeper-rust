@@ -236,3 +236,92 @@ async fn ephemeral_registration_cleans_up_on_backend_drop() {
         "ephemeral registration should have been cleaned up after session expiry, got {list:?}"
     );
 }
+
+/// Deleting the `idgen` parent (e.g. by the HOB GC path that wipes a
+/// generator directory and lets a later put recreate it) used to reset
+/// the suffix back to its initial value because the old `seq_create`
+/// keyed off the parent record's `modifications_count`. Two generators
+/// straddling that delete then issued the same ledger ID.
+///
+/// Post-fix the suffix lives in a dedicated counter key (`{idgen}-counter`)
+/// outside the parent directory, so deleting `idgen` does not influence
+/// the next id issued. This test exercises that property end-to-end.
+#[tokio::test]
+#[ignore]
+async fn idgen_resists_parent_delete_collision() {
+    use liboxia::client::OxiaClient;
+    use liboxia::client_options::OxiaClientOptions;
+    use std::collections::HashSet;
+
+    if !is_docker_available() {
+        eprintln!("[SKIP] docker not available");
+        return;
+    }
+
+    let container = OxiaContainer::start().expect("start oxia container");
+    let uri = oxia_uri(container.port);
+
+    let backend1 = open_metadata_backend(&uri, None, Some(Duration::from_secs(10)))
+        .await
+        .expect("open backend 1");
+    backend1
+        .registration_manager
+        .init_new_cluster(
+            &LedgerLayout {
+                manager_factory_class: "LegacyHierarchicalLedgerManagerFactory".into(),
+                manager_version: 1,
+            },
+            "idgen-collision-test",
+        )
+        .await
+        .expect("init_new_cluster");
+
+    let mut ids: HashSet<i64> = HashSet::new();
+    for _ in 0..5 {
+        let id = backend1
+            .id_generator
+            .generate_ledger_id()
+            .await
+            .expect("first round generate");
+        assert!(
+            ids.insert(id),
+            "first round emitted duplicate id {id}"
+        );
+    }
+    let first_round: Vec<i64> = ids.iter().copied().collect();
+
+    // Connect a raw oxia client to delete `/ledgers/idgen` directly,
+    // simulating the GC-recreate path that used to reset the counter.
+    let raw = OxiaClient::new(OxiaClientOptions {
+        service_address: format!("http://127.0.0.1:{}", container.port),
+        namespace: "default".to_string(),
+        identity: format!("test-collision-{}", uuid::Uuid::new_v4()),
+        session_timeout: Duration::from_secs(10),
+        ..Default::default()
+    })
+    .await
+    .expect("raw oxia client");
+    let _ = raw.delete("/ledgers/idgen".to_string()).await;
+
+    // Drop backend1 so a fresh backend2 has to re-ensure the path,
+    // forcing it through the recreate code path.
+    drop(backend1);
+
+    let backend2 = open_metadata_backend(&uri, None, Some(Duration::from_secs(10)))
+        .await
+        .expect("open backend 2");
+
+    for _ in 0..5 {
+        let id = backend2
+            .id_generator
+            .generate_ledger_id()
+            .await
+            .expect("second round generate");
+        assert!(
+            ids.insert(id),
+            "second round emitted id {id} which was already issued before the \
+             /ledgers/idgen delete (first round: {first_round:?})",
+        );
+    }
+    raw.shutdown().await.ok();
+}
