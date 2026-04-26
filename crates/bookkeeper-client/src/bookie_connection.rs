@@ -308,46 +308,90 @@ impl BookieChannel {
 
     /// Ensure connection is live (reconnecting with backoff if needed),
     /// then enqueue a request and return the response receiver.
+    ///
+    /// The reconnect path runs WITHOUT the channel-state mutex held —
+    /// `open_connection` does a TCP connect plus an optional TLS
+    /// handshake (capped at `STARTTLS_TIMEOUT`), which used to stall
+    /// every concurrent caller waiting on the same `Mutex<ChannelState>`.
     async fn enqueue(
         &self,
         data: Bytes,
     ) -> Result<oneshot::Receiver<Result<V2Response, ClientError>>, ClientError> {
         let (response_tx, response_rx) = oneshot::channel();
+
+        // Happy path: there is an existing live sender. Clone it under
+        // the lock and release immediately.
+        let sender = {
+            let state = self.state.lock().await;
+            match &state.sender {
+                Some(tx) if !tx.is_closed() => Some(tx.clone()),
+                _ => None,
+            }
+        };
+
+        let sender = match sender {
+            Some(s) => s,
+            None => self.reconnect().await?,
+        };
+
+        sender
+            .send(PendingRequest { data, response_tx })
+            .await
+            .map_err(|_| ClientError::ConnectionClosed)?;
+        Ok(response_rx)
+    }
+
+    /// Decide whether to attempt a reconnect, perform it without
+    /// holding the lock, then re-acquire to publish the result. Two
+    /// concurrent callers may both end up dialing — one's connection
+    /// will become orphaned and dropped — but this avoids the worse
+    /// problem of pinning every other in-flight request behind a
+    /// single TLS handshake.
+    async fn reconnect(&self) -> Result<mpsc::Sender<PendingRequest>, ClientError> {
+        // First, decide whether *we* are the task that runs the connect.
+        // While holding the lock briefly, also enforce backoff.
         {
             let mut state = self.state.lock().await;
-            let needs_reconnect = match &state.sender {
-                None => true,
-                Some(tx) => tx.is_closed(),
-            };
-            if needs_reconnect {
-                let now = tokio::time::Instant::now();
-                if let Some(last) = state.last_connect_attempt {
-                    if now.duration_since(last) < state.current_backoff {
-                        state.sender = None;
-                        return Err(ClientError::ConnectionClosed);
-                    }
-                }
-                state.last_connect_attempt = Some(now);
-                match Self::open_connection(
-                    self.addr, self.server_hostname.as_deref(), self.tls.clone(), &self.tcp_config,
-                ).await {
-                    Ok(tx) => {
-                        state.sender = Some(tx);
-                        state.current_backoff = MIN_RECONNECT_BACKOFF;
-                    }
-                    Err(e) => {
-                        state.sender = None;
-                        state.current_backoff = (state.current_backoff * 2).min(MAX_RECONNECT_BACKOFF);
-                        return Err(e);
-                    }
+            // Re-check: another task may have just completed the connect.
+            if let Some(tx) = &state.sender {
+                if !tx.is_closed() {
+                    return Ok(tx.clone());
                 }
             }
-            state.sender.as_ref().unwrap()
-                .send(PendingRequest { data, response_tx })
-                .await
-                .map_err(|_| ClientError::ConnectionClosed)?;
+            let now = tokio::time::Instant::now();
+            if let Some(last) = state.last_connect_attempt {
+                if now.duration_since(last) < state.current_backoff {
+                    state.sender = None;
+                    return Err(ClientError::ConnectionClosed);
+                }
+            }
+            state.last_connect_attempt = Some(now);
         }
-        Ok(response_rx)
+
+        // Lock released — TCP connect / TLS handshake here without
+        // serialising every other request on the channel.
+        let result = Self::open_connection(
+            self.addr,
+            self.server_hostname.as_deref(),
+            self.tls.clone(),
+            &self.tcp_config,
+        )
+        .await;
+
+        let mut state = self.state.lock().await;
+        match result {
+            Ok(tx) => {
+                state.sender = Some(tx.clone());
+                state.current_backoff = MIN_RECONNECT_BACKOFF;
+                Ok(tx)
+            }
+            Err(e) => {
+                state.sender = None;
+                state.current_backoff =
+                    (state.current_backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -694,7 +738,33 @@ fn sign_safe_mod(dividend: i64, divisor: i64) -> i64 {
 ///
 /// `server_hostname` is used for SNI when present (matching Java which uses
 /// `address.getHostName()`); when None, falls back to the IP literal.
+/// Cap on the StartTLS exchange + TLS handshake. A misbehaving bookie
+/// that accepts the TCP connection but never replies (or never finishes
+/// the handshake) would otherwise stall this channel forever and
+/// effectively wedge the per-channel mutex held in `enqueue` above.
+const STARTTLS_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn perform_starttls(
+    stream: TcpStream,
+    addr: SocketAddr,
+    server_hostname: Option<&str>,
+    connector: &TlsConnector,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ClientError> {
+    match tokio::time::timeout(
+        STARTTLS_TIMEOUT,
+        perform_starttls_inner(stream, addr, server_hostname, connector),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("StartTLS handshake timed out after {STARTTLS_TIMEOUT:?}"),
+        ))),
+    }
+}
+
+async fn perform_starttls_inner(
     mut stream: TcpStream,
     addr: SocketAddr,
     server_hostname: Option<&str>,
