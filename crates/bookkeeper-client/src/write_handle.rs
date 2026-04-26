@@ -961,7 +961,7 @@ impl WriteHandle {
     /// spawned ack-collector task will pick up the response via the same oneshot
     /// channel, or the entry will succeed via the other ack quorum members.
     async fn resend_in_flight_to_new_ensemble(
-        &self,
+        &mut self,
         conns: &[Arc<BookieConnection>],
         failed_indices: &[usize],
     ) {
@@ -983,11 +983,20 @@ impl WriteHandle {
                 if write_set.contains(&failed_idx) && failed_idx < conns.len() {
                     let conn = Arc::clone(&conns[failed_idx]);
                     let entry = entry_bytes.clone();
-                    // Fire-and-forget: the ack will be counted by the existing
-                    // spawned task, or the entry already has enough acks.
-                    tokio::spawn(async move {
+                    // Spawn the resend, but track it via the closed-flag so
+                    // close() can no-op these in-flight resends and tracking
+                    // them via pending_adds means close() will await them.
+                    // Pre-fix the spawn was fire-and-forget — close() returned
+                    // while detached resend tasks kept writing to bookies
+                    // against a now-closed ledger.
+                    let closed = Arc::clone(&self.closed);
+                    let handle = tokio::spawn(async move {
+                        if closed.load(Ordering::Acquire) {
+                            return;
+                        }
                         let _ = conn.send_add_entry_with_flags(0, mk, entry, ds).await;
                     });
+                    self.pending_adds.push(handle);
                 }
             }
         }
