@@ -140,6 +140,13 @@ impl RecoveryHandle {
     /// Reads entries sequentially until ENOENTRY. Returns the last entry ID found.
     /// Note: total_length for entries up to recovery_lac is obtained from fence().
     /// This method only scans forward from recovery_lac+1.
+    ///
+    /// Quorum-safe missing-entry detection: an entry is declared missing only
+    /// after `write_quorum - ack_quorum + 1` *definitive* NoEntry responses,
+    /// matching Java's `PendingReadOp` recovery fast-fail. With fewer
+    /// definitive misses we cannot distinguish "entry truly absent" from
+    /// "we couldn't reach the bookie that has it" — surfacing this as an
+    /// error prevents silently truncating the ledger.
     pub async fn forward_read(
         &mut self,
         conns: &[Arc<BookieConnection>],
@@ -148,9 +155,16 @@ impl RecoveryHandle {
         let mut last_entry = recovery_lac;
         let mut entry_id = recovery_lac + 1;
 
+        let missing_threshold = self
+            .schedule
+            .write_quorum_size()
+            .saturating_sub(self.schedule.ack_quorum_size())
+            + 1;
+
         loop {
             let write_set = self.schedule.write_set(entry_id);
             let mut found = false;
+            let mut missing_count: usize = 0;
 
             for &bookie_idx in &write_set {
                 if bookie_idx >= conns.len() {
@@ -158,25 +172,51 @@ impl RecoveryHandle {
                 }
                 match conns[bookie_idx].send_read_entry(0, self.ledger_id, entry_id, None).await {
                     Ok(V2Response::Read { error_code, data, .. }) => {
-                        if error_code == V2_EOK {
-                            if let Some(entry_data) = data {
-                                if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
-                                    self.total_length = entry.length;
-                                    last_entry = entry_id;
-                                    found = true;
+                        match BKError::from_v2_code(error_code) {
+                            BKError::Ok => {
+                                if let Some(entry_data) = data {
+                                    if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
+                                        self.total_length = entry.length;
+                                        last_entry = entry_id;
+                                        found = true;
+                                        break;
+                                    }
                                 }
+                                // EOK with missing/unparseable data: don't
+                                // count as definitive missing — try other
+                                // bookies in the write set.
                             }
-                            break;
+                            BKError::NoEntry => {
+                                missing_count += 1;
+                            }
+                            _ => {
+                                // Other bookie-level errors (fenced, etc.) do
+                                // not contribute to the missing threshold.
+                            }
                         }
                     }
-                    _ => continue,
+                    _ => {
+                        // Connection / transport errors aren't definitive
+                        // misses either.
+                    }
                 }
             }
 
-            if !found {
+            if found {
+                entry_id += 1;
+                continue;
+            }
+
+            if missing_count >= missing_threshold {
                 break;
             }
-            entry_id += 1;
+
+            return Err(ClientError::Protocol(format!(
+                "forward_read: ledger={} entry={} unresolved — \
+                 {missing_count} NoEntry replies, threshold {missing_threshold}; \
+                 cannot determine ledger end without more reachable bookies",
+                self.ledger_id, entry_id,
+            )));
         }
 
         // If no entries were found beyond recovery_lac (or total_length was not set

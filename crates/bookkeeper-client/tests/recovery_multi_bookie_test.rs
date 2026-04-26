@@ -208,3 +208,64 @@ async fn read_after_recovery_returns_all_entries() {
 
     for b in bookies { b.shutdown().await; }
 }
+
+/// Recovery's `forward_read` must not declare an entry "missing" until it has
+/// received `(E - AQ + 1)` *definitive* NoEntry responses (Java's invariant).
+/// Otherwise, errors from unreachable bookies are conflated with absence,
+/// silently truncating the ledger and losing committed entries.
+///
+/// Repro: E=3, W=2, A=2 — round-robin places write_set(0)=[0,1].
+/// Both bookies 0 and 1 are killed; bookie 2 is alive. Reading entry 0 yields
+/// 2 errors (no NoEntry responses at all). Pre-fix the loop sees `found=false`
+/// and declares entry 0 missing, returning `last_entry = -1` — silent loss
+/// of all 5 committed entries. Threshold for declaring missing is
+/// `E - AQ + 1 = 2`, but we have 0 NoEntry replies, so the ambiguity must be
+/// surfaced as an error rather than swallowed.
+#[tokio::test]
+async fn forward_read_does_not_truncate_when_quorum_unreachable() {
+    let (mut bookies, _dirs, addrs) = spawn_bookies(3).await;
+
+    // Write 5 entries with E=3, W=2, A=2 — round-robin replicates
+    // each entry to a 2-bookie write set.
+    {
+        let mut client = BookKeeperClient::new(addrs.clone());
+        let mut wh = client.create_ledger(7, 3, 2, 2, DigestType::Crc32c, b"").await.unwrap();
+        for i in 0..5 {
+            wh.append(client.connections(), format!("e{i}").as_bytes()).await.unwrap();
+        }
+    }
+
+    // Connect to all 3 bookies BEFORE killing them so the conns array
+    // preserves ensemble-position indexing (conns[i] = bookie i).
+    let conns = connect_all(&addrs).await;
+
+    // Kill bookies 0 and 1. write_set(0) = [0, 1], so entry 0's only
+    // copies are now unreachable.
+    let dead0 = bookies.remove(0);
+    let dead1 = bookies.remove(0); // was bookies[1]
+    dead0.shutdown().await;
+    dead1.shutdown().await;
+
+    let schedule = RoundRobinDistributionSchedule::new(3, 2, 2);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = generate_master_key(b"");
+    let mut recovery = RecoveryHandle::new(7, addrs.clone(), schedule, dm, master_key);
+
+    let result = recovery.forward_read(&conns, -1).await;
+
+    // Post-fix: forward_read MUST NOT silently return Ok(-1). With 0 NoEntry
+    // responses against a threshold of 2, the recovery cannot determine
+    // whether entry 0 exists — so it must surface an error rather than
+    // declare the ledger empty.
+    match result {
+        Ok(last) => panic!(
+            "forward_read returned Ok({last}) despite ambiguous quorum: \
+             entry 0's write_set [0,1] is fully unreachable, no bookie \
+             returned NoEntry, yet recovery declared the entry missing — \
+             this silently truncates the ledger and loses committed entries",
+        ),
+        Err(_) => { /* expected: ambiguous → error */ }
+    }
+
+    for b in bookies { b.shutdown().await; }
+}
