@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use liboxia::client::{GetOption, OxiaClient};
+use liboxia::client::{GetOption, OxiaClient, PutOption};
 use liboxia::errors::OxiaError;
 
 use super::errors::map_oxia_error;
@@ -46,11 +46,25 @@ impl LayoutManager for OxiaLayoutManager {
     async fn store_ledger_layout(&self, layout: &LedgerLayout) -> Result<(), MetadataError> {
         create_parents(&self.client, self.paths.layout()).await?;
         let data = layout.serialize();
-        self.client
-            .put(self.paths.layout().to_string(), data.into_bytes())
+        // Refuse to overwrite an existing layout. Two operators (or an
+        // accidental re-run of `cluster init`) racing to install a layout
+        // would otherwise silently clobber whichever one ran first; the
+        // only safe behaviour is to surface the conflict.
+        match self
+            .client
+            .put_with_options(
+                self.paths.layout().to_string(),
+                data.into_bytes(),
+                vec![PutOption::ExpectVersionId(-1)],
+            )
             .await
-            .map_err(|e| map_oxia_error(e, None))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(OxiaError::UnexpectedVersionId()) => Err(MetadataError::InvalidConfig(
+                "layout already exists; refusing to overwrite an installed cluster layout".into(),
+            )),
+            Err(e) => Err(map_oxia_error(e, None)),
+        }
     }
 
     async fn delete_ledger_layout(&self) -> Result<(), MetadataError> {

@@ -134,24 +134,42 @@ impl RegistrationManager for OxiaRegistrationManager {
         version: i64,
     ) -> Result<(), MetadataError> {
         let key = self.paths.cookie_path(bookie_id);
-        self.client
+        match self
+            .client
             .put_with_options(
                 key,
                 data.to_vec(),
                 vec![PutOption::ExpectVersionId(version)],
             )
             .await
-            .map_err(|e| map_oxia_error(e, None))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            // Distinguish "version mismatch" from "key gone" so callers can
+            // retry / re-read instead of treating both as an opaque error.
+            Err(OxiaError::UnexpectedVersionId()) => Err(MetadataError::VersionConflict {
+                expected: version,
+                actual: -1,
+            }),
+            Err(OxiaError::KeyNotFound()) => Err(MetadataError::NotFound(0)),
+            Err(e) => Err(map_oxia_error(e, None)),
+        }
     }
 
     async fn delete_cookie(&self, bookie_id: &str, version: i64) -> Result<(), MetadataError> {
         let key = self.paths.cookie_path(bookie_id);
-        self.client
+        match self
+            .client
             .delete_with_options(key, vec![DeleteOption::ExpectVersionId(version)])
             .await
-            .map_err(|e| map_oxia_error(e, None))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(OxiaError::UnexpectedVersionId()) => Err(MetadataError::VersionConflict {
+                expected: version,
+                actual: -1,
+            }),
+            Err(OxiaError::KeyNotFound()) => Err(MetadataError::NotFound(0)),
+            Err(e) => Err(map_oxia_error(e, None)),
+        }
     }
 
     async fn get_cluster_instance_id(&self) -> Result<Option<String>, MetadataError> {
