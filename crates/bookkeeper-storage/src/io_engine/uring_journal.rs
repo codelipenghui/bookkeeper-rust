@@ -87,22 +87,42 @@ impl JournalIo for UringJournalIo {
             .map(|cqe| (cqe.result(), cqe.user_data()))
             .collect();
 
-        let mut need_retry_fsync = false;
+        // First pass: classify each CQE. We must NOT eager-return on a
+        // negative FSYNC result before we've inspected the WRITEV CQE,
+        // because IO_LINK auto-cancels a linked SQE when the previous
+        // one is "short" (return -ECANCELED on the FSYNC). That's not
+        // a real error — it's the trigger for our short-write retry.
+        let mut writev_ret: Option<i32> = None;
+        let mut fsync_ret: Option<i32> = None;
         for (ret, user_data) in &cqes {
-            if *ret < 0 {
-                return Err(io::Error::from_raw_os_error(-*ret));
+            match *user_data {
+                1 => writev_ret = Some(*ret),
+                2 => fsync_ret = Some(*ret),
+                _ => {}
             }
-            // user_data=1 is the WRITEV CQE — check for short write
-            if *user_data == 1 && (*ret as usize) < total_bytes {
-                let written = *ret as usize;
+        }
+        // Real WRITEV errors are still fatal.
+        if let Some(r) = writev_ret {
+            if r < 0 {
+                return Err(io::Error::from_raw_os_error(-r));
+            }
+            let written = r as usize;
+            if written < total_bytes {
+                // Short write: complete the missing tail, then retry the
+                // FSYNC. The linked FSYNC was auto-cancelled by the
+                // kernel; we ignore its CQE result here.
                 self.retry_short_write(fd, entries, written)?;
-                need_retry_fsync = true;
+                self.submit_fsync(&mut ring, fd)?;
+                return Ok(());
             }
         }
-        if need_retry_fsync {
-            self.submit_fsync(&mut ring, fd)?;
+        // No short write — the linked FSYNC must have run normally;
+        // surface its error if any.
+        if let Some(r) = fsync_ret {
+            if r < 0 {
+                return Err(io::Error::from_raw_os_error(-r));
+            }
         }
-
         Ok(())
     }
 
