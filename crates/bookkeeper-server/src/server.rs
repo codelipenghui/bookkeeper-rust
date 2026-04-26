@@ -39,6 +39,10 @@ pub struct BookieServer {
     http_addr: Option<SocketAddr>,
     shutdown_tx: watch::Sender<bool>,
     accept_handle: Option<tokio::task::JoinHandle<()>>,
+    /// In-flight connection tasks. shutdown() waits for this to drain
+    /// before checkpointing so we don't ack a write that's about to be
+    /// dropped.
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
     storage: Arc<dyn bookkeeper_storage::ledger_storage::LedgerStorage>,
     state: Arc<BookieStateManager>,
     zk_reg: Option<(bookkeeper_metadata::backend::MetadataBackend, String)>,
@@ -674,7 +678,10 @@ impl BookieServer {
             None
         };
 
-        // Spawn accept loop
+        // Shared counter for in-flight connection tasks. Exposed to
+        // shutdown() so checkpoint waits for connections to drain
+        // instead of running while writes are still being acked.
+        let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let accept_handle = tokio::spawn(accept_loop(
             listener,
             processor,
@@ -685,6 +692,7 @@ impl BookieServer {
             config.server_sock_keepalive,
             config.server_tcp_no_delay,
             config.max_connections,
+            active_connections.clone(),
         ));
 
         // Start scrubber if localScrubInterval > 0
@@ -716,6 +724,7 @@ impl BookieServer {
             http_addr,
             shutdown_tx,
             accept_handle: Some(accept_handle),
+            active_connections,
             storage: storage_for_shutdown,
             state,
             zk_reg,
@@ -787,11 +796,36 @@ impl BookieServer {
         }
         tracing::info!("Background tasks stopped.");
 
-        // Step 4: Wait for accept loop to finish (drains in-flight connections).
+        // Step 4: Wait for accept loop to finish (stops accepting new
+        // connections), then drain in-flight per-connection tasks.
         if let Some(h) = self.accept_handle.take() {
             h.await.ok();
         }
         tracing::info!("Accept loop stopped.");
+        // Wait up to 10s for active connection tasks to drain. Without
+        // this, checkpoint can run while a connection task is still
+        // emitting an add-entry response — leading to writes that were
+        // ack'd but whose journal record didn't make it to disk before
+        // the journal was flushed and rotated.
+        {
+            let drain_deadline = tokio::time::Instant::now()
+                + tokio::time::Duration::from_secs(10);
+            while self.active_connections.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                if tokio::time::Instant::now() >= drain_deadline {
+                    let stragglers = self
+                        .active_connections
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    tracing::warn!(
+                        stragglers,
+                        "shutdown drain timed out — connections still in flight; \
+                         proceeding to checkpoint anyway",
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            tracing::info!("In-flight connections drained.");
+        }
 
         // Step 5: Flush storage — persist write cache to entry logs + checkpoint.
         // Matches Java's SyncThread.shutdown() which waits up to 5 minutes.
@@ -1666,8 +1700,8 @@ async fn accept_loop(
     tcp_keepalive: bool,
     tcp_no_delay: bool,
     max_connections: usize,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     loop {
         tokio::select! {
