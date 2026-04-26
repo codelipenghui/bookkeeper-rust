@@ -575,6 +575,7 @@ impl BookieServer {
                 gc_force_major: gc_force_major.clone(),
                 gc_force_minor: gc_force_minor.clone(),
                 gc_status: http_api::GcStatus::default(),
+                http_admin_token: config.http_admin_token.clone(),
             };
             let router = http_api::create_router(http_state);
             let http_host = &config.http_server_host;

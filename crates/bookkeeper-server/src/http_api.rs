@@ -87,9 +87,15 @@ pub struct HttpState {
     pub gc_force_minor: Arc<std::sync::atomic::AtomicBool>,
     /// Shared GC status for the gc_details endpoint.
     pub gc_status: GcStatus,
+    /// Bearer token required on Authorization for any non-GET request.
+    /// When `None` the admin API is unauthenticated (legacy behavior).
+    /// When `Some`, mutating endpoints (POST/PUT/DELETE) reject the
+    /// request with 401 if the header is missing or doesn't match.
+    pub http_admin_token: Option<String>,
 }
 
 pub fn create_router(http_state: HttpState) -> Router {
+    use axum::response::IntoResponse;
     let router = Router::new()
         // Existing
         .route("/heartbeat", axum::routing::get(heartbeat))
@@ -152,7 +158,47 @@ pub fn create_router(http_state: HttpState) -> Router {
         axum::routing::get(pprof_flamegraph),
     );
 
-    router.with_state(http_state)
+    let token = http_state.http_admin_token.clone();
+    // When a token is configured, require it on Authorization for any
+    // non-GET/HEAD request. GET endpoints stay open so monitoring
+    // (heartbeat, /metrics, state probes) keeps working.
+    let auth_layer = axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let token = token.clone();
+            async move {
+                let Some(expected) = token else {
+                    return next.run(req).await;
+                };
+                if req.method() == axum::http::Method::GET
+                    || req.method() == axum::http::Method::HEAD
+                {
+                    return next.run(req).await;
+                }
+                let provided = req
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.strip_prefix("Bearer "))
+                    .unwrap_or("");
+                let ok = provided.len() == expected.len()
+                    && provided
+                        .as_bytes()
+                        .iter()
+                        .zip(expected.as_bytes())
+                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                        == 0;
+                if !ok {
+                    return (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        "missing or invalid bearer token for mutating admin endpoint",
+                    )
+                        .into_response();
+                }
+                next.run(req).await
+            }
+        },
+    );
+    router.layer(auth_layer).with_state(http_state)
 }
 
 // ---------------------------------------------------------------------------

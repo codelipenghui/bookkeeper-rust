@@ -240,6 +240,14 @@ pub struct ServerConfig {
     pub http_server_port: i32,
     /// HTTP server bind host.
     pub http_server_host: String,
+    /// Bearer token required on the Authorization header for any
+    /// mutating HTTP admin endpoint (POST/PUT/DELETE). When `None`
+    /// the admin API is fully unauthenticated, matching the legacy
+    /// behavior. Set this to a non-empty value to require auth on
+    /// destructive operations like /api/v1/ledger/delete and
+    /// /api/v1/autorecovery/bookie. GET endpoints stay
+    /// unauthenticated regardless.
+    pub http_admin_token: Option<String>,
 
     // Data Integrity
     pub local_scrub_interval: i64,
@@ -506,6 +514,7 @@ impl Default for ServerConfig {
             http_server_enabled: false,
             http_server_port: 8080,
             http_server_host: "0.0.0.0".to_string(),
+            http_admin_token: None,
             local_scrub_interval: 0,
             // Java defaults `localScrubRateLimit` to 60 entries/sec. Leaving
             // it unlimited risks saturating a production bookie's IO when
@@ -795,6 +804,7 @@ impl ServerConfig {
         load_bool(props, "httpServerEnabled", &mut c.http_server_enabled);
         load_parsed(props, "httpServerPort", &mut c.http_server_port);
         load_string(props, "httpServerHost", &mut c.http_server_host);
+        load_opt_string(props, "httpAdminToken", &mut c.http_admin_token);
         // Data integrity
         load_parsed(props, "localScrubInterval", &mut c.local_scrub_interval);
         load_parsed(props, "localScrubRateLimit", &mut c.local_scrub_rate_limit);

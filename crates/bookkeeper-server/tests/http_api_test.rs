@@ -366,3 +366,91 @@ async fn who_is_auditor_without_zk_returns_503() {
 
     server.shutdown().await;
 }
+
+/// HTTP admin API has a bearer-token gate for mutating endpoints. By
+/// default the token is unset and the API is wide open (legacy
+/// behavior). When `http_admin_token` is configured, every non-GET
+/// request must carry `Authorization: Bearer <token>` or get 401.
+/// GET endpoints (monitoring) stay open regardless.
+///
+/// Pre-fix: no auth layer; PUT /api/v1/bookie/gc returns 200 from
+/// any caller. Post-fix: PUT without auth → 401; PUT with the right
+/// token → 200; GET /api/v1/bookie/state without auth → 200 (still
+/// open as expected).
+#[tokio::test]
+async fn http_admin_token_gates_mutating_endpoints() {
+    let dir = TempDir::new().unwrap();
+    let mut config = test_config(&dir);
+    config.http_admin_token = Some("test-token".to_string());
+    let server = BookieServer::start(config).await.unwrap();
+    let http_addr = server.http_addr().unwrap();
+    let client = reqwest::Client::new();
+
+    // GET stays open.
+    let resp = client
+        .get(format!("http://{}/api/v1/bookie/state", http_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "GET should not require a token");
+
+    // PUT without auth → 401.
+    let resp = client
+        .put(format!("http://{}/api/v1/bookie/gc", http_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "PUT to a mutating endpoint without auth must be rejected",
+    );
+
+    // PUT with a wrong token → 401.
+    let resp = client
+        .put(format!("http://{}/api/v1/bookie/gc", http_addr))
+        .header("Authorization", "Bearer wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "wrong bearer token must be rejected");
+
+    // PUT with the right token → 200.
+    let resp = client
+        .put(format!("http://{}/api/v1/bookie/gc", http_addr))
+        .header("Authorization", "Bearer test-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "matching bearer token must allow the request through",
+    );
+
+    server.shutdown().await;
+}
+
+/// Without `http_admin_token`, the API is unauthenticated (legacy
+/// behavior). PUT /api/v1/bookie/gc must succeed without any header.
+#[tokio::test]
+async fn http_admin_open_when_token_not_configured() {
+    let dir = TempDir::new().unwrap();
+    // Default test_config leaves http_admin_token = None.
+    let server = BookieServer::start(test_config(&dir)).await.unwrap();
+    let http_addr = server.http_addr().unwrap();
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("http://{}/api/v1/bookie/gc", http_addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "with no admin token configured, PUT must remain unauthenticated",
+    );
+
+    server.shutdown().await;
+}
