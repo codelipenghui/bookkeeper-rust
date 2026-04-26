@@ -531,52 +531,67 @@ impl ZkBookKeeper {
         digest_type: DigestType,
         password: &[u8],
     ) -> Result<(ReadHandle, Vec<Arc<BookieConnection>>), ClientError> {
-        let versioned = self
-            .ledger_manager
-            .read_ledger_metadata(ledger_id)
-            .await
-            .map_err(|e| ClientError::Protocol(format!("read metadata: {e}")))?;
-
-        let md = versioned.value();
-        let version = versioned.version();
-
-        // Validate digest type up front, matching Java's behavior.
-        if let Some(stored_dt) = md.digest_type() {
-            let stored_proto = from_meta_digest(stored_dt);
-            if stored_proto != digest_type {
-                return Err(ClientError::DigestTypeMismatch {
-                    expected: format!("{stored_proto:?}"),
-                    actual: format!("{digest_type:?}"),
-                });
+        // Read metadata, optionally CAS to IN_RECOVERY, and re-read on
+        // VersionConflict so the rest of recovery operates against
+        // up-to-date metadata. Pre-fix the VersionConflict branch fell
+        // through using `md` from the stale read, so the recovery
+        // proceeded against the wrong ensemble.
+        let mut attempts = 0;
+        let (md, _version) = loop {
+            attempts += 1;
+            if attempts > bookkeeper_common::MAX_CAS_RETRIES {
+                return Err(ClientError::Protocol(
+                    "recovery: IN_RECOVERY transition CAS failed after retries".into(),
+                ));
             }
-        }
+            let versioned = self
+                .ledger_manager
+                .read_ledger_metadata(ledger_id)
+                .await
+                .map_err(|e| ClientError::Protocol(format!("read metadata: {e}")))?;
+            let md = versioned.value().clone();
+            let version = versioned.version();
 
-        // If already closed, just return a read handle
-        if md.state() == LedgerState::Closed {
-            return self.open_ledger(ledger_id, digest_type, password).await;
-        }
+            if let Some(stored_dt) = md.digest_type() {
+                let stored_proto = from_meta_digest(stored_dt);
+                if stored_proto != digest_type {
+                    return Err(ClientError::DigestTypeMismatch {
+                        expected: format!("{stored_proto:?}"),
+                        actual: format!("{digest_type:?}"),
+                    });
+                }
+            }
 
-        // Step 2: Transition metadata to IN_RECOVERY state (CAS update in ZK).
-        // Matches Java's LedgerRecoveryOp which transitions to State.IN_RECOVERY
-        // before fencing. This prevents concurrent writers and other recovery
-        // clients from conflicting by using the ZK version as an arbitrator.
-        if md.state() != LedgerState::InRecovery {
-            let in_recovery_md = LedgerMetadataBuilder::from_existing(md)
+            if md.state() == LedgerState::Closed {
+                return self.open_ledger(ledger_id, digest_type, password).await;
+            }
+
+            if md.state() == LedgerState::InRecovery {
+                break (md, version);
+            }
+
+            let in_recovery_md = LedgerMetadataBuilder::from_existing(&md)
                 .with_in_recovery_state()
                 .build()
                 .map_err(|e| ClientError::Protocol(format!("build IN_RECOVERY metadata: {e}")))?;
-            match self.ledger_manager.write_ledger_metadata(ledger_id, &in_recovery_md, version).await {
-                Ok(_) => {}
+            match self
+                .ledger_manager
+                .write_ledger_metadata(ledger_id, &in_recovery_md, version)
+                .await
+            {
+                Ok(_) => break (in_recovery_md, version + 1),
                 Err(MetadataError::VersionConflict { .. }) => {
-                    // Another client already moved the state — re-read and continue.
-                    // This is safe: the CAS guarantees that at most one client can
-                    // transition from OPEN → IN_RECOVERY for a given version.
+                    // Another client raced us. Re-read so the rest of
+                    // recovery sees their updated metadata.
+                    continue;
                 }
-                Err(e) => return Err(ClientError::Protocol(format!("set IN_RECOVERY: {e}"))),
+                Err(e) => {
+                    return Err(ClientError::Protocol(format!("set IN_RECOVERY: {e}")))
+                }
             }
-        }
+        };
+        let md = &md;
 
-        // Get last ensemble for recovery
         let ensembles = md.all_ensembles();
         let (last_segment_entry, ensemble) = ensembles
             .iter()
