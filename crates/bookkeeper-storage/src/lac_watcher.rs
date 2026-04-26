@@ -89,6 +89,44 @@ impl LacWatcherRegistry {
         Some(rx)
     }
 
+    /// Race-free version of `watch_async`: registers the watcher, then
+    /// re-reads LAC via `recheck` while still holding the watcher lock.
+    /// If LAC advanced between the caller's snapshot and registration,
+    /// the just-registered watcher is fired immediately instead of
+    /// being left to wait for a notification that already happened.
+    ///
+    /// Without this, a long-poll caller can race with a concurrent
+    /// `notify_lac_advance` and hang to its full timeout: the notifier
+    /// drains an empty watcher list, then the watcher is registered
+    /// against an already-stale `previous_lac`.
+    pub fn watch_async_with_recheck<F>(
+        &self,
+        ledger_id: i64,
+        previous_lac: i64,
+        current_lac: i64,
+        recheck: F,
+    ) -> Option<tokio::sync::oneshot::Receiver<i64>>
+    where
+        F: FnOnce() -> i64,
+    {
+        if current_lac > previous_lac {
+            return None;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut watchers = self.async_watchers.lock().unwrap();
+        watchers.entry(ledger_id).or_default().push((previous_lac, tx));
+        // Re-snapshot under the watcher lock. notify_lac_advance also
+        // takes this lock, so a value seen here cannot have a matching
+        // notify slip past us.
+        let after = recheck();
+        if after > previous_lac {
+            for tx in drain_matching(&mut watchers, ledger_id, |prev| after > prev) {
+                tx.fire(after);
+            }
+        }
+        Some(rx)
+    }
+
     /// Notify all watchers for a ledger that LAC has advanced.
     pub fn notify_lac_advance(&self, ledger_id: i64, new_lac: i64) {
         let sync = drain_matching(&mut self.watchers.lock().unwrap(), ledger_id, |prev| new_lac > prev);

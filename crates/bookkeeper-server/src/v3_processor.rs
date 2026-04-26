@@ -118,7 +118,18 @@ pub async fn process_v3_request(
                     let effective_lac = if current_lac > previous_lac {
                         current_lac // already advanced
                     } else if let Some(watchers) = processor.storage().lac_watchers() {
-                        if let Some(rx) = watchers.watch_async(ledger_id, previous_lac, current_lac) {
+                        // Use the recheck variant so a notify that fires
+                        // between our `get_last_add_confirmed` snapshot and
+                        // watcher registration doesn't leave us blocked
+                        // until timeout. The recheck closure runs under the
+                        // watcher mutex, so notify_lac_advance can't race.
+                        let storage = processor.storage();
+                        if let Some(rx) = watchers.watch_async_with_recheck(
+                            ledger_id,
+                            previous_lac,
+                            current_lac,
+                            || storage.get_last_add_confirmed(ledger_id).unwrap_or(-1),
+                        ) {
                             let timeout = std::time::Duration::from_millis(timeout_ms);
                             match tokio::time::timeout(timeout, rx).await {
                                 Ok(Ok(new_lac)) => new_lac,
