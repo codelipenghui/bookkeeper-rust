@@ -1297,6 +1297,17 @@ impl LedgerStorage for DbLedgerStorage {
     async fn write_entry_to_log(&self, entry: &[u8]) -> Result<u64, StorageError> {
         let encoded_size = (4 + entry.len()) as u64;
 
+        // Acquire flush_mutex so compaction (the only caller of this
+        // path) can't rotate or extend the entry log while drain_flushing
+        // is mid-flight. drain_flushing's segment list is captured
+        // atomically under the same mutex, so without this guard a
+        // concurrent compaction could rotate, write to a NEW fd, and
+        // flush would fsync only the OLD fd — leaving compaction's
+        // bytes in page cache while the index referenced them.
+        // Matches Java's SingleDirectoryDbLedgerStorage which acquires
+        // flushMutex around any write that touches the entry log.
+        let _flush_lock = self.flush_mutex.lock().await;
+
         // Reserve offset atomically under the lock. The offset is advanced
         // *before* the I/O so that a concurrent caller gets a distinct
         // position. If the write fails we accept a gap in the log — this
