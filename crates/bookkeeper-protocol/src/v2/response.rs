@@ -130,20 +130,46 @@ pub fn decode_response(data: Bytes) -> Result<V2Response, ResponseDecodeError> {
             let mut lac_body = None;
             let mut last_entry_body = None;
             let mut pos = V2_RESPONSE_HEADER_SIZE;
-            // Decode length-prefixed lac_body
+            // Decode length-prefixed lac_body. A negative length on the
+            // wire is a hard protocol error — silently casting it to a
+            // huge usize and falling out of the bounds check would
+            // collapse the field to None and let recovery treat a
+            // corrupt response as a legitimate "absent" answer.
             if pos + 4 <= data.len() {
-                let lac_len = i32::from_be_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                let lac_len_raw = i32::from_be_bytes(data[pos..pos+4].try_into().unwrap());
                 pos += 4;
-                if lac_len > 0 && pos + lac_len <= data.len() {
+                if lac_len_raw < 0 {
+                    return Err(ResponseDecodeError::Malformed(format!(
+                        "ReadLac: negative lac_body length {lac_len_raw}"
+                    )));
+                }
+                let lac_len = lac_len_raw as usize;
+                if lac_len > 0 {
+                    if pos.checked_add(lac_len).map_or(true, |end| end > data.len()) {
+                        return Err(ResponseDecodeError::Malformed(format!(
+                            "ReadLac: lac_body length {lac_len} exceeds payload"
+                        )));
+                    }
                     lac_body = Some(data.slice(pos..pos + lac_len));
                     pos += lac_len;
                 }
             }
-            // Decode length-prefixed last_entry_body
+            // Same protocol invariant for the trailing last_entry_body.
             if pos + 4 <= data.len() {
-                let entry_len = i32::from_be_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                let entry_len_raw = i32::from_be_bytes(data[pos..pos+4].try_into().unwrap());
                 pos += 4;
-                if entry_len > 0 && pos + entry_len <= data.len() {
+                if entry_len_raw < 0 {
+                    return Err(ResponseDecodeError::Malformed(format!(
+                        "ReadLac: negative last_entry length {entry_len_raw}"
+                    )));
+                }
+                let entry_len = entry_len_raw as usize;
+                if entry_len > 0 {
+                    if pos.checked_add(entry_len).map_or(true, |end| end > data.len()) {
+                        return Err(ResponseDecodeError::Malformed(format!(
+                            "ReadLac: last_entry length {entry_len} exceeds payload"
+                        )));
+                    }
                     last_entry_body = Some(data.slice(pos..pos + entry_len));
                 }
             }
@@ -161,9 +187,22 @@ pub fn decode_response(data: Bytes) -> Result<V2Response, ResponseDecodeError> {
             let mut offset = V2_RESPONSE_HEADER_SIZE + 8;
             let mut entries = Vec::new();
             while offset + 4 <= data.len() {
-                let size = i32::from_be_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                let size_raw = i32::from_be_bytes(data[offset..offset + 4].try_into().unwrap());
                 offset += 4;
-                if offset + size > data.len() { break; }
+                // A negative size is a protocol violation. Casting it to
+                // usize and then "breaking" on the bounds check would
+                // truncate the entry list and quietly hide the error.
+                if size_raw < 0 {
+                    return Err(ResponseDecodeError::Malformed(format!(
+                        "BatchRead: negative entry size {size_raw}"
+                    )));
+                }
+                let size = size_raw as usize;
+                if offset.checked_add(size).map_or(true, |end| end > data.len()) {
+                    return Err(ResponseDecodeError::Malformed(format!(
+                        "BatchRead: entry size {size} exceeds payload"
+                    )));
+                }
                 entries.push(data.slice(offset..offset + size));
                 offset += size;
             }
@@ -244,4 +283,6 @@ pub enum ResponseDecodeError {
     TooShort,
     #[error("unknown opcode: {0}")]
     UnknownOpcode(u8),
+    #[error("malformed response: {0}")]
+    Malformed(String),
 }
