@@ -33,9 +33,17 @@ pub async fn process_v3_request(
     let v2_response = match operation {
         op if op == bookkeeper_proto::OperationType::AddEntry as i32 => {
             if let Some(add) = req.add_request {
+                // Reject keys that are shorter or longer than 20 bytes —
+                // Java's WriteEntryProcessorV3 requires an exactly-sized
+                // masterKey. Silently zero-padding a short key would let a
+                // wrong-data client masquerade as the legitimate one;
+                // truncating a long key would mismatch on every subsequent
+                // op against the same ledger.
+                if add.master_key.len() != MASTER_KEY_LENGTH {
+                    return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
+                }
                 let mut master_key = [0u8; MASTER_KEY_LENGTH];
-                let key_len = add.master_key.len().min(MASTER_KEY_LENGTH);
-                master_key[..key_len].copy_from_slice(&add.master_key[..key_len]);
+                master_key.copy_from_slice(&add.master_key);
 
                 let mut flags: u16 = 0;
                 if add.flag == Some(bookkeeper_proto::add_request::Flag::RecoveryAdd as i32) {
@@ -75,9 +83,12 @@ pub async fn process_v3_request(
                 if read.flag == Some(bookkeeper_proto::read_request::Flag::FenceLedger as i32) {
                     flags |= FLAG_DO_FENCING;
                     if let Some(mk) = read.master_key {
+                        // Same exact-length requirement as AddEntry — see comment there.
+                        if mk.len() != MASTER_KEY_LENGTH {
+                            return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
+                        }
                         let mut key = [0u8; MASTER_KEY_LENGTH];
-                        let len = mk.len().min(MASTER_KEY_LENGTH);
-                        key[..len].copy_from_slice(&mk[..len]);
+                        key.copy_from_slice(&mk);
                         master_key_opt = Some(key);
                     }
                 }
@@ -147,9 +158,12 @@ pub async fn process_v3_request(
         }
         op if op == bookkeeper_proto::OperationType::WriteLac as i32 => {
             if let Some(wl) = req.write_lac_request {
+                // Exact 20-byte requirement (see AddEntry comment).
+                if wl.master_key.len() != MASTER_KEY_LENGTH {
+                    return (build_v3_error_response(txn_id, operation, BKError::BadRequest), false);
+                }
                 let mut master_key = [0u8; MASTER_KEY_LENGTH];
-                let key_len = wl.master_key.len().min(MASTER_KEY_LENGTH);
-                master_key[..key_len].copy_from_slice(&wl.master_key[..key_len]);
+                master_key.copy_from_slice(&wl.master_key);
                 let v2_req = V2Request::WriteLac {
                     ledger_id: wl.ledger_id,
                     lac: wl.lac,

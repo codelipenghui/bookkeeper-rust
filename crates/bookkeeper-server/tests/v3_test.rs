@@ -252,3 +252,43 @@ async fn v3_start_tls_on_non_tls_bookie_returns_ebadreq() {
 
     server.shutdown().await;
 }
+
+/// V3 AddEntry must reject masterKeys whose length isn't exactly 20.
+/// Pre-fix the V3→V2 conversion silently zero-padded a short key (so a
+/// wrong-data client masquerades as the legitimate one) or truncated a
+/// long key (so subsequent ops against the same ledger always
+/// mismatched).
+#[tokio::test]
+async fn v3_add_entry_rejects_wrong_length_master_key() {
+    let dir = TempDir::new().unwrap();
+    let server = BookieServer::start(test_config(&dir)).await.unwrap();
+    let addr = server.local_addr();
+
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (mut reader, mut writer) = stream.into_split();
+    let mut codec = BookieCodec::new(5 * 1024 * 1024);
+    let mut read_buf = BytesMut::with_capacity(4096);
+
+    let entry_body = build_entry_body(1, 0, -1, b"hello");
+
+    // Short key (5 bytes)
+    let short_req = make_v3_add_request(10, 1, 0, b"short", &entry_body);
+    let short_resp = send_v3_request(&mut reader, &mut writer, &mut codec, &mut read_buf, &short_req).await;
+    assert_eq!(
+        short_resp.status,
+        StatusCode::Ebadreq as i32,
+        "AddEntry with a 5-byte masterKey must return EBADREQ"
+    );
+
+    // Long key (40 bytes)
+    let long_key = vec![0xAAu8; 40];
+    let long_req = make_v3_add_request(11, 1, 0, &long_key, &entry_body);
+    let long_resp = send_v3_request(&mut reader, &mut writer, &mut codec, &mut read_buf, &long_req).await;
+    assert_eq!(
+        long_resp.status,
+        StatusCode::Ebadreq as i32,
+        "AddEntry with a 40-byte masterKey must return EBADREQ"
+    );
+
+    server.shutdown().await;
+}
