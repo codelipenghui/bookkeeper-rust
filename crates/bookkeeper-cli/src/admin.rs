@@ -387,9 +387,11 @@ pub async fn cmd_deleteledger(
     let backend = open_zk_backend(zk, ledger_root).await?;
     let lm = backend.ledger_manager;
 
-    // Read metadata first to show what we're deleting
+    // Read metadata first to show what we're deleting and capture
+    // the version we observed.
     let versioned = lm.read_ledger_metadata(ledger_id).await?;
     let md = versioned.value();
+    let observed_version = versioned.version();
 
     if !force {
         println!("Ledger {} — state={:?} E={} W={} A={}",
@@ -400,9 +402,20 @@ pub async fn cmd_deleteledger(
         return Ok(());
     }
 
-    // Use version -1 (ANY) to match Java's unconditional delete behavior
-    lm.remove_ledger_metadata(ledger_id, -1).await?;
-    println!("Ledger {ledger_id} deleted successfully.");
+    // CAS on the version we just read so a concurrent process that
+    // re-creates or updates the ledger between our read and delete
+    // surfaces a VersionConflict instead of silently completing the
+    // delete and dropping the new state.
+    match lm.remove_ledger_metadata(ledger_id, observed_version).await {
+        Ok(()) => println!("Ledger {ledger_id} deleted successfully."),
+        Err(bookkeeper_metadata::ledger_metadata::MetadataError::VersionConflict { .. }) => {
+            return Err(format!(
+                "Ledger {ledger_id} was modified concurrently (version mismatch); \
+                 re-run after re-checking the ledger state"
+            ).into());
+        }
+        Err(e) => return Err(format!("delete failed: {e}").into()),
+    }
     Ok(())
 }
 
@@ -1265,16 +1278,53 @@ pub async fn cmd_triggeraudit(
 /// Format (wipe and reinitialize) cluster metadata in ZooKeeper.
 /// Matches Java's MetaFormatCommand: deletes existing metadata then
 /// recreates a clean structure ready for use.
+///
+/// `expected_instance_id`, when supplied, must equal the instance id
+/// already stored at `ledger_root` — a guard against the operator
+/// confusing this command with `bookieformat` and pointing it at the
+/// wrong cluster.
 pub async fn cmd_metaformat(
     zk: &str,
     ledger_root: &str,
     force: bool,
+    expected_instance_id: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !force {
         println!("WARNING: This will FORMAT all BookKeeper metadata at {ledger_root}.");
         println!("All ledger data references will be lost.");
         println!("Use --force to confirm.");
         return Ok(());
+    }
+
+    // Verify the cluster identity before wiping. If the operator passed
+    // --expected-instance-id, refuse to proceed unless it matches the id
+    // currently stored at /ledgers/INSTANCEID. With nothing to compare
+    // against, surface what the cluster looks like and require an
+    // explicit re-confirmation by re-running with --expected-instance-id.
+    {
+        let client = zookeeper_client::Client::connect(zk).await?;
+        let instance_path = format!("{ledger_root}/INSTANCEID");
+        let current_instance = match client.get_data(&instance_path).await {
+            Ok((data, _)) => Some(String::from_utf8(data).unwrap_or_default()),
+            Err(zookeeper_client::Error::NoNode) => None,
+            Err(e) => return Err(format!("read INSTANCEID: {e}").into()),
+        };
+        match (expected_instance_id, current_instance.as_deref()) {
+            (Some(expected), Some(actual)) if expected != actual => {
+                return Err(format!(
+                    "refusing to metaformat: expected instance id '{expected}' \
+                     but ZK has '{actual}' — point the command at the right cluster",
+                ).into());
+            }
+            (None, Some(actual)) => {
+                return Err(format!(
+                    "refusing to metaformat: cluster at {ledger_root} has instance id \
+                     '{actual}'. Re-run with --expected-instance-id={actual} to confirm \
+                     you really mean to wipe THIS cluster (not bookieformat'd).",
+                ).into());
+            }
+            _ => { /* (None, None) — fresh tree, ok. (Some, Some) match — ok. */ }
+        }
     }
 
     {

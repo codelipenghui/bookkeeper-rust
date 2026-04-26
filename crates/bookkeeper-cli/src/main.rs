@@ -324,6 +324,12 @@ enum Commands {
         /// Confirm destructive operation
         #[arg(long)]
         force: bool,
+        /// Expected current INSTANCEID at `ledger_root`. The format
+        /// refuses to proceed unless this matches the value already in
+        /// ZK — guards against confusing this with `bookieformat` and
+        /// pointing it at the wrong cluster.
+        #[arg(long)]
+        expected_instance_id: Option<String>,
     },
     /// Print the last journal checkpoint mark
     Lastmark {
@@ -540,8 +546,13 @@ fn main() {
         Commands::Triggeraudit { zk, ledger_root } => {
             admin::cmd_triggeraudit(&zk, &ledger_root).await
         }
-        Commands::Metaformat { zk, ledger_root, force } => {
-            admin::cmd_metaformat(&zk, &ledger_root, force).await
+        Commands::Metaformat { zk, ledger_root, force, expected_instance_id } => {
+            admin::cmd_metaformat(
+                &zk,
+                &ledger_root,
+                force,
+                expected_instance_id.as_deref(),
+            ).await
         }
         Commands::Lastmark { data_dir } => {
             admin::cmd_lastmark(&data_dir).await
