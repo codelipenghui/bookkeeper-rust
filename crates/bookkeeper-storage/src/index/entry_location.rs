@@ -80,7 +80,29 @@ impl EntryLocationIndex {
     }
 
     /// Iterate all entries for a given ledger, returning (entry_id, location) pairs.
+    /// Buffers the full result — for large ledgers in scrub-style hot paths,
+    /// prefer [`for_each_ledger_entry`] which streams via callback.
     pub fn iter_ledger_entries(&self, ledger_id: i64) -> Result<Vec<(i64, u64)>, StorageError> {
+        let mut results = Vec::new();
+        self.for_each_ledger_entry(ledger_id, |eid, loc| {
+            results.push((eid, loc));
+            Ok(())
+        })?;
+        Ok(results)
+    }
+
+    /// Stream every (entry_id, location) for a ledger through `f` without
+    /// buffering. Use this from per-ledger consistency-check / scrub
+    /// loops where the buffered Vec form is O(N) per ledger and called
+    /// per ledger — i.e. quadratic in entry count for large bookies.
+    pub fn for_each_ledger_entry<F>(
+        &self,
+        ledger_id: i64,
+        mut f: F,
+    ) -> Result<(), StorageError>
+    where
+        F: FnMut(i64, u64) -> Result<(), StorageError>,
+    {
         let mut start = [0u8; 16];
         start[0..8].copy_from_slice(&ledger_id.to_be_bytes());
 
@@ -88,8 +110,9 @@ impl EntryLocationIndex {
         // wrapping_add: see delete_ledger comment.
         end[0..8].copy_from_slice(&ledger_id.wrapping_add(1).to_be_bytes());
 
-        let mut results = Vec::new();
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward));
+        let iter = self
+            .db
+            .iterator(rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward));
         for item in iter {
             let (key, value) = item?;
             if key.len() != 16 || &key[..] >= &end[..] {
@@ -97,9 +120,9 @@ impl EntryLocationIndex {
             }
             let entry_id = i64::from_be_bytes(key[8..16].try_into().unwrap());
             let location = u64::from_be_bytes(value[..8].try_into().unwrap());
-            results.push((entry_id, location));
+            f(entry_id, location)?;
         }
-        Ok(results)
+        Ok(())
     }
 
     /// Get the last entry ID stored for a ledger by doing a floor scan.
