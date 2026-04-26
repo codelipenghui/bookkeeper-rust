@@ -465,6 +465,48 @@ impl Auditor {
             tracing::info!("Auditor: new bookies detected: {:?}", new_bookies);
         }
 
+        // Probe each apparently-failed bookie. A bookie that disappeared
+        // from ZK's list might just be re-registering after a transient
+        // session expiry — treating it as failed would unnecessarily
+        // mark thousands of ledgers under-replicated. Only declare it
+        // failed if we can't establish a TCP connection to it.
+        let failed: Vec<String> = if failed.is_empty() {
+            failed
+        } else {
+            let probe_futs = failed.iter().map(|b| {
+                let bookie = b.clone();
+                async move {
+                    let alive = match bookie.parse::<std::net::SocketAddr>() {
+                        Ok(sa) => tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            tokio::net::TcpStream::connect(sa),
+                        ).await.map(|r| r.is_ok()).unwrap_or(false),
+                        Err(_) => match tokio::net::lookup_host(bookie.as_str()).await {
+                            Ok(mut iter) => match iter.next() {
+                                Some(sa) => tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    tokio::net::TcpStream::connect(sa),
+                                ).await.map(|r| r.is_ok()).unwrap_or(false),
+                                None => false,
+                            },
+                            Err(_) => false,
+                        },
+                    };
+                    (bookie, alive)
+                }
+            });
+            futures::future::join_all(probe_futs)
+                .await
+                .into_iter()
+                .filter_map(|(b, alive)| if alive {
+                    tracing::info!("Auditor: bookie {b} disappeared from ZK but is reachable; skipping audit");
+                    None
+                } else {
+                    Some(b)
+                })
+                .collect()
+        };
+
         if !failed.is_empty() {
             // Check if another audit is already running (deduplication)
             if self.auditing.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
