@@ -403,7 +403,11 @@ async fn on_ensemble_change_callback_invoked() {
         master_key,
     );
     wh.set_on_ensemble_change(Box::new(move |_first_entry, _ensemble| {
-        callback_flag.store(true, Ordering::Release);
+        let cb_flag = callback_flag.clone();
+        Box::pin(async move {
+            cb_flag.store(true, Ordering::Release);
+            Ok(())
+        })
     }));
 
     let mut conns: Vec<Arc<BookieConnection>> = vec![
@@ -1253,14 +1257,22 @@ async fn ensemble_change_does_not_emit_two_segments_at_same_lac() {
     let ens_info = wh.ensemble_info_for_test();
     let inj_addr = s1.clone();
     wh.set_on_ensemble_change(Box::new(move |first, ens| {
-        inv_clone.lock().unwrap().push((first, ens.to_vec()));
-        // On the *first* callback, simulate a delayed bookie failure
-        // that would normally arrive from a post-quorum write completion
-        // path. With the bug present this triggers a second segment
-        // update at the same first_entry_id.
-        if !inj_clone.swap(true, Ordering::SeqCst) {
-            ens_info.push_delayed_failure_for_test(0, inj_addr.clone());
-        }
+        let inv = inv_clone.clone();
+        let inj = inj_clone.clone();
+        let ens_info = ens_info.clone();
+        let addr = inj_addr.clone();
+        let ensemble = ens.to_vec();
+        Box::pin(async move {
+            inv.lock().unwrap().push((first, ensemble));
+            // On the *first* callback, simulate a delayed bookie failure
+            // that would normally arrive from a post-quorum write completion
+            // path. With the bug present this triggers a second segment
+            // update at the same first_entry_id.
+            if !inj.swap(true, Ordering::SeqCst) {
+                ens_info.push_delayed_failure_for_test(0, addr);
+            }
+            Ok(())
+        })
     }));
 
     let mut conns: Vec<Arc<BookieConnection>> =

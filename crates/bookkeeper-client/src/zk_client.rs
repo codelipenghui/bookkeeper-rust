@@ -364,32 +364,25 @@ impl ZkBookKeeper {
         }
 
         // Wire ensemble change callback to update metadata in ZK.
-        // On failure, sets the shared error slot so subsequent writes fail,
-        // matching Java's handleUnrecoverableErrorDuringAdd behavior.
+        // The closure now returns a future the writer awaits before
+        // letting more writes flow against the new in-memory ensemble —
+        // a failed CAS surfaces as a write error instead of split-brain
+        // between writer and ZK metadata.
         let lm = self.ledger_manager.clone();
         let pw = password.to_vec();
         let meta_dt = meta_digest;
-        let error_slot = wh.metadata_error_slot();
         wh.set_on_ensemble_change(Box::new(move |first_entry_id, new_ensemble| {
             let lm = lm.clone();
             let pw = pw.clone();
             let ensemble_owned: Vec<String> = new_ensemble.to_vec();
-            let err_slot = error_slot.clone();
-            tokio::spawn(async move {
-                if let Err(e) = update_ensemble_metadata(
+            Box::pin(async move {
+                update_ensemble_metadata(
                     lm.as_ref(), ledger_id, first_entry_id, &ensemble_owned, ensemble_size,
                     write_quorum, ack_quorum, meta_dt, &pw,
                 )
                 .await
-                {
-                    let msg = format!("{e}");
-                    tracing::error!(
-                        "ensemble change metadata update failed for ledger {ledger_id}: {msg}"
-                    );
-                    let mut slot = err_slot.lock().unwrap();
-                    *slot = Some(msg);
-                }
-            });
+                .map_err(|e| format!("{e}"))
+            })
         }));
 
         // Step 5: Get connections

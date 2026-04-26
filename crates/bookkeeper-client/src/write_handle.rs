@@ -294,8 +294,17 @@ impl Drop for ExplicitLacFlushHandle {
 
 /// Callback invoked when an ensemble change occurs.
 /// Arguments: (first_entry_id_of_new_segment, new_ensemble).
-/// The caller can use this to perform a metadata CAS update (e.g. in ZooKeeper).
-pub type OnEnsembleChange = Box<dyn Fn(i64, &[String]) + Send + Sync>;
+/// The caller uses this to perform the metadata CAS update (e.g. in ZK
+/// or oxia). The returned future completes once the CAS has resolved —
+/// the writer awaits it before continuing, so a failed CAS surfaces as
+/// a write error instead of letting the writer pile up entries against
+/// an in-memory ensemble that ZK doesn't yet know about (split-brain
+/// between writer and readers if the writer then crashes).
+pub type OnEnsembleChange = Box<
+    dyn Fn(i64, &[String]) -> futures::future::BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync,
+>;
 
 /// Default write quorum timeout (30 seconds).
 const DEFAULT_ADD_ENTRY_QUORUM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -908,10 +917,21 @@ impl WriteHandle {
                 let new_ensemble = self.ensemble_info.current_ensemble();
                 self.ensemble_info.add_segment(new_segment_start, new_ensemble.clone());
 
-                // Step 4: Invoke metadata callback once — the caller is
-                // responsible for any persistent CAS update.
+                // Step 4: Invoke the metadata CAS callback and AWAIT its
+                // completion before letting more writes flow against the
+                // new in-memory ensemble. A failed CAS surfaces here as
+                // a write error instead of letting the writer keep
+                // committing entries that ZK never recorded. Pre-fix the
+                // CAS was a fire-and-forget tokio::spawn — a writer crash
+                // before the spawn finished left ZK on the old ensemble
+                // while the writer kept emitting entries on the new one.
                 if let Some(ref cb) = self.on_ensemble_change {
-                    cb(new_segment_start, &new_ensemble);
+                    if let Err(msg) = cb(new_segment_start, &new_ensemble).await {
+                        *self.metadata_error.lock().unwrap() = Some(msg.clone());
+                        return Err(ClientError::Protocol(format!(
+                            "ensemble change metadata CAS failed: {msg}"
+                        )));
+                    }
                 }
 
                 // Step 4b: Re-send in-flight entries that were targeting any
@@ -961,7 +981,18 @@ impl WriteHandle {
         self.ensemble_info.add_segment(new_start, current_ens.clone());
 
         if let Some(ref cb) = self.on_ensemble_change {
-            cb(new_start, &current_ens);
+            if let Err(msg) = cb(new_start, &current_ens).await {
+                *self.metadata_error.lock().unwrap() = Some(msg.clone());
+                // Don't return Err here — we still need to clear the flag
+                // and flush LAC so callers don't deadlock waiting for LAC
+                // advancement. The metadata_error slot will fail subsequent
+                // writes (Java's handleUnrecoverableErrorDuringAdd).
+                self.ensemble_info.changing_ensemble.store(false, Ordering::Release);
+                self.flush_lac();
+                return Err(ClientError::Protocol(format!(
+                    "delayed-failure ensemble change CAS failed: {msg}"
+                )));
+            }
         }
 
         // Clear flag and flush queued LAC entries
