@@ -67,6 +67,14 @@ impl EnsembleInfo {
         self.segments.lock().unwrap().clone()
     }
 
+    /// Push a delayed bookie failure onto the queue. Test-only helper; the
+    /// production code populates this from the per-write completion paths
+    /// (post-quorum failures and pre-quorum partial failures).
+    #[doc(hidden)]
+    pub fn push_delayed_failure_for_test(&self, idx: usize, addr: String) {
+        self.delayed_failures.lock().unwrap().push((idx, addr));
+    }
+
     /// Register an in-flight entry for potential re-send after ensemble change.
     fn register_in_flight(&self, entry_id: i64, entry_bytes: Bytes) {
         self.in_flight_entries.lock().unwrap().insert(entry_id, entry_bytes);
@@ -509,6 +517,13 @@ impl WriteHandle {
         self.ensemble_info.segments()
     }
 
+    /// Return the shared `EnsembleInfo` so tests can inject delayed failures
+    /// or inspect the segments map from outside the crate.
+    #[doc(hidden)]
+    pub fn ensemble_info_for_test(&self) -> Arc<EnsembleInfo> {
+        Arc::clone(&self.ensemble_info)
+    }
+
     /// Replace the bookie at `failed_bookie_idx` with one from the available pool
     /// that is not already in the current ensemble. Connects to the replacement and
     /// updates `conns` in-place.
@@ -842,50 +857,52 @@ impl WriteHandle {
                 // Step 1: Set changing_ensemble flag — gates LAC advancement
                 self.ensemble_info.changing_ensemble.store(true, Ordering::Release);
 
-                // Step 2: Replace every failed bookie
+                // Step 2: Replace every failed bookie. Drain any concurrently
+                // accumulated delayed failures into the same change so the
+                // segment add and metadata callback fire exactly once at
+                // first_entry_id = LAC + 1. Two callbacks at the same
+                // first_entry_id would silently overwrite each other in the
+                // segments map and on ZK, leaving the writer's local view
+                // briefly inconsistent with the persisted metadata.
+                let mut all_failed: Vec<usize> = failed_indices.clone();
                 for idx in &failed_indices {
                     self.handle_bookie_failure(conns, *idx).await?;
                 }
+                loop {
+                    let delayed = std::mem::take(
+                        &mut *self.ensemble_info.delayed_failures.lock().unwrap(),
+                    );
+                    if delayed.is_empty() {
+                        break;
+                    }
+                    for (idx, _addr) in &delayed {
+                        all_failed.push(*idx);
+                        self.handle_bookie_failure(conns, *idx).await?;
+                    }
+                }
 
-                // Step 3: Add new ensemble segment at LAC + 1
+                // Step 3: Add ONE ensemble segment at LAC + 1 with the final
+                // post-replacement ensemble.
                 let new_segment_start = self.last_add_confirmed() + 1;
                 let new_ensemble = self.ensemble_info.current_ensemble();
                 self.ensemble_info.add_segment(new_segment_start, new_ensemble.clone());
 
-                // Step 4: Invoke metadata callback if set
+                // Step 4: Invoke metadata callback once — the caller is
+                // responsible for any persistent CAS update.
                 if let Some(ref cb) = self.on_ensemble_change {
                     cb(new_segment_start, &new_ensemble);
                 }
 
-                // Step 4b: Re-send in-flight entries that were targeting the
-                // failed bookies to the replacement bookies in the new ensemble.
-                // Matches Java's unsetSuccessAndSendWriteRequest which iterates
-                // pendingAddOps and re-sends affected entries.
-                self.resend_in_flight_to_new_ensemble(conns, &failed_indices).await;
+                // Step 4b: Re-send in-flight entries that were targeting any
+                // of the failed bookie indices (immediate or delayed) to
+                // their replacements in the new ensemble.
+                self.resend_in_flight_to_new_ensemble(conns, &all_failed).await;
 
                 // Step 5: Clear changing_ensemble and flush queued LAC entries
                 self.ensemble_info.changing_ensemble.store(false, Ordering::Release);
                 self.flush_lac();
 
-                // Step 6: Process any delayed failures accumulated during the change
-                let delayed = std::mem::take(&mut *self.ensemble_info.delayed_failures.lock().unwrap());
-                if !delayed.is_empty() {
-                    // Recursive handling: set flag again and process
-                    self.ensemble_info.changing_ensemble.store(true, Ordering::Release);
-                    for (idx, _addr) in &delayed {
-                        self.handle_bookie_failure(conns, *idx).await?;
-                    }
-                    let seg_start = self.last_add_confirmed() + 1;
-                    let ens = self.ensemble_info.current_ensemble();
-                    self.ensemble_info.add_segment(seg_start, ens.clone());
-                    if let Some(ref cb) = self.on_ensemble_change {
-                        cb(seg_start, &ens);
-                    }
-                    self.ensemble_info.changing_ensemble.store(false, Ordering::Release);
-                    self.flush_lac();
-                }
-
-                // Step 7: Retry the failed write
+                // Step 6: Retry the failed write
                 self.last_add_pushed -= 1;
                 self.current_length -= payload.len() as i64;
                 self.append_async(conns, payload)?.wait().await

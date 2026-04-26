@@ -1196,3 +1196,94 @@ async fn pending_add_resolves_implies_lac_advanced_past_entry() {
 
     server.shutdown().await;
 }
+
+/// `WriteHandle`'s ensemble-change loop must not invoke the metadata
+/// callback twice at the same `first_entry_id`.
+///
+/// `EnsembleInfo::add_segment` keys segments by `first_entry_id` (a
+/// BTreeMap), so two ensemble changes that fire at the same `LAC + 1`
+/// silently overwrite each other in both the local map and the on-ZK
+/// metadata when the on_ensemble_change callback persists the change.
+/// During the window between the two callbacks, ZK carries the
+/// intermediate ensemble — a writer crash there leaves recovery
+/// starting from stale metadata.
+///
+/// Repro: kill the only ensemble bookie, force a WriteQuorumFailed,
+/// and inject a delayed bookie failure from inside the *first*
+/// on_ensemble_change callback. Pre-fix, the WriteQuorumFailed
+/// handler's tail-end "drain delayed_failures" branch fires a second
+/// segment update at the same `first_entry_id`; post-fix, the loop
+/// drains delayed failures into the same change so only one callback
+/// is emitted.
+#[tokio::test]
+async fn ensemble_change_does_not_emit_two_segments_at_same_lac() {
+    let dir0 = TempDir::new().unwrap();
+    let dir1 = TempDir::new().unwrap();
+    let dir2 = TempDir::new().unwrap();
+    let server0 = BookieServer::start(test_config(&dir0)).await.unwrap();
+    let server1 = BookieServer::start(test_config(&dir1)).await.unwrap();
+    let server2 = BookieServer::start(test_config(&dir2)).await.unwrap();
+    let addr0 = server0.local_addr();
+    let addr1 = server1.local_addr();
+    let addr2 = server2.local_addr();
+    let s0 = addr0.to_string();
+    let s1 = addr1.to_string();
+    let s2 = addr2.to_string();
+
+    let schedule = RoundRobinDistributionSchedule::new(1, 1, 1);
+    let dm = DigestManager::new(DigestType::Crc32c);
+    let master_key = [0u8; 20];
+
+    // Ensemble = [b0]. Available pool puts the live replacements (b1, b2)
+    // ahead of the dead bookie (b0) so the first replacement picks b1
+    // (alive) and a second would pick b2 (also alive) — neither retries
+    // the killed addr.
+    let mut wh = WriteHandle::with_available_bookies(
+        100,
+        vec![s0.clone()],
+        vec![s1.clone(), s2.clone(), s0.clone()],
+        schedule, dm, master_key,
+    );
+
+    let invocations: Arc<std::sync::Mutex<Vec<(i64, Vec<String>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let injected = Arc::new(AtomicBool::new(false));
+    let inv_clone = invocations.clone();
+    let inj_clone = injected.clone();
+    let ens_info = wh.ensemble_info_for_test();
+    let inj_addr = s1.clone();
+    wh.set_on_ensemble_change(Box::new(move |first, ens| {
+        inv_clone.lock().unwrap().push((first, ens.to_vec()));
+        // On the *first* callback, simulate a delayed bookie failure
+        // that would normally arrive from a post-quorum write completion
+        // path. With the bug present this triggers a second segment
+        // update at the same first_entry_id.
+        if !inj_clone.swap(true, Ordering::SeqCst) {
+            ens_info.push_delayed_failure_for_test(0, inj_addr.clone());
+        }
+    }));
+
+    let mut conns: Vec<Arc<BookieConnection>> =
+        vec![Arc::new(BookieConnection::connect(addr0).await.unwrap())];
+
+    // Successful write so LAC = 0 and the next ensemble change targets
+    // first_entry_id = 1.
+    wh.append_with_ensemble_change(&mut conns, b"ok").await.unwrap();
+    server0.shutdown().await;
+
+    // Failed write triggers the WriteQuorumFailed → ensemble change path.
+    wh.append_with_ensemble_change(&mut conns, b"trigger").await.unwrap();
+
+    let inv = invocations.lock().unwrap();
+    let same_id = inv.iter().filter(|(id, _)| *id == 1).count();
+    assert!(
+        same_id <= 1,
+        "got {same_id} on_ensemble_change invocations at first_entry_id=1; \
+         multiple callbacks at the same first_entry_id silently overwrite the \
+         persisted ZK ensemble during the recovery window. Recorded: {:?}",
+        *inv,
+    );
+
+    server1.shutdown().await;
+    server2.shutdown().await;
+}
