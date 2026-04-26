@@ -843,12 +843,22 @@ impl DbLedgerStorage {
         // Matches Java's `DefaultEntryLogger.BufferedLogChannel.appendLedgersMap()`,
         // invoked from `EntryLogManagerBase.createNewLog` before rolling
         // over to a new log file.
+        //
+        // The append+sync needs to happen BEFORE the index update so a
+        // crash between the index commit and the page-cache flush can
+        // never leave the index pointing past the file's durable end.
+        // append_ledgers_map can fail or be skipped — sync_data is
+        // best-effort; either way we sync first, then index.
         for mut rl in rotated_logs {
             if let Err(e) = Self::append_ledgers_map(&mut rl.file, &rl.ledger_sizes) {
                 // Non-fatal: the file is still readable, GC just falls back
                 // to scanning the body as it does for pre-existing files.
                 tracing::warn!("failed to append ledgers map for log {:x}: {e}", rl.log_id);
             }
+            // Fsync the rotated file once more after the ledgers-map
+            // append so all of its bytes are durable before the index
+            // commit below.
+            let _ = rl.file.sync_data();
         }
 
         storage_metrics::FLUSH_ENTRYLOG.observe(entrylog_start.elapsed().as_secs_f64());
