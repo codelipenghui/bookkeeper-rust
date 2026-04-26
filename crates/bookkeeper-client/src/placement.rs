@@ -847,6 +847,22 @@ impl EnsemblePlacementPolicy for RegionAwarePlacementPolicy {
     }
 
     fn on_cluster_changed(&mut self, writable: &[String], _readonly: &[String]) { self.writable_bookies = writable.to_vec(); }
+
+    /// Trait override for region-aware adherence.
+    ///
+    /// The inherent `is_ensemble_adhering(&[String])` (above) is what
+    /// the implementation is built around, but until this override
+    /// existed the trait dispatch fell through to the default no-op
+    /// `MeetsStrict` — silently disabling the auditor's region-aware
+    /// adherence check.
+    fn is_ensemble_adhering(
+        &self,
+        ensemble: &[String],
+        _write_quorum_size: usize,
+        _ack_quorum_size: usize,
+    ) -> PolicyAdherence {
+        Self::is_ensemble_adhering(self, ensemble)
+    }
 }
 
 /// Zone-aware placement policy — alias for RegionAware.
