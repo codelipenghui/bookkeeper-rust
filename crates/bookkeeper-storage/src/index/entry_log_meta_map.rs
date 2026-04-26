@@ -103,10 +103,26 @@ impl EntryLogMeta {
         let count = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
 
+        // Cap allocation: a malicious / corrupt header that claims a
+        // huge ledger count would otherwise let us reserve gigabytes
+        // before we discover the body is truncated.
+        let max_possible = data.len().saturating_sub(pos) / 16;
+        if count > max_possible {
+            return Err(StorageError::CorruptData(format!(
+                "entry log meta truncated: header claims {count} ledgers but \
+                 payload only has room for {max_possible}"
+            )));
+        }
         let mut ledgers = HashMap::with_capacity(count);
         for _ in 0..count {
             if pos + 16 > data.len() {
-                break;
+                // Header lied about count vs. actual payload — refuse to
+                // silently shorten the active-ledgers list (the next GC
+                // would then judge "no active ledgers" and delete the
+                // file).
+                return Err(StorageError::CorruptData(
+                    "entry log meta truncated mid-ledger entry".into(),
+                ));
             }
             let ledger_id = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
@@ -208,5 +224,63 @@ impl EntryLogMetadataMap {
 
     pub fn flush(&self) -> Result<(), StorageError> {
         self.db.flush().map_err(StorageError::from)
+    }
+}
+
+#[cfg(test)]
+mod deserialize_tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_serializes_then_deserializes() {
+        let mut meta = EntryLogMeta::new(42);
+        meta.ledgers.insert(1, 100);
+        meta.ledgers.insert(2, 200);
+        meta.total_size = 300;
+        let bytes = meta.serialize();
+        let parsed = EntryLogMeta::deserialize(&bytes).expect("roundtrip");
+        assert_eq!(parsed.log_id, 42);
+        assert_eq!(parsed.total_size, 300);
+        assert_eq!(parsed.ledgers.get(&1), Some(&100));
+        assert_eq!(parsed.ledgers.get(&2), Some(&200));
+    }
+
+    /// A truncated payload — the header claims `count` ledgers but the
+    /// body is short — must error rather than silently shorten the
+    /// active-ledgers list. The next GC cycle would otherwise judge the
+    /// log file "no active ledgers" and delete it, dropping live data.
+    #[test]
+    fn truncated_body_is_rejected() {
+        let mut meta = EntryLogMeta::new(7);
+        meta.ledgers.insert(10, 50);
+        meta.ledgers.insert(20, 60);
+        meta.total_size = 110;
+        let mut bytes = meta.serialize();
+        // Lop off the last ledger entry (16 bytes).
+        bytes.truncate(bytes.len() - 16);
+        let result = EntryLogMeta::deserialize(&bytes);
+        assert!(
+            matches!(result, Err(StorageError::CorruptData(_))),
+            "truncated payload must error, got {result:?}",
+        );
+    }
+
+    /// A header that claims an absurdly large ledger count must not
+    /// cause us to allocate gigabytes before discovering the body is
+    /// short.
+    #[test]
+    fn deserialize_rejects_implausible_ledger_count() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SERIALIZATION_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&7i64.to_be_bytes()); // log_id
+        bytes.extend_from_slice(&0i64.to_be_bytes()); // total_size
+        bytes.extend_from_slice(&0i64.to_be_bytes()); // remaining_size
+        // Claim 1 billion ledgers; we only have 0 bytes of body.
+        bytes.extend_from_slice(&1_000_000_000i64.to_be_bytes());
+        let result = EntryLogMeta::deserialize(&bytes);
+        assert!(
+            matches!(result, Err(StorageError::CorruptData(_))),
+            "implausible ledger count must error, got {result:?}",
+        );
     }
 }
