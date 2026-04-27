@@ -854,7 +854,22 @@ impl BookieServer {
         // checkpoint can race with EntryCopier writes into the write
         // cache.
         if let Some(h) = self.data_integ_handle.take() {
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), h).await;
+            // `run_full_check` only checks the shutdown signal between
+            // ticks, not inside `copy_from_available` (network I/O can
+            // stall arbitrarily long). On timeout, abort the task so the
+            // leaked future doesn't keep calling `add_entry` after we've
+            // started checkpoint+storage shutdown — `JoinHandle::Drop`
+            // alone DETACHES the task rather than aborting it.
+            let abort_handle = h.abort_handle();
+            if tokio::time::timeout(tokio::time::Duration::from_secs(30), h)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "Data-integrity service did not stop within 30s; aborting"
+                );
+                abort_handle.abort();
+            }
         }
         tracing::info!("Background tasks stopped.");
 
