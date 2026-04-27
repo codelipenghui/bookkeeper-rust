@@ -1292,15 +1292,31 @@ fn flush_write_buf(
                     }
                 };
                 metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.inc();
-                if tx.send(ForceWriteRequest {
+                if let Err(send_err) = tx.send(ForceWriteRequest {
                     file: dup_file,
                     acks,
                     oldest_enqueue_time: oldest_enqueue,
                     log_id: state.log_id,
                     last_flushed_position: state.position,
-                }).is_err() {
-                    tracing::error!("Force-write thread gone");
+                }) {
+                    // The force-write thread has died and will never fsync
+                    // this batch. The entries are on the page cache but not
+                    // durable, and we cannot ack the writes. Without
+                    // signaling fatal here the writer loop kept accepting
+                    // new entries and acking writes that would never
+                    // complete — silent loss of durability. Fire the fatal
+                    // callback so the bookie flips read-only, and drop the
+                    // returned ForceWriteRequest (its `acks` are dropped
+                    // unsent, callers observe RecvError and surface I/O).
                     metrics::JOURNAL_FORCE_WRITE_QUEUE_SIZE.dec();
+                    tracing::error!("FATAL: force-write thread gone, dropping batch");
+                    if let Some(ref callback) = on_fatal_error {
+                        callback(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "force-write thread terminated; journal cannot fsync",
+                        ));
+                    }
+                    drop(send_err);
                 }
             } else {
                 // Mode 3: no sync -- ACK immediately, record e2e latency.
