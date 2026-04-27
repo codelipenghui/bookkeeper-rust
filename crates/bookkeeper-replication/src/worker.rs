@@ -560,6 +560,10 @@ impl ReplicationWorker {
         dm: DigestManager,
         master_key: [u8; MASTER_KEY_LENGTH],
     ) -> Result<(), ReplicationError> {
+        // The metadata we recover against — refreshed if a grace-period
+        // re-read finds an ensemble change in flight.
+        let mut current_md: LedgerMetadata = md.clone();
+
         // Grace period: wait before fencing to let the writing client handle
         // the failure itself. Matches Java's openLedgerRereplicationGracePeriod.
         if self.open_ledger_grace_period_ms > 0 {
@@ -572,7 +576,13 @@ impl ReplicationWorker {
             ))
             .await;
 
-            // Re-check if the ledger was closed during the grace period
+            // Re-read metadata after the grace period. The writer may have
+            // closed the ledger (handled below) OR added a new ensemble
+            // segment (in which case we must recover against the LATEST
+            // ensemble — recovering against the stale `md` parameter would
+            // fence the wrong bookies and close the ledger with a
+            // last_entry_id derived from the old segment, dropping entries
+            // the writer committed against the new one).
             let versioned = self
                 .ledger_manager
                 .read_ledger_metadata(ledger_id)
@@ -592,9 +602,10 @@ impl ReplicationWorker {
                     )
                     .await;
             }
+            current_md = versioned.value().clone();
         }
 
-        let ensembles = md.all_ensembles();
+        let ensembles = current_md.all_ensembles();
         let (last_segment_entry, ensemble) = ensembles
             .iter()
             .next_back()
