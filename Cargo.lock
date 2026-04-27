@@ -707,6 +707,7 @@ dependencies = [
  "hmac",
  "prost 0.14.3",
  "sha1",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

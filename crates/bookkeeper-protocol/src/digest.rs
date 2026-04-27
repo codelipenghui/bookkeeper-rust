@@ -146,6 +146,20 @@ impl DigestManager {
             return true;
         }
         let computed = self.compute(metadata, payload);
-        computed.as_slice() == expected
+        // CRC variants are not MACs — `==` is fine, and any timing
+        // signal carries no security value because the digest is not
+        // secret. HMAC verification, however, is a MAC check: a
+        // byte-by-byte `==` short-circuits at the first mismatch and
+        // leaks where the forgery diverges from the real tag, letting
+        // a network-adjacent attacker recover a valid MAC one byte at
+        // a time over many probes. Use `subtle::ConstantTimeEq` for
+        // the HMAC path.
+        match self.digest_type {
+            DigestType::HmacSha1 => {
+                use subtle::ConstantTimeEq;
+                bool::from(computed.as_slice().ct_eq(expected))
+            }
+            _ => computed.as_slice() == expected,
+        }
     }
 }
