@@ -211,6 +211,30 @@ pub async fn process_v3_request(
                         false,
                     );
                 }
+                // Cheap DoS guard: the V3 ForceLedger wire format carries
+                // no master key, so the most we can do is reject calls
+                // for ledgers this bookie doesn't host. Without this any
+                // unauthenticated client could repeatedly trigger
+                // journal fsyncs for ledger ids it doesn't own.
+                match processor.storage().ledger_exists(fl.ledger_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return (
+                            build_v3_force_ledger_response(
+                                txn_id,
+                                fl.ledger_id,
+                                BKError::NoLedger,
+                            ),
+                            false,
+                        );
+                    }
+                    Err(_) => {
+                        return (
+                            build_v3_force_ledger_response(txn_id, fl.ledger_id, BKError::Io),
+                            false,
+                        );
+                    }
+                }
                 // `FORCE_LEDGER_REQUEST` is recorded end-to-end by the writer task
                 // once the response is flushed (matches Java's
                 // PacketProcessorBaseV3.sendResponse → enqueueNanos semantics).

@@ -721,7 +721,25 @@ impl EnsemblePlacementPolicy for RackAwarePlacementPolicy {
             return Ok(best.to_string());
         }
 
-        // Last resort: any available bookie
+        // Last resort: any available bookie. Even here, prefer one in
+        // a rack that's already absent from the current ensemble — that
+        // preserves SOME rack diversity instead of compounding the
+        // failure by picking a same-rack peer of the failed bookie.
+        // Pre-fix this loop returned the first writable_bookies entry,
+        // which (with deterministic ordering) tended to cluster
+        // replacements onto a single rack under repeated failures.
+        let current_racks: HashSet<String> = current_ensemble
+            .iter()
+            .map(|b| self.rack_of(b))
+            .collect();
+        for b in &self.writable_bookies {
+            if !current_set.contains(b.as_str())
+                && !exclude.contains(b)
+                && !current_racks.contains(&self.rack_of(b))
+            {
+                return Ok(b.clone());
+            }
+        }
         for b in &self.writable_bookies {
             if !current_set.contains(b.as_str()) && !exclude.contains(b) {
                 return Ok(b.clone());

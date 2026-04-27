@@ -134,17 +134,22 @@ pub async fn run(
                 Err(e) => Err(ReplicationError::Failed(format!("worker task panic: {e}"))),
             }
         }
-        _ = shutdown_rx.changed() => {
-            if *shutdown_rx.borrow() {
-                tracing::info!("AutoRecoveryMain: shutdown requested");
-                let _ = auditor_shutdown_tx.send(true);
-                let _ = worker_shutdown_tx.send(true);
-                let _ = auditor_task.await;
-                let _ = worker_task.await;
-                Ok(())
-            } else {
-                Ok(())
+        _ = async {
+            // Wait for shutdown_rx to actually go *true*. A bare
+            // `shutdown_rx.changed()` arm exits the supervisor on ANY
+            // change (e.g. a watcher init that flips false→false→true)
+            // and the auditor + worker subtasks would then run unsupervised.
+            loop {
+                if *shutdown_rx.borrow() { break; }
+                if shutdown_rx.changed().await.is_err() { break; }
             }
+        } => {
+            tracing::info!("AutoRecoveryMain: shutdown requested");
+            let _ = auditor_shutdown_tx.send(true);
+            let _ = worker_shutdown_tx.send(true);
+            let _ = auditor_task.await;
+            let _ = worker_task.await;
+            Ok(())
         }
     };
 

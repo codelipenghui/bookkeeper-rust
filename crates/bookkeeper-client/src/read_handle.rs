@@ -383,7 +383,14 @@ impl ReadHandle {
             })
             .collect();
 
-        let best_lac: i64 = current_lac;
+        // Track the maximum LAC across replies — Java's
+        // ReadLastConfirmedOp returns the highest LAC seen across the
+        // ack quorum, not whichever bookie answered first. A single
+        // replica with a stale LAC could otherwise win against the
+        // up-to-date quorum.
+        let ack_quorum = self.schedule.ack_quorum_size();
+        let mut best_lac: i64 = current_lac;
+        let mut ok_count: usize = 0;
         let mut saw_any = false;
         while let Some(result) = futs.next().await {
             if let Ok(V2Response::Read { error_code, entry_id, .. }) = result {
@@ -392,9 +399,11 @@ impl ReadHandle {
                     BKError::Ok | BKError::NoEntry => {
                         saw_any = true;
                         if entry_id > best_lac {
-                            // First response exceeding current_lac — return immediately.
-                            self.update_last_confirmed(entry_id);
-                            return Ok(entry_id);
+                            best_lac = entry_id;
+                        }
+                        ok_count += 1;
+                        if ok_count >= ack_quorum {
+                            break;
                         }
                     }
                     _ => {}
@@ -403,6 +412,10 @@ impl ReadHandle {
         }
 
         if saw_any {
+            if best_lac > current_lac {
+                self.update_last_confirmed(best_lac);
+                return Ok(best_lac);
+            }
             // All responses came back but none exceeded current_lac.
             // Java returns NoSuchEntryException in this case.
             Err(ClientError::BookieError { error: BKError::NoEntry })
@@ -572,10 +585,18 @@ impl ReadHandle {
             let mut failed = self.failed_bookies.write().unwrap();
             failed.insert(ensemble[failed_bookie_idx].clone());
         }
-        // Rotate sticky index
+        // Rotate sticky index. Use write_quorum_size for the modulo so the
+        // next sticky bookie lands inside any reasonable per-entry write
+        // set (the write set for entry e is [e%E .. (e+W-1)%E]).
+        // Rotating by ensemble_size could drift the sticky to a bookie
+        // that holds no entries for the entry id we're reading, forcing
+        // an extra rotation on the next failure. Matches Java's
+        // LedgerHandle.recordReadErrorOnBookie which keeps sticky inside
+        // the write quorum.
         let sticky = self.sticky_bookie_index.load(Ordering::Acquire);
         if sticky != STICKY_READ_DISABLED && sticky as usize == failed_bookie_idx {
-            let next = (sticky as usize + 1) % self.schedule.ensemble_size();
+            let wq = self.schedule.write_quorum_size().max(1);
+            let next = (sticky as usize + 1) % wq;
             self.sticky_bookie_index.store(next as isize, Ordering::Release);
         }
     }

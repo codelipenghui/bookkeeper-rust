@@ -1363,10 +1363,26 @@ impl WriteHandleAdv {
         let ensemble_info = Arc::clone(&self.inner.ensemble_info);
         let quorum_timeout = self.inner.add_entry_quorum_timeout;
 
+        // Caller must supply at least `write_quorum` connections (and we
+        // already verified `>= ack_quorum` above; the path below requires
+        // one connection per write-set position). Falling back to
+        // conns_for_write[0] when a slot is missing — as the previous
+        // code did — would route multiple ensemble indices to the SAME
+        // bookie, and the same bookie's ack would count as multiple
+        // distinct acks toward the quorum, letting "ack quorum reached"
+        // hold on a single bookie.
+        if conns_for_write.len() < write_set.len() {
+            return Err(ClientError::Protocol(format!(
+                "append_adv_async: not enough connections for write quorum: \
+                 have {}, need {}",
+                conns_for_write.len(),
+                write_set.len(),
+            )));
+        }
         let conn_handles: Vec<(usize, Arc<BookieConnection>)> = write_set
             .iter()
             .enumerate()
-            .map(|(pos, &ensemble_idx)| (ensemble_idx, Arc::clone(&conns_for_write.get(pos).unwrap_or(&conns_for_write[0]))))
+            .map(|(pos, &ensemble_idx)| (ensemble_idx, Arc::clone(&conns_for_write[pos])))
             .collect();
 
         // Register the PendingAdd's signaling slot in LacState up front
