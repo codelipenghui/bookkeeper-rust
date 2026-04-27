@@ -57,7 +57,7 @@ impl CacheEntry {
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 use crate::StorageError;
 
@@ -279,6 +279,19 @@ pub struct UnifiedCache {
     /// rotation overwrote those bytes with no `index.remove`.
     rotation_lock: parking_lot::Mutex<()>,
     last_entry: DashMap<i64, i64>,
+    /// Ledgers that have been deleted at the storage layer. Both
+    /// `put_write` (front) and `drain` (back) consult this set so an
+    /// add_entry that raced past `validate_for_write` before the
+    /// storage's `delete_ledger` removed the row cannot resurrect
+    /// entry-location rows pointing into the active entry log. Mirrors
+    /// Java's `WriteCache.deletedLedgers` (consulted in both
+    /// `WriteCache.put` and `WriteCache.forEach`). The set is
+    /// monotonically growing: its size is bounded by the number of
+    /// distinct deletes the bookie has performed; entries are
+    /// effectively i64s so the footprint is small relative to the
+    /// alternative (per-buffer clear coordination across two write
+    /// buffers + 4 read segments).
+    deleted_ledgers: DashSet<i64>,
 }
 
 impl UnifiedCache {
@@ -295,10 +308,41 @@ impl UnifiedCache {
             current_segment: AtomicUsize::new(0),
             rotation_lock: parking_lot::Mutex::new(()),
             last_entry: DashMap::new(),
+            deleted_ledgers: DashSet::new(),
         }
     }
 
+    /// Mark a ledger as deleted at the storage layer. After this returns,
+    /// any future `put_write` for this ledger will be rejected and any
+    /// already-tracked entries for this ledger will be skipped by `drain`
+    /// (so the entry-location index is not resurrected).
+    ///
+    /// Caller (db_ledger_storage::delete_ledger) must hold the storage
+    /// flush_mutex around this call so an in-flight drain finishes
+    /// before the marker is published.
+    pub fn purge_ledger(&self, ledger_id: i64) {
+        self.deleted_ledgers.insert(ledger_id);
+        self.last_entry.remove(&ledger_id);
+        // Best-effort: drop any cached index entries so reads see the
+        // deletion immediately. Drain still skips via `is_deleted` if
+        // a concurrent `put_write` lands a new entry between the mark
+        // and the retain.
+        self.index.retain(|(l, _e), _ce| *l != ledger_id);
+    }
+
+    /// Whether `ledger_id` has been marked deleted via `purge_ledger`.
+    pub fn is_deleted(&self, ledger_id: i64) -> bool {
+        self.deleted_ledgers.contains(&ledger_id)
+    }
+
     pub fn put_write(&self, l: i64, e: i64, data: &[u8]) -> Result<(), StorageError> {
+        // Reject writes to a ledger that the storage has already deleted.
+        // The drain-side check below catches the narrow race where this
+        // check passes and the deletion lands before `index.insert` runs;
+        // both checks together close the cache-resurrection window.
+        if self.deleted_ledgers.contains(&l) {
+            return Err(StorageError::LedgerNotFound(l));
+        }
         let (idx, buf, _guard) = self.acquire_active_write_slot();
         let offset = buf.reserve(data.len()).map_err(|_| StorageError::StorageFull)?;
         unsafe { buf.write_at(offset, data); }
@@ -557,6 +601,17 @@ impl UnifiedCache {
         let entries = buf.take_entries();
         let mut result = Ok(());
         for (l, e) in entries {
+            // Skip entries for ledgers that the storage has deleted
+            // since this entry was tracked. Without this, a put_write
+            // that raced ahead of `delete_ledger`'s `validate_for_write`
+            // check would resurrect the entry-location row on flush —
+            // GC would then have to clean it up, and a read that lands
+            // before GC would surface "deleted" data. Mirrors Java's
+            // `WriteCache.forEach` skip on `deletedLedgers.contains`.
+            if self.deleted_ledgers.contains(&l) {
+                self.index.remove(&(l, e));
+                continue;
+            }
             // Look up location *before* removing from index.
             let ce = match self.index.get(&(l, e)) {
                 Some(r) => *r.value(),
