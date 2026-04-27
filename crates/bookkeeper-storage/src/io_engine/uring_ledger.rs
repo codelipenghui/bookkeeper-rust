@@ -633,7 +633,12 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
             .count();
         if still_in_flight > 0 {
             if let Err(e) = ring.submit_and_wait(still_in_flight) {
-                // Fatal ring error — notify all pending callers.
+                // Fatal ring error — notify all pending callers and unpin
+                // every fd this batch touched. Without this unpin, the
+                // pins survive until the next successful batch's
+                // unpin_all; repeated failures across distinct log_ids
+                // exhaust the FdCache and `get_or_open` starts returning
+                // WouldBlock for every read.
                 let err_msg = e.to_string();
                 let err_kind = e.kind();
                 for op in pending {
@@ -649,6 +654,7 @@ fn ledger_ring_loop(rx: Receiver<LedgerRequest>) {
                         }
                     }
                 }
+                fd_cache.unpin_all();
                 continue;
             }
         }
