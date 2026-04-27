@@ -86,6 +86,14 @@ pub struct WriteBuffer {
     offset: AtomicUsize,
     max_size: usize,
     entries: Mutex<Vec<(i64, i64)>>,
+    /// Number of put_write callers currently between `enter` and `leave`
+    /// on this buffer. The flush worker reads this counter after rotating
+    /// `active_write` to wait until all writers that loaded the old
+    /// `active_write` value have finished publishing their entry — this
+    /// guarantees `take_entries` captures every (l, e) whose bytes still
+    /// live in the buffer, so `reset` cannot orphan a write whose index
+    /// entry would otherwise survive into the next rotation.
+    writers_in_flight: AtomicUsize,
 }
 
 // SAFETY:
@@ -117,6 +125,33 @@ impl WriteBuffer {
             offset: AtomicUsize::new(0),
             max_size: aligned,
             entries: Mutex::new(Vec::new()),
+            writers_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    /// Mark a writer as starting work on this buffer. Pair with
+    /// [`WriteBuffer::leave`]; prefer [`InFlightGuard`] for the RAII
+    /// pattern so a panic between `enter` and `leave` cannot wedge the
+    /// counter and stall the next flush.
+    pub fn enter(&self) {
+        self.writers_in_flight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Mark a writer as finished publishing its entry to this buffer.
+    pub fn leave(&self) {
+        self.writers_in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Spin until every concurrent writer holding a slot on this buffer
+    /// has published its entry and decremented the counter. Cheap on
+    /// the fast path: callers only invoke this from the flush worker
+    /// after the active-write rotation, so the contention window is
+    /// bounded by however long an in-flight `put_write` takes to finish
+    /// `reserve + write_at + index.insert + track_entry` — microseconds
+    /// in practice.
+    pub fn wait_quiesced(&self) {
+        while self.writers_in_flight.load(Ordering::Acquire) > 0 {
+            std::hint::spin_loop();
         }
     }
 
@@ -196,6 +231,29 @@ impl WriteBuffer {
     }
 }
 
+/// RAII guard that decrements a [`WriteBuffer`]'s in-flight writer
+/// counter when dropped. Constructed via [`WriteBuffer::enter`] in
+/// `acquire_active_write_slot` and held across the entire
+/// `reserve → write_at → index.insert → track_entry` sequence so that
+/// a flush worker spinning in `wait_quiesced` is guaranteed to observe
+/// the writer until every step of the publication has retired.
+pub struct InFlightGuard<'a> {
+    buf: &'a WriteBuffer,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(buf: &'a WriteBuffer) -> Self {
+        buf.enter();
+        Self { buf }
+    }
+}
+
+impl<'a> Drop for InFlightGuard<'a> {
+    fn drop(&mut self) {
+        self.buf.leave();
+    }
+}
+
 /// Semantic alias for a read-cache segment. Same shape and mechanics as
 /// [`WriteBuffer`]; the alias keeps call sites self-documenting. Because
 /// this is a *type alias* (not a newtype), `WriteBuffer` and `ReadSegment`
@@ -241,8 +299,7 @@ impl UnifiedCache {
     }
 
     pub fn put_write(&self, l: i64, e: i64, data: &[u8]) -> Result<(), StorageError> {
-        let idx = self.active_write.load(Ordering::Acquire);
-        let buf = &self.write_bufs[idx as usize];
+        let (idx, buf, _guard) = self.acquire_active_write_slot();
         let offset = buf.reserve(data.len()).map_err(|_| StorageError::StorageFull)?;
         unsafe { buf.write_at(offset, data); }
         // Insert into the unified index BEFORE appending to the buffer's
@@ -263,6 +320,43 @@ impl UnifiedCache {
             .and_modify(|v| if e > *v { *v = e; })
             .or_insert(e);
         Ok(())
+        // _guard drops here, decrementing writers_in_flight on `buf`.
+    }
+
+    /// Reserve a slot on the currently-active write buffer and return a
+    /// guard that keeps the flush worker from rotating-and-resetting the
+    /// buffer out from under us.
+    ///
+    /// Mirrors the contract Java's `SingleDirectoryDbLedgerStorage.addEntry`
+    /// gets from its `StampedLock writeCacheRotationLock`: a put is
+    /// committed to a single buffer atomically with respect to swap, so
+    /// either the put completes fully on the to-be-flushed buffer (and
+    /// gets drained next cycle) or it completes fully on the new active
+    /// buffer.
+    ///
+    /// Pattern: load active_write → enter() → reload active_write. If the
+    /// reload disagrees, a rotation happened in the gap; release the
+    /// ticket and retry on the new active buffer. The Acquire-Release
+    /// memory ordering on `active_write` (Acquire on the loads, AcqRel
+    /// on the rotation CAS) plus AcqRel on the in-flight counter ensures
+    /// that any rotation observed by the post-enter reload is also
+    /// observable via the counter to the flush worker's
+    /// `wait_quiesced` — and conversely, any rotation that races us
+    /// while `active_write` still reads as `idx` cannot have committed,
+    /// so the flush worker has not yet started waiting on this buffer.
+    fn acquire_active_write_slot(&self) -> (u8, &Arc<WriteBuffer>, InFlightGuard<'_>) {
+        loop {
+            let idx = self.active_write.load(Ordering::Acquire);
+            let buf = &self.write_bufs[idx as usize];
+            let guard = InFlightGuard::new(buf);
+            if self.active_write.load(Ordering::Acquire) == idx {
+                return (idx, buf, guard);
+            }
+            // A rotation snuck in between our two reads. The guard's
+            // Drop returns the ticket; loop re-reads the (now flipped)
+            // active_write and acquires a slot on the new buffer.
+            drop(guard);
+        }
     }
 
     /// Invariant I1: the data copy happens inside the DashMap `.map(..)`
@@ -448,6 +542,18 @@ impl UnifiedCache {
         F: FnMut(i64, i64, &[u8]) -> Result<(), E>,
     {
         let buf = &self.write_bufs[guard.flushing_idx as usize];
+        // Wait for every in-flight `put_write` that loaded `active_write`
+        // before our `start_flush` CAS to publish its entry to this
+        // buffer. After the CAS, no new writers can arrive on this
+        // buffer (they observe the flipped `active_write` and either
+        // route to the other buffer or retry the slot acquisition), so
+        // the counter only drains. Without this fence, a writer whose
+        // `track_entry` lands after our `take_entries` would survive
+        // `reset` only as a dangling index entry, and the bytes the
+        // writer claimed at its reserved offset would be overwritten on
+        // the next time this buffer becomes active — corrupting reads
+        // and the eventual entry-log write of that (l, e).
+        buf.wait_quiesced();
         let entries = buf.take_entries();
         let mut result = Ok(());
         for (l, e) in entries {

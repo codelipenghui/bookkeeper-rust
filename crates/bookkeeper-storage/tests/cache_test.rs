@@ -393,3 +393,115 @@ fn unified_get_holds_ref_across_drain() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     reader.join().unwrap();
 }
+
+/// Regression for the rotation race where a writer that loaded
+/// `active_write` before `start_flush`'s CAS could publish its entry
+/// after `take_entries` and `reset` had already run on its buffer —
+/// the writer's bytes survive on disk only as a dangling index entry,
+/// and the reserved offset is reused by later writers, so the next
+/// drain of that buffer reads garbage and writes the wrong bytes
+/// downstream.
+///
+/// Multiple writer threads stamp a recoverable payload (`ledger:entry`)
+/// on every put. A separate flusher thread spins `start_flush + drain`,
+/// collecting every (l, e, bytes) triple it observes. Final assertion:
+/// no drained entry has corrupted bytes. Also asserts that every (l, e)
+/// the writers got `Ok` from is recovered in either the drained set or
+/// the post-stop final drain — i.e., no write is silently lost.
+#[test]
+fn unified_put_write_concurrent_with_rotation_does_not_corrupt_or_lose_entries() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    fn payload_for(l: i64, e: i64) -> Vec<u8> {
+        format!("ledger={l},entry={e},marker=DEADBEEF").into_bytes()
+    }
+
+    // Generous buffer so writers don't trip StorageFull during the
+    // race; the test's purpose is to stress the rotation path, not
+    // the overflow path.
+    let c = StdArc::new(UnifiedCache::new(8 * 1024 * 1024, 1024 * 1024));
+    let n_writers = 4;
+    let entries_per_writer: i64 = 2_000;
+
+    let drained: StdArc<Mutex<Vec<(i64, i64, Vec<u8>)>>> =
+        StdArc::new(Mutex::new(Vec::new()));
+    let stop = StdArc::new(AtomicBool::new(false));
+
+    // Flusher: spins start_flush + drain while writers are running.
+    let c_f = StdArc::clone(&c);
+    let drained_f = StdArc::clone(&drained);
+    let stop_f = StdArc::clone(&stop);
+    let flusher = thread::spawn(move || {
+        while !stop_f.load(Ordering::Relaxed) {
+            let g = c_f.start_flush();
+            c_f.drain::<_, std::convert::Infallible>(g, |l, e, d| {
+                drained_f.lock().unwrap().push((l, e, d.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+            thread::yield_now();
+        }
+    });
+
+    // Writers: each writes a disjoint ledger to keep the (l, e) keys
+    // unique without coordination.
+    let writer_handles: Vec<_> = (0..n_writers)
+        .map(|w| {
+            let c_w = StdArc::clone(&c);
+            thread::spawn(move || {
+                let l = w as i64;
+                let mut acked: Vec<i64> = Vec::with_capacity(entries_per_writer as usize);
+                for e in 0..entries_per_writer {
+                    let bytes = payload_for(l, e);
+                    if c_w.put_write(l, e, &bytes).is_ok() {
+                        acked.push(e);
+                    }
+                }
+                (l, acked)
+            })
+        })
+        .collect();
+
+    let writer_results: Vec<(i64, Vec<i64>)> =
+        writer_handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    stop.store(true, Ordering::Relaxed);
+    flusher.join().unwrap();
+
+    // Drain anything still resident; loop both buffers to be sure.
+    for _ in 0..2 {
+        let g = c.start_flush();
+        c.drain::<_, std::convert::Infallible>(g, |l, e, d| {
+            drained.lock().unwrap().push((l, e, d.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // 1. Every drained entry has correct bytes — the rotation race used
+    //    to corrupt these.
+    let drained = drained.lock().unwrap();
+    for (l, e, bytes) in drained.iter() {
+        let expected = payload_for(*l, *e);
+        assert_eq!(
+            bytes, &expected,
+            "drain returned corrupted bytes for ledger={l} entry={e}",
+        );
+    }
+
+    // 2. Every put_write that returned Ok ends up drained. (drain removes
+    //    the index entry, so anything not in `drained` would also not be
+    //    in the index — i.e., silently lost.)
+    let drained_keys: HashSet<(i64, i64)> =
+        drained.iter().map(|(l, e, _)| (*l, *e)).collect();
+    for (l, acked) in writer_results {
+        for e in acked {
+            assert!(
+                drained_keys.contains(&(l, e)),
+                "ack'd write was not drained: ledger={l} entry={e}",
+            );
+        }
+    }
+}
