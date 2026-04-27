@@ -510,7 +510,7 @@ impl DbLedgerStorage {
                 let lac = Self::extract_lac(entry_data);
 
                 if self.ledger_index.get(ledger_id).ok().flatten().is_none() {
-                    let _ = self.ledger_index.set(ledger_id, false, None, None);
+                    let _ = self.ledger_index.set(ledger_id, false, None);
                 }
                 if lac >= 0 {
                     // Monotonic merge — a stale replayed entry whose lac
@@ -909,17 +909,13 @@ impl DbLedgerStorage {
         self.entry_location_index.flush()?;
         storage_metrics::FLUSH_LOCATIONS_INDEX.observe(locations_start.elapsed().as_secs_f64());
 
-        // Persist in-memory LAC cache to RocksDB in one WriteBatch.
-        // Previously this was a per-ledger read-modify-write loop (2N
-        // RocksDB ops per flush); multi-partition workloads made it the
-        // dominant write-amplification source. batch_update_lac coalesces
-        // into one multi_get + one write_batch regardless of ledger count.
-        let lac_entries: Vec<(i64, i64)> = self.lac_cache.iter()
-            .map(|e| (*e.key(), *e.value()))
-            .collect();
-        if let Err(e) = self.ledger_index.batch_update_lac(&lac_entries) {
-            tracing::warn!("batch LAC update failed during flush: {e}");
-        }
+        // The integer LAC is intentionally not persisted to RocksDB —
+        // Java's `LedgerData` proto stores only the optional WriteLac
+        // body in `explicitLac`, and the integer is reconstructed on
+        // restart from journal replay (see init_journal). The previous
+        // batch write into `LedgerData.explicit_lac` clobbered any raw
+        // body a prior WriteLac had written, breaking digest verification
+        // on every read.
 
         // Persist the current high-water mark for entry-log id so that a
         // GC-then-restart can't recycle this id even if no rotation has
@@ -960,7 +956,7 @@ impl LedgerStorage for DbLedgerStorage {
             let idx = Arc::clone(&self.ledger_index);
             let created = tokio::task::spawn_blocking(move || -> Result<bool, StorageError> {
                 if idx.get(ledger_id)?.is_none() {
-                    idx.set(ledger_id, false, None, None)?;
+                    idx.set(ledger_id, false, None)?;
                     Ok(true)
                 } else {
                     Ok(false)
@@ -1202,11 +1198,11 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn set_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(), StorageError> {
-        let (fenced, existing_lac) = match self.ledger_index.get(ledger_id)? {
-            Some(existing) => (existing.fenced, existing.lac),
-            None => (false, None),
+        let fenced = match self.ledger_index.get(ledger_id)? {
+            Some(existing) => existing.fenced,
+            None => false,
         };
-        self.ledger_index.set(ledger_id, fenced, Some(master_key), existing_lac)?;
+        self.ledger_index.set(ledger_id, fenced, Some(master_key))?;
         // Empty master key is the "not-yet-set" sentinel used by the
         // data-integrity pre-boot check (`processPreBoot` creates the row
         // before the real key is known). Cache it as None so a subsequent
@@ -1249,7 +1245,7 @@ impl LedgerStorage for DbLedgerStorage {
                 self.set_master_key(ledger_id, master_key)
             }
             None => {
-                self.ledger_index.set(ledger_id, false, Some(master_key), None)?;
+                self.ledger_index.set(ledger_id, false, Some(master_key))?;
                 self.meta_cache.insert(
                     ledger_id,
                     Arc::new(LedgerMetaCacheEntry {
@@ -1268,13 +1264,18 @@ impl LedgerStorage for DbLedgerStorage {
         if let Some(entry_id) = self.unified_cache.last_entry_id(ledger_id) {
             return Ok(entry_id);
         }
-        // 2. Check in-memory LAC cache
+        // 2. Check in-memory LAC cache (populated by add_entry / WriteLac
+        //    and reconstructed on startup from journal replay).
         if let Some(lac) = self.lac_cache.get(&ledger_id) {
             return Ok(*lac);
         }
-        // 3. Fall back to RocksDB ledger index (persisted LAC)
+        // 3. Ledger row exists but no LAC info yet — return -1 (no
+        //    confirmed entries). Java's getLastAddConfirmed returns
+        //    `LedgerHandle.INVALID_ENTRY_ID` (-1) in the same case;
+        //    the integer LAC is intentionally not persisted (`LedgerData`
+        //    only stores the optional explicitLac body).
         match self.ledger_index.get(ledger_id)? {
-            Some(data) => Ok(data.lac.unwrap_or(-1)),
+            Some(_) => Ok(-1),
             None => Err(StorageError::LedgerNotFound(ledger_id)),
         }
     }
@@ -1287,17 +1288,14 @@ impl LedgerStorage for DbLedgerStorage {
         // higher value (e.g., from a recent add_entry), accepting the
         // smaller value would violate the per-ledger monotonicity
         // invariant that readers rely on.
-        let promoted = self
-            .lac_cache
+        //
+        // The integer LAC lives in `lac_cache` only — Java does the same;
+        // its `LedgerData` proto has no integer LAC field. The value is
+        // reconstructed on restart via journal replay.
+        self.lac_cache
             .entry(ledger_id)
             .and_modify(|v| *v = (*v).max(lac))
             .or_insert(lac);
-        let new_lac = *promoted;
-        drop(promoted);
-        // Persist via the ledger index so the LAC survives restart —
-        // pre-fix only the in-memory cache was updated, so the
-        // explicit LAC was silently dropped on bookie restart.
-        self.ledger_index.update_lac(ledger_id, new_lac)?;
         Ok(())
     }
 
@@ -1574,8 +1572,8 @@ impl LedgerStorage for DbLedgerStorage {
                         }),
                     );
                 } else {
-                    // No key stored — store it (preserving existing fenced/lac)
-                    self.ledger_index.set(ledger_id, data.fenced, Some(master_key), data.lac)?;
+                    // No key stored — store it (preserving existing fenced bit)
+                    self.ledger_index.set(ledger_id, data.fenced, Some(master_key))?;
                     self.meta_cache.insert(
                         ledger_id,
                         Arc::new(LedgerMetaCacheEntry {
@@ -1588,7 +1586,7 @@ impl LedgerStorage for DbLedgerStorage {
             }
             None => {
                 // Create new ledger with key
-                self.ledger_index.set(ledger_id, false, Some(master_key), None)?;
+                self.ledger_index.set(ledger_id, false, Some(master_key))?;
                 self.meta_cache.insert(
                     ledger_id,
                     Arc::new(LedgerMetaCacheEntry {

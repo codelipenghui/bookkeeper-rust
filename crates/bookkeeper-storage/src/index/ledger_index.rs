@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 use prost::Message;
-use rocksdb::{Cache, DB, WriteBatch};
+use rocksdb::{Cache, DB};
 use crate::rocksdb_options;
 use crate::StorageError;
 
@@ -16,13 +16,17 @@ const STORAGE_FLAGS_KEY: i64 = -0xeefd;
 /// index still references.
 const LAST_ENTRY_LOG_ID_KEY: i64 = -0xeefc;
 
-/// Ledger metadata stored in the bookie's RocksDB.
+/// Ledger metadata stored in the bookie's RocksDB. Mirrors Java's
+/// `LedgerData` proto in `DbLedgerStorageDataFormats.proto` — note that
+/// the integer LAC is intentionally absent. The persisted `explicitLac`
+/// field carries the WriteLac body (raw bytes with digest); the integer
+/// LAC lives in the in-memory `lac_cache` and is reconstructed on
+/// restart.
 #[derive(Debug, Clone)]
 pub struct LedgerData {
     pub exists: bool,
     pub fenced: bool,
     pub master_key: Option<Vec<u8>>,
-    pub lac: Option<i64>,
 }
 
 /// RocksDB-backed ledger metadata index.
@@ -52,13 +56,19 @@ impl LedgerMetadataIndex {
         Ok(Self { db, block_cache, flags_lock: Mutex::new(()) })
     }
 
-    pub fn set(&self, ledger_id: i64, fenced: bool, master_key: Option<&[u8]>, lac: Option<i64>) -> Result<(), StorageError> {
+    /// Persist a LedgerData row. The on-disk proto matches Java's
+    /// LedgerData (DbLedgerStorageDataFormats.proto): `explicitLac` is
+    /// the raw body written by WriteLac (with digest), NEVER an
+    /// integer LAC. The integer LAC lives in the in-memory `lac_cache`
+    /// and is reconstructed on restart from journal replay /
+    /// last-entry tracking — exactly as Java does.
+    pub fn set(&self, ledger_id: i64, fenced: bool, master_key: Option<&[u8]>) -> Result<(), StorageError> {
         let key = ledger_id.to_be_bytes();
         let proto = bookkeeper_proto::LedgerData {
             exists: true,
             fenced,
             master_key: master_key.map(|k| k.to_vec()).unwrap_or_default(),
-            explicit_lac: lac.map(|l| l.to_be_bytes().to_vec()),
+            explicit_lac: None,
             limbo: None,
         };
         let value = proto.encode_to_vec();
@@ -74,14 +84,10 @@ impl LedgerMetadataIndex {
                 if !proto.exists {
                     return Ok(None);
                 }
-                let lac = proto.explicit_lac.as_ref().and_then(|b| {
-                    if b.len() >= 8 { Some(i64::from_be_bytes(b[..8].try_into().unwrap())) } else { None }
-                });
                 Ok(Some(LedgerData {
                     exists: proto.exists,
                     fenced: proto.fenced,
                     master_key: if proto.master_key.is_empty() { None } else { Some(proto.master_key) },
-                    lac,
                 }))
             }
             None => Ok(None),
@@ -97,40 +103,18 @@ impl LedgerMetadataIndex {
         }
     }
 
-    pub fn update_lac(&self, ledger_id: i64, lac: i64) -> Result<(), StorageError> {
-        if let Some(mut data) = self.get_raw(ledger_id)? {
-            data.explicit_lac = Some(lac.to_be_bytes().to_vec());
-            self.put_raw(ledger_id, &data)
-        } else {
-            Err(StorageError::LedgerNotFound(ledger_id))
-        }
-    }
-
-    /// Persist a batch of `(ledger_id, lac)` updates in a single RocksDB
-    /// `WriteBatch`. Reads are coalesced into one `multi_get` so the whole
-    /// path is two RocksDB calls (multi_get + write_batch) regardless of
-    /// how many ledgers are touched. Called from the write-cache flush path;
-    /// Java's `SingleDirectoryDbLedgerStorage.flush` does the same.
-    ///
-    /// Ledgers missing from the index are silently skipped — the flush path
-    /// can race with a concurrent `delete_ledger`, and a missing row is not
-    /// a recovery error.
-    pub fn batch_update_lac(&self, entries: &[(i64, i64)]) -> Result<(), StorageError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let keys: Vec<[u8; 8]> = entries.iter().map(|(id, _)| id.to_be_bytes()).collect();
-        let results = self.db.multi_get(keys.iter());
-        let mut batch = WriteBatch::default();
-        for ((ledger_id, lac), result) in entries.iter().zip(results) {
-            let Some(raw) = result? else { continue };
-            let mut proto = bookkeeper_proto::LedgerData::decode(&raw[..])
-                .map_err(|e| StorageError::CorruptData(format!("ledger data decode: {e}")))?;
-            proto.explicit_lac = Some(lac.to_be_bytes().to_vec());
-            batch.put(ledger_id.to_be_bytes(), proto.encode_to_vec());
-        }
-        self.db.write(batch).map_err(StorageError::from)
-    }
+    // The integer LAC is intentionally NOT persisted in `LedgerData`.
+    // Java doesn't either — its `LedgerData` proto only has
+    // `explicitLac` (raw body). The integer LAC lives in
+    // `transientLedgerInfoCache` (Java) / `lac_cache` (Rust) and is
+    // reconstructed on restart from journal replay + entry-log scan.
+    //
+    // The previous Rust code wrote the 8-byte integer LAC into the
+    // `explicit_lac` field via `update_lac` / `batch_update_lac`,
+    // clobbering whatever raw body `set_explicit_lac_body` had stored
+    // for the same field. Subsequent `get_explicit_lac_body()` calls
+    // returned 8 bytes claiming to be a body-with-digest — clients
+    // failed digest verification on every read.
 
     /// Enumerate all ledger IDs in the index.
     /// Used by GC to compare local ledgers against metadata store.

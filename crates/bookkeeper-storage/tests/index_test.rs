@@ -47,38 +47,27 @@ fn entry_location_delete_ledger() {
 fn ledger_index_put_get() {
     let dir = TempDir::new().unwrap();
     let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
-    index.set(1, false, Some(b"masterkey"), Some(42)).unwrap();
+    index.set(1, false, Some(b"masterkey")).unwrap();
     let data = index.get(1).unwrap().unwrap();
     assert!(!data.fenced);
     assert_eq!(data.master_key, Some(b"masterkey".to_vec()));
-    assert_eq!(data.lac, Some(42));
 }
 
 #[test]
 fn ledger_index_fence() {
     let dir = TempDir::new().unwrap();
     let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
-    index.set(1, false, Some(b"key"), None).unwrap();
+    index.set(1, false, Some(b"key")).unwrap();
     index.set_fenced(1).unwrap();
     let data = index.get(1).unwrap().unwrap();
     assert!(data.fenced);
 }
 
 #[test]
-fn ledger_index_update_lac() {
-    let dir = TempDir::new().unwrap();
-    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
-    index.set(1, false, Some(b"key"), Some(10)).unwrap();
-    index.update_lac(1, 50).unwrap();
-    let data = index.get(1).unwrap().unwrap();
-    assert_eq!(data.lac, Some(50));
-}
-
-#[test]
 fn ledger_index_delete() {
     let dir = TempDir::new().unwrap();
     let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
-    index.set(1, false, None, None).unwrap();
+    index.set(1, false, None).unwrap();
     index.delete(1).unwrap();
     assert!(index.get(1).unwrap().is_none());
 }
@@ -153,7 +142,7 @@ fn storage_flags_key_is_not_a_ledger() {
     let dir = TempDir::new().unwrap();
     let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
     assert!(index.set_storage_state_flags(0, 0x1).unwrap());
-    index.set(42, false, Some(b"pw"), None).unwrap();
+    index.set(42, false, Some(b"pw")).unwrap();
     let ledgers = index.list_all_ledgers().unwrap();
     assert_eq!(ledgers, vec![42]);
 }
@@ -162,7 +151,7 @@ fn storage_flags_key_is_not_a_ledger() {
 fn limbo_state_round_trip() {
     let dir = TempDir::new().unwrap();
     let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
-    index.set(7, false, Some(b"pw"), None).unwrap();
+    index.set(7, false, Some(b"pw")).unwrap();
     assert!(!index.has_limbo(7).unwrap());
     index.set_limbo(7).unwrap();
     assert!(index.has_limbo(7).unwrap());
@@ -178,37 +167,6 @@ fn limbo_requires_existing_ledger() {
     // clear is a no-op on absent ledgers
     assert!(index.clear_limbo(999).is_ok());
     assert!(!index.has_limbo(999).unwrap());
-}
-
-#[test]
-fn batch_update_lac_overwrites_existing_and_preserves_other_fields() {
-    let dir = TempDir::new().unwrap();
-    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
-    // Seed 3 ledgers with master keys + one initial LAC, leave one absent.
-    index.set(1, false, Some(b"pw1"), Some(10)).unwrap();
-    index.set(2, true,  Some(b"pw2"), None).unwrap();
-    index.set(3, false, Some(b"pw3"), Some(5)).unwrap();
-
-    index
-        .batch_update_lac(&[(1, 42), (2, 100), (3, 7), (99, 1)]) // 99 absent — skipped
-        .unwrap();
-
-    // LAC updates persisted.
-    assert_eq!(index.get(1).unwrap().unwrap().lac, Some(42));
-    assert_eq!(index.get(2).unwrap().unwrap().lac, Some(100));
-    assert_eq!(index.get(3).unwrap().unwrap().lac, Some(7));
-    // Other fields preserved.
-    assert_eq!(index.get(2).unwrap().unwrap().fenced, true);
-    assert_eq!(index.get(1).unwrap().unwrap().master_key.as_deref(), Some(&b"pw1"[..]));
-    // Missing ledger remained absent.
-    assert!(index.get(99).unwrap().is_none());
-}
-
-#[test]
-fn batch_update_lac_empty_is_noop() {
-    let dir = TempDir::new().unwrap();
-    let index = LedgerMetadataIndex::open(dir.path(), None).unwrap();
-    index.batch_update_lac(&[]).unwrap();
 }
 
 /// `delete_ledger` and `iter_ledger_entries` build their range bounds
