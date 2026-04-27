@@ -193,6 +193,33 @@ pub fn create_router(http_state: HttpState) -> Router {
                         .fold(0u8, |acc, (a, b)| acc | (a ^ b))
                         == 0;
                 if !ok {
+                    // Audit: emit a warn on every failed auth attempt so
+                    // a probing or misconfigured caller leaves a trail in
+                    // the bookie logs. The previous middleware silently
+                    // 401'd, so an admin investigating "why is X not
+                    // working" had no signal that the request even made
+                    // it to this server. Rate limiting is left to the
+                    // log layer — the audit value is in *having* the
+                    // record, not in deduplicating it.
+                    let peer = req
+                        .extensions()
+                        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                        .map(|ci| ci.0.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let token_status = if provided.is_empty() {
+                        "missing"
+                    } else if provided.len() != expected.len() {
+                        "wrong-length"
+                    } else {
+                        "mismatched"
+                    };
+                    tracing::warn!(
+                        method = %req.method(),
+                        path = %req.uri().path(),
+                        peer = %peer,
+                        token_status,
+                        "http admin: rejected unauthenticated request",
+                    );
                     return (
                         axum::http::StatusCode::UNAUTHORIZED,
                         "missing or invalid bearer token for mutating admin endpoint",
