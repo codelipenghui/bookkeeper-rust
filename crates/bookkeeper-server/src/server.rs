@@ -2004,11 +2004,15 @@ where
     R: tokio::io::AsyncReadExt + Unpin,
     W: tokio::io::AsyncWriteExt + Unpin + Send + 'static,
 {
-    // Unbounded channel: backpressure is already enforced by the TCP socket's
-    // write buffer. The bounded variant was ~6% of hot-path CPU because every
-    // send/recv acquired a batch_semaphore permit — unbounded is a simple
-    // atomic linked-list push/pop.
-    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<EnqueuedResponse>();
+    // Bounded response channel — caps per-connection memory at
+    // ~RESPONSE_CHANNEL_DEPTH × max_response_size. Under a slow / stalled
+    // client the writer task lags, the channel fills, and per-request
+    // futures `send().await` block, providing backpressure end-to-end.
+    // The previous unbounded variant let a slow client OOM the bookie
+    // by accepting requests at line rate while the socket couldn't drain.
+    const RESPONSE_CHANNEL_DEPTH: usize = 4096;
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::channel::<EnqueuedResponse>(RESPONSE_CHANNEL_DEPTH);
 
     // Writer task: sends framed responses to the socket.
     // Matches Java's closeChannelOnResponseTimeout: if a write takes longer
@@ -2126,7 +2130,7 @@ where
                                 queued_at: std::time::Instant::now(),
                                 kind,
                                 success: false,
-                            });
+                            }).await;
                             continue 'decode;
                         }
                         if is_auth_op {
@@ -2143,7 +2147,7 @@ where
                                 queued_at: std::time::Instant::now(),
                                 kind,
                                 success,
-                            });
+                            }).await;
                         }));
                     } else {
                         is_v3 = Some(false);
@@ -2165,7 +2169,7 @@ where
                                     queued_at: std::time::Instant::now(),
                                     kind: RequestKind::Other,
                                     success: false,
-                                });
+                                }).await;
                             }));
                             continue 'decode;
                         }
@@ -2183,7 +2187,7 @@ where
                                 queued_at: std::time::Instant::now(),
                                 kind,
                                 success,
-                            });
+                            }).await;
                         }));
                     }
                 }
