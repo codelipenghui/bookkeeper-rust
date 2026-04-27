@@ -1198,11 +1198,10 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn set_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(), StorageError> {
-        let fenced = match self.ledger_index.get(ledger_id)? {
-            Some(existing) => existing.fenced,
-            None => false,
-        };
-        self.ledger_index.set(ledger_id, fenced, Some(master_key))?;
+        // Atomic at the index level — preserves any concurrently-set
+        // fence bit (Java's `LedgerMetadataIndex.setMasterKey` does the
+        // same get-modify-set under `lockForLedger`).
+        let (fenced, _limbo) = self.ledger_index.set_master_key(ledger_id, master_key)?;
         // Empty master key is the "not-yet-set" sentinel used by the
         // data-integrity pre-boot check (`processPreBoot` creates the row
         // before the real key is known). Cache it as None so a subsequent
@@ -1245,11 +1244,15 @@ impl LedgerStorage for DbLedgerStorage {
                 self.set_master_key(ledger_id, master_key)
             }
             None => {
-                self.ledger_index.set(ledger_id, false, Some(master_key))?;
+                // Use the atomic helper rather than `set` so a concurrent
+                // `set_fenced` (e.g. recovery racing the first add_entry)
+                // can't be lost. `set_master_key` handles the missing-row
+                // case by creating with `fenced=false`.
+                let (fenced, _limbo) = self.ledger_index.set_master_key(ledger_id, master_key)?;
                 self.meta_cache.insert(
                     ledger_id,
                     Arc::new(LedgerMetaCacheEntry {
-                        fenced: false,
+                        fenced,
                         master_key: Some(master_key.to_vec()),
                     }),
                 );
@@ -1259,6 +1262,16 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn get_last_add_confirmed(&self, ledger_id: i64) -> Result<i64, StorageError> {
+        // Limbo gate: a ledger flagged for data-integrity recovery must
+        // not surface ANY local view (LAC integer, explicit body, or entry
+        // bytes) until recovery has completed. Java's `throwIfLimbo` runs
+        // in every read path (`getLastAddConfirmed`, `getExplicitLac`,
+        // `getEntry`); without this check, a long-poll or ReadLac client
+        // would observe the stale local LAC and advance its cursor past
+        // the limbo bookie's un-recovered tail.
+        if self.ledger_index.has_limbo(ledger_id)? {
+            return Err(StorageError::Unauthorized(ledger_id));
+        }
         // 1. Check unified cache — last_entry_id tracks the maximum entry_id
         //    written across both write buffers (never cleared on flush swap).
         if let Some(entry_id) = self.unified_cache.last_entry_id(ledger_id) {
@@ -1308,6 +1321,10 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn get_explicit_lac_body(&self, ledger_id: i64) -> Result<Option<Vec<u8>>, StorageError> {
+        // Limbo gate — see `get_last_add_confirmed` above.
+        if self.ledger_index.has_limbo(ledger_id)? {
+            return Err(StorageError::Unauthorized(ledger_id));
+        }
         // Check in-memory cache first (fast path)
         if let Some(body) = self.explicit_lac_cache.get(&ledger_id) {
             return Ok(Some(body.clone()));
@@ -1445,8 +1462,13 @@ impl LedgerStorage for DbLedgerStorage {
     }
 
     fn update_entry_locations(&self, batch: &[(i64, i64, u64)]) -> Result<(), StorageError> {
-        // No per-entry flush needed — write_batch already wrote to disk.
-        // Just update the RocksDB index.
+        // Caller must ensure the entry-log bytes are durable before
+        // calling this — `LedgerIo::write_batch` only writes to the page
+        // cache. In the compaction path the durability + lock
+        // invariants are handled by `update_entry_locations_with_flush_lock`,
+        // which fsyncs the active log fd before committing the batch.
+        // This non-locked variant is kept for trait completeness and
+        // tests; production should not call it on a real storage.
         self.entry_location_index.put_batch(batch)?;
         self.entry_location_index.flush()
     }
@@ -1460,6 +1482,30 @@ impl LedgerStorage for DbLedgerStorage {
         // Matches Java's SingleDirectoryDbLedgerStorage.updateEntriesLocations()
         // which acquires flushMutex before calling entryLocationIndex.updateLocations().
         let _lock = self.flush_mutex.lock().await;
+
+        // Fsync the active entry log fd before committing the new
+        // locations. `write_entry_to_log` (the compaction write path)
+        // calls `LedgerIo::write_batch` which lands bytes in the kernel
+        // page cache but does NOT sync. If the bookie crashes after this
+        // index commit but before the next checkpoint, RocksDB recovery
+        // restores entry-location rows pointing into the active log file
+        // for offsets the kernel never wrote — reads of those compacted
+        // entries return zeros (or short-read errors from a torn extend),
+        // and digest verification fails. Mirrors Java's
+        // `EntryLogCompactor.flush()` which calls `entryLogger.flush()`
+        // (fsyncs the active channel) BEFORE
+        // `ledgerStorage.updateEntriesLocations(...)`.
+        let active_file = {
+            let log_state = self.log_state.lock()
+                .unwrap_or_else(|p| p.into_inner());
+            log_state.file.as_ref().and_then(|f| f.try_clone().ok())
+        };
+        if let Some(file) = active_file {
+            tokio::task::spawn_blocking(move || file.sync_data())
+                .await
+                .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
+        }
+
         self.entry_location_index.put_batch(batch)?;
         self.entry_location_index.flush()
     }
@@ -1473,6 +1519,18 @@ impl LedgerStorage for DbLedgerStorage {
         // leaving dangling index entries pointing at GC-eligible bytes).
         // Matches Java's deleteLedger which holds writeCacheRotationLock.
         let _flush_lock = self.flush_mutex.lock().await;
+
+        // Mark the ledger deleted in the unified cache BEFORE clearing
+        // any other state. `purge_ledger`:
+        //   - rejects any future put_write for this ledger (front gate)
+        //   - causes drain to skip already-tracked entries for this
+        //     ledger (back gate, closes the put_write-vs-delete race)
+        //   - removes existing index/last_entry rows synchronously
+        // Without this, a put_write that raced past validate_for_write
+        // before delete cleared meta_cache would survive into drain and
+        // resurrect entry-location rows pointing into the active log —
+        // a "deleted" ledger's bytes leak back through reads (until GC).
+        self.unified_cache.purge_ledger(ledger_id);
 
         // Notify long poll watchers that this ledger is gone
         self.lac_watchers.notify_ledger_closed(ledger_id);
@@ -1549,7 +1607,7 @@ impl LedgerStorage for DbLedgerStorage {
         // before, since every request re-read the ledger metadata row.
         if let Some(meta) = self.meta_cache.get(&ledger_id) {
             if let Some(stored) = &meta.master_key {
-                if stored.as_slice() != master_key {
+                if !constant_time_eq(stored.as_slice(), master_key) {
                     return Err(StorageError::Unauthorized(ledger_id));
                 }
                 return Ok(meta.fenced);
