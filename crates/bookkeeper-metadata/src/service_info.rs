@@ -41,7 +41,30 @@ impl BookieServiceInfo {
     pub fn from_protobuf_bytes(data: &[u8]) -> Result<Self, MetadataError> {
         let info = bookkeeper_proto::BookieServiceInfoFormat::decode(data)
             .map_err(|e| MetadataError::SerializationError(format!("service info decode: {e}")))?;
-        let endpoint = info.endpoints.first()
+        // Prefer the `bookie-rpc` endpoint when more than one is
+        // present; otherwise fall back to the first. The current
+        // BookieServiceInfo struct only models a single endpoint, so
+        // we still discard the alternates — but a service-mesh
+        // deployment with rotating IPs at least gets a tracing log
+        // pointing at the silent loss until this struct is widened
+        // to carry every endpoint.
+        if info.endpoints.len() > 1 {
+            tracing::debug!(
+                "BookieServiceInfo: {} endpoints present, only the first \
+                 bookie-rpc endpoint is retained ({})",
+                info.endpoints.len(),
+                info.endpoints
+                    .iter()
+                    .map(|e| format!("{}@{}:{}", e.protocol, e.host, e.port))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        let endpoint = info
+            .endpoints
+            .iter()
+            .find(|e| e.protocol == "bookie-rpc")
+            .or_else(|| info.endpoints.first())
             .ok_or_else(|| MetadataError::SerializationError("no endpoints in service info".into()))?;
         Ok(Self {
             bookie_id: endpoint.id.clone(),
