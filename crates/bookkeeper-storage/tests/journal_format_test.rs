@@ -61,10 +61,14 @@ fn padding_minimum_size() {
 }
 
 #[test]
-fn padding_at_boundary_uses_full_alignment() {
-    // At position 4096 (already aligned): pad to NEXT boundary = 4096 bytes
+fn padding_at_boundary_skips_emit() {
+    // At position 4096 (already aligned): no padding needed. Mirrors
+    // Java's `Journal.writePaddingBytes` which short-circuits when
+    // `position % alignment == 0`. The previous Rust behavior emitted
+    // a full alignment of padding, wasting one alignment per
+    // boundary-aligned flush.
     let padding = calculate_padding(4096, 4096);
-    assert_eq!(padding.len(), 4096);
+    assert!(padding.is_empty());
 }
 
 #[test]

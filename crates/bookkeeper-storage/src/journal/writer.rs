@@ -1317,6 +1317,14 @@ fn flush_write_buf(
                         ));
                     }
                     drop(send_err);
+                    // Stop processing — without the force-write thread we
+                    // can never fsync, and continuing the outer loop would
+                    // dirty more pages and re-fire the fatal callback per
+                    // batch. The bookie's read-only transition closes the
+                    // request channel, but until that lands let the writer
+                    // exit immediately.
+                    write_buf.clear();
+                    return;
                 }
             } else {
                 // Mode 3: no sync -- ACK immediately, record e2e latency.

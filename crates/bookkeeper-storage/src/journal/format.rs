@@ -44,6 +44,20 @@ impl JournalHeader {
             return Err(StorageError::CorruptData("invalid journal magic".into()));
         }
         let version = i32::from_be_bytes(data[4..8].try_into().unwrap());
+        // Reject unknown / forward-incompatible versions loudly. Without
+        // this check, a journal written by a future build (or after a
+        // failed downgrade) silently parses; with `skip_invalid_record=true`
+        // (the default for crash recovery) the whole file is then treated
+        // as one big invalid-record stream and the previously-acked
+        // entries are silently dropped on replay. Mirrors Java's
+        // `JournalChannel` constructor which throws on out-of-range
+        // formatVersion.
+        if version < MIN_COMPAT_JOURNAL_FORMAT_VERSION || version > CURRENT_JOURNAL_FORMAT_VERSION {
+            return Err(StorageError::CorruptData(format!(
+                "unsupported journal format version {version} \
+                 (this build supports {MIN_COMPAT_JOURNAL_FORMAT_VERSION}..={CURRENT_JOURNAL_FORMAT_VERSION})"
+            )));
+        }
         Ok(Self { version })
     }
 }
@@ -60,8 +74,17 @@ pub fn encode_journal_entry(payload: &[u8]) -> Vec<u8> {
 /// Returns the complete padding block: [PADDING_MASK(4)][zero_fill_len(4)][zeros].
 /// The length field stores the zero-fill byte count (NOT including the 8-byte header),
 /// matching Java's Journal.writePaddingBytes format.
+///
+/// Returns an empty Vec when `current_pos` is already aligned — Java's
+/// `Journal.writePaddingBytes` short-circuits the same way (`if (0 !=
+/// bytesToAlign)`). The previous Rust version always emitted at least
+/// `alignment` bytes of padding when already aligned, wasting space.
 pub fn calculate_padding(current_pos: u64, alignment: u64) -> Vec<u8> {
-    let next_aligned = ((current_pos + alignment - 1) / alignment) * alignment;
+    let bytes_to_align = current_pos % alignment;
+    if bytes_to_align == 0 {
+        return Vec::new();
+    }
+    let next_aligned = current_pos + (alignment - bytes_to_align);
     let mut total_len = (next_aligned - current_pos) as usize;
     if total_len < 8 {
         total_len += alignment as usize;
