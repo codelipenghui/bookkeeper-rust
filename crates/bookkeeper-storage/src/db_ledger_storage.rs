@@ -187,9 +187,15 @@ pub struct DbLedgerStorage {
 /// Request to the dedicated flush worker. Callers pick `OnSwap` for the fast
 /// add-entry unblock path (signal as soon as active cache is empty) or
 /// `OnDrain` for the checkpoint path (signal once data is durable).
+///
+/// `OnDrain` carries an `Arc<StorageError>` rather than a `StorageError` so a
+/// single drain result can be broadcast to every coalesced waiter — without
+/// the Arc one of two concurrent checkpoints would see "channel dropped"
+/// and conclude the flush had failed even though it actually succeeded,
+/// skipping the lastMark write and stalling journal cleanup.
 enum FlushReq {
     OnSwap(tokio::sync::oneshot::Sender<()>),
-    OnDrain(tokio::sync::oneshot::Sender<Result<(), StorageError>>),
+    OnDrain(tokio::sync::oneshot::Sender<Result<(), Arc<StorageError>>>),
 }
 
 impl DbLedgerStorage {
@@ -345,28 +351,25 @@ impl DbLedgerStorage {
                         // add_entry callers that all hit a full cache get woken
                         // by the same swap.
                         let mut swap_waiters: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
-                        let mut drain_waiter: Option<
-                            tokio::sync::oneshot::Sender<Result<(), StorageError>>,
-                        > = None;
+                        let mut drain_waiters: Vec<
+                            tokio::sync::oneshot::Sender<Result<(), Arc<StorageError>>>,
+                        > = Vec::new();
                         let push = |req: FlushReq,
                                         swap_waiters: &mut Vec<_>,
-                                        drain_waiter: &mut Option<_>| {
+                                        drain_waiters: &mut Vec<_>| {
                             match req {
                                 FlushReq::OnSwap(s) => swap_waiters.push(s),
-                                FlushReq::OnDrain(d) => {
-                                    // StorageError is not Clone, so only one drain
-                                    // waiter per batch gets the real result; any
-                                    // extras see the dropped oneshot and surface a
-                                    // synthesized error back to their caller.
-                                    if drain_waiter.is_none() {
-                                        *drain_waiter = Some(d);
-                                    }
-                                }
+                                // Collect every drain waiter; the result is
+                                // shared via Arc below so all of them see the
+                                // same outcome — coalesced concurrent
+                                // checkpoints used to drop their channel and
+                                // misclassify a successful flush as failure.
+                                FlushReq::OnDrain(d) => drain_waiters.push(d),
                             }
                         };
-                        push(first, &mut swap_waiters, &mut drain_waiter);
+                        push(first, &mut swap_waiters, &mut drain_waiters);
                         while let Ok(next) = rx.try_recv() {
-                            push(next, &mut swap_waiters, &mut drain_waiter);
+                            push(next, &mut swap_waiters, &mut drain_waiters);
                         }
 
                         let flush_start = Instant::now();
@@ -380,10 +383,18 @@ impl DbLedgerStorage {
                             let _ = s.send(());
                         }
                         let res = storage.drain_flushing(flush_start, flush_guard).await;
-                        if let Some(d) = drain_waiter {
-                            let _ = d.send(res);
-                        } else if let Err(e) = res {
-                            tracing::warn!("background flush drain failed: {e}");
+                        let shared: Result<(), Arc<StorageError>> = match res {
+                            Ok(()) => Ok(()),
+                            Err(e) => Err(Arc::new(e)),
+                        };
+                        if drain_waiters.is_empty() {
+                            if let Err(e) = &shared {
+                                tracing::warn!("background flush drain failed: {e}");
+                            }
+                        } else {
+                            for d in drain_waiters {
+                                let _ = d.send(shared.clone());
+                            }
                         }
                     }
                 });
@@ -426,7 +437,14 @@ impl DbLedgerStorage {
             return self.flush().await;
         }
         match resp_rx.await {
-            Ok(res) => res,
+            Ok(Ok(())) => Ok(()),
+            // The shared error is wrapped in Arc so multiple coalesced
+            // waiters see the same result; surface it back to the caller
+            // via a fresh StorageError carrying the formatted message.
+            Ok(Err(arc)) => Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("{arc}"),
+            ))),
             Err(_) => Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "flush worker dropped the response channel",
