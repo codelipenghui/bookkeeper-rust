@@ -107,7 +107,7 @@ impl Cookie {
                 format!("journal_dirs mismatch: '{}' vs '{}'", self.journal_dirs, other.journal_dirs)));
         }
         // Ledger dirs: self may be a superset of other (expansion)
-        if !is_superset_dirs(&self.ledger_dirs, &other.ledger_dirs) {
+        if !is_superset_dirs(&self.ledger_dirs, &other.ledger_dirs)? {
             return Err(MetadataError::InvalidConfig(
                 format!("ledger_dirs mismatch: '{}' vs '{}'", self.ledger_dirs, other.ledger_dirs)));
         }
@@ -117,7 +117,7 @@ impl Cookie {
         // would happily start without that dir's RocksDB available.
         match (&self.index_dirs, &other.index_dirs) {
             (Some(s), Some(o)) => {
-                if !is_superset_dirs(s, o) {
+                if !is_superset_dirs(s, o)? {
                     return Err(MetadataError::InvalidConfig(format!(
                         "index_dirs mismatch: '{s}' vs '{o}'"
                     )));
@@ -154,18 +154,40 @@ fn encode_dir_paths(dirs: &[&str]) -> String {
     s
 }
 
-fn decode_dir_paths(encoded: &str) -> Vec<&str> {
-    if let Some(idx) = encoded.find('\t') {
-        encoded[idx + 1..].split('\t').collect()
-    } else {
-        vec![]
+fn decode_dir_paths(encoded: &str) -> Result<Vec<&str>, MetadataError> {
+    // Empty encoded string = zero-dir cookie field. The matching
+    // `encode_dir_paths(&[])` produces "0", but historically the empty
+    // string has also been observed; accept both.
+    if encoded.is_empty() {
+        return Ok(Vec::new());
     }
+    let mut parts = encoded.split('\t');
+    let count_str = parts.next().unwrap_or("");
+    let count: usize = count_str.parse().map_err(|_| {
+        MetadataError::SerializationError(format!(
+            "cookie dir-paths: leading count is not an integer: {count_str:?}"
+        ))
+    })?;
+    let dirs: Vec<&str> = parts.collect();
+    if dirs.len() != count {
+        // Reject torn / truncated cookies. The previous behavior was
+        // to silently return whatever made it past the first \t, which
+        // let `is_superset_dirs(local, "0")` pass for any local dir set
+        // — a bookie could boot with the wrong dir set and the cluster
+        // would never notice. Mirrors Java's strict count enforcement
+        // in `Cookie.parseFromBytes` via the protobuf TextFormat parser.
+        return Err(MetadataError::SerializationError(format!(
+            "cookie dir-paths: declared {count} entries but found {} (encoded: {encoded:?})",
+            dirs.len()
+        )));
+    }
+    Ok(dirs)
 }
 
-fn is_superset_dirs(a: &str, b: &str) -> bool {
-    let dirs_a: std::collections::HashSet<&str> = decode_dir_paths(a).into_iter().collect();
-    let dirs_b: std::collections::HashSet<&str> = decode_dir_paths(b).into_iter().collect();
-    dirs_b.is_subset(&dirs_a)
+fn is_superset_dirs(a: &str, b: &str) -> Result<bool, MetadataError> {
+    let dirs_a: std::collections::HashSet<&str> = decode_dir_paths(a)?.into_iter().collect();
+    let dirs_b: std::collections::HashSet<&str> = decode_dir_paths(b)?.into_iter().collect();
+    Ok(dirs_b.is_subset(&dirs_a))
 }
 
 fn parse_proto_text_cookie(text: &str) -> Result<Cookie, MetadataError> {
