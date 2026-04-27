@@ -41,25 +41,11 @@ impl BookieServiceInfo {
     pub fn from_protobuf_bytes(data: &[u8]) -> Result<Self, MetadataError> {
         let info = bookkeeper_proto::BookieServiceInfoFormat::decode(data)
             .map_err(|e| MetadataError::SerializationError(format!("service info decode: {e}")))?;
-        // Prefer the `bookie-rpc` endpoint when more than one is
-        // present; otherwise fall back to the first. The current
-        // BookieServiceInfo struct only models a single endpoint, so
-        // we still discard the alternates — but a service-mesh
-        // deployment with rotating IPs at least gets a tracing log
-        // pointing at the silent loss until this struct is widened
-        // to carry every endpoint.
-        if info.endpoints.len() > 1 {
-            tracing::debug!(
-                "BookieServiceInfo: {} endpoints present, only the first \
-                 bookie-rpc endpoint is retained ({})",
-                info.endpoints.len(),
-                info.endpoints
-                    .iter()
-                    .map(|e| format!("{}@{}:{}", e.protocol, e.host, e.port))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-        }
+        // Prefer the `bookie-rpc` endpoint over alternates so a
+        // service-mesh deployment that publishes a sidecar endpoint
+        // first doesn't silently capture the BookieServiceInfo. The
+        // struct still models only a single endpoint, so true
+        // multi-endpoint support is a separate change.
         let endpoint = info
             .endpoints
             .iter()
