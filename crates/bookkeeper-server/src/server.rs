@@ -630,7 +630,18 @@ impl BookieServer {
             let http_local_addr = http_listener.local_addr()?;
             let mut http_shutdown_rx = shutdown_rx.clone();
             let handle = tokio::spawn(async move {
-                let server = axum::serve(http_listener, router).with_graceful_shutdown(async move {
+                // `into_make_service_with_connect_info` injects the
+                // `ConnectInfo<SocketAddr>` extension on every request,
+                // which the admin auth middleware reads to log the peer
+                // address on rejected attempts. Without it, every audit
+                // line records `peer = <unknown>` regardless of the
+                // attacker's IP — defeating the "leave a forensic trail"
+                // purpose of the audit log.
+                let server = axum::serve(
+                    http_listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
                     // Drive shutdown when the global shutdown signal flips.
                     while http_shutdown_rx.changed().await.is_ok() {
                         if *http_shutdown_rx.borrow() {
