@@ -245,8 +245,19 @@ impl UnifiedCache {
         let buf = &self.write_bufs[idx as usize];
         let offset = buf.reserve(data.len()).map_err(|_| StorageError::StorageFull)?;
         unsafe { buf.write_at(offset, data); }
-        buf.track_entry(l, e);
+        // Insert into the unified index BEFORE appending to the buffer's
+        // tracking list. Without this ordering, a concurrent flush whose
+        // `take_entries` happens after `track_entry` but before
+        // `index.insert` would: (1) capture (l, e) in the captured Vec,
+        // (2) look up the index, find None, `continue` past it, and
+        // (3) reset the buffer's offset. The eventual `index.insert`
+        // then leaves a dangling index entry pointing at a buffer slot
+        // that gets recycled on the next rotation, with no `index.remove`
+        // to follow — silent corruption on read-cache reads. With the
+        // reorder, drain's lookup is guaranteed to find the entry as long
+        // as the corresponding `track_entry` is in the captured set.
         self.index.insert((l, e), CacheEntry::write(idx, offset as u32, data.len() as u32));
+        buf.track_entry(l, e);
         self.last_entry
             .entry(l)
             .and_modify(|v| if e > *v { *v = e; })
