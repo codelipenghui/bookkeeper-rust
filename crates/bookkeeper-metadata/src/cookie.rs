@@ -177,15 +177,15 @@ fn parse_proto_text_cookie(text: &str) -> Result<Cookie, MetadataError> {
 
     for line in text.lines() {
         let line = line.trim();
-        if let Some(val) = extract_proto_text_field(line, "bookieHost") {
+        if let Some(val) = extract_proto_text_field(line, "bookieHost")? {
             bookie_id = val;
-        } else if let Some(val) = extract_proto_text_field(line, "journalDir") {
+        } else if let Some(val) = extract_proto_text_field(line, "journalDir")? {
             journal_dirs = val;
-        } else if let Some(val) = extract_proto_text_field(line, "ledgerDirs") {
+        } else if let Some(val) = extract_proto_text_field(line, "ledgerDirs")? {
             ledger_dirs = val;
-        } else if let Some(val) = extract_proto_text_field(line, "instanceId") {
+        } else if let Some(val) = extract_proto_text_field(line, "instanceId")? {
             if !val.is_empty() { instance_id = Some(val); }
-        } else if let Some(val) = extract_proto_text_field(line, "indexDirs") {
+        } else if let Some(val) = extract_proto_text_field(line, "indexDirs")? {
             if !val.is_empty() { index_dirs = Some(val); }
         }
     }
@@ -198,12 +198,38 @@ fn parse_proto_text_cookie(text: &str) -> Result<Cookie, MetadataError> {
 }
 
 /// Extract a field value from a protobuf text format line.
-/// Returns the unescaped string value.
-fn extract_proto_text_field(line: &str, field_name: &str) -> Option<String> {
-    let rest = line.strip_prefix(field_name)?;
-    let rest = rest.strip_prefix(": \"")?;
-    let raw = rest.strip_suffix('"')?;
-    Some(proto_text_unescape(raw))
+///
+/// Three-way result:
+/// - `Ok(None)`: line is not this field (no match), caller can try the next.
+/// - `Ok(Some(value))`: line was this field, parsed successfully.
+/// - `Err(_)`: line clearly tried to be this field (`name: "...`) but was
+///   malformed — missing closing quote, wrong separator, etc. Surfacing
+///   this fails the parse closed; the previous code returned `None` for
+///   any of those cases, so a torn cookie line silently dropped its
+///   field and the parser kept its default (empty string). A bookie
+///   restart against such a cookie was indistinguishable from "this
+///   field was never set".
+fn extract_proto_text_field(line: &str, field_name: &str) -> Result<Option<String>, MetadataError> {
+    let after_name = match line.strip_prefix(field_name) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    // Disambiguate prefix-overlap (`bookieHost` vs hypothetical
+    // `bookieHostExtra`): require an exact ':' immediately after the
+    // field name. If the next char isn't ':', this line isn't this
+    // field — let the caller try the next one.
+    if !after_name.starts_with(':') {
+        return Ok(None);
+    }
+    let after_colon = after_name.strip_prefix(": \"")
+        .ok_or_else(|| MetadataError::SerializationError(format!(
+            "malformed cookie field {field_name}: expected `{field_name}: \"...\"`, got `{line}`",
+        )))?;
+    let raw = after_colon.strip_suffix('"')
+        .ok_or_else(|| MetadataError::SerializationError(format!(
+            "malformed cookie field {field_name}: missing closing quote in `{line}`",
+        )))?;
+    Ok(Some(proto_text_unescape(raw)))
 }
 
 use bookkeeper_common::proto_text::{escape as proto_text_escape, unescape as proto_text_unescape};
