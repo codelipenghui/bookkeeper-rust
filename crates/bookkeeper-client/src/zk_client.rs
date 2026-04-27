@@ -36,7 +36,12 @@ pub struct ZkBookKeeper {
     /// Active connections keyed by bookie address.
     connections: std::collections::HashMap<String, Arc<BookieConnection>>,
     /// Ensemble placement policy (default or rack-aware).
-    placement: Box<dyn crate::placement::EnsemblePlacementPolicy>,
+    /// Wrapped in `Arc<Mutex<...>>` so the background bookie watcher can
+    /// also call `on_cluster_changed` when bookies are added or removed.
+    /// Without this the policy's view of the cluster was frozen at the
+    /// initial `refresh_bookies` snapshot — newly-added bookies were
+    /// never picked, decommissioned bookies were re-selected.
+    placement: Arc<parking_lot::Mutex<Box<dyn crate::placement::EnsemblePlacementPolicy>>>,
     /// Number of TCP channels per bookie (matching Java's numChannelsPerBookie).
     num_channels_per_bookie: usize,
     /// Speculative read policy (None = disabled).
@@ -81,6 +86,10 @@ impl ZkBookKeeper {
         let id_generator = backend.id_generator;
 
         let bookie_addrs = Arc::new(parking_lot::RwLock::new(Vec::new()));
+        let placement: Arc<parking_lot::Mutex<Box<dyn crate::placement::EnsemblePlacementPolicy>>> =
+            Arc::new(parking_lot::Mutex::new(Box::new(
+                crate::placement::DefaultPlacementPolicy::new(),
+            )));
 
         let mut client = Self {
             zk_client: zk_client.clone(),
@@ -89,7 +98,7 @@ impl ZkBookKeeper {
             id_generator,
             bookie_addrs: bookie_addrs.clone(),
             connections: std::collections::HashMap::new(),
-            placement: Box::new(crate::placement::DefaultPlacementPolicy::new()),
+            placement: placement.clone(),
             num_channels_per_bookie: 1,
             speculative_policy: None,
             tls_connector: None,
@@ -109,6 +118,7 @@ impl ZkBookKeeper {
             zk_client,
             paths,
             bookie_addrs,
+            placement,
         ));
         client._watcher_handle = Some(watcher_handle);
 
@@ -131,7 +141,7 @@ impl ZkBookKeeper {
             .collect();
 
         // Update placement policy with new bookie list
-        self.placement.on_cluster_changed(&addrs, &[]);
+        self.placement.lock().on_cluster_changed(&addrs, &[]);
 
         *self.bookie_addrs.write() = addrs;
 
@@ -235,6 +245,7 @@ impl ZkBookKeeper {
         let exclude_set: std::collections::HashSet<String> = exclude.iter().cloned().collect();
         let result = self
             .placement
+            .lock()
             .new_ensemble(ensemble_size, write_quorum, ack_quorum, &exclude_set)
             .map_err(|e| ClientError::Protocol(format!("{e}")))?;
         if result.adherence != crate::placement::PolicyAdherence::MeetsStrict {
@@ -245,10 +256,11 @@ impl ZkBookKeeper {
 
     /// Set a custom placement policy (e.g., rack-aware).
     pub fn set_placement_policy(&mut self, policy: Box<dyn crate::placement::EnsemblePlacementPolicy>) {
-        self.placement = policy;
+        let mut guard = self.placement.lock();
+        *guard = policy;
         // Update with current bookie list
         let addrs = self.bookie_addrs.read().clone();
-        self.placement.on_cluster_changed(&addrs, &[]);
+        guard.on_cluster_changed(&addrs, &[]);
     }
 
     /// Create a new ledger. Allocates ID from ZK, selects ensemble, stores metadata.
@@ -907,6 +919,7 @@ async fn bookie_watcher_loop(
     zk_client: zk::Client,
     paths: ZkPaths,
     bookie_addrs: Arc<parking_lot::RwLock<Vec<String>>>,
+    placement: Arc<parking_lot::Mutex<Box<dyn crate::placement::EnsemblePlacementPolicy>>>,
 ) {
     let available_path = paths.available().to_string();
     let mut backoff_ms: u64 = 100;
@@ -914,6 +927,12 @@ async fn bookie_watcher_loop(
         match zk_client.list_and_watch_children(&available_path).await {
             Ok((children, watcher)) => {
                 let addrs: Vec<String> = children.into_iter().filter(|c| c != "readonly").collect();
+                // Notify the placement policy BEFORE publishing the new
+                // bookie list. Without this the policy's view of the
+                // cluster was frozen at startup, so newly-added bookies
+                // were never selected and decommissioned ones kept
+                // being picked.
+                placement.lock().on_cluster_changed(&addrs, &[]);
                 *bookie_addrs.write() = addrs;
                 backoff_ms = 100; // reset on success
 
