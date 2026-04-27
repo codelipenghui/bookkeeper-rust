@@ -775,6 +775,36 @@ impl EnsemblePlacementPolicy for RackAwarePlacementPolicy {
         }
         racks.len() >= self.min_racks_per_write_quorum
     }
+
+    /// Trait override for rack-aware adherence.
+    ///
+    /// Without this override the trait method falls through to the
+    /// default `MeetsStrict`, silently disabling the auditor's
+    /// `RackawareEnsemblePlacementPolicyImpl.isEnsembleAdheringToPlacementPolicy`
+    /// equivalent — every rack-aware violation passed audit.
+    fn is_ensemble_adhering(
+        &self,
+        ensemble: &[String],
+        write_quorum_size: usize,
+        _ack_quorum_size: usize,
+    ) -> PolicyAdherence {
+        if self.check_write_quorum_coverage(ensemble, write_quorum_size) {
+            PolicyAdherence::MeetsStrict
+        } else {
+            // Distinct racks regardless of write-quorum coverage:
+            // 2+ racks but failing per-quorum coverage is "soft", a
+            // single rack is "fail". Mirrors Java's tri-state.
+            let mut racks: HashSet<String> = HashSet::new();
+            for b in ensemble {
+                racks.insert(self.rack_of(b));
+            }
+            if racks.len() >= 2 {
+                PolicyAdherence::MeetsSoft
+            } else {
+                PolicyAdherence::Fail
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
