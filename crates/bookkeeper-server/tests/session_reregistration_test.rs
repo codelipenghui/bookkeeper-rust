@@ -15,6 +15,7 @@
 //!
 //! Requires Docker. Skipped gracefully when docker is unreachable.
 
+use bookkeeper_metadata::ledger_metadata::MetadataError;
 use bookkeeper_metadata::service_info::BookieServiceInfo;
 use bookkeeper_metadata::traits::RegistrationManager;
 use bookkeeper_metadata::zk::registration::ZkRegistrationManager;
@@ -135,4 +136,41 @@ async fn register_bookie_is_idempotent_on_node_exists() {
 
     let listed = writable_bookies(&reg).await;
     assert!(listed.iter().any(|b| b == bookie_id), "expected {bookie_id} in {listed:?}");
+}
+
+/// Two bookie processes that share the same `bookie_id` must not be
+/// allowed to silently overwrite each other's ephemeral registration.
+/// ZK lets any client `set_data` on an ephemeral regardless of session
+/// ownership (only `delete` is owner-bound), so without an explicit
+/// `ephemeral_owner == session_id` check the second registrar would
+/// clobber the first's `BookieServiceInfo` payload — clients reading
+/// `available/<bookie-id>` would be steered at the wrong endpoint and
+/// the two processes would advertise alternating identities. Mirrors
+/// Java's `ZKRegistrationManager.checkRegNodeAndWaitExpired` which
+/// refuses to overwrite a foreign-session ephemeral.
+#[tokio::test]
+async fn register_bookie_refuses_overwrite_from_different_session() {
+    let Some((_zk_container, connect, _port)) = start_zk().await else { return; };
+
+    let bookie_id = "split-brain-bookie:3181";
+    let info = BookieServiceInfo::new(bookie_id, "127.0.0.1", 3181);
+
+    let reg1 = ZkRegistrationManager::new(&connect, "/ledgers").await
+        .expect("connect to ZK as session 1");
+    reg1.register_bookie(bookie_id, false, &info).await
+        .expect("first register");
+
+    // A second client = a different ZK session. With `reg1` still alive
+    // the ephemeral is owned by session 1, so a register from session 2
+    // must surface as `AlreadyExists` rather than silently winning the
+    // CAS update.
+    let reg2 = ZkRegistrationManager::new(&connect, "/ledgers").await
+        .expect("connect to ZK as session 2");
+    let err = reg2.register_bookie(bookie_id, false, &info).await.expect_err(
+        "register_bookie must reject foreign-session overwrite"
+    );
+    match err {
+        MetadataError::AlreadyExists(_) => {}
+        other => panic!("expected AlreadyExists, got {other:?}"),
+    }
 }

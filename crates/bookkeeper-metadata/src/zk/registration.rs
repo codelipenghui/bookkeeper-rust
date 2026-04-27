@@ -107,12 +107,31 @@ impl RegistrationManager for ZkRegistrationManager {
         match self.client.create(&path, &data, &options).await {
             Ok(_) => Ok(()),
             Err(zk::Error::NodeExists) => {
-                // Existing ephemeral registration. CAS-update on the
-                // observed stat version so a concurrent change (or a
-                // stale registration we shouldn't overwrite) surfaces
-                // as a VersionConflict instead of silently clobbering.
+                // Existing ephemeral registration. Two possibilities:
+                //   (a) Owned by THIS session — re-register after a
+                //       transient state change (read-only flip).
+                //       CAS-update is correct.
+                //   (b) Owned by a DIFFERENT session — another bookie
+                //       claims the same `bookie_id`. ZK lets any client
+                //       set_data on an ephemeral regardless of owner
+                //       (only delete is owner-bound), so a naive
+                //       CAS-update would silently clobber the other
+                //       bookie's BookieServiceInfo and leave both
+                //       processes running with split-brain on the
+                //       advertised endpoint. Mirrors Java's
+                //       `ZKRegistrationManager.checkRegNodeAndWaitExpired`
+                //       which refuses to overwrite a foreign-session
+                //       ephemeral.
                 let (_existing, stat) = self.client.get_data(&path).await
                     .map_err(|e| MetadataError::ConnectionError(format!("re-register get: {e}")))?;
+                let our_session = self.client.session_id().0;
+                if stat.ephemeral_owner != 0 && stat.ephemeral_owner != our_session {
+                    return Err(MetadataError::AlreadyExists(format!(
+                        "bookie '{bookie_id}' is already registered by another session \
+                         (ephemeral_owner=0x{:x}, this session=0x{:x})",
+                        stat.ephemeral_owner, our_session,
+                    )));
+                }
                 match self.client.set_data(&path, &data, Some(stat.version)).await {
                     Ok(_) => Ok(()),
                     Err(zk::Error::BadVersion) => Err(MetadataError::VersionConflict {

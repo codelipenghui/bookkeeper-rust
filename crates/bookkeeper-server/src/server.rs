@@ -1164,10 +1164,14 @@ async fn run_session_watcher(
 }
 
 /// Idempotent create-or-update of the bookie's ephemeral registration
-/// znode. `NodeExists` falls back to `set_data` — the stale ephemeral
-/// from the previous session is swept by the ZK server ~session-timeout
-/// after expiry, so a quick reconnect can legitimately land on an
-/// already-present znode owned by the previous session's inode.
+/// znode. On `NodeExists` we verify the existing znode is owned by THIS
+/// session before updating — a `set_data` against a foreign-session
+/// ephemeral would silently clobber the other holder's
+/// `BookieServiceInfo` (ZK only owner-binds `delete`, not `set_data`)
+/// and create a split-brain on the advertised endpoint. If the prior
+/// znode was owned by our previous (now-expired) session, ZK will sweep
+/// it on session-timeout; the next session-watcher tick will retry the
+/// create. Mirrors Java's `ZKRegistrationManager.checkRegNodeAndWaitExpired`.
 async fn re_register_ephemeral(
     client: &zookeeper_client::Client,
     path: &str,
@@ -1178,7 +1182,18 @@ async fn re_register_ephemeral(
     match client.create(path, data, &options).await {
         Ok(_) => Ok(()),
         Err(zookeeper_client::Error::NodeExists) => {
-            client.set_data(path, data, None).await.map(|_| ())
+            let (_existing, stat) = client.get_data(path).await?;
+            let our_session = client.session_id().0;
+            if stat.ephemeral_owner != 0 && stat.ephemeral_owner != our_session {
+                tracing::warn!(
+                    "Cannot re-register ephemeral at {path}: \
+                     owned by another session (ephemeral_owner=0x{:x}, \
+                     this session=0x{:x}). Will retry on next session event.",
+                    stat.ephemeral_owner, our_session,
+                );
+                return Err(zookeeper_client::Error::NodeExists);
+            }
+            client.set_data(path, data, Some(stat.version)).await.map(|_| ())
         }
         Err(e) => Err(e),
     }

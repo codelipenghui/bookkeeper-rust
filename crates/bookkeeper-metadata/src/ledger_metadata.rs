@@ -228,6 +228,13 @@ pub enum MetadataError {
     NotFound(i64),
     #[error("ledger already exists: {0}")]
     LedgerExists(i64),
+    /// A non-ledger key (e.g. a registration ephemeral or cookie) is
+    /// already present and cannot be overwritten without losing data
+    /// owned by another holder. Distinct from `LedgerExists` so that
+    /// callers handling registration/cookie races can pattern-match
+    /// without conflating with ledger-id collisions.
+    #[error("metadata key already exists: {0}")]
+    AlreadyExists(String),
     #[error("version conflict: expected {expected}, got {actual}")]
     VersionConflict { expected: i64, actual: i64 },
     #[error("metadata store connection error: {0}")]
