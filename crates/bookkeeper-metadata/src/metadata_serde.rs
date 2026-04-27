@@ -1,6 +1,7 @@
 use prost::Message;
 
 use crate::ledger_metadata::*;
+use bookkeeper_common::proto_text::unescape as proto_text_unescape;
 
 const VERSION_HEADER: &[u8] = b"BookieMetadataFormatVersion\t";
 const LINE_SPLITTER: u8 = b'\n';
@@ -142,7 +143,11 @@ fn parse_v2(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError
     let mut ensemble_size: i32 = 0;
     let mut quorum_size: i32 = 0;
     let mut ack_quorum_size: Option<i32> = None;
-    let mut state_val: i32 = 1; // OPEN
+    // Track whether the `state` field was actually present. Defaulting
+    // a missing state to OPEN silently lets a torn metadata write
+    // (which lost the `state:` line) be parsed as OPEN — and recovery
+    // could then overwrite a CLOSED ledger.
+    let mut state_seen: Option<i32> = None;
     let mut last_entry_id: i64 = -1;
     let mut length: i64 = 0;
     let mut ctime: Option<i64> = None;
@@ -208,7 +213,7 @@ fn parse_v2(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError
                     }
                     "ackQuorumSize" => { ack_quorum_size = value.parse().ok(); }
                     "state" => {
-                        state_val = match value {
+                        let parsed = match value {
                             "OPEN" => 1,
                             "IN_RECOVERY" => 2,
                             "CLOSED" => 3,
@@ -218,6 +223,7 @@ fn parse_v2(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError
                                 ))
                             })?,
                         };
+                        state_seen = Some(parsed);
                     }
                     "lastEntryId" => {
                         last_entry_id = value.parse().map_err(|e| {
@@ -249,8 +255,13 @@ fn parse_v2(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError
                         });
                     }
                     "password" => {
+                        // Java's TextFormat encodes the password with `\"`,
+                        // `\\`, `\t`, `\n`, `\r` escapes. Storing the raw
+                        // post-quote-trim bytes corrupts any password
+                        // containing those characters and produces digest
+                        // mismatches on every read of that ledger.
                         let cleaned = value.trim_matches('"');
-                        password = Some(cleaned.as_bytes().to_vec());
+                        password = Some(proto_text_unescape(cleaned).into_bytes());
                     }
                     _ => {}
                 }
@@ -269,6 +280,12 @@ fn parse_v2(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError
         builder = builder.new_ensemble_entry(first_entry, members);
     }
 
+    // The proto's `state` field is required. Java treats a missing state
+    // as a parse error; matching that here guards against torn metadata
+    // (the `state:` line lost mid-write) being silently parsed as OPEN.
+    let state_val = state_seen.ok_or_else(|| {
+        MetadataError::SerializationError("v2 metadata missing required 'state' field".into())
+    })?;
     if state_val == 2 {
         builder = builder.with_in_recovery_state();
     } else if state_val == 3 {
@@ -276,13 +293,25 @@ fn parse_v2(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError
     }
 
     if let Some(pw) = password {
-        // Match against proto values: CRC32=1, HMAC=2, CRC32C=3, DUMMY=4
+        // When a password is present the digest_type is required; silently
+        // defaulting to CRC32 for a metadata blob that lost the `digestType`
+        // line would mismatch the bookie's actual digest and break every
+        // read of that ledger.
         let dt = match digest_type {
             Some(1) => DigestType::Crc32,
             Some(2) => DigestType::Hmac,
             Some(3) => DigestType::Crc32c,
             Some(4) => DigestType::Dummy,
-            _ => DigestType::Crc32,
+            Some(other) => {
+                return Err(MetadataError::SerializationError(format!(
+                    "unknown digestType: {other}"
+                )));
+            }
+            None => {
+                return Err(MetadataError::SerializationError(
+                    "v2 metadata has password but missing digestType".into(),
+                ));
+            }
         };
         builder = builder.with_digest_type(dt).with_password(pw);
     }
