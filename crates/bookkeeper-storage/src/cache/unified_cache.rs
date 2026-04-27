@@ -212,6 +212,14 @@ pub struct UnifiedCache {
     active_write: AtomicU8,
     read_segments: [Arc<ReadSegment>; READ_CACHE_SEGMENTS],
     current_segment: AtomicUsize,
+    /// Serialises the read-cache segment rotation. The rotation must
+    /// evict the next-to-be-used segment AND reset its offset before
+    /// any concurrent `put_read` lands in it; without this lock the
+    /// CAS-then-reset window let a writer's `track_entry` fall between
+    /// `take_entries` and `reset()` — `reset()` cleared the writer's
+    /// tracking record while the index entry survived, and the next
+    /// rotation overwrote those bytes with no `index.remove`.
+    rotation_lock: parking_lot::Mutex<()>,
     last_entry: DashMap<i64, i64>,
 }
 
@@ -227,6 +235,7 @@ impl UnifiedCache {
             active_write: AtomicU8::new(0),
             read_segments: std::array::from_fn(|_| Arc::new(ReadSegment::new(seg_size))),
             current_segment: AtomicUsize::new(0),
+            rotation_lock: parking_lot::Mutex::new(()),
             last_entry: DashMap::new(),
         }
     }
@@ -381,21 +390,33 @@ impl UnifiedCache {
                 unsafe { seg.write_at(off, data); }
                 return Some((cur as u8, off));
             }
-            // Current segment full. CAS to rotate. Winner evicts the next.
-            let next = (cur + 1) % READ_CACHE_SEGMENTS;
-            if self
-                .current_segment
-                .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                // I3: remove-from-index before offset reset.
-                let evicted = self.read_segments[next].take_entries();
-                for (el, ee) in evicted {
-                    self.index.remove(&(el, ee));
-                }
-                self.read_segments[next].reset();
+            // Current segment full. Acquire the rotation lock so eviction
+            // and reset of the next segment finish before it becomes
+            // current — without serialisation, a concurrent `put_read`
+            // could read the just-rotated `current_segment` and race a
+            // `track_entry` between this thread's `take_entries` and
+            // `reset()`, leading to silent overwrite of cached bytes
+            // whose index entry was never removed.
+            let _rot = self.rotation_lock.lock();
+            // Re-check: another rotator may have already advanced past
+            // `cur` and possibly past several segments. Drop the lock
+            // and retry the fast path against the new current.
+            if self.current_segment.load(Ordering::Acquire) != cur {
+                drop(_rot);
+                continue;
             }
-            // Either we rotated or someone else did; retry on the new current.
+            let next = (cur + 1) % READ_CACHE_SEGMENTS;
+            // Evict and reset BEFORE swapping current — under the lock
+            // no put_read can be racing into seg[next] yet because
+            // current_segment still points at `cur`.
+            let evicted = self.read_segments[next].take_entries();
+            for (el, ee) in evicted {
+                self.index.remove(&(el, ee));
+            }
+            self.read_segments[next].reset();
+            self.current_segment.store(next, Ordering::Release);
+            drop(_rot);
+            // Retry on the new current.
         }
     }
 
