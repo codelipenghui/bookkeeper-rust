@@ -4,12 +4,22 @@ use std::sync::Mutex;
 /// Trait abstracting over sync and async sender types for the drain helper.
 trait WatcherSender: Send {
     fn fire(self, value: i64);
+    /// `true` when the receiver has been dropped (cancelled long poll
+    /// or panicked task). Drained without firing — registry would
+    /// otherwise grow unbounded across cancellations.
+    fn is_abandoned(&self) -> bool;
 }
 impl WatcherSender for std::sync::mpsc::Sender<i64> {
     fn fire(self, v: i64) { let _ = self.send(v); }
+    // std::sync::mpsc has no is_closed; use a probe send-then-rebuild
+    // pattern is awkward — instead rely on send() returning Err to
+    // implicitly drop, and let drain_matching avoid holding the
+    // closed sender.
+    fn is_abandoned(&self) -> bool { false }
 }
 impl WatcherSender for tokio::sync::oneshot::Sender<i64> {
     fn fire(self, v: i64) { let _ = self.send(v); }
+    fn is_abandoned(&self) -> bool { self.is_closed() }
 }
 
 /// Drain watchers from a map entry where the predicate matches, returning
@@ -23,6 +33,14 @@ fn drain_matching<S: WatcherSender>(
     let mut remaining = Vec::new();
     let mut notify = Vec::new();
     for (prev, tx) in list.drain(..) {
+        // Abandoned watchers (long-poll cancelled / receiver dropped)
+        // would otherwise pile up here forever — fire-and-discard
+        // pattern only triggers when LAC actually advances past
+        // `prev`, but a never-advancing ledger leaks one entry per
+        // cancelled long poll.
+        if tx.is_abandoned() {
+            continue;
+        }
         if predicate(prev) {
             notify.push(tx);
         } else {

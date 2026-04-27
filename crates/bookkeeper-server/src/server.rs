@@ -595,6 +595,11 @@ impl BookieServer {
                 gc_force_minor: gc_force_minor.clone(),
                 gc_status: http_api::GcStatus::default(),
                 http_admin_token: config.http_admin_token.clone(),
+                // Cap concurrent recover-bookie / decommission spawns. 16
+                // is generous for a real operator workload and bounds the
+                // amplification factor for a misbehaving / malicious
+                // caller.
+                recover_inflight: Arc::new(tokio::sync::Semaphore::new(16)),
             };
             let router = http_api::create_router(http_state);
             let http_host = &config.http_server_host;

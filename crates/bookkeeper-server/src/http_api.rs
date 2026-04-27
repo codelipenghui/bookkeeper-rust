@@ -92,6 +92,11 @@ pub struct HttpState {
     /// When `Some`, mutating endpoints (POST/PUT/DELETE) reject the
     /// request with 401 if the header is missing or doesn't match.
     pub http_admin_token: Option<String>,
+    /// Bound on concurrent background tasks spawned by mutating
+    /// admin endpoints (recover_bookie, decommission_bookie). The
+    /// previous unbounded `tokio::spawn` per request let an attacker
+    /// detach unlimited tasks just by hammering the endpoint.
+    pub recover_inflight: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn create_router(http_state: HttpState) -> Router {
@@ -606,17 +611,27 @@ async fn has_underreplicated_ledgers(
     client: &zookeeper_client::Client,
     path: &str,
 ) -> bool {
-    let children = match client.get_children(path).await {
-        Ok((c, _)) => c,
-        Err(_) => return false,
-    };
-    for child in &children {
-        if child.starts_with("urL") {
-            return true;
+    // Iterative breadth-first walk with a depth cap. The original
+    // recursive variant could blow the async-stack on a pathological
+    // ZK tree, and an attacker that can write arbitrary nodes under
+    // `/ledgers/underreplication` could exploit that. Java's auditor
+    // uses the same hierarchical layout (4 levels of hex-tree) so a
+    // depth of 8 covers every legitimate path with margin to spare.
+    const MAX_DEPTH: usize = 8;
+    let mut frontier: Vec<(String, usize)> = vec![(path.to_string(), 0)];
+    while let Some((p, depth)) = frontier.pop() {
+        if depth > MAX_DEPTH {
+            continue;
         }
-        let child_path = format!("{}/{}", path, child);
-        if Box::pin(has_underreplicated_ledgers(client, &child_path)).await {
-            return true;
+        let children = match client.get_children(&p).await {
+            Ok((c, _)) => c,
+            Err(_) => continue,
+        };
+        for child in children {
+            if child.starts_with("urL") {
+                return true;
+            }
+            frontier.push((format!("{p}/{child}"), depth + 1));
         }
     }
     false
@@ -1257,6 +1272,20 @@ async fn recover_bookie_endpoint(
 ) -> impl IntoResponse {
     let (client, paths) = require_zk_json!(state);
 
+    // Bound concurrent recover-bookie background tasks. Without this an
+    // attacker can `POST` repeatedly to fan out unbounded tokio tasks,
+    // each holding ZK + ledger-manager state.
+    let permit = match state.recover_inflight.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "triggered": false,
+                "note": "recover-bookie concurrency limit reached",
+            })),
+        ),
+    };
+
     // Mark all ledgers on the bookies as under-replicated.
     // Spawn as background task — recovery is asynchronous (auditor/worker
     // performs the actual data movement).
@@ -1266,6 +1295,7 @@ async fn recover_bookie_endpoint(
     let delete_cookie = body.delete_cookie;
     let lm_for_task = state.ledger_manager.clone();
     tokio::spawn(async move {
+        let _permit = permit; // released when the task exits
         let lm = match lm_for_task {
             Some(lm) => lm,
             None => return,
