@@ -133,6 +133,17 @@ struct LedgerMetaCacheEntry {
     master_key: Option<Vec<u8>>,
 }
 
+/// A log file that was rotated away. Carries the ledger→bytes map built
+/// while the file was active so the next flush phase can append the
+/// self-describing ledgers map (matching Java's `appendLedgersMap()` in
+/// `DefaultEntryLogger.BufferedLogChannel`). Without this, GC has to scan
+/// the whole log body to discover which ledgers it contains.
+struct RotatedLog {
+    log_id: u32,
+    file: fs::File,
+    ledger_sizes: std::collections::HashMap<i64, u64>,
+}
+
 pub struct DbLedgerStorage {
     base_dir: PathBuf,
     unified_cache: Arc<UnifiedCache>,
@@ -685,16 +696,6 @@ impl DbLedgerStorage {
             write_offset: u64,
             framed_entries: Vec<Vec<u8>>,
             locations: Vec<(i64, i64, u32, u64)>, // (ledger_id, entry_id, log_id, position)
-        }
-        /// A log file that was rotated away mid-flush. Carries the ledger→bytes
-        /// map built while the file was active, so Phase 2 can append the
-        /// self-describing ledgers map (matching Java's `appendLedgersMap()`
-        /// in `DefaultEntryLogger.BufferedLogChannel`). Without this, GC has
-        /// to scan the whole log body to discover which ledgers it contains.
-        struct RotatedLog {
-            log_id: u32,
-            file: fs::File,
-            ledger_sizes: std::collections::HashMap<i64, u64>,
         }
         let segments: Vec<FlushSegment>;
         let rotated_logs: Vec<RotatedLog>;
@@ -1325,11 +1326,23 @@ impl LedgerStorage for DbLedgerStorage {
         // *before* the I/O so that a concurrent caller gets a distinct
         // position. If the write fails we accept a gap in the log — this
         // is the same trade-off Java makes in SingleDirectoryDbLedgerStorage.
-        let (fd, write_offset, log_id, _file_guard) = {
+        //
+        // On rotation we extract the old File and its accumulated
+        // ledger-size map under the lock; the actual ledgers-map append +
+        // sync_data on the rotated file runs after the lock drops so the
+        // log_state mutex is held only briefly.
+        let (fd, write_offset, log_id, _file_guard, rotated) = {
             let mut log_state = self.log_state.lock().unwrap();
 
+            let mut rotated: Option<RotatedLog> = None;
             if log_state.offset + encoded_size > self.storage_config.max_entry_log_size {
-                log_state.file = None;
+                if let Some(old_file) = log_state.file.take() {
+                    rotated = Some(RotatedLog {
+                        log_id: log_state.log_id,
+                        file: old_file,
+                        ledger_sizes: std::mem::take(&mut log_state.current_log_ledger_sizes),
+                    });
+                }
                 log_state.log_id += 1;
                 log_state.offset = LOGFILE_HEADER_SIZE as u64;
                 // Persist the new high-water mark so a restart after GC
@@ -1350,11 +1363,46 @@ impl LedgerStorage for DbLedgerStorage {
             let write_offset = log_state.offset;
             let log_id = log_state.log_id;
 
+            // Track per-ledger bytes for the new entry on the active log
+            // so its ledgers map covers compaction-written entries too.
+            // Without this the compaction path would silently leave gaps
+            // in the per-log ledger-size map relative to drain_flushing.
+            // Entry layout: [ledgerId(8 BE)][entryId(8 BE)][payload].
+            if let Some(lid_bytes) = entry.get(0..8) {
+                let lid = i64::from_be_bytes(lid_bytes.try_into().unwrap());
+                *log_state.current_log_ledger_sizes.entry(lid).or_insert(0) += encoded_size;
+            }
+
             // Reserve the space atomically before releasing the lock
             log_state.offset += encoded_size;
 
-            (fd, write_offset, log_id, file_guard)
+            (fd, write_offset, log_id, file_guard, rotated)
         };
+
+        // Finalise the rotated log (if any) before continuing with the new
+        // entry's I/O. Java does this in `EntryLogManagerBase.createNewLog`:
+        // append the ledgers map to the just-rotated channel and add it to
+        // `rotatedLogChannels` so the next flush fsyncs it. We don't have a
+        // shared rotated-list with drain_flushing, but we hold flush_mutex,
+        // so doing the append + sync_data inline is safe and keeps the
+        // invariant "an in-flight log_id, once retired, is durable before
+        // any subsequent index commit references the new log_id".
+        if let Some(mut rl) = rotated {
+            let log_id_for_log = rl.log_id;
+            let res = tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+                Self::append_ledgers_map(&mut rl.file, &rl.ledger_sizes)?;
+                rl.file.sync_data()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| StorageError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            if let Err(e) = res {
+                tracing::warn!(
+                    "compaction rotation: failed to finalise rotated log {:x}: {e}",
+                    log_id_for_log
+                );
+            }
+        }
 
         let framed = Self::frame_entry(entry);
         self.ledger_io.write_batch(fd, write_offset, vec![framed]).await?;
