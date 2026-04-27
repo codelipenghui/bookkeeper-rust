@@ -1768,16 +1768,29 @@ async fn accept_loop(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _peer_addr)) => {
-                        // Connection limit check
+                        // Atomic admission: fetch_add first, then check the
+                        // pre-increment value. If two accepts race they both
+                        // perform a fetch_add, but only the one whose `prev`
+                        // is below the cap keeps the slot — the loser rolls
+                        // back. The previous load+check+fetch_add pattern
+                        // let two concurrent accepts both observe `current
+                        // < max`, both increment, and both pass the cap.
                         if max_connections > 0 {
-                            let current = active_connections.load(std::sync::atomic::Ordering::Relaxed);
-                            if current >= max_connections {
-                                tracing::warn!("Connection limit reached ({max_connections}), rejecting");
+                            let prev = active_connections
+                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            if prev >= max_connections {
+                                active_connections
+                                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                                tracing::warn!(
+                                    "Connection limit reached ({max_connections}), rejecting",
+                                );
                                 drop(stream);
                                 continue;
                             }
+                        } else {
+                            active_connections
+                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                         }
-                        active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let conn_count = active_connections.clone();
 
                         let _ = stream.set_nodelay(tcp_no_delay);
