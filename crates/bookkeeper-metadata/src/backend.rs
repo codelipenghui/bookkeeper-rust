@@ -81,7 +81,7 @@ async fn open_oxia_backend(
 
     Ok(MetadataBackend {
         ledger_manager: Arc::new(OxiaLedgerManager::new(handle.client.clone(), paths.clone())),
-        id_generator: Arc::new(OxiaLedgerIdGenerator::new(handle.client.clone(), &paths)),
+        id_generator: Arc::new(OxiaLedgerIdGenerator::new(handle.client.clone(), &paths).await?),
         layout_manager: Arc::new(OxiaLayoutManager::new(handle.client.clone(), paths.clone())),
         registration_manager: Arc::new(OxiaRegistrationManager::new(handle.client, paths.clone())),
         paths,

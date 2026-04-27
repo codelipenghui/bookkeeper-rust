@@ -30,14 +30,24 @@ pub struct OxiaLedgerIdGenerator {
 }
 
 impl OxiaLedgerIdGenerator {
-    pub fn new(client: Arc<OxiaClient>, paths: &LedgerPaths) -> Self {
-        Self {
+    pub async fn new(client: Arc<OxiaClient>, paths: &LedgerPaths) -> Result<Self, MetadataError> {
+        let me = Self {
             client,
             short_gen_dir: paths.idgen().to_string(),
             long_gen_dir: paths.idgen_long().to_string(),
             long_path_known: Mutex::new(None),
             short_gen_dir_ensured: AtomicBool::new(false),
-        }
+        };
+        // Eagerly create the short-id directory at construction so a
+        // fresh cluster doesn't expose the lazy-creation race that ZK's
+        // counterpart already avoids: two cooperating bookies both
+        // missing the directory could race on the first generate, and
+        // a delete between `ensure_path` and the put it guards would
+        // silently slip through. Both backends now look the same to
+        // their callers.
+        me.ensure_path(&me.short_gen_dir).await?;
+        me.short_gen_dir_ensured.store(true, std::sync::atomic::Ordering::Release);
+        Ok(me)
     }
 
     /// Best-effort creation of an empty-valued record at `path`.
