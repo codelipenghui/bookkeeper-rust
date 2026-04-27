@@ -877,11 +877,21 @@ fn pick_replacement<'a>(available: &'a [String], exclude: &HashSet<String>) -> O
         .map(|s| s.as_str())
 }
 
-/// Connect to a bookie by address string.
+/// Connect to a bookie by address string. Accepts either a literal
+/// `ip:port` or a `hostname:port` form — auditor.rs grew the same
+/// fallback in commit 6b6e0f9 (otherwise any deployment using DNS-named
+/// bookies cannot run replication at all).
 async fn connect_to_bookie(addr: &str) -> Result<Arc<BookieConnection>, ReplicationError> {
-    let socket_addr: SocketAddr = addr
-        .parse()
-        .map_err(|e| ReplicationError::Failed(format!("parse addr {addr}: {e}")))?;
+    let socket_addr = match addr.parse::<SocketAddr>() {
+        Ok(sa) => sa,
+        Err(_) => {
+            let mut iter = tokio::net::lookup_host(addr).await.map_err(|e| {
+                ReplicationError::Failed(format!("resolve addr {addr}: {e}"))
+            })?;
+            iter.next()
+                .ok_or_else(|| ReplicationError::Failed(format!("no addr for {addr}")))?
+        }
+    };
     let conn = BookieConnection::connect(socket_addr)
         .await
         .map_err(ReplicationError::Client)?;
