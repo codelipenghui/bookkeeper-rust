@@ -802,10 +802,13 @@ impl DbLedgerStorage {
                 }
             } // log_state MutexGuard dropped
 
-            if empty_drain {
-                storage_metrics::FLUSH.observe(flush_start.elapsed().as_secs_f64());
-                return Ok(());
-            }
+            // Even when no entries were drained, fall through to the LAC
+            // and last-entry-log-id persistence below. The previous
+            // early-return skipped batch_update_lac and
+            // set_last_entry_log_id, so a flush whose only purpose was
+            // advancing LAC silently dropped the advance — replay-on-
+            // crash had to re-derive it from the journal.
+            let _ = empty_drain;
 
             segments = segs;
             rotated_logs = rotated;
