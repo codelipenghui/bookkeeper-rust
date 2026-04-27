@@ -59,6 +59,11 @@ pub struct BookieServer {
     /// the admin API kept accepting `set_readonly`, `trigger_gc`,
     /// `recover_bookie`, etc., on a half-shut-down bookie.
     http_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the data-integrity service loop. Tracked on the server
+    /// so `shutdown()` can wait for an in-flight `run_full_check` to
+    /// finish — without that wait, checkpoint can race with
+    /// `entry_copier.add_entry` writes into the write cache.
+    data_integ_handle: Option<tokio::task::JoinHandle<()>>,
     /// Dedicated tokio runtime for the ZK client.
     ///
     /// Isolating the ZK session/heartbeat tasks from the main runtime
@@ -735,7 +740,7 @@ impl BookieServer {
         // Gated on `data_integrity_checking` — disabled by default.
         // Reuses the DataIntegrityCheck built earlier for the cookie
         // validator so pre-boot and full-check share cached ledger state.
-        let _data_integ_handle = match (&data_integ_check, config.data_integrity_checking) {
+        let data_integ_handle = match (&data_integ_check, config.data_integrity_checking) {
             (Some(check), true) => Some(spawn_data_integrity_service(
                 Arc::clone(check),
                 shutdown_tx.subscribe(),
@@ -760,6 +765,7 @@ impl BookieServer {
             session_watcher_handle,
             scrubber_handle,
             http_handle,
+            data_integ_handle,
             zk_runtime,
             ledger_directories: config.ledger_directories.clone(),
         })
@@ -818,6 +824,13 @@ impl BookieServer {
         }
         if let Some(h) = self.scrubber_handle.take() {
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
+        }
+        // Wait for the data-integrity service loop to finish any in-flight
+        // run_full_check before the storage checkpoint runs — otherwise
+        // checkpoint can race with EntryCopier writes into the write
+        // cache.
+        if let Some(h) = self.data_integ_handle.take() {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), h).await;
         }
         tracing::info!("Background tasks stopped.");
 
