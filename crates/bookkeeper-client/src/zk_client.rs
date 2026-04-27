@@ -932,13 +932,16 @@ async fn bookie_watcher_loop(
         match zk_client.list_and_watch_children(&available_path).await {
             Ok((children, watcher)) => {
                 let addrs: Vec<String> = children.into_iter().filter(|c| c != "readonly").collect();
-                // Notify the placement policy BEFORE publishing the new
-                // bookie list. Without this the policy's view of the
-                // cluster was frozen at startup, so newly-added bookies
-                // were never selected and decommissioned ones kept
-                // being picked.
+                // Publish the new `bookie_addrs` BEFORE notifying the
+                // placement policy. A `select_ensemble` racing the
+                // watcher between these two writes would otherwise see
+                // the policy's view extended to a newly-added bookie
+                // while the public `bookie_addrs` snapshot still
+                // reflected the old cluster — the inverted ordering let
+                // the policy hand back a bookie the caller wouldn't
+                // recognise on its on-demand checks.
+                *bookie_addrs.write() = addrs.clone();
                 placement.lock().on_cluster_changed(&addrs, &[]);
-                *bookie_addrs.write() = addrs;
                 backoff_ms = 100; // reset on success
 
                 // Wait for the watcher to fire (persistent loop: re-install
