@@ -92,12 +92,27 @@ pub struct EntryLocation {
 }
 
 impl EntryLocation {
-    pub fn new(log_id: u32, position: u32) -> Self {
-        debug_assert!(
-            (position as u64) < u32::MAX as u64,
-            "entry log position {position} exceeds u32::MAX — increase MAX_ENTRY_LOG_SIZE guard"
-        );
-        Self { log_id, position }
+    /// Build a location from a log_id and a position. The on-disk format
+    /// packs both into a single 64-bit value with the position in the low
+    /// 32 bits (matching Java's `(logId << 32) | (offset & 0xFFFFFFFF)`),
+    /// so a position that doesn't fit in u32 can't be encoded — it would
+    /// silently truncate and the entry-location index would point at the
+    /// wrong byte.
+    ///
+    /// Java caps `logSizeLimit` at 1 GiB so the offset always fits;
+    /// this checked constructor surfaces the overflow as a hard error
+    /// rather than a debug-only assert.
+    pub fn new(log_id: u32, position: u64) -> Result<Self, StorageError> {
+        if position > u32::MAX as u64 {
+            return Err(StorageError::CorruptData(format!(
+                "entry log position {position} exceeds u32::MAX; \
+                 max_entry_log_size must be <= u32::MAX"
+            )));
+        }
+        Ok(Self {
+            log_id,
+            position: position as u32,
+        })
     }
 
     pub fn log_id(&self) -> u32 {

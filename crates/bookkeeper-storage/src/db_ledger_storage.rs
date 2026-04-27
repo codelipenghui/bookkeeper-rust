@@ -823,8 +823,11 @@ impl DbLedgerStorage {
                 segment.framed_entries,
             ).await?;
             for (ledger_id, entry_id, log_id, position) in segment.locations {
-                batch.push((ledger_id, entry_id,
-                    EntryLocation::new(log_id, position as u32).to_u64()));
+                batch.push((
+                    ledger_id,
+                    entry_id,
+                    EntryLocation::new(log_id, position)?.to_u64(),
+                ));
             }
             file_guards.push(segment._file_guard);
         }
@@ -1357,7 +1360,7 @@ impl LedgerStorage for DbLedgerStorage {
         self.ledger_io.write_batch(fd, write_offset, vec![framed]).await?;
 
         let position = write_offset + 4;
-        let location = EntryLocation::new(log_id, position as u32).to_u64();
+        let location = EntryLocation::new(log_id, position)?.to_u64();
         Ok(location)
     }
 
