@@ -53,6 +53,12 @@ pub struct BookieServer {
     sync_handle: Option<tokio::task::JoinHandle<()>>,
     session_watcher_handle: Option<tokio::task::JoinHandle<()>>,
     scrubber_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the HTTP admin axum server. We track it so `shutdown()`
+    /// can drive `with_graceful_shutdown` and wait for in-flight admin
+    /// requests to finish before storage checkpoint runs. Without this
+    /// the admin API kept accepting `set_readonly`, `trigger_gc`,
+    /// `recover_bookie`, etc., on a half-shut-down bookie.
+    http_handle: Option<tokio::task::JoinHandle<()>>,
     /// Dedicated tokio runtime for the ZK client.
     ///
     /// Isolating the ZK session/heartbeat tasks from the main runtime
@@ -605,13 +611,26 @@ impl BookieServer {
             let http_host = &config.http_server_host;
             let http_listener = tokio::net::TcpListener::bind(format!("{http_host}:{http_port}")).await?;
             let http_local_addr = http_listener.local_addr()?;
-            tokio::spawn(async move {
-                axum::serve(http_listener, router).await.ok();
+            let mut http_shutdown_rx = shutdown_rx.clone();
+            let handle = tokio::spawn(async move {
+                let server = axum::serve(http_listener, router).with_graceful_shutdown(async move {
+                    // Drive shutdown when the global shutdown signal flips.
+                    while http_shutdown_rx.changed().await.is_ok() {
+                        if *http_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                });
+                if let Err(e) = server.await {
+                    tracing::warn!("http admin server exited with error: {e}");
+                }
             });
-            Some(http_local_addr)
+            (Some(http_local_addr), Some(handle))
         } else {
-            None
+            (None, None)
         };
+        let http_local_addr = http_addr.0;
+        let http_handle = http_addr.1;
 
         // Start SyncThread — periodic flush of write cache to entry logs.
         // Matches Java's SyncThread which runs every flushInterval ms (default 10s).
@@ -726,7 +745,7 @@ impl BookieServer {
 
         Ok(BookieServer {
             local_addr,
-            http_addr,
+            http_addr: http_local_addr,
             shutdown_tx,
             accept_handle: Some(accept_handle),
             active_connections,
@@ -740,6 +759,7 @@ impl BookieServer {
             sync_handle,
             session_watcher_handle,
             scrubber_handle,
+            http_handle,
             zk_runtime,
             ledger_directories: config.ledger_directories.clone(),
         })
@@ -805,6 +825,14 @@ impl BookieServer {
         // connections), then drain in-flight per-connection tasks.
         if let Some(h) = self.accept_handle.take() {
             h.await.ok();
+        }
+        // Drive HTTP admin shutdown alongside the accept loop drain so the
+        // admin API stops handling `set_readonly` / `trigger_gc` /
+        // `recover_bookie` while the rest of shutdown runs. The handle's
+        // task drives `axum::serve(...).with_graceful_shutdown(...)` so it
+        // returns once in-flight admin requests complete.
+        if let Some(h) = self.http_handle.take() {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), h).await;
         }
         tracing::info!("Accept loop stopped.");
         // Wait up to 10s for active connection tasks to drain. Without
