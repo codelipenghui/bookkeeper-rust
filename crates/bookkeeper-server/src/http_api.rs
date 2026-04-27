@@ -1354,6 +1354,23 @@ async fn decommission_endpoint(
 ) -> impl IntoResponse {
     let (client, paths) = require_zk_json!(state);
 
+    // Bound concurrent decommission background tasks. The recover-bookie
+    // sibling endpoint already gated on `recover_inflight`; without the
+    // same gate here a caller can fan out unbounded ZK + ledger-manager
+    // work by `POST`ing repeatedly to /decommission.
+    let permit = match state.recover_inflight.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "triggered": false,
+                    "note": "decommission concurrency limit reached",
+                })),
+            );
+        }
+    };
+
     // Spawn decommission as background task — long-running
     let zk = client.clone();
     let p = paths.clone();
@@ -1361,6 +1378,7 @@ async fn decommission_endpoint(
     let delete_cookie = body.delete_cookie;
     let lm_for_task = state.ledger_manager.clone();
     tokio::spawn(async move {
+        let _permit = permit; // released when the task exits
         let lm = match lm_for_task {
             Some(lm) => lm,
             None => return,
