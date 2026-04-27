@@ -15,6 +15,7 @@ default = []
 profiling = ["bookkeeper-server/profiling"]
 
 [dependencies]
+bookkeeper-common = { workspace = true }
 bookkeeper-metadata = { workspace = true }
 bookkeeper-client = { workspace = true }
 bookkeeper-server = { workspace = true }

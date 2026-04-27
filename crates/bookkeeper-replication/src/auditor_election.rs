@@ -74,14 +74,27 @@ impl AuditorElector {
                 ElectionResult::Elected => {
                     tracing::info!("Auditor elected: {}", self.bookie_id);
 
-                    // Update election znode data with our bookie ID (for debugging)
+                    // Publish our bookie ID under the election znode so
+                    // operators (and the HTTP cluster_info endpoint) can
+                    // see the current auditor. Pre-fix this used
+                    // `let _ = ...` and silently swallowed transient ZK
+                    // errors — operators would then read stale
+                    // current-auditor data from the previous winner.
+                    // We treat the publish as best-effort but log so
+                    // a misconfigured bookie surfaces in the logs.
                     let vote_data = crate::text_format::serialize_auditor_vote(&AuditorVoteFormat {
                         bookie_id: Some(self.bookie_id.clone()),
                     });
-                    let _ = self
+                    if let Err(e) = self
                         .client
                         .set_data(&self.election_path, &vote_data, None)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            bookie_id = %self.bookie_id,
+                            "auditor election: failed to publish vote-data: {e}",
+                        );
+                    }
 
                     // Run auditor until shutdown or leadership lost
                     let auditor_shutdown = shutdown_rx.clone();

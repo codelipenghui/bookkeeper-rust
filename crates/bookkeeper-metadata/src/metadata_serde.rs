@@ -180,25 +180,59 @@ fn parse_v2(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError
             let value = value.trim();
             if in_segment {
                 match key {
-                    "firstEntryId" => { seg_first_entry = value.parse().unwrap_or(0); }
+                    "firstEntryId" => {
+                        seg_first_entry = value.parse().map_err(|e| {
+                            MetadataError::SerializationError(format!(
+                                "parse firstEntryId='{value}': {e}"
+                            ))
+                        })?;
+                    }
                     "ensembleMember" => { seg_members.push(value.trim_matches('"').to_string()); }
                     _ => {}
                 }
             } else {
                 match key {
-                    "ensembleSize" => { ensemble_size = value.parse().unwrap_or(0); }
-                    "quorumSize" => { quorum_size = value.parse().unwrap_or(0); }
+                    "ensembleSize" => {
+                        ensemble_size = value.parse().map_err(|e| {
+                            MetadataError::SerializationError(format!(
+                                "parse ensembleSize='{value}': {e}"
+                            ))
+                        })?;
+                    }
+                    "quorumSize" => {
+                        quorum_size = value.parse().map_err(|e| {
+                            MetadataError::SerializationError(format!(
+                                "parse quorumSize='{value}': {e}"
+                            ))
+                        })?;
+                    }
                     "ackQuorumSize" => { ack_quorum_size = value.parse().ok(); }
                     "state" => {
                         state_val = match value {
                             "OPEN" => 1,
                             "IN_RECOVERY" => 2,
                             "CLOSED" => 3,
-                            _ => value.parse().unwrap_or(1),
+                            other => other.parse().map_err(|e| {
+                                MetadataError::SerializationError(format!(
+                                    "parse state='{other}': {e}"
+                                ))
+                            })?,
                         };
                     }
-                    "lastEntryId" => { last_entry_id = value.parse().unwrap_or(-1); }
-                    "length" => { length = value.parse().unwrap_or(0); }
+                    "lastEntryId" => {
+                        last_entry_id = value.parse().map_err(|e| {
+                            MetadataError::SerializationError(format!(
+                                "parse lastEntryId='{value}': {e}"
+                            ))
+                        })?;
+                    }
+                    "length" => {
+                        length = value.parse().map_err(|e| {
+                            MetadataError::SerializationError(format!(
+                                "parse length='{value}': {e}"
+                            ))
+                        })?;
+                    }
                     "ctime" => { ctime = value.parse().ok(); }
                     "digestType" => {
                         // Values must match proto: CRC32=1, HMAC=2, CRC32C=3, DUMMY=4
@@ -207,7 +241,11 @@ fn parse_v2(ledger_id: i64, body: &[u8]) -> Result<LedgerMetadata, MetadataError
                             "HMAC" => 2,
                             "CRC32C" | "CRC32_C" => 3,
                             "DUMMY" => 4,
-                            _ => value.parse().unwrap_or(1),
+                            other => other.parse().map_err(|e| {
+                                MetadataError::SerializationError(format!(
+                                    "parse digestType='{other}': {e}"
+                                ))
+                            })?,
                         });
                     }
                     "password" => {

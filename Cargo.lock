@@ -598,6 +598,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "bookkeeper-client",
+ "bookkeeper-common",
  "bookkeeper-config",
  "bookkeeper-metadata",
  "bookkeeper-protocol",

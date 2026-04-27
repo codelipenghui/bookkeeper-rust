@@ -2151,9 +2151,28 @@ where
                         }));
                     } else {
                         is_v3 = Some(false);
+                        // Send a BadRequest response for unparseable V2
+                        // frames instead of tearing down the whole
+                        // pipelined connection. Tearing down lost
+                        // every other in-flight request the client had
+                        // queued before the bad frame arrived.
                         let req = match decode_request(frame_bytes) {
                             Ok(r) => r,
-                            Err(_) => break 'outer,
+                            Err(_) => {
+                                let resp = V2Response::Add {
+                                    error_code: bookkeeper_common::error::BKError::BadRequest.to_v2_code(),
+                                    ledger_id: 0,
+                                    entry_id: 0,
+                                };
+                                let _ = resp_tx_ref.send(EnqueuedResponse {
+                                    bytes: encode_response(&resp).freeze(),
+                                    enqueued_at,
+                                    queued_at: std::time::Instant::now(),
+                                    kind: RequestKind::Other,
+                                    success: false,
+                                }).await;
+                                continue 'decode;
+                            }
                         };
                         let is_auth_req = matches!(&req, V2Request::Auth { .. });
                         if !authenticated && !is_auth_req {

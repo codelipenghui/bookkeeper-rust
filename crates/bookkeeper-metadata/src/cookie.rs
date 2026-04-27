@@ -111,6 +111,29 @@ impl Cookie {
             return Err(MetadataError::InvalidConfig(
                 format!("ledger_dirs mismatch: '{}' vs '{}'", self.ledger_dirs, other.ledger_dirs)));
         }
+        // Index dirs: same superset rule as ledger_dirs. Missing index
+        // dirs were silently accepted before, so a deployment that
+        // dropped an index dir would pass validation and the bookie
+        // would happily start without that dir's RocksDB available.
+        match (&self.index_dirs, &other.index_dirs) {
+            (Some(s), Some(o)) => {
+                if !is_superset_dirs(s, o) {
+                    return Err(MetadataError::InvalidConfig(format!(
+                        "index_dirs mismatch: '{s}' vs '{o}'"
+                    )));
+                }
+            }
+            (None, Some(o)) => {
+                return Err(MetadataError::InvalidConfig(format!(
+                    "index_dirs missing locally; ZK cookie expects: '{o}'"
+                )));
+            }
+            // (Some, None) is fine — adding index dirs to a previously
+            // index-less deployment is allowed (matches the ledger-dirs
+            // expansion rule).
+            // (None, None) is also fine.
+            _ => {}
+        }
         // Instance ID must match if both present
         if let (Some(a), Some(b)) = (&self.instance_id, &other.instance_id) {
             if a != b {

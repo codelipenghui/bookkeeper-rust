@@ -213,22 +213,27 @@ impl RegistrationManager for ZkRegistrationManager {
     }
 
     async fn init_new_cluster(&self, layout: &LedgerLayout, instance_id: &str) -> Result<(), MetadataError> {
-        // Check if cluster already exists
-        match self.client.get_data(self.paths.layout()).await {
-            Ok(_) => return Err(MetadataError::InvalidConfig(
-                "cluster already initialized (LAYOUT exists)".into())),
-            Err(zk::Error::NoNode) => {} // Good — fresh cluster
-            Err(e) => return Err(MetadataError::ConnectionError(format!("check layout: {e}"))),
-        }
-
-        // Create root paths
+        // Create root paths first so the LAYOUT create below doesn't
+        // fail with NoNode on the parent.
         self.ensure_parent_paths().await?;
 
-        // Create LAYOUT — Java format: "{layoutFormatVersion}\n{class}:{managerVersion}"
+        // CAS-create the LAYOUT znode. The previous get_data + create
+        // sequence had a TOCTOU window where two concurrent callers
+        // could both pass the existence check and both proceed to
+        // create — the loser's `create` would race the winner's. ZK's
+        // `create` itself returns NodeExists atomically when the node
+        // is already there, so use that as the existence check.
         let layout_data = layout.serialize();
         let persistent_options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
-        self.client.create(self.paths.layout(), layout_data.as_bytes(), &persistent_options).await
-            .map_err(|e| MetadataError::ConnectionError(format!("create layout: {e}")))?;
+        match self.client.create(self.paths.layout(), layout_data.as_bytes(), &persistent_options).await {
+            Ok(_) => {}
+            Err(zk::Error::NodeExists) => {
+                return Err(MetadataError::InvalidConfig(
+                    "cluster already initialized (LAYOUT exists)".into(),
+                ));
+            }
+            Err(e) => return Err(MetadataError::ConnectionError(format!("create layout: {e}"))),
+        }
 
         // Create instance ID
         self.client.create(self.paths.instance_id(), instance_id.as_bytes(), &persistent_options).await

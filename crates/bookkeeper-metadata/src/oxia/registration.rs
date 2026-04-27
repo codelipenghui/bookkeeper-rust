@@ -197,34 +197,47 @@ impl RegistrationManager for OxiaRegistrationManager {
         layout: &LedgerLayout,
         instance_id: &str,
     ) -> Result<(), MetadataError> {
-        // Create-or-fail — matches ZK impl. We only need key existence,
-        // not the value, so IncludeValue is intentionally omitted here.
-        match self.client.get(self.paths.layout().to_string()).await {
-            Ok(_) => {
-                return Err(MetadataError::InvalidConfig(
-                    "cluster already initialized (LAYOUT exists)".into(),
-                ))
-            }
-            Err(OxiaError::KeyNotFound()) => {}
-            Err(e) => return Err(map_oxia_error(e, None)),
-        }
-
         create_parents(&self.client, self.paths.layout()).await?;
-        self.client
-            .put(
+
+        // CAS-create the LAYOUT key with ExpectVersionId(-1) (oxia's
+        // "key must not exist"). Pre-fix this used a get-then-put
+        // sequence: two concurrent operators could both pass the
+        // existence check and both `put` on top, silently sharing /
+        // overwriting the cluster layout. Using ExpectVersionId(-1)
+        // is atomic.
+        match self
+            .client
+            .put_with_options(
                 self.paths.layout().to_string(),
                 layout.serialize().into_bytes(),
+                vec![PutOption::ExpectVersionId(-1)],
             )
             .await
-            .map_err(|e| map_oxia_error(e, None))?;
-        self.client
-            .put(
+        {
+            Ok(_) => {}
+            Err(OxiaError::UnexpectedVersionId()) => {
+                return Err(MetadataError::InvalidConfig(
+                    "cluster already initialized (LAYOUT exists)".into(),
+                ));
+            }
+            Err(e) => return Err(map_oxia_error(e, None)),
+        }
+        // Same atomic-create discipline for INSTANCEID — the LAYOUT
+        // CAS guarantees only one caller reaches this point, but the
+        // ExpectVersionId(-1) costs nothing extra and makes the
+        // failure mode explicit if a future caller bypasses init.
+        match self
+            .client
+            .put_with_options(
                 self.paths.instance_id().to_string(),
                 instance_id.as_bytes().to_vec(),
+                vec![PutOption::ExpectVersionId(-1)],
             )
             .await
-            .map_err(|e| map_oxia_error(e, None))?;
-        Ok(())
+        {
+            Ok(_) | Err(OxiaError::UnexpectedVersionId()) => Ok(()),
+            Err(e) => Err(map_oxia_error(e, None)),
+        }
     }
 }
 

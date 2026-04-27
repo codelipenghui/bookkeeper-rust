@@ -31,15 +31,22 @@ impl<'a> EntryBuilder<'a> {
     pub fn payload(mut self, v: &'a [u8]) -> Self { self.payload = v; self }
 
     pub fn build(self) -> BytesMut {
+        // Build the 32-byte metadata header on the stack first so the
+        // digest computation and the BytesMut writes are decoupled.
+        // The previous version relied on the buffer containing exactly
+        // 32 bytes after four `put_i64` calls and `.try_into().expect`
+        // would panic if a future refactor altered that order.
+        let mut metadata: [u8; METADATA_LENGTH] = [0; METADATA_LENGTH];
+        metadata[0..8].copy_from_slice(&self.ledger_id.to_be_bytes());
+        metadata[8..16].copy_from_slice(&self.entry_id.to_be_bytes());
+        metadata[16..24].copy_from_slice(&self.lac.to_be_bytes());
+        metadata[24..32].copy_from_slice(&self.length.to_be_bytes());
+
+        let digest = self.dm.compute(&metadata, self.payload);
         let digest_len = self.dm.digest_type().digest_length();
         let total = METADATA_LENGTH + digest_len + self.payload.len();
         let mut buf = BytesMut::with_capacity(total);
-        buf.put_i64(self.ledger_id);
-        buf.put_i64(self.entry_id);
-        buf.put_i64(self.lac);
-        buf.put_i64(self.length);
-        let metadata: &[u8; 32] = (&buf[..32]).try_into().expect("buf contains 32 metadata bytes");
-        let digest = self.dm.compute(metadata, self.payload);
+        buf.put_slice(&metadata);
         buf.put_slice(digest.as_slice());
         buf.put_slice(self.payload);
         buf

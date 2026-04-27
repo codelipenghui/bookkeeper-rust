@@ -46,6 +46,12 @@ pub struct BookieStateManager {
     /// When set, state transitions are written to this file so they
     /// survive restarts. Matches Java's `persistBookieStatusEnabled`.
     status_file: Option<PathBuf>,
+    /// Serialises persist() so two transitions interleaving their
+    /// file writes don't end up with the older state on disk. Without
+    /// this, A: CAS Running→ReadOnly, B: CAS ReadOnly→Running, then
+    /// A's persist (ReadOnly) lands AFTER B's persist (Running) and
+    /// the file claims ReadOnly while in-memory state is Running.
+    persist_lock: std::sync::Mutex<()>,
     /// When true, the bookie was manually set to read-only (via HTTP API)
     /// and should NOT be automatically recovered by the disk monitor.
     /// Matches Java's `isManuallyModifiedToReadOnly()`.
@@ -57,6 +63,7 @@ impl BookieStateManager {
         Self {
             state: AtomicU8::new(BookieState::Starting as u8),
             status_file: None,
+            persist_lock: std::sync::Mutex::new(()),
             manually_read_only: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -71,6 +78,7 @@ impl BookieStateManager {
         Self {
             state: AtomicU8::new(initial),
             status_file: Some(status_file.to_path_buf()),
+            persist_lock: std::sync::Mutex::new(()),
             manually_read_only: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -107,9 +115,22 @@ impl BookieStateManager {
         }
     }
 
-    fn persist(&self, state: BookieState) {
+    fn persist(&self, _state_hint: BookieState) {
         if let Some(ref path) = self.status_file {
-            let _ = std::fs::write(path, state.as_str());
+            // Hold persist_lock and write whatever the *current* state
+            // actually is. Without this, the older transition's write
+            // can land on disk after the newer transition's, leaving
+            // the file claiming a stale state. The CAS already
+            // serialised the transitions in memory; writing the
+            // current state under a lock makes the disk reflect that
+            // serialisation order regardless of which task's I/O
+            // completes first.
+            let _guard = match self.persist_lock.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let current = BookieState::from_u8(self.state.load(Ordering::SeqCst));
+            let _ = std::fs::write(path, current.as_str());
         }
     }
 

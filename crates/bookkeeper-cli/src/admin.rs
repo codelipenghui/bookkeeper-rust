@@ -905,12 +905,47 @@ async fn cmd_recover_ledger(
 
     println!("  Recovery complete: lastEntry={last_entry} length={total_length}");
 
-    // Update metadata to CLOSED state
-    let closed_md = bookkeeper_metadata::ledger_metadata::LedgerMetadataBuilder::from_existing(md)
-        .with_closed_state(last_entry, total_length)
-        .build()?;
-    lm.write_ledger_metadata(ledger_id, &closed_md, versioned.version()).await?;
-    println!("  Ledger {ledger_id} closed in metadata store.");
+    // Re-read metadata before the close-write so we CAS against the
+    // current version. Pre-fix this used `versioned.version()` from the
+    // original read at the START of cmd_recover — if a concurrent
+    // process (another recovery, an ensemble change, or a
+    // delete-then-recreate) updated the metadata between then and now,
+    // our close write either (a) BadVersion-failed, or (b) clobbered
+    // the concurrent update by accidentally hitting the same version.
+    // CAS with retry on BadVersion bounded by MAX_CAS_RETRIES so a
+    // sustained writer-doing-stuff scenario surfaces as an error
+    // rather than spinning forever.
+    let mut close_attempts = 0;
+    loop {
+        close_attempts += 1;
+        if close_attempts > bookkeeper_common::MAX_CAS_RETRIES {
+            return Err(format!(
+                "recover: close-metadata CAS failed after {} retries — \
+                 metadata is being modified concurrently",
+                bookkeeper_common::MAX_CAS_RETRIES
+            ).into());
+        }
+        let v = lm.read_ledger_metadata(ledger_id).await?;
+        let current = v.value();
+        if current.state() == bookkeeper_metadata::ledger_metadata::LedgerState::Closed {
+            println!("  Ledger {ledger_id} was closed by another writer; nothing to do.");
+            return Ok(());
+        }
+        let closed_md = bookkeeper_metadata::ledger_metadata::LedgerMetadataBuilder::from_existing(current)
+            .with_closed_state(last_entry, total_length)
+            .build()?;
+        match lm.write_ledger_metadata(ledger_id, &closed_md, v.version()).await {
+            Ok(_) => {
+                println!("  Ledger {ledger_id} closed in metadata store.");
+                break;
+            }
+            Err(bookkeeper_metadata::ledger_metadata::MetadataError::VersionConflict { .. }) => {
+                // Re-read and retry against the new version.
+                continue;
+            }
+            Err(e) => return Err(format!("close after recovery: {e}").into()),
+        }
+    }
 
     Ok(())
 }
@@ -942,13 +977,33 @@ pub async fn cmd_decommissionbookie(
     // CAS on the stat version we just read so a concurrent admin's value isn't
     // overwritten by our re-write of stale data. BadVersion means someone else
     // modified the node — that itself triggers the watcher we wanted to fire,
-    // so we treat the result as best-effort either way.
+    // so we treat the result as best-effort. We DO surface unexpected ZK
+    // errors so operators don't see "Triggered audit." after a silent
+    // failure.
     {
         let delay_path = format!("{}/lostBookieRecoveryDelay", zk_raw.paths.underreplication());
-        if let Ok((data, stat)) = zk_raw.client.get_data(&delay_path).await {
-            let _ = zk_raw.client.set_data(&delay_path, &data, Some(stat.version)).await;
+        match zk_raw.client.get_data(&delay_path).await {
+            Ok((data, stat)) => {
+                match zk_raw.client.set_data(&delay_path, &data, Some(stat.version)).await {
+                    Ok(_) | Err(zookeeper_client::Error::BadVersion) => {
+                        println!("Triggered audit.");
+                    }
+                    Err(e) => {
+                        return Err(format!("trigger audit: set_data failed: {e}").into());
+                    }
+                }
+            }
+            Err(zookeeper_client::Error::NoNode) => {
+                // No watcher node yet — that's a non-fatal indicator the
+                // auditor hasn't published one. Note for the operator
+                // and continue with the rest of decommission.
+                println!("Note: no lostBookieRecoveryDelay znode yet; auditor watcher \
+                         will pick up the failure on next cycle.");
+            }
+            Err(e) => {
+                return Err(format!("trigger audit: get_data failed: {e}").into());
+            }
         }
-        println!("Triggered audit.");
     }
 
     // Step 3: Find all ledgers that have this bookie in their ensemble
