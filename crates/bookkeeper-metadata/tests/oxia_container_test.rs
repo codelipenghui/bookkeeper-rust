@@ -417,7 +417,9 @@ async fn hob_gc_skips_non_empty_hobs() {
 
     let paths = LedgerPaths::new("/ledgers");
     let client = Arc::new(raw.clone());
-    let gen = OxiaLedgerIdGenerator::new(client, &paths);
+    let gen = OxiaLedgerIdGenerator::new(client, &paths)
+        .await
+        .expect("idgen new");
 
     // Seed HOB-1..=HOB-5 directly so we have more than HOB_GC_KEEP=3.
     for hob in 1..=5 {
