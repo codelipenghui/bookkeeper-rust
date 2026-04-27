@@ -121,7 +121,7 @@ impl GarbageCollector {
             .filter(|id| !active_ledgers_in_metadata.contains(id))
             .copied().collect();
         for ledger_id in dead {
-            if let Err(e) = self.storage.delete_ledger(ledger_id) {
+            if let Err(e) = self.storage.delete_ledger(ledger_id).await {
                 tracing::warn!("GC: failed to delete ledger {ledger_id}: {e}");
             } else {
                 active_local.remove(&ledger_id);

@@ -64,8 +64,11 @@ pub trait LedgerStorage: Send + Sync {
     /// Get the explicit LAC body previously stored by WriteLac.
     fn get_explicit_lac_body(&self, ledger_id: i64) -> Result<Option<Vec<u8>>, StorageError>;
 
-    /// Delete a ledger and all its entries.
-    fn delete_ledger(&self, ledger_id: i64) -> Result<(), StorageError>;
+    /// Delete a ledger and all its entries. Async because the impl
+    /// acquires `flush_mutex` to serialise against an in-flight drain
+    /// (otherwise `drain_flushing` could re-insert entry-location rows
+    /// for the just-deleted ledger).
+    async fn delete_ledger(&self, ledger_id: i64) -> Result<(), StorageError>;
 
     /// List all ledger IDs in local storage.
     fn get_active_ledgers(&self) -> Result<Vec<i64>, StorageError>;

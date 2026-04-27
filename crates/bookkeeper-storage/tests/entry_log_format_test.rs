@@ -39,7 +39,7 @@ fn test_encode_entry_log_entry() {
 
 #[test]
 fn entry_location_encoding() {
-    let loc = EntryLocation::new(10, 2048);
+    let loc = EntryLocation::new(10, 2048).unwrap();
     let encoded = loc.to_u64();
     assert_eq!(encoded, (10u64 << 32) | 2048);
     let decoded = EntryLocation::from_u64(encoded);

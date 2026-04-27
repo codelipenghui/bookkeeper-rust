@@ -122,7 +122,7 @@ impl LedgerStorage for StubStorage {
     fn get_explicit_lac_body(&self, _l: i64) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(None)
     }
-    fn delete_ledger(&self, _l: i64) -> Result<(), StorageError> {
+    async fn delete_ledger(&self, _l: i64) -> Result<(), StorageError> {
         Ok(())
     }
     fn get_active_ledgers(&self) -> Result<Vec<i64>, StorageError> {

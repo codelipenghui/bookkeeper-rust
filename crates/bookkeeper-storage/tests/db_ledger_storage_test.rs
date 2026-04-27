@@ -81,7 +81,7 @@ async fn delete_ledger() {
     let dir = TempDir::new().unwrap();
     let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
     storage.add_entry(&make_entry(1, 0, -1, b"data")).await.unwrap();
-    storage.delete_ledger(1).unwrap();
+    storage.delete_ledger(1).await.unwrap();
     assert!(!storage.ledger_exists(1).unwrap());
 }
 

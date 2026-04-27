@@ -1466,11 +1466,27 @@ impl LedgerStorage for DbLedgerStorage {
         self.entry_location_index.flush()
     }
 
-    fn delete_ledger(&self, ledger_id: i64) -> Result<(), StorageError> {
+    async fn delete_ledger(&self, ledger_id: i64) -> Result<(), StorageError> {
+        // Hold flush_mutex across the index/cache evictions so an
+        // in-flight drain cannot re-insert entry-location rows for the
+        // ledger we're about to delete (drain reads write-cache entries
+        // queued before this delete acquired the lock; without the lock
+        // it would commit those rows after our delete_ledger returned,
+        // leaving dangling index entries pointing at GC-eligible bytes).
+        // Matches Java's deleteLedger which holds writeCacheRotationLock.
+        let _flush_lock = self.flush_mutex.lock().await;
+
         // Notify long poll watchers that this ledger is gone
         self.lac_watchers.notify_ledger_closed(ledger_id);
         self.ledger_index.delete(ledger_id)?;
         self.entry_location_index.delete_ledger(ledger_id)?;
+        // Persist both index deletes before returning so a crash before
+        // the next checkpoint can't surface ghost entries from RocksDB
+        // memtables. The flushes are cheap on empty memtables; on busy
+        // ones they coalesce with the next flush anyway.
+        self.entry_location_index.flush()?;
+        self.ledger_index.flush()?;
+
         self.meta_cache.remove(&ledger_id);
         self.lac_cache.remove(&ledger_id);
         self.explicit_lac_cache.remove(&ledger_id);
