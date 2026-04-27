@@ -190,11 +190,17 @@ impl DataIntegrityCheck {
     }
 
     fn preboot_ledger(&self, id: i64, md: &LedgerMetadata) -> Result<(), DataIntegError> {
-        // Ensure the ledger exists locally with an empty master key (real
-        // key is populated later via EntryCopier::new_batch or regular
-        // client traffic).
+        // Stamp the SHA-1-derived master key (not an empty placeholder) on
+        // first creation. The previous empty stamp left the row's master
+        // key as `[]`, and `EntryCopier::new_batch` only re-stamps when the
+        // row doesn't yet exist — so the real key was never written, and
+        // every fenced read returned Unauthorized while the first inbound
+        // AddEntry could overwrite the empty key with whatever the caller
+        // sent.
         if !self.storage.ledger_exists(id)? {
-            self.storage.set_master_key(id, &[])?;
+            let pw = md.password().unwrap_or(&[]);
+            let master_key = bookkeeper_protocol::digest::generate_master_key(pw);
+            self.storage.set_master_key(id, &master_key)?;
         }
         if md.state() == LedgerState::Closed {
             return Ok(());
@@ -304,10 +310,13 @@ impl DataIntegrityCheck {
         original: &LedgerMetadata,
     ) -> Result<Option<LedgerMetadata>, DataIntegError> {
         // Pre-boot may have put the local entry in limbo even if the bookie
-        // doesn't know about it yet; touch master key first so the storage
-        // row exists.
+        // doesn't know about it yet; stamp the real SHA-1 master key first
+        // so the storage row exists with a key that matches what real clients
+        // will present.
         if !self.storage.ledger_exists(ledger_id)? {
-            self.storage.set_master_key(ledger_id, &[])?;
+            let pw = original.password().unwrap_or(&[]);
+            let master_key = bookkeeper_protocol::digest::generate_master_key(pw);
+            self.storage.set_master_key(ledger_id, &master_key)?;
         }
         if !self.storage.has_limbo_state(ledger_id)? {
             return Ok(Some(original.clone()));
