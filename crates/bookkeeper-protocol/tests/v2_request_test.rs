@@ -118,11 +118,15 @@ fn batch_read_with_fencing_round_trips_master_key() {
 /// Matches Java's BookieProtoEncoding.RequestEnDeCoderPreV3 for AUTH.
 #[test]
 fn auth_request_encodes_as_protobuf_auth_message() {
-    let req = V2Request::Auth { payload: Bytes::from_static(b"my-token") };
+    let req = V2Request::Auth {
+        auth_plugin_name: "my-plugin".to_string(),
+        payload: Bytes::from_static(b"my-token"),
+    };
     let encoded = encode_request(&req);
     let decoded = decode_request(encoded.freeze()).unwrap();
     match decoded {
-        V2Request::Auth { payload } => {
+        V2Request::Auth { auth_plugin_name, payload } => {
+            assert_eq!(auth_plugin_name, "my-plugin");
             assert_eq!(payload.as_ref(), b"my-token");
         }
         _ => panic!("expected Auth"),

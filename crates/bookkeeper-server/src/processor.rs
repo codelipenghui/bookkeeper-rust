@@ -264,9 +264,12 @@ impl RequestProcessor {
                 // End-to-end `GET_BOOKIE_INFO_REQUEST` recorded by the writer task.
                 self.handle_get_bookie_info(requested)
             }
-            V2Request::Auth { payload: _ } => {
-                // Auth disabled: return success with empty payload.
-                // Matches Java's AuthenticationDisabledAuthProviderFactory behavior.
+            V2Request::Auth { .. } => {
+                // Auth frames are handled by the connection-level auth gate
+                // in handle_connection_io (it owns ConnectionAuthState).
+                // Reaching the processor means the gate failed to short-
+                // circuit — return generic success to avoid stalling the
+                // client; the gate will reject the next non-Auth frame.
                 V2Response::Auth { error_code: V2_EOK, payload: bytes::Bytes::new() }
             }
             V2Request::BatchReadEntry { flags, ledger_id, start_entry_id, request_id, max_count, max_size, master_key } => {

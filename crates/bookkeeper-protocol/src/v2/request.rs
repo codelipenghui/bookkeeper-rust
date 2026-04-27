@@ -6,7 +6,7 @@ use crate::v2::header::PacketHeader;
 pub enum V2Request {
     AddEntry { flags: u16, master_key: [u8; MASTER_KEY_LENGTH], entry_data: Bytes, deferred_sync: bool },
     ReadEntry { flags: u16, ledger_id: i64, entry_id: i64, master_key: Option<[u8; MASTER_KEY_LENGTH]> },
-    Auth { payload: Bytes },
+    Auth { auth_plugin_name: String, payload: Bytes },
     WriteLac { ledger_id: i64, lac: i64, master_key: [u8; MASTER_KEY_LENGTH], body: Bytes },
     ReadLac { ledger_id: i64 },
     GetBookieInfo { flags: u16, requested: i64 },
@@ -73,13 +73,13 @@ pub fn encode_request(req: &V2Request) -> BytesMut {
             if let Some(key) = master_key { buf.put_slice(key); }
             buf
         }
-        V2Request::Auth { payload } => {
+        V2Request::Auth { auth_plugin_name, payload } => {
             // Java's V2 Auth encoding wraps the payload in a protobuf AuthMessage:
             // [4-byte header][protobuf-serialized AuthMessage{authPluginName, payload}]
             // Matches Java's BookieProtoEncoding.RequestEnDeCoderPreV3 for AUTH.
             use prost::Message;
             let auth_msg = bookkeeper_proto::AuthMessage {
-                auth_plugin_name: String::new(),
+                auth_plugin_name: auth_plugin_name.clone(),
                 payload: payload.to_vec(),
             };
             let proto_bytes = auth_msg.encode_to_vec();
@@ -171,15 +171,18 @@ pub fn decode_request(data: Bytes) -> Result<V2Request, RequestDecodeError> {
         OP_AUTH => {
             // Java's V2 Auth encoding wraps payload in protobuf AuthMessage.
             // Try to decode it; if it fails (e.g., raw bytes from old client),
-            // fall back to treating the whole thing as the payload.
+            // fall back to treating the whole thing as the payload with an
+            // empty plugin name (the connection-level auth state will reject
+            // it if a plugin is required).
             let raw = data.slice(4..);
-            let payload = if let Ok(auth_msg) = prost::Message::decode(raw.as_ref() as &[u8]) {
-                let auth_msg: bookkeeper_proto::AuthMessage = auth_msg;
-                Bytes::from(auth_msg.payload)
-            } else {
-                raw
-            };
-            Ok(V2Request::Auth { payload })
+            let (auth_plugin_name, payload) =
+                if let Ok(auth_msg) = prost::Message::decode(raw.as_ref() as &[u8]) {
+                    let auth_msg: bookkeeper_proto::AuthMessage = auth_msg;
+                    (auth_msg.auth_plugin_name, Bytes::from(auth_msg.payload))
+                } else {
+                    (String::new(), raw)
+                };
+            Ok(V2Request::Auth { auth_plugin_name, payload })
         }
         OP_WRITE_LAC => {
             if data.len() < 4 + 16 + MASTER_KEY_LENGTH { return Err(RequestDecodeError::TooShort); }

@@ -14,6 +14,7 @@ use bookkeeper_protocol::v2::response::{encode_response, V2Response};
 use bookkeeper_storage::db_ledger_storage::{DbLedgerStorage, CURRENT_DIR};
 
 use bookkeeper_config::server::ServerConfig;
+use crate::auth::{BookieAuthProviderFactory, ConnectionAuthState};
 use crate::http_api;
 use crate::processor::RequestProcessor;
 use crate::state::{BookieState, BookieStateManager};
@@ -293,11 +294,22 @@ impl BookieServer {
         // An unknown plugin class is a HARD ERROR (not a silent fallback to
         // disabled auth) so an operator typo cannot accidentally turn off
         // authentication in production.
-        let auth_factory = crate::auth::create_auth_factory(
-            config.bookie_auth_provider_factory_class.as_deref(),
-            config.tls_client_authentication,
-        )?;
+        let auth_factory: Arc<dyn BookieAuthProviderFactory> = Arc::from(
+            crate::auth::create_auth_factory(
+                config.bookie_auth_provider_factory_class.as_deref(),
+                config.tls_client_authentication,
+            )?,
+        );
         let auth_disabled = auth_factory.plugin_name() == "AUTHENTICATION_DISABLED";
+        // Refuse to start when an operator wires up TLS-based client auth
+        // but the listener has no certificate / key — the listener would
+        // be plaintext, every TLS-auth check would short-circuit, and the
+        // bookie would treat every connection as authenticated.
+        if config.tls_client_authentication
+            && (config.tls_certificate_path.is_none() || config.tls_key_path.is_none())
+        {
+            return Err("tls_client_authentication=true requires tls_certificate_path and tls_key_path to be set; refusing to run with plaintext listener".into());
+        }
         if !auth_disabled {
             processor_inner.set_require_auth(true);
             tracing::info!("Auth enabled: {} (connections must authenticate)", auth_factory.plugin_name());
@@ -722,6 +734,7 @@ impl BookieServer {
             config.server_tcp_no_delay,
             config.max_connections,
             active_connections.clone(),
+            auth_factory.clone(),
         ));
 
         // Start scrubber if localScrubInterval > 0
@@ -1747,6 +1760,7 @@ async fn accept_loop(
     tcp_no_delay: bool,
     max_connections: usize,
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    auth_factory: Arc<dyn BookieAuthProviderFactory>,
 ) {
 
     loop {
@@ -1784,17 +1798,18 @@ async fn accept_loop(
                             }
                         }
                         let guard = ConnCounterGuard(conn_count);
+                        let af = auth_factory.clone();
                         if let Some(ref tls) = tls_acceptor {
                             let tls = tls.clone();
                             tokio::spawn(async move {
                                 let _guard = guard;
                                 let acceptor = tls.acceptor().await;
-                                handle_starttls_connection(stream, proc, max_frame_size, acceptor).await;
+                                handle_starttls_connection(stream, proc, max_frame_size, acceptor, af).await;
                             });
                         } else {
                             tokio::spawn(async move {
                                 let _guard = guard;
-                                handle_connection(stream, proc, max_frame_size).await;
+                                handle_connection(stream, proc, max_frame_size, af).await;
                             });
                         }
                     }
@@ -1825,6 +1840,7 @@ async fn handle_starttls_connection(
     processor: Arc<RequestProcessor>,
     max_frame_size: usize,
     tls_acceptor: tokio_rustls::TlsAcceptor,
+    auth_factory: Arc<dyn BookieAuthProviderFactory>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::codec::{Decoder, Encoder};
@@ -1863,12 +1879,24 @@ async fn handle_starttls_connection(
                             }
                         }
 
-                        // Upgrade to TLS
+                        // Upgrade to TLS. The connection-level auth state
+                        // is created here so we can call on_protocol_upgrade
+                        // immediately after the handshake — that's how the
+                        // TLS-cert auth provider records that the client
+                        // cert was validated.
                         let tcp_stream = reader.reunite(writer).unwrap();
                         match tls_acceptor.accept(tcp_stream).await {
                             Ok(tls_stream) => {
+                                let mut auth_state = ConnectionAuthState::new(&*auth_factory);
+                                auth_state.on_protocol_upgrade();
                                 let (tls_reader, tls_writer) = tokio::io::split(tls_stream);
-                                handle_connection_io(tls_reader, tls_writer, processor, max_frame_size).await;
+                                handle_connection_io(
+                                    tls_reader,
+                                    tls_writer,
+                                    processor,
+                                    max_frame_size,
+                                    auth_state,
+                                ).await;
                             }
                             Err(e) => {
                                 tracing::warn!("TLS handshake failed after StartTLS: {e}");
@@ -1904,9 +1932,11 @@ async fn handle_connection(
     stream: TcpStream,
     processor: Arc<RequestProcessor>,
     max_frame_size: usize,
+    auth_factory: Arc<dyn BookieAuthProviderFactory>,
 ) {
+    let auth_state = ConnectionAuthState::new(&*auth_factory);
     let (reader, writer) = stream.into_split();
-    handle_connection_io(reader, writer, processor, max_frame_size).await;
+    handle_connection_io(reader, writer, processor, max_frame_size, auth_state).await;
 }
 
 /// End-to-end "request" classification used by the `*_REQUEST` histograms.
@@ -1982,6 +2012,56 @@ pub(crate) fn observe_request_latency(kind: RequestKind, success: bool, elapsed:
 
 /// Map a V2 request to its `RequestKind` + a stable flag indicating whether
 /// the fence flag is set (so a later response we can mark `ReadFence`).
+/// Synthesise a typed Unauthorized response for `req` so the client's
+/// pending future resolves cleanly. Pre-fix the unauthenticated path
+/// produced an Auth-shaped response instead, which had no correlation
+/// with the original request's op-type.
+fn unauthorized_response_for(req: &V2Request) -> V2Response {
+    let code = bookkeeper_common::error::BKError::Unauthorized.to_v2_code();
+    match req {
+        V2Request::AddEntry { entry_data, .. } => {
+            let (ledger_id, entry_id) =
+                bookkeeper_protocol::entry::peek_ids(entry_data).unwrap_or((0, 0));
+            V2Response::Add { error_code: code, ledger_id, entry_id }
+        }
+        V2Request::ReadEntry { ledger_id, entry_id, .. } => V2Response::Read {
+            error_code: code,
+            ledger_id: *ledger_id,
+            entry_id: *entry_id,
+            data: None,
+        },
+        V2Request::BatchReadEntry { ledger_id, start_entry_id, request_id, .. } => {
+            V2Response::BatchRead {
+                error_code: code,
+                ledger_id: *ledger_id,
+                entry_id: *start_entry_id,
+                request_id: *request_id,
+                entries: Vec::new(),
+            }
+        }
+        V2Request::WriteLac { ledger_id, lac, .. } => V2Response::WriteLac {
+            error_code: code,
+            ledger_id: *ledger_id,
+            entry_id: *lac,
+        },
+        V2Request::ReadLac { ledger_id } => V2Response::ReadLac {
+            error_code: code,
+            ledger_id: *ledger_id,
+            entry_id: 0,
+            lac_body: None,
+            last_entry_body: None,
+        },
+        V2Request::GetBookieInfo { .. } => V2Response::GetBookieInfo {
+            error_code: code,
+            ledger_id: 0,
+            entry_id: 0,
+            free_disk_space: 0,
+            total_disk_capacity: 0,
+        },
+        V2Request::Auth { .. } => V2Response::Auth { error_code: code, payload: Bytes::new() },
+    }
+}
+
 pub(crate) fn v2_request_kind(req: &V2Request) -> RequestKind {
     match req {
         V2Request::AddEntry { .. } => RequestKind::Add,
@@ -2040,6 +2120,7 @@ async fn handle_connection_io<R, W>(
     mut writer: W,
     processor: Arc<RequestProcessor>,
     max_frame_size: usize,
+    mut auth_state: ConnectionAuthState,
 )
 where
     R: tokio::io::AsyncReadExt + Unpin,
@@ -2123,9 +2204,13 @@ where
     let mut buf = BytesMut::with_capacity(4096);
     let mut is_v3: Option<bool> = None;
     // Per-connection auth gate. When auth is disabled (default), all
-    // connections start authenticated. Otherwise, non-AUTH requests
-    // are rejected with EUA until the handshake completes.
-    let mut authenticated = !processor.require_auth();
+    // connections are immediately authenticated. Otherwise, AUTH frames
+    // are routed through `auth_state.process_auth(...)` and the gate
+    // flips only when the provider returns Complete. Pre-fix the gate
+    // flipped on op-type alone, so any client could bypass authentication
+    // by sending an empty Auth frame.
+    let auth_required = processor.require_auth();
+    let mut authenticated = !auth_required;
 
     let processor_ref: &RequestProcessor = &processor;
     let resp_tx_ref = &resp_tx;
@@ -2174,8 +2259,55 @@ where
                             }).await;
                             continue 'decode;
                         }
-                        if is_auth_op {
-                            authenticated = true;
+                        if is_auth_op && auth_required {
+                            // Drive the actual auth state machine. Pre-fix
+                            // we flipped `authenticated` on op-type alone;
+                            // now process_auth has to return Complete.
+                            let txn_id = v3_req.header.txn_id as u64;
+                            let operation = v3_req.header.operation;
+                            let kind = v3_request_kind(operation);
+                            let auth_msg = v3_req.auth_request.clone().unwrap_or(
+                                bookkeeper_proto::AuthMessage {
+                                    auth_plugin_name: String::new(),
+                                    payload: Vec::new(),
+                                },
+                            );
+                            let resp_bytes = match auth_state.process_auth(
+                                &auth_msg.auth_plugin_name,
+                                &auth_msg.payload,
+                            ) {
+                                Ok(None) => {
+                                    authenticated = true;
+                                    crate::v3_processor::build_v3_auth_success(
+                                        txn_id,
+                                        auth_state.plugin_name(),
+                                        Vec::new(),
+                                    )
+                                }
+                                Ok(Some(resp_payload)) => {
+                                    crate::v3_processor::build_v3_auth_success(
+                                        txn_id,
+                                        auth_state.plugin_name(),
+                                        resp_payload,
+                                    )
+                                }
+                                Err(_) => crate::v3_processor::build_v3_error_response(
+                                    txn_id,
+                                    operation,
+                                    bookkeeper_common::error::BKError::Unauthorized,
+                                ),
+                            };
+                            let _ = resp_tx_ref.send(EnqueuedResponse {
+                                bytes: Bytes::from(resp_bytes),
+                                enqueued_at,
+                                queued_at: std::time::Instant::now(),
+                                kind,
+                                success: authenticated,
+                            }).await;
+                            continue 'decode;
+                        } else if is_auth_op {
+                            // auth_required=false: process_v3_request returns
+                            // AUTHENTICATION_DISABLED via the disabled provider.
                         }
                         let kind = v3_request_kind(v3_req.header.operation);
                         in_flight.push(Box::pin(async move {
@@ -2217,24 +2349,53 @@ where
                         };
                         let is_auth_req = matches!(&req, V2Request::Auth { .. });
                         if !authenticated && !is_auth_req {
-                            in_flight.push(Box::pin(async move {
-                                let resp = processor_ref
-                                    .process_request(V2Request::Auth {
+                            // Send a typed Unauthorized response of the
+                            // appropriate shape for the requested op so the
+                            // client's pending future resolves cleanly.
+                            // Pre-fix we synthesised a V2Request::Auth with
+                            // an empty payload, which dropped the original
+                            // request and confused the client.
+                            let kind = v2_request_kind(&req);
+                            let resp = unauthorized_response_for(&req);
+                            let _ = resp_tx_ref.send(EnqueuedResponse {
+                                bytes: encode_response(&resp).freeze(),
+                                enqueued_at,
+                                queued_at: std::time::Instant::now(),
+                                kind,
+                                success: false,
+                            }).await;
+                            continue 'decode;
+                        }
+                        if is_auth_req && auth_required {
+                            // Run the real auth state machine.
+                            if let V2Request::Auth { auth_plugin_name, payload } = &req {
+                                let resp = match auth_state.process_auth(auth_plugin_name, payload) {
+                                    Ok(None) => {
+                                        authenticated = true;
+                                        V2Response::Auth {
+                                            error_code: V2_EOK,
+                                            payload: bytes::Bytes::new(),
+                                        }
+                                    }
+                                    Ok(Some(resp_payload)) => V2Response::Auth {
+                                        error_code: V2_EOK,
+                                        payload: bytes::Bytes::from(resp_payload),
+                                    },
+                                    Err(_) => V2Response::Auth {
+                                        error_code: bookkeeper_common::error::BKError::Unauthorized
+                                            .to_v2_code(),
                                         payload: bytes::Bytes::new(),
-                                    })
-                                    .await;
+                                    },
+                                };
                                 let _ = resp_tx_ref.send(EnqueuedResponse {
                                     bytes: encode_response(&resp).freeze(),
                                     enqueued_at,
                                     queued_at: std::time::Instant::now(),
                                     kind: RequestKind::Other,
-                                    success: false,
+                                    success: authenticated,
                                 }).await;
-                            }));
-                            continue 'decode;
-                        }
-                        if is_auth_req {
-                            authenticated = true;
+                                continue 'decode;
+                            }
                         }
                         let kind = v2_request_kind(&req);
                         in_flight.push(Box::pin(async move {

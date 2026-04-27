@@ -87,6 +87,13 @@ impl ConnectionAuthState {
         self.authenticated
     }
 
+    /// Plugin name this connection's provider was instantiated for.
+    /// Used by the connection-level handler when synthesising an Auth
+    /// response so the client sees the same plugin it negotiated against.
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+
     /// Process an AUTH request. Returns the response payload (if any).
     pub fn process_auth(
         &mut self,

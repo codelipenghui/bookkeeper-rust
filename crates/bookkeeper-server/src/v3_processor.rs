@@ -436,6 +436,23 @@ pub fn build_v3_error_response(txn_id: u64, operation: i32, err: BKError) -> Vec
     resp.encode_to_vec()
 }
 
+/// Build an EOK Auth response carrying the provider's reply payload.
+/// Used by the connection-level auth gate when it has run
+/// `ConnectionAuthState::process_auth` itself and needs to send the
+/// resulting AuthMessage back to the client.
+pub fn build_v3_auth_success(txn_id: u64, plugin_name: &str, payload: Vec<u8>) -> Vec<u8> {
+    let resp = bookkeeper_proto::Response {
+        header: make_v3_header(txn_id, bookkeeper_proto::OperationType::Auth as i32),
+        status: bookkeeper_proto::StatusCode::Eok as i32,
+        auth_response: Some(bookkeeper_proto::AuthMessage {
+            auth_plugin_name: plugin_name.to_string(),
+            payload,
+        }),
+        ..Default::default()
+    };
+    resp.encode_to_vec()
+}
+
 /// Convert a sorted list of entry IDs into contiguous (first, last) ranges.
 fn entries_to_ranges(entries: &[i64]) -> Vec<(i64, i64)> {
     if entries.is_empty() {
