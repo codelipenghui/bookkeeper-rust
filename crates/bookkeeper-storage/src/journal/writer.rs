@@ -846,7 +846,28 @@ fn journal_uring_loop(
             None
         };
 
-        let file = state.file.as_mut().unwrap();
+        // After a rotation failure (e.g. ENFILE / disk full / dir gone)
+        // `state.file` can stay None. Unwrapping panics the journal
+        // thread; the queue then fills up forever and the bookie keeps
+        // accepting writes that never complete. Drop this batch
+        // (oneshot senders dropped → receivers see RecvError) and
+        // signal on_fatal_error so the bookie can flip read-only.
+        let file = match state.file.as_mut() {
+            Some(f) => f,
+            None => {
+                if let Some(ref cb) = on_fatal_error {
+                    cb(io::Error::new(
+                        io::ErrorKind::Other,
+                        "journal file not open after rotate failure",
+                    ));
+                }
+                pending_acks.clear();
+                write_buf.clear();
+                pending_bytes = 0;
+                pending_oldest_enqueue = None;
+                continue;
+            }
+        };
 
         // Measure flush (write_all) latency
         let flush_start = Instant::now();
@@ -1185,7 +1206,26 @@ fn flush_write_buf(
         None
     };
 
-    let file = state.file.as_mut().unwrap();
+    // After a rotation failure (ENFILE / disk full / dir gone) `state.file`
+    // can stay None. Unwrapping panics this thread, the queue fills up
+    // forever and the bookie keeps acking writes that never complete.
+    // Drop the batch (oneshot senders dropped → callers see RecvError)
+    // and signal on_fatal_error.
+    let file = match state.file.as_mut() {
+        Some(f) => f,
+        None => {
+            if let Some(ref cb) = on_fatal_error {
+                cb(io::Error::new(
+                    io::ErrorKind::Other,
+                    "journal file not open after rotate failure",
+                ));
+            }
+            pending_acks.clear();
+            write_buf.clear();
+            *pending_oldest_enqueue = None;
+            return;
+        }
+    };
 
     // Measure flush (write_all) latency
     let flush_start = Instant::now();
