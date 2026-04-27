@@ -171,9 +171,16 @@ impl RegistrationManager for ZkRegistrationManager {
         crate::zk_path::ensure_zk_path(&self.client, self.paths.cookies()).await?;
         let path = self.paths.cookie_path(bookie_id);
         let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
-        self.client.create(&path, data, &options).await
-            .map_err(|e| MetadataError::ConnectionError(format!("create cookie: {e}")))?;
-        Ok(())
+        match self.client.create(&path, data, &options).await {
+            Ok(_) => Ok(()),
+            // Mirror oxia: turn duplicate-cookie into a typed error so
+            // callers can distinguish "cookie already exists" (operator
+            // action needed) from "ZK is unreachable" (retry).
+            Err(zk::Error::NodeExists) => Err(MetadataError::ConnectionError(format!(
+                "create cookie: bookie '{bookie_id}' already has a cookie"
+            ))),
+            Err(e) => Err(MetadataError::ConnectionError(format!("create cookie: {e}"))),
+        }
     }
 
     async fn update_cookie(&self, bookie_id: &str, data: &[u8], version: i64) -> Result<(), MetadataError> {
@@ -183,9 +190,18 @@ impl RegistrationManager for ZkRegistrationManager {
                 actual: -1,
             })?;
         let path = self.paths.cookie_path(bookie_id);
-        self.client.set_data(&path, data, Some(zk_version)).await
-            .map_err(|e| MetadataError::ConnectionError(format!("update cookie: {e}")))?;
-        Ok(())
+        match self.client.set_data(&path, data, Some(zk_version)).await {
+            Ok(_) => Ok(()),
+            // Distinguish version conflict / vanished cookie from a
+            // generic transport error so callers can retry / re-read
+            // instead of treating both as opaque ConnectionError.
+            Err(zk::Error::BadVersion) => Err(MetadataError::VersionConflict {
+                expected: version,
+                actual: -1,
+            }),
+            Err(zk::Error::NoNode) => Err(MetadataError::NotFound(0)),
+            Err(e) => Err(MetadataError::ConnectionError(format!("update cookie: {e}"))),
+        }
     }
 
     async fn delete_cookie(&self, bookie_id: &str, version: i64) -> Result<(), MetadataError> {
@@ -195,9 +211,15 @@ impl RegistrationManager for ZkRegistrationManager {
                 actual: -1,
             })?;
         let path = self.paths.cookie_path(bookie_id);
-        self.client.delete(&path, Some(zk_version)).await
-            .map_err(|e| MetadataError::ConnectionError(format!("delete cookie: {e}")))?;
-        Ok(())
+        match self.client.delete(&path, Some(zk_version)).await {
+            Ok(()) => Ok(()),
+            Err(zk::Error::BadVersion) => Err(MetadataError::VersionConflict {
+                expected: version,
+                actual: -1,
+            }),
+            Err(zk::Error::NoNode) => Err(MetadataError::NotFound(0)),
+            Err(e) => Err(MetadataError::ConnectionError(format!("delete cookie: {e}"))),
+        }
     }
 
     async fn get_cluster_instance_id(&self) -> Result<Option<String>, MetadataError> {

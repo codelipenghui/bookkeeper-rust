@@ -32,10 +32,16 @@ impl LayoutManager for ZkLayoutManager {
 
     async fn store_ledger_layout(&self, layout: &LedgerLayout) -> Result<(), MetadataError> {
         let data = layout.serialize();
-        self.client.create(self.paths.layout(), data.as_bytes(),
-            &zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all())).await
-            .map_err(|e| MetadataError::ConnectionError(format!("store layout: {e}")))?;
-        Ok(())
+        match self.client.create(self.paths.layout(), data.as_bytes(),
+            &zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all())).await {
+            Ok(_) => Ok(()),
+            // Mirror oxia/layout.rs: a NodeExists is "layout already exists"
+            // (operator should not be re-formatting), not a transport fault.
+            Err(zk::Error::NodeExists) => Err(MetadataError::InvalidConfig(
+                "layout already exists; refusing to overwrite".into(),
+            )),
+            Err(e) => Err(MetadataError::ConnectionError(format!("store layout: {e}"))),
+        }
     }
 
     async fn delete_ledger_layout(&self) -> Result<(), MetadataError> {
