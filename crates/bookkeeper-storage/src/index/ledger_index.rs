@@ -5,6 +5,12 @@ use rocksdb::{Cache, DB};
 use crate::rocksdb_options;
 use crate::StorageError;
 
+/// Number of stripes for per-ledger RMW serialization. Java's
+/// `LedgerMetadataIndex` uses `Striped.lock(ledgerCount=64)` for the
+/// same purpose. 64 keeps the contention window small while bounding
+/// fixed memory.
+const LEDGER_LOCK_STRIPES: usize = 64;
+
 /// Reserved RocksDB key used to store whole-storage state flags.
 /// On-disk compatible with Java's `LedgerMetadataIndex.STORAGE_FLAGS` constant.
 const STORAGE_FLAGS_KEY: i64 = -0xeefd;
@@ -42,6 +48,13 @@ pub struct LedgerMetadataIndex {
     /// concurrent `set_storage_state_flag`/`clear_storage_state_flag` callers
     /// don't clobber each other. Matches Java's `synchronized(ledgersDb)`.
     flags_lock: Mutex<()>,
+    /// Per-ledger striped locks serializing read-modify-write on a
+    /// single ledger row. Without this, two concurrent setters
+    /// (e.g. `set_fenced` racing `set_master_key`, or `set_limbo`
+    /// racing `set_explicit_lac_body`) interleave at the get→put
+    /// boundary and one writer's bit silently loses. Mirrors Java's
+    /// `LedgerMetadataIndex.lockForLedger(ledgerId)`.
+    ledger_locks: Vec<Mutex<()>>,
 }
 
 impl LedgerMetadataIndex {
@@ -53,7 +66,21 @@ impl LedgerMetadataIndex {
         let (opts, block_cache) =
             rocksdb_options::load_or_default(rocksdb_conf, rocksdb_options::DEFAULT_LEDGER_METADATA_CONF)?;
         let db = DB::open(&opts, path)?;
-        Ok(Self { db, block_cache, flags_lock: Mutex::new(()) })
+        let ledger_locks = (0..LEDGER_LOCK_STRIPES).map(|_| Mutex::new(())).collect();
+        Ok(Self { db, block_cache, flags_lock: Mutex::new(()), ledger_locks })
+    }
+
+    /// Lock the stripe responsible for `ledger_id`. Hold across any
+    /// get-modify-put sequence on the LedgerData row to prevent two
+    /// setters from clobbering each other's bits.
+    fn lock_for_ledger(&self, ledger_id: i64) -> std::sync::MutexGuard<'_, ()> {
+        // Wrap the stripe index modulo LEDGER_LOCK_STRIPES (a power of
+        // two), masking off the sign bit to keep negative ledger ids
+        // (used by reserved keys, only ever locked by callers that touch
+        // those keys directly) inside the array bounds.
+        let idx = (ledger_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
+        let stripe = (idx as usize) & (LEDGER_LOCK_STRIPES - 1);
+        self.ledger_locks[stripe].lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Persist a LedgerData row. The on-disk proto matches Java's
@@ -63,6 +90,11 @@ impl LedgerMetadataIndex {
     /// and is reconstructed on restart from journal replay /
     /// last-entry tracking — exactly as Java does.
     pub fn set(&self, ledger_id: i64, fenced: bool, master_key: Option<&[u8]>) -> Result<(), StorageError> {
+        // `set` is semantically "create-or-replace this ledger row" — its
+        // caller (validate_for_write) intentionally overwrites every field,
+        // so taking the per-ledger lock here is mostly defensive against
+        // racing `set_*` mutators on the same ledger.
+        let _g = self.lock_for_ledger(ledger_id);
         let key = ledger_id.to_be_bytes();
         let proto = bookkeeper_proto::LedgerData {
             exists: true,
@@ -95,6 +127,7 @@ impl LedgerMetadataIndex {
     }
 
     pub fn set_fenced(&self, ledger_id: i64) -> Result<(), StorageError> {
+        let _g = self.lock_for_ledger(ledger_id);
         if let Some(mut data) = self.get_raw(ledger_id)? {
             data.fenced = true;
             self.put_raw(ledger_id, &data)
@@ -143,6 +176,7 @@ impl LedgerMetadataIndex {
     /// Matches Java's `LedgerMetadataIndex.setExplicitLac()` which stores the
     /// raw LAC body (with digest) in the `explicitLac` field of `LedgerData`.
     pub fn set_explicit_lac_body(&self, ledger_id: i64, body: &[u8]) -> Result<(), StorageError> {
+        let _g = self.lock_for_ledger(ledger_id);
         let key = ledger_id.to_be_bytes();
         let mut proto = self.get_raw(ledger_id)?.unwrap_or_else(|| bookkeeper_proto::LedgerData {
             exists: true,
@@ -219,8 +253,35 @@ impl LedgerMetadataIndex {
         Ok(true)
     }
 
+    /// Atomically install a master key on a ledger row, preserving the
+    /// existing `fenced` and `limbo` bits. Creates the row with
+    /// `fenced=false, limbo=None` when the ledger doesn't exist yet.
+    /// Returns the post-update `(fenced, limbo)` so the caller can
+    /// refresh its in-memory cache without a second read.
+    ///
+    /// Mirrors Java's `LedgerMetadataIndex.setMasterKey(ledgerId, key)`
+    /// which holds `lockForLedger` around the read-modify-write —
+    /// without this, a concurrent `set_fenced` racing the master-key
+    /// write loses the fence bit.
+    pub fn set_master_key(&self, ledger_id: i64, master_key: &[u8]) -> Result<(bool, bool), StorageError> {
+        let _g = self.lock_for_ledger(ledger_id);
+        let mut proto = self.get_raw(ledger_id)?.unwrap_or_else(|| bookkeeper_proto::LedgerData {
+            exists: true,
+            fenced: false,
+            master_key: Vec::new(),
+            explicit_lac: None,
+            limbo: None,
+        });
+        proto.master_key = master_key.to_vec();
+        let fenced = proto.fenced;
+        let limbo = proto.limbo.unwrap_or(false);
+        self.put_raw(ledger_id, &proto)?;
+        Ok((fenced, limbo))
+    }
+
     /// Mark a ledger as in limbo (awaiting data-integrity recovery).
     pub fn set_limbo(&self, ledger_id: i64) -> Result<(), StorageError> {
+        let _g = self.lock_for_ledger(ledger_id);
         let mut proto = self.get_raw(ledger_id)?.ok_or(StorageError::LedgerNotFound(ledger_id))?;
         proto.limbo = Some(true);
         self.put_raw(ledger_id, &proto)
@@ -229,6 +290,7 @@ impl LedgerMetadataIndex {
     /// Clear a ledger's limbo state. No-op when the ledger is absent or
     /// already out of limbo (limbo field unset or `Some(false)`).
     pub fn clear_limbo(&self, ledger_id: i64) -> Result<(), StorageError> {
+        let _g = self.lock_for_ledger(ledger_id);
         if let Some(mut proto) = self.get_raw(ledger_id)? {
             if proto.limbo.unwrap_or(false) {
                 proto.limbo = Some(false);
