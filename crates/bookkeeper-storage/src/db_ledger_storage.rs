@@ -593,6 +593,19 @@ impl DbLedgerStorage {
                 use std::io::Write;
                 let header = EntryLogHeader::new(elf::HEADER_CURRENT_VERSION);
                 f.write_all(&header.to_bytes())?;
+                // Persist the high-water mark as soon as the file is
+                // created, not only on rotation. Otherwise a fresh
+                // bookie that writes a single log file (no rotation),
+                // then has GC delete it before the first checkpoint
+                // persisted last_entry_log_id, would on restart re-pick
+                // log_id from an empty dir scan — recycling an id the
+                // entry-location index still points at and silently
+                // overwriting bytes those index entries reference.
+                if let Err(e) = self.ledger_index.set_last_entry_log_id(log_id) {
+                    tracing::warn!(
+                        "failed to persist last_entry_log_id={log_id} on creation: {e}"
+                    );
+                }
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
