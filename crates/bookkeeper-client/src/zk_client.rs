@@ -361,6 +361,11 @@ impl ZkBookKeeper {
             master_key,
         );
 
+        // Hand the placement policy to the WriteHandle so
+        // `handle_bookie_failure` picks rack/region-aware replacements
+        // instead of "first available bookie not in the ensemble".
+        wh.set_placement(self.placement.clone());
+
         // Bridge client config to WriteHandle settings
         if let Some(ref cfg) = self.client_config {
             if cfg.add_entry_quorum_timeout > 0 {

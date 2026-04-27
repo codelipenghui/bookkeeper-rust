@@ -369,8 +369,18 @@ const PENDING_ADDS_PRUNE_INTERVAL: usize = 100;
 
 pub struct WriteHandle {
     ledger_id: i64,
-    /// All bookies available in the pool, used to find replacements on failure.
+    /// All bookies available in the pool, used as a fallback for finding
+    /// replacements on failure when no placement policy has been wired in.
+    /// When `placement` is `Some`, the policy's `replace_bookie` is the
+    /// authoritative source — `available_bookies` is a snapshot from
+    /// construction time and may be stale relative to cluster changes.
     available_bookies: Vec<String>,
+    /// Optional placement policy for replacement selection on bookie
+    /// failure. Wired from the client (`zk_client::open_write_handle`)
+    /// so that rack-aware / region-aware deployments preserve their
+    /// diversity constraints across ensemble changes; absent only in
+    /// tests that bypass the client wiring.
+    placement: Option<Arc<parking_lot::Mutex<Box<dyn crate::placement::EnsemblePlacementPolicy>>>>,
     schedule: RoundRobinDistributionSchedule,
     digest_manager: DigestManager,
     master_key: [u8; MASTER_KEY_LENGTH],
@@ -437,6 +447,7 @@ impl WriteHandle {
         Self {
             ledger_id,
             available_bookies,
+            placement: None,
             schedule,
             digest_manager,
             master_key,
@@ -499,6 +510,18 @@ impl WriteHandle {
         self.on_ensemble_change = Some(cb);
     }
 
+    /// Inject the cluster's placement policy so `handle_bookie_failure`
+    /// can pick rack-aware / region-aware replacements rather than
+    /// falling back to "first available bookie not in the current
+    /// ensemble" — the latter silently downgrades to no-policy on
+    /// every ensemble change.
+    pub fn set_placement(
+        &mut self,
+        placement: Arc<parking_lot::Mutex<Box<dyn crate::placement::EnsemblePlacementPolicy>>>,
+    ) {
+        self.placement = Some(placement);
+    }
+
     /// Return the current last-add-confirmed value.
     pub fn last_add_confirmed(&self) -> i64 {
         self.lac_value.load(Ordering::Acquire)
@@ -533,28 +556,59 @@ impl WriteHandle {
         Arc::clone(&self.ensemble_info)
     }
 
-    /// Replace the bookie at `failed_bookie_idx` with one from the available pool
-    /// that is not already in the current ensemble. Connects to the replacement and
-    /// updates `conns` in-place.
+    /// Replace the bookie at `failed_bookie_idx` with one chosen by the
+    /// configured placement policy (rack-aware / region-aware /
+    /// default), connect to it, and patch `conns` in-place.
+    ///
+    /// Falls back to "first available bookie not in the current
+    /// ensemble" only when no placement policy has been wired in
+    /// (`set_placement`) — typical in tests. In production wiring (via
+    /// `zk_client::open_write_handle`) the policy is always set, so
+    /// rack/region constraints survive ensemble changes.
+    ///
+    /// The chosen address is resolved via `parse-or-lookup_host`, so
+    /// DNS-named bookies work the same as IP-literal ones — mirrors
+    /// the auditor / replication-worker fix from commit `cc8def7`.
     pub async fn handle_bookie_failure(
         &mut self,
         conns: &mut Vec<Arc<BookieConnection>>,
         failed_bookie_idx: usize,
     ) -> Result<(), ClientError> {
         let current_ensemble = self.ensemble_info.current_ensemble();
-        let current_set: std::collections::HashSet<&str> =
-            current_ensemble.iter().map(|s| s.as_str()).collect();
+        let to_replace = current_ensemble
+            .get(failed_bookie_idx)
+            .cloned()
+            .ok_or_else(|| ClientError::Protocol(format!(
+                "failed_bookie_idx {failed_bookie_idx} out of range \
+                 (ensemble size {})",
+                current_ensemble.len(),
+            )))?;
+        let exclude: std::collections::HashSet<String> =
+            current_ensemble.iter().cloned().collect();
 
-        let replacement = self
-            .available_bookies
-            .iter()
-            .find(|b| !current_set.contains(b.as_str()))
-            .ok_or_else(|| ClientError::Protocol("no available replacement bookie".into()))?
-            .clone();
+        let replacement = if let Some(ref policy) = self.placement {
+            // ensemble_size / wq / aq are derived from the schedule —
+            // the placement policy uses them for adherence checks.
+            let es = self.schedule.ensemble_size();
+            let wq = self.schedule.write_quorum_size();
+            let aq = self.schedule.ack_quorum_size();
+            policy
+                .lock()
+                .replace_bookie(es, wq, aq, &current_ensemble, &to_replace, &exclude)
+                .map_err(|e| ClientError::Protocol(format!(
+                    "placement policy could not replace {to_replace}: {e}",
+                )))?
+        } else {
+            self.available_bookies
+                .iter()
+                .find(|b| !exclude.contains(b.as_str()))
+                .cloned()
+                .ok_or_else(|| ClientError::Protocol(
+                    "no available replacement bookie".into(),
+                ))?
+        };
 
-        let addr: std::net::SocketAddr = replacement
-            .parse()
-            .map_err(|e| ClientError::Protocol(format!("bad replacement addr: {e}")))?;
+        let addr = resolve_bookie_address(&replacement).await?;
         let new_conn = Arc::new(BookieConnection::connect(addr).await?);
 
         // Update ensemble in the current (latest) segment.
@@ -1493,4 +1547,20 @@ impl WriteHandleAdv {
     pub fn set_on_ensemble_change(&mut self, cb: OnEnsembleChange) {
         self.inner.set_on_ensemble_change(cb);
     }
+}
+
+/// Resolve a bookie's `host:port` (or `ip:port`) address string to a
+/// `SocketAddr`. Mirrors the auditor / replication-worker pattern: try
+/// the IP-literal fast path first, fall back to `tokio::net::lookup_host`
+/// for DNS names. Without the fallback, deployments with DNS-named
+/// bookies cannot recover from a bookie failure on an open ledger.
+async fn resolve_bookie_address(addr: &str) -> Result<std::net::SocketAddr, ClientError> {
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return Ok(sa);
+    }
+    let mut iter = tokio::net::lookup_host(addr)
+        .await
+        .map_err(|e| ClientError::Protocol(format!("resolve {addr}: {e}")))?;
+    iter.next()
+        .ok_or_else(|| ClientError::Protocol(format!("no addresses for {addr}")))
 }
