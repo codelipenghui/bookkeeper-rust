@@ -23,6 +23,13 @@ pub enum StorageError {
     /// returned from `triggerFlushAndAddEntry()` after `maxThrottleTimeNanos`.
     #[error("operation rejected: write cache full, flush throttle timeout")]
     OperationRejected,
+    /// Ledger is in limbo: the data-integrity pre-boot pass marked it
+    /// pending repair, so reads / writes against it must fail until the
+    /// full integrity check has fenced+recovered the ledger. Matches
+    /// Java's `BKLedgerNeedsIntegrityCheckException` raised by
+    /// `SingleDirectoryDbLedgerStorage.throwIfLimbo()`.
+    #[error("ledger {0} is in limbo (pending integrity check)")]
+    DataUnknown(i64),
 }
 
 impl From<rocksdb::Error> for StorageError {

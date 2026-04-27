@@ -1018,6 +1018,16 @@ impl LedgerStorage for DbLedgerStorage {
 
     async fn get_entry(&self, ledger_id: i64, entry_id: i64) -> Result<Bytes, StorageError> {
         let read_start = Instant::now();
+        // Limbo gate: ledgers that the data-integrity pre-boot pass put
+        // into limbo must not serve reads until the full integrity
+        // check has fenced + recovered them. Matches Java's
+        // SingleDirectoryDbLedgerStorage.throwIfLimbo() called from
+        // every read path. Without this, a stale data dir whose cookie
+        // has been auto-stamped by the data-integrity validator could
+        // serve un-repaired entries to clients.
+        if self.ledger_index.has_limbo(ledger_id)? {
+            return Err(StorageError::DataUnknown(ledger_id));
+        }
         // Single unified cache lookup covers active write buffer, flushing
         // write buffer, and read cache in one DashMap probe (O(1)).
         if let Some(data) = self.unified_cache.get(ledger_id, entry_id) {

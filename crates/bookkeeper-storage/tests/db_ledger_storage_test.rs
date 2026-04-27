@@ -85,6 +85,33 @@ async fn delete_ledger() {
     assert!(!storage.ledger_exists(1).unwrap());
 }
 
+/// A ledger marked limbo by the data-integrity pre-boot pass must
+/// refuse reads with `DataUnknown` until the post-boot full check has
+/// fenced+recovered it. Without this gate, an auto-stamped cookie on a
+/// stale data dir would silently serve un-repaired entries to clients.
+/// Matches Java's `SingleDirectoryDbLedgerStorage.throwIfLimbo()`
+/// guard.
+#[tokio::test]
+async fn limbo_ledger_blocks_get_entry() {
+    use bookkeeper_storage::StorageError;
+
+    let dir = TempDir::new().unwrap();
+    let storage = DbLedgerStorage::open(dir.path(), default_ledger_io()).unwrap();
+    storage.add_entry(&make_entry(7, 0, -1, b"old")).await.unwrap();
+    // Initially readable.
+    storage.get_entry(7, 0).await.unwrap();
+    // Pre-boot pass marks it limbo.
+    storage.set_limbo_state(7).unwrap();
+    let err = storage.get_entry(7, 0).await.unwrap_err();
+    assert!(
+        matches!(err, StorageError::DataUnknown(7)),
+        "get_entry on a limbo ledger must error with DataUnknown, got {err:?}",
+    );
+    // Clearing limbo (post-recovery) restores reads.
+    storage.clear_limbo_state(7).unwrap();
+    storage.get_entry(7, 0).await.unwrap();
+}
+
 #[tokio::test]
 async fn concurrent_add_during_flush() {
     let dir = TempDir::new().unwrap();

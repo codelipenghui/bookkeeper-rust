@@ -28,6 +28,17 @@ pub enum CookieValidationError {
     ZkMissingButLocalsPresent,
     #[error("cookie mismatch and data-integrity stamping is disabled")]
     MismatchStampingDisabled,
+    /// `data_integrity_stamp_missing_cookies` is on but no
+    /// `DataIntegrityCheck` was wired into the validator. Java's
+    /// `DataIntegrityCookieValidation` runs a substantive pre-boot
+    /// pass before stamping (sets `NEEDS_INTEGRITY_CHECK`, ensures
+    /// every ZK-known ledger has a local record, and marks open
+    /// ledgers limbo+fenced so reads fail until the post-boot
+    /// integrity check repairs them). Without that pass, stamping a
+    /// fresh cookie can silently legitimise a stale data dir.
+    #[error("cookie mismatch with data-integrity stamping enabled but no DataIntegrityCheck \
+             configured — refusing to stamp without the pre-boot integrity pass")]
+    StampingRequiresDataIntegrityCheck,
     #[error("metadata error: {0}")]
     Metadata(#[from] bookkeeper_metadata::ledger_metadata::MetadataError),
     #[error("data-integrity error: {0}")]
@@ -119,13 +130,20 @@ impl DataIntegrityCookieValidator {
             return Err(CookieValidationError::MismatchStampingDisabled);
         }
 
+        // Pre-boot integrity pass MUST run before stamping. Without it,
+        // a stale data dir can be silently legitimised by a fresh
+        // cookie. Java's DataIntegrityCookieValidation has the same
+        // hard requirement — it constructs the validator with a
+        // non-null DataIntegrityCheck.
+        let check = self
+            .check
+            .as_ref()
+            .ok_or(CookieValidationError::StampingRequiresDataIntegrityCheck)?;
         tracing::warn!(
             "data-integ cookie: cookies disagree with master; running pre-boot check \
              before stamping"
         );
-        if let Some(check) = &self.check {
-            check.run_preboot_check("INVALID_COOKIE").await?;
-        }
+        check.run_preboot_check("INVALID_COOKIE").await?;
         let zk_version = reg_cookie.as_ref().map(|(_, v)| *v);
         self.stamp_all(&master, zk_version).await?;
         Ok(())
@@ -395,8 +413,14 @@ mod tests {
         assert!(matches!(err, CookieValidationError::MismatchStampingDisabled));
     }
 
+    /// Stamping with mismatched cookies but NO DataIntegrityCheck wired
+    /// in must error rather than silently stamp a fresh cookie. Without
+    /// the pre-boot integrity pass (set NEEDS_INTEGRITY_CHECK, ensure
+    /// local records for ZK ledgers, mark open ledgers limbo+fenced),
+    /// stamping legitimises a stale data dir. Java's
+    /// DataIntegrityCookieValidation has the same hard requirement.
     #[tokio::test]
-    async fn mismatch_with_stamping_updates_zk_and_disks() {
+    async fn mismatch_with_stamping_but_no_check_errors() {
         let tmp = TempDir::new().unwrap();
         let journal = tmp.path().join("journal");
         let ledger = tmp.path().join("ledger");
@@ -411,7 +435,63 @@ mod tests {
         let v = DataIntegrityCookieValidator::new(
             layout(&journal, &ledger),
             reg.clone(),
-            None,  // no DataIntegrityCheck injected — stamping still proceeds
+            None, // no DataIntegrityCheck — stamping must refuse
+            true,
+        );
+
+        let err = v.check_and_stamp().await.unwrap_err();
+        assert!(
+            matches!(err, CookieValidationError::StampingRequiresDataIntegrityCheck),
+            "got {err:?} — stamping without the pre-boot integrity pass would let a \
+             stale data dir be silently legitimised by the fresh cookie",
+        );
+        // ZK and local cookies are unchanged because we refused to stamp.
+        let zk_cookie = reg.cookie.lock().unwrap().clone().unwrap();
+        assert_eq!(zk_cookie.1, 3, "ZK cookie version must NOT have been bumped");
+        assert!(!journal.join("current/VERSION").exists(), "no local cookie stamped");
+    }
+
+    /// Stamping with a wired DataIntegrityCheck DOES proceed — the
+    /// `mismatch_with_stamping_runs_preboot_check` test below verifies
+    /// the pre-boot pass ran. This test covers the post-stamp side
+    /// effects (ZK version bumped, local cookies on disk).
+    #[tokio::test]
+    async fn mismatch_with_stamping_and_check_updates_zk_and_disks() {
+        use crate::datainteg::check::{DataIntegrityCheck, DataIntegrityConfig};
+        use crate::datainteg::entry_copier::EntryCopier;
+        use crate::datainteg::test_helpers::{EmptyLedgerManager, NoopRecovery, StubStorage};
+        use bookkeeper_metadata::traits::LedgerManager;
+        use bookkeeper_storage::ledger_storage::LedgerStorage;
+
+        let tmp = TempDir::new().unwrap();
+        let journal = tmp.path().join("journal");
+        let ledger = tmp.path().join("ledger");
+        let stale = Cookie::new(
+            "bk1:3181",
+            journal.to_str().unwrap(),
+            &[ledger.to_str().unwrap()],
+            Some("OLD-INSTANCE"),
+            None,
+        );
+        let reg = MockReg::with_cookie("inst-1", stale.serialize().as_bytes(), 3);
+        let storage = StubStorage::new(0);
+        let lm: Arc<dyn LedgerManager> = Arc::new(EmptyLedgerManager);
+        let copier = Arc::new(EntryCopier::new(
+            "bk1:3181".to_string(),
+            storage.clone() as Arc<dyn LedgerStorage>,
+        ));
+        let check = Arc::new(DataIntegrityCheck::with_config(
+            "bk1:3181".to_string(),
+            lm,
+            storage as Arc<dyn LedgerStorage>,
+            copier,
+            Arc::new(NoopRecovery),
+            DataIntegrityConfig { max_inflight: 4, max_entries_inflight: 4 },
+        ));
+        let v = DataIntegrityCookieValidator::new(
+            layout(&journal, &ledger),
+            reg.clone(),
+            Some(check),
             true,
         );
 

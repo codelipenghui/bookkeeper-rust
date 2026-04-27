@@ -694,6 +694,9 @@ impl RequestProcessor {
             // Matches Java's `OperationRejectedException` → ETOOMANYREQUESTS.
             // Signals the client to back off / retry on another bookie.
             bookkeeper_storage::StorageError::OperationRejected => BKError::TooManyRequests,
+            // Limbo ledgers (data-integrity pre-boot has them pending
+            // repair) → Java's BKDataUnknownException → EUNKNOWN_LEDGER_STATE.
+            bookkeeper_storage::StorageError::DataUnknown(_) => BKError::UnknownLedgerState,
             _ => BKError::Io,
         }
     }

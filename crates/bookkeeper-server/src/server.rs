@@ -2236,6 +2236,18 @@ async fn build_data_integrity_check(
         return Ok(None);
     }
     let Some(zk_servers) = config.zk_servers.as_deref() else {
+        // Stamping a missing cookie without an integrity-check pre-boot
+        // can silently legitimise stale local data. Treat the
+        // misconfiguration as fatal rather than a warning. (When only
+        // `data_integrity_checking` is on without ZK we still warn-and-skip
+        // — that path doesn't risk legitimising stale data.)
+        if config.data_integrity_stamp_missing_cookies {
+            return Err(
+                "data_integrity_stamp_missing_cookies requires zk_servers — stamping \
+                 without the data-integrity pre-boot pass would silently legitimise \
+                 stale local data".into(),
+            );
+        }
         tracing::warn!("data-integrity enabled but no ZK servers configured — skipping");
         return Ok(None);
     };
