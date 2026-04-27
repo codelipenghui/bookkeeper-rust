@@ -61,31 +61,56 @@ impl SpeculativeReadPolicy {
     }
 }
 
-/// Shared state across entries in a batch read, matching Java's heardFromHostsBitSet.
-/// Bit N is set when bookie index N has responded successfully for ANY entry.
-/// Used to suppress unnecessary speculative reads.
+/// Shared state across entries in a batch read, matching Java's
+/// heardFromHostsBitSet. Bit N is set when bookie index N has responded
+/// successfully for ANY entry. Used to suppress unnecessary speculative
+/// reads.
+///
+/// Backed by a vector of `AtomicU64` words sized at construction so
+/// ensembles larger than 64 bookies are tracked correctly. The previous
+/// single-`AtomicU64` representation silently dropped every mark/check
+/// for bookies at index 64+ — speculative reads then kept firing
+/// against bookies that had already responded.
 #[derive(Clone)]
 pub struct HeardFromHosts {
-    bits: Arc<AtomicU64>,
+    /// Each word covers 64 bookie indices. `words[k]` bit `b` <=> bookie
+    /// index `k * 64 + b`.
+    words: Arc<Vec<AtomicU64>>,
+    bookie_count: usize,
 }
 
 impl HeardFromHosts {
-    pub fn new() -> Self {
-        Self { bits: Arc::new(AtomicU64::new(0)) }
+    pub fn new(bookie_count: usize) -> Self {
+        let n_words = (bookie_count + 63) / 64;
+        let words = (0..n_words).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            words: Arc::new(words),
+            bookie_count,
+        }
     }
 
     /// Mark a bookie index as "heard from" (responded successfully).
+    /// Indices beyond the ensemble size are silently ignored — the
+    /// caller bounds-checks against `conns.len()` upstream, so this only
+    /// fires on programmer error.
     pub fn mark_heard(&self, bookie_idx: usize) {
-        if bookie_idx < 64 {
-            self.bits.fetch_or(1u64 << bookie_idx, Ordering::Release);
+        if bookie_idx >= self.bookie_count {
+            return;
         }
+        let word = bookie_idx / 64;
+        let bit = bookie_idx % 64;
+        self.words[word].fetch_or(1u64 << bit, Ordering::Release);
     }
 
     /// Check if ANY of the given bookie indices have been heard from.
     pub fn any_heard(&self, indices: &[usize]) -> bool {
-        let bits = self.bits.load(Ordering::Acquire);
         for &idx in indices {
-            if idx < 64 && (bits & (1u64 << idx)) != 0 {
+            if idx >= self.bookie_count {
+                continue;
+            }
+            let word = idx / 64;
+            let bit = idx % 64;
+            if (self.words[word].load(Ordering::Acquire) & (1u64 << bit)) != 0 {
                 return true;
             }
         }
@@ -770,7 +795,7 @@ impl ReadHandle {
         concurrency: usize,
     ) -> Result<Vec<Vec<u8>>, ClientError> {
         let concurrency = concurrency.max(1);
-        let heard_from = HeardFromHosts::new();
+        let heard_from = HeardFromHosts::new(conns.len());
 
         let results: Vec<Result<Vec<u8>, ClientError>> = stream::iter(first_entry..=last_entry)
             .map(|eid| {

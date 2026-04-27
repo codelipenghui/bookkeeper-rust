@@ -48,7 +48,7 @@ fn policy_zero_multiplier_defaults_to_2() {
 
 #[test]
 fn heardfrom_marks_and_checks_bits() {
-    let h = HeardFromHosts::new();
+    let h = HeardFromHosts::new(8);
     assert!(!h.any_heard(&[0, 1, 2]));
     h.mark_heard(1);
     assert!(h.any_heard(&[0, 1, 2]));
@@ -61,19 +61,27 @@ fn heardfrom_marks_and_checks_bits() {
 }
 
 #[test]
-fn heardfrom_handles_high_indices_safely() {
-    let h = HeardFromHosts::new();
-    // Index >= 64 silently ignored (no panic)
-    h.mark_heard(100);
-    assert!(!h.any_heard(&[100]));
-    assert!(!h.any_heard(&[0, 50, 63]));
+fn heardfrom_tracks_indices_above_64_for_large_ensembles() {
+    // With the multi-word backing, indices past 63 are tracked
+    // correctly when the ensemble is sized for them. The previous
+    // single-AtomicU64 representation silently dropped these.
+    let h = HeardFromHosts::new(128);
+    assert!(!h.any_heard(&[64, 100, 127]));
+    h.mark_heard(64);
+    h.mark_heard(127);
+    assert!(h.any_heard(&[64]));
+    assert!(h.any_heard(&[127]));
+    assert!(!h.any_heard(&[65, 126]));
+    // Indices beyond the configured ensemble size are silently ignored.
+    h.mark_heard(200);
+    assert!(!h.any_heard(&[200]));
 }
 
 #[test]
 fn heardfrom_clone_shares_state() {
-    let h1 = HeardFromHosts::new();
+    let h1 = HeardFromHosts::new(8);
     let h2 = h1.clone();
     h1.mark_heard(5);
-    // Both views see the bit (Arc<AtomicU64>)
+    // Both views see the bit (Arc<Vec<AtomicU64>>)
     assert!(h2.any_heard(&[5]));
 }
