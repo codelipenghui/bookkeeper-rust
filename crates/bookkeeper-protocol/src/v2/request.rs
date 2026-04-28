@@ -52,6 +52,41 @@ impl V2Request {
             | V2Request::Auth { .. } => None,
         }
     }
+
+    /// Derive the [`CorrelationKey`] under which this request's
+    /// response will arrive. Used by the client connection task to
+    /// route the response to the matching `oneshot::Sender` via
+    /// content-based dispatch (mirrors Java's `EntryCompletionKey` /
+    /// `TxnCompletionKey` allocation in `PerChannelBookieClient`'s
+    /// per-op send paths).
+    pub fn correlation_key(&self) -> crate::v2::response::CorrelationKey {
+        use crate::v2::response::CorrelationKey;
+        match self {
+            V2Request::AddEntry { entry_data, .. } => {
+                let (ledger_id, entry_id) = crate::entry::peek_ids(entry_data)
+                    .unwrap_or((0, 0));
+                CorrelationKey::V2Entry { op: OP_ADD_ENTRY, ledger_id, entry_id }
+            }
+            V2Request::ReadEntry { ledger_id, entry_id, .. } => {
+                CorrelationKey::V2Entry { op: OP_READ_ENTRY, ledger_id: *ledger_id, entry_id: *entry_id }
+            }
+            V2Request::BatchReadEntry { request_id, .. } => {
+                CorrelationKey::V2BatchRead { request_id: *request_id }
+            }
+            V2Request::WriteLac { ledger_id, .. } => {
+                CorrelationKey::V2Ledger { op: OP_WRITE_LAC, ledger_id: *ledger_id }
+            }
+            V2Request::ReadLac { ledger_id, .. } => {
+                CorrelationKey::V2Ledger { op: OP_READ_LAC, ledger_id: *ledger_id }
+            }
+            V2Request::Auth { .. } => CorrelationKey::V2Auth,
+            // GetBookieInfo is sent as V3 by the Rust client; the V2
+            // request variant exists for completeness only. Pretend it's
+            // a singleton bucket — no concurrent V2 GetBookieInfo can
+            // occur in practice.
+            V2Request::GetBookieInfo { .. } => CorrelationKey::V2Auth,
+        }
+    }
 }
 
 pub fn encode_request(req: &V2Request) -> BytesMut {
