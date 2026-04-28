@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::join_all;
-use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::oneshot;
 
-use bookkeeper_common::error::BKError;
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::digest::DigestManager;
 use bookkeeper_protocol::v2::response::V2Response;
@@ -36,6 +35,12 @@ pub struct EnsembleInfo {
     /// entries that were targeting the failed bookie.
     /// Matches Java's `PendingAddOp` queue iterated by `unsetSuccessAndSendWriteRequest`.
     in_flight_entries: std::sync::Mutex<BTreeMap<i64, Bytes>>,
+    /// Per-entry shared quorum-tracking context. The resend path
+    /// looks up the context here so its result feeds the SAME ack
+    /// counter the original submission's per-bookie tasks are
+    /// updating. Mirrors the `PendingAddOp` instance Java reuses
+    /// across `sendWriteRequest` calls.
+    pending_acks: std::sync::Mutex<BTreeMap<i64, Arc<PendingAddCtx>>>,
 }
 
 impl EnsembleInfo {
@@ -47,7 +52,20 @@ impl EnsembleInfo {
             changing_ensemble: AtomicBool::new(false),
             delayed_failures: std::sync::Mutex::new(Vec::new()),
             in_flight_entries: std::sync::Mutex::new(BTreeMap::new()),
+            pending_acks: std::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn register_pending_ctx(&self, entry_id: i64, ctx: Arc<PendingAddCtx>) {
+        self.pending_acks.lock().unwrap().insert(entry_id, ctx);
+    }
+
+    fn remove_pending_ctx(&self, entry_id: i64) {
+        self.pending_acks.lock().unwrap().remove(&entry_id);
+    }
+
+    fn get_pending_ctx(&self, entry_id: i64) -> Option<Arc<PendingAddCtx>> {
+        self.pending_acks.lock().unwrap().get(&entry_id).cloned()
     }
 
     /// Return the current (latest) ensemble.
@@ -263,6 +281,267 @@ impl PendingAdd {
     pub async fn wait(self) -> Result<i64, ClientError> {
         self.rx.await.map_err(|_| ClientError::ConnectionClosed)?
     }
+}
+
+// ---------------------------------------------------------------------------
+// PendingAddCtx — shared per-entry quorum state
+// ---------------------------------------------------------------------------
+//
+// One Arc<PendingAddCtx> per in-flight entry. Every per-bookie write
+// task (initial submission AND any resend triggered by an ensemble
+// change) records its result into this context. The first writer to
+// drive the AckSet over the quorum threshold (or the first writer to
+// hit an unrecoverable status) resolves the user's PendingAdd via
+// the LacState machinery.
+//
+// Mirrors Apache BookKeeper's `PendingAddOp`: a per-entry instance
+// with an `ackSet` and a `completed` flag, where
+// `unsetSuccessAndSendWriteRequest` re-runs `sendWriteRequest`
+// against the same instance after an ensemble change so the new
+// bookie's ack lands in the same `ackSet`.
+
+struct PendingAddCtx {
+    entry_id: i64,
+    /// Per-bookie ack/failure tracker. Idempotent for repeated
+    /// reports from the same ensemble index, and a fail-then-ack
+    /// from the same index correctly retracts the failure (matches
+    /// Java's `BitSet ackSet` + `BookieId[] failureMap` semantics).
+    ack_set: std::sync::Mutex<crate::distribution::AckSet>,
+    /// Failed ensemble indices recorded so far. Drained on success
+    /// to populate `EnsembleInfo::delayed_failures` for proactive
+    /// ensemble change.
+    failed_indices: std::sync::Mutex<Vec<usize>>,
+    /// Latched once the user's PendingAdd is signaled — prevents
+    /// double-signaling if both a quorum-reached and a
+    /// quorum-impossible / timeout event race after the first event.
+    completed: AtomicBool,
+    // State needed to invoke LacState::signal_success / signal_error.
+    lac_state: Arc<LacState>,
+    lac_value: Arc<AtomicI64>,
+    ensemble_info: Arc<EnsembleInfo>,
+    deferred_sync: bool,
+    /// Optional caller-supplied hook fired exactly once when the
+    /// PendingAdd is signaled (success, failure, timeout, or
+    /// unrecoverable). Used by `WriteHandleAdv` to remove the entry
+    /// id from its dedup set without spawning a polling task.
+    on_completed: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+}
+
+impl PendingAddCtx {
+    fn new(
+        entry_id: i64,
+        schedule: &RoundRobinDistributionSchedule,
+        lac_state: Arc<LacState>,
+        lac_value: Arc<AtomicI64>,
+        ensemble_info: Arc<EnsembleInfo>,
+        deferred_sync: bool,
+    ) -> Self {
+        Self::new_with_hook(
+            entry_id, schedule, lac_state, lac_value, ensemble_info, deferred_sync, None,
+        )
+    }
+
+    fn new_with_hook(
+        entry_id: i64,
+        schedule: &RoundRobinDistributionSchedule,
+        lac_state: Arc<LacState>,
+        lac_value: Arc<AtomicI64>,
+        ensemble_info: Arc<EnsembleInfo>,
+        deferred_sync: bool,
+        on_completed: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Self {
+        Self {
+            entry_id,
+            ack_set: std::sync::Mutex::new(schedule.new_ack_set()),
+            failed_indices: std::sync::Mutex::new(Vec::new()),
+            completed: AtomicBool::new(false),
+            lac_state,
+            lac_value,
+            ensemble_info,
+            deferred_sync,
+            on_completed: std::sync::Mutex::new(on_completed),
+        }
+    }
+
+    /// Atomically claim the right to signal the user's PendingAdd.
+    /// Returns `true` exactly once across the lifetime of this ctx;
+    /// subsequent calls return `false`. Also performs registry
+    /// cleanup so the in-flight entry / pending-ctx maps don't grow
+    /// past the entries the user is actually waiting on.
+    fn claim_completion(&self) -> bool {
+        let first = !self.completed.swap(true, Ordering::AcqRel);
+        if first {
+            self.ensemble_info.remove_in_flight(self.entry_id);
+            self.ensemble_info.remove_pending_ctx(self.entry_id);
+            if let Some(hook) = self.on_completed.lock().unwrap().take() {
+                hook();
+            }
+        }
+        first
+    }
+
+    /// Record a successful ack from `ensemble_idx`. If this brings
+    /// the ack count to quorum, signal LacState (success). Idempotent
+    /// for repeated acks from the same index; retracts a prior
+    /// failure recorded for the same index.
+    fn record_ack(self: &Arc<Self>, ensemble_idx: usize) {
+        // Drop the lock before signalling so LacState's mutex
+        // ordering doesn't compose with this one across a wait.
+        let now_quorum = {
+            let mut ack = self.ack_set.lock().unwrap();
+            ack.complete_bookie(ensemble_idx)
+        };
+        // Forget any prior fail-record on this index — the bookie at
+        // this slot has now answered Ok, so it shouldn't appear in
+        // the post-success "delayed failures" list either.
+        self.failed_indices.lock().unwrap().retain(|&i| i != ensemble_idx);
+        if now_quorum && self.claim_completion() {
+            // Drain post-quorum failures to delayed_failures for
+            // proactive ensemble change. Mirrors the behaviour of the
+            // pre-refactor ack-collector loop.
+            self.publish_delayed_failures();
+            self.lac_state.signal_success(
+                self.entry_id,
+                &self.lac_value,
+                &self.ensemble_info,
+                self.deferred_sync,
+            );
+        }
+    }
+
+    /// Record a failure from `ensemble_idx` with reason `err`. If
+    /// this pushes the failure count past tolerable, signal LacState
+    /// with the supplied error. Idempotent for repeated failures from
+    /// the same index; retracts a prior ack recorded for the same
+    /// index.
+    fn record_fail(self: &Arc<Self>, ensemble_idx: usize, err: ClientError) {
+        let now_impossible = {
+            let mut ack = self.ack_set.lock().unwrap();
+            ack.fail_bookie(ensemble_idx)
+        };
+        {
+            let mut failed = self.failed_indices.lock().unwrap();
+            if !failed.contains(&ensemble_idx) {
+                failed.push(ensemble_idx);
+            }
+        }
+        if now_impossible && self.claim_completion() {
+            // Don't publish delayed failures on the failure path —
+            // there is no successful pending-add waiting on an
+            // ensemble change to re-route, the user's wait() resolves
+            // with the supplied error directly.
+            self.lac_state.signal_error(
+                self.entry_id,
+                wrap_quorum_failure(err, self.entry_id, &self.failed_indices.lock().unwrap()),
+            );
+        }
+    }
+
+    /// Record an unrecoverable bookie status (Fenced, Unauthorized).
+    /// Resolves the PendingAdd immediately with the typed error,
+    /// regardless of how many other bookies might still ack.
+    fn record_unrecoverable(self: &Arc<Self>, error: bookkeeper_common::error::BKError) {
+        if self.claim_completion() {
+            self.lac_state.signal_error(
+                self.entry_id,
+                ClientError::UnrecoverableWrite { error, entry_id: self.entry_id },
+            );
+        }
+    }
+
+    /// Record the per-write quorum timeout. If still uncompleted,
+    /// resolves the PendingAdd with a timeout error.
+    fn record_timeout(self: &Arc<Self>, timeout: Duration) {
+        if self.claim_completion() {
+            self.lac_state.signal_error(
+                self.entry_id,
+                ClientError::Protocol(format!(
+                    "add entry quorum timeout ({timeout:?}) for entry {}", self.entry_id
+                )),
+            );
+        }
+    }
+
+    /// Append every failed bookie index recorded against this entry
+    /// to `EnsembleInfo::delayed_failures`. Called on the success
+    /// path so the next ensemble change can reconcile the failed
+    /// slots.
+    fn publish_delayed_failures(&self) {
+        let failed = self.failed_indices.lock().unwrap();
+        if failed.is_empty() {
+            return;
+        }
+        let current_ens = self.ensemble_info.current_ensemble();
+        let mut delayed = self.ensemble_info.delayed_failures.lock().unwrap();
+        for &idx in failed.iter() {
+            if idx < current_ens.len() {
+                delayed.push((idx, current_ens[idx].clone()));
+            }
+        }
+    }
+}
+
+fn wrap_quorum_failure(
+    err: ClientError,
+    entry_id: i64,
+    failed_indices: &[usize],
+) -> ClientError {
+    let message = err.to_string();
+    ClientError::WriteQuorumFailed {
+        message,
+        failed_indices: failed_indices.to_vec(),
+        entry_id,
+    }
+}
+
+/// Issue an AddEntry request to one bookie and feed the result into
+/// the per-entry [`PendingAddCtx`]. Used for both initial submissions
+/// and resends after ensemble change. The task takes ownership of an
+/// `Arc<PendingAddCtx>` so it can be `tokio::spawn`-ed independently
+/// — the ctx is reference-counted so the user's `PendingAdd` can
+/// resolve from any sender's response, including a resend's.
+fn spawn_send_to_bookie(
+    ctx: Arc<PendingAddCtx>,
+    ensemble_idx: usize,
+    conn: Arc<BookieConnection>,
+    entry: Bytes,
+    master_key: [u8; MASTER_KEY_LENGTH],
+    deferred_sync: bool,
+    closed: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if closed.load(Ordering::Acquire) {
+            // Don't write to bookies after the user closed the handle.
+            // The PendingAdd's signal will already have come from
+            // close()'s drain path.
+            return;
+        }
+        match conn.send_add_entry_with_flags(0, master_key, entry, deferred_sync).await {
+            Ok(V2Response::Add { error_code, .. }) if error_code == V2_EOK => {
+                ctx.record_ack(ensemble_idx);
+            }
+            Ok(V2Response::Add { error_code, .. }) => {
+                let bk_err = bookkeeper_common::error::BKError::from_v2_code(error_code);
+                if matches!(
+                    bk_err,
+                    bookkeeper_common::error::BKError::Fenced
+                        | bookkeeper_common::error::BKError::Unauthorized,
+                ) {
+                    ctx.record_unrecoverable(bk_err);
+                } else {
+                    ctx.record_fail(
+                        ensemble_idx,
+                        ClientError::BookieError { error: bk_err },
+                    );
+                }
+            }
+            Ok(_) => ctx.record_fail(
+                ensemble_idx,
+                ClientError::Protocol("unexpected response type".into()),
+            ),
+            Err(e) => ctx.record_fail(ensemble_idx, e),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -671,21 +950,8 @@ impl WriteHandle {
             }
         }
 
-        let ack_quorum = self.schedule.ack_quorum_size();
-        let write_quorum = self.schedule.write_quorum_size();
         let mk = self.master_key;
         let use_deferred_sync = self.deferred_sync;
-        let lac_value = Arc::clone(&self.lac_value);
-        let lac_state = Arc::clone(&self.lac_state);
-        let ensemble_info = Arc::clone(&self.ensemble_info);
-
-        // Clone Arc<BookieConnection> handles for the spawned task, keeping the
-        // write-set position alongside each handle so we can report which indices failed.
-        let conn_handles: Vec<(usize, Arc<BookieConnection>)> = write_set
-            .iter()
-            .enumerate()
-            .map(|(pos, &ensemble_idx)| (ensemble_idx, Arc::clone(&conns[pos])))
-            .collect();
 
         // Register the PendingAdd's signaling slot BEFORE spawning so the
         // callback order is deterministic relative to LAC advancement.
@@ -694,180 +960,61 @@ impl WriteHandle {
         let pending_add = self.lac_state.register(entry_id);
         let quorum_timeout = self.add_entry_quorum_timeout;
 
-        // RAII guard so the in-flight registry is cleared even if the
-        // spawned ack-collector panics or is dropped mid-await. Without
-        // this, in_flight_entries would grow unbounded under any panic
-        // path inside the quorum-collection task.
-        struct InFlightGuard {
-            ensemble_info: Arc<EnsembleInfo>,
-            entry_id: i64,
-        }
-        impl Drop for InFlightGuard {
-            fn drop(&mut self) {
-                self.ensemble_info.remove_in_flight(self.entry_id);
-            }
-        }
-        let in_flight_guard = InFlightGuard {
-            ensemble_info: Arc::clone(&ensemble_info),
+        // Per-entry shared quorum context. Both the per-bookie initial
+        // submission tasks AND any later resend triggered by an ensemble
+        // change feed their results into this single AckSet, so a
+        // resend's Ok lands in the same quorum the original task is
+        // waiting on. Mirrors Java's `PendingAddOp` instance reused
+        // across `sendWriteRequest` calls.
+        let ctx = Arc::new(PendingAddCtx::new(
             entry_id,
-        };
+            &self.schedule,
+            Arc::clone(&self.lac_state),
+            Arc::clone(&self.lac_value),
+            Arc::clone(&self.ensemble_info),
+            use_deferred_sync,
+        ));
+        self.ensemble_info.register_pending_ctx(entry_id, Arc::clone(&ctx));
 
-        let handle = tokio::spawn(async move {
-            // Move the guard into the task so its Drop runs on every exit
-            // path: success, error, panic, or future cancellation.
-            let _in_flight_guard = in_flight_guard;
-            // Wrap the entire quorum collection in a timeout.
-            // Matches Java's addEntryQuorumTimeoutNanos monitoring.
-            let write_result = tokio::time::timeout(quorum_timeout, async {
-                let mut futs: FuturesUnordered<_> = conn_handles
-                    .into_iter()
-                    .map(|(ensemble_idx, conn)| {
-                        let entry = entry_bytes.clone();
-                        let ds = use_deferred_sync;
-                        async move { (ensemble_idx, conn.send_add_entry_with_flags(0, mk, entry, ds).await) }
-                    })
-                    .collect();
-
-                let mut ack_count = 0usize;
-                let mut fail_count = 0usize;
-                let mut failed_indices: Vec<usize> = Vec::new();
-                let mut last_err: Option<ClientError> = None;
-                let max_tolerable = write_quorum - ack_quorum;
-
-                // Resolve as soon as ack quorum is reached OR becomes impossible.
-                while let Some((ensemble_idx, result)) = futs.next().await {
-                    match result {
-                        Ok(V2Response::Add { error_code, .. }) if error_code == V2_EOK => {
-                            ack_count += 1;
-                        }
-                        Ok(V2Response::Add { error_code, .. }) => {
-                            let bk_err = BKError::from_v2_code(error_code);
-                            match bk_err {
-                                BKError::Fenced | BKError::Unauthorized => {
-                                    return Err(ClientError::UnrecoverableWrite {
-                                        error: bk_err,
-                                        entry_id,
-                                    });
-                                }
-                                _ => {
-                                    last_err = Some(ClientError::BookieError { error: bk_err });
-                                    failed_indices.push(ensemble_idx);
-                                    fail_count += 1;
-                                }
-                            }
-                        }
-                        Ok(_) => {
-                            last_err = Some(ClientError::Protocol("unexpected response type".into()));
-                            failed_indices.push(ensemble_idx);
-                            fail_count += 1;
-                        }
-                        Err(e) => {
-                            last_err = Some(e);
-                            failed_indices.push(ensemble_idx);
-                            fail_count += 1;
-                        }
-                    }
-
-                    if ack_count >= ack_quorum {
-                        // Quorum reached — collect remaining failures
-                        // in the background for proactive ensemble change.
-                        let ens_info = Arc::clone(&ensemble_info);
-                        tokio::spawn(async move {
-                            while let Some((idx, result)) = futs.next().await {
-                                let failed = match result {
-                                    Ok(V2Response::Add { error_code, .. }) => error_code != V2_EOK,
-                                    _ => true,
-                                };
-                                if failed {
-                                    let current_ens = ens_info.current_ensemble();
-                                    let mut delayed = ens_info.delayed_failures.lock().unwrap();
-                                    if idx < current_ens.len() {
-                                        delayed.push((idx, current_ens[idx].clone()));
-                                    }
-                                }
-                            }
-                        });
-                        return Ok((failed_indices, last_err));
-                    }
-
-                    if fail_count > max_tolerable {
-                        // Quorum impossible — fail immediately
-                        let message = last_err
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "ack quorum impossible".into());
-                        return Err(ClientError::WriteQuorumFailed {
-                            message,
-                            failed_indices,
-                            entry_id,
-                        });
-                    }
+        // Per-write quorum timeout. Spawned separately from the
+        // bookie-write tasks so it fires regardless of how many of
+        // them are still in flight.
+        {
+            let ctx_for_timeout = Arc::clone(&ctx);
+            let closed_for_timeout = Arc::clone(&self.closed);
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(quorum_timeout).await;
+                if !closed_for_timeout.load(Ordering::Acquire) {
+                    ctx_for_timeout.record_timeout(quorum_timeout);
                 }
+            });
+            self.pending_adds.push(handle);
+        }
 
-                // All futures resolved without reaching quorum
-                if ack_count >= ack_quorum {
-                    Ok((failed_indices, last_err))
-                } else {
-                    let message = last_err
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "failed to reach ack quorum".into());
-                    Err(ClientError::WriteQuorumFailed {
-                        message,
-                        failed_indices,
-                        entry_id,
-                    })
-                }
-            }).await;
-
-            // (in_flight removal is handled by the RAII guard above —
-            // running on every exit path including panic / cancellation.)
-
-            // Signal the PendingAdd.  Success path goes through LacState
-            // which fires callbacks in LAC-advancement order (matching
-            // Java's sendAddSuccessCallbacks).  Error paths signal
-            // immediately with the specific error.
-            match write_result {
-                Err(_) => {
-                    lac_state.signal_error(
-                        entry_id,
-                        ClientError::Protocol(format!(
-                            "add entry quorum timeout ({quorum_timeout:?}) for entry {entry_id}"
-                        )),
-                    );
-                }
-                Ok(Err(e)) => {
-                    lac_state.signal_error(entry_id, e);
-                }
-                Ok(Ok((failed_indices, _last_err))) => {
-                    // Record pre-quorum failures for ensemble change
-                    if !failed_indices.is_empty() {
-                        let current_ens = ensemble_info.current_ensemble();
-                        let mut delayed = ensemble_info.delayed_failures.lock().unwrap();
-                        for &idx in &failed_indices {
-                            if idx < current_ens.len() {
-                                delayed.push((idx, current_ens[idx].clone()));
-                            }
-                        }
-                    }
-                    // Success: enter LacState.  This either fires our
-                    // oneshot right away (single-entry / in-order case),
-                    // defers it until an earlier entry's ack arrives
-                    // (out-of-order case — matches Java's pendingAddOps
-                    // head-of-queue wait), holds it until an ensemble
-                    // change completes, or fires immediately for
-                    // deferred-sync mode.
-                    lac_state.signal_success(
-                        entry_id, &lac_value, &ensemble_info, use_deferred_sync,
-                    );
-                }
-            }
-        });
+        // Spawn one write task per write-set position. Each task feeds
+        // its result back into the shared ctx; the first to push the
+        // ack-set over quorum (or hit an unrecoverable status) signals
+        // the user's PendingAdd via LacState.
+        for (pos, &ensemble_idx) in write_set.iter().enumerate() {
+            let conn = Arc::clone(&conns[pos]);
+            let entry = entry_bytes.clone();
+            let handle = spawn_send_to_bookie(
+                Arc::clone(&ctx),
+                ensemble_idx,
+                conn,
+                entry,
+                mk,
+                use_deferred_sync,
+                Arc::clone(&self.closed),
+            );
+            self.pending_adds.push(handle);
+        }
 
         // Periodically prune completed handles to prevent unbounded growth.
         // Java's PendingAddOp is GC'd naturally; Rust JoinHandles need explicit cleanup.
         if self.pending_adds.len() % PENDING_ADDS_PRUNE_INTERVAL == 0 {
             self.pending_adds.retain(|h| !h.is_finished());
         }
-        self.pending_adds.push(handle);
         Ok(pending_add)
     }
 
@@ -1056,16 +1203,36 @@ impl WriteHandle {
         Ok(())
     }
 
+    /// Test-only: trigger the in-flight-resend path for the given
+    /// failed bookie indices without going through the `append_async`
+    /// → `WriteQuorumFailed` → `handle_bookie_failure` chain. Used by
+    /// integration tests that need to deterministically resend
+    /// in-flight entries against an already-replaced ensemble slot.
+    #[doc(hidden)]
+    pub async fn resend_in_flight_for_test(
+        &mut self,
+        conns: &[Arc<BookieConnection>],
+        failed_indices: &[usize],
+    ) {
+        self.resend_in_flight_to_new_ensemble(conns, failed_indices).await;
+    }
+
     /// Re-send in-flight entries that targeted the failed bookies to the
     /// new replacement bookies. This is the Rust equivalent of Java's
     /// `PendingAddOp.unsetSuccessAndSendWriteRequest()` which iterates
     /// all `pendingAddOps` and re-sends entries affected by the ensemble change.
     ///
-    /// For each in-flight entry whose write set includes a failed bookie index,
-    /// we send the pre-built entry bytes to the replacement bookie (now at that
-    /// index in `conns`). This runs fire-and-forget — the entry's existing
-    /// spawned ack-collector task will pick up the response via the same oneshot
-    /// channel, or the entry will succeed via the other ack quorum members.
+    /// For each in-flight entry whose write set includes a failed bookie
+    /// index, the resend is dispatched against the replacement bookie at
+    /// that ensemble index AND records its result into the same
+    /// [`PendingAddCtx`] the original initial-write tasks are using.
+    /// The first task — initial OR resend — to drive the per-entry ack
+    /// set over quorum resolves the user's `PendingAdd`. Without this
+    /// shared-state wiring, the resend would be fire-and-forget and
+    /// the original ack-collector would keep waiting on the dead
+    /// bookie's response future until the per-write quorum timeout
+    /// fires (default 30 seconds), surfacing the entry as a timeout
+    /// error even though the data WAS durable on the replacement.
     async fn resend_in_flight_to_new_ensemble(
         &mut self,
         conns: &[Arc<BookieConnection>],
@@ -1084,24 +1251,27 @@ impl WriteHandle {
         let mk = self.master_key;
         let ds = self.deferred_sync;
         for (entry_id, entry_bytes) in entries {
+            // The pending-ctx may be gone if the entry already
+            // resolved (e.g. quorum already reached on the surviving
+            // bookies before the ensemble change committed). Skip the
+            // resend for such entries — there is nothing to add to.
+            let Some(ctx) = self.ensemble_info.get_pending_ctx(entry_id) else {
+                continue;
+            };
             let write_set = self.schedule.write_set(entry_id);
             for &failed_idx in failed_indices {
                 if write_set.contains(&failed_idx) && failed_idx < conns.len() {
                     let conn = Arc::clone(&conns[failed_idx]);
                     let entry = entry_bytes.clone();
-                    // Spawn the resend, but track it via the closed-flag so
-                    // close() can no-op these in-flight resends and tracking
-                    // them via pending_adds means close() will await them.
-                    // Pre-fix the spawn was fire-and-forget — close() returned
-                    // while detached resend tasks kept writing to bookies
-                    // against a now-closed ledger.
-                    let closed = Arc::clone(&self.closed);
-                    let handle = tokio::spawn(async move {
-                        if closed.load(Ordering::Acquire) {
-                            return;
-                        }
-                        let _ = conn.send_add_entry_with_flags(0, mk, entry, ds).await;
-                    });
+                    let handle = spawn_send_to_bookie(
+                        Arc::clone(&ctx),
+                        failed_idx,
+                        conn,
+                        entry,
+                        mk,
+                        ds,
+                        Arc::clone(&self.closed),
+                    );
                     self.pending_adds.push(handle);
                 }
             }
@@ -1408,13 +1578,8 @@ impl WriteHandleAdv {
             )));
         }
 
-        let ack_quorum = self.inner.schedule.ack_quorum_size();
-        let write_quorum = self.inner.schedule.write_quorum_size();
         let mk = self.inner.master_key;
         let use_deferred_sync = self.inner.deferred_sync;
-        let lac_value = Arc::clone(&self.inner.lac_value);
-        let lac_state = Arc::clone(&self.inner.lac_state);
-        let ensemble_info = Arc::clone(&self.inner.ensemble_info);
         let quorum_timeout = self.inner.add_entry_quorum_timeout;
 
         // Caller must supply at least `write_quorum` connections (and we
@@ -1433,86 +1598,59 @@ impl WriteHandleAdv {
                 write_set.len(),
             )));
         }
-        let conn_handles: Vec<(usize, Arc<BookieConnection>)> = write_set
-            .iter()
-            .enumerate()
-            .map(|(pos, &ensemble_idx)| (ensemble_idx, Arc::clone(&conns_for_write[pos])))
-            .collect();
 
         // Register the PendingAdd's signaling slot in LacState up front
         // — see WriteHandle::append_async for the rationale.
         let pending_add = self.inner.lac_state.register(entry_id);
         let pending_entry_ids = Arc::clone(&self.pending_entry_ids);
 
-        tokio::spawn(async move {
-            let write_result = tokio::time::timeout(quorum_timeout, async {
-                let mut futs: FuturesUnordered<_> = conn_handles
-                    .into_iter()
-                    .map(|(ensemble_idx, conn)| {
-                        let entry = entry_bytes.clone();
-                        let ds = use_deferred_sync;
-                        async move { (ensemble_idx, conn.send_add_entry_with_flags(0, mk, entry, ds).await) }
-                    })
-                    .collect();
+        // Per-entry shared quorum context. See `WriteHandle::append_async`
+        // for the design rationale: every write task (initial AND any
+        // resend after an ensemble change) records into the same ctx so
+        // a resend's ack reaches the same quorum the original tasks
+        // are tracking. The completion hook drops the entry id from
+        // the dedup set so memory stays bounded at the truly-in-flight
+        // count.
+        let dedup = Arc::clone(&pending_entry_ids);
+        let ctx = Arc::new(PendingAddCtx::new_with_hook(
+            entry_id,
+            &self.inner.schedule,
+            Arc::clone(&self.inner.lac_state),
+            Arc::clone(&self.inner.lac_value),
+            Arc::clone(&self.inner.ensemble_info),
+            use_deferred_sync,
+            Some(Box::new(move || {
+                dedup.lock().unwrap().remove(&entry_id);
+            })),
+        ));
+        self.inner.ensemble_info.register_pending_ctx(entry_id, Arc::clone(&ctx));
 
-                let mut ack_count = 0usize;
-                let mut fail_count = 0usize;
-                let max_tolerable = write_quorum - ack_quorum;
+        // Per-write quorum timeout.
+        {
+            let ctx_for_timeout = Arc::clone(&ctx);
+            let closed_for_timeout = Arc::clone(&self.inner.closed);
+            tokio::spawn(async move {
+                tokio::time::sleep(quorum_timeout).await;
+                if !closed_for_timeout.load(Ordering::Acquire) {
+                    ctx_for_timeout.record_timeout(quorum_timeout);
+                }
+            });
+        }
 
-                while let Some((_, result)) = futs.next().await {
-                    match result {
-                        Ok(V2Response::Add { error_code, .. }) if error_code == V2_EOK => {
-                            ack_count += 1;
-                        }
-                        Ok(V2Response::Add { error_code, .. }) => {
-                            let bk_err = BKError::from_v2_code(error_code);
-                            if matches!(bk_err, BKError::Fenced | BKError::Unauthorized) {
-                                return Err(ClientError::UnrecoverableWrite { error: bk_err, entry_id });
-                            }
-                            fail_count += 1;
-                        }
-                        _ => { fail_count += 1; }
-                    }
-                    if ack_count >= ack_quorum {
-                        return Ok(());
-                    }
-                    if fail_count > max_tolerable {
-                        return Err(ClientError::Protocol(format!(
-                            "ack quorum impossible for entry {entry_id}"
-                        )));
-                    }
-                }
-                if ack_count >= ack_quorum {
-                    Ok(())
-                } else {
-                    Err(ClientError::Protocol(format!("failed to reach ack quorum for entry {entry_id}")))
-                }
-            }).await;
-
-            // Signal via LacState — success path fires in LAC-advancement
-            // order (even for adv where entry IDs may be sparse; entries
-            // without contiguous predecessors wait in the pending map
-            // until their predecessor arrives).
-            match write_result {
-                Err(_) => {
-                    lac_state.signal_error(
-                        entry_id,
-                        ClientError::Protocol(format!(
-                            "add entry quorum timeout ({quorum_timeout:?}) for entry {entry_id}"
-                        )),
-                    );
-                }
-                Ok(Err(e)) => lac_state.signal_error(entry_id, e),
-                Ok(Ok(())) => {
-                    lac_state.signal_success(
-                        entry_id, &lac_value, &ensemble_info, use_deferred_sync,
-                    );
-                }
-            }
-            // Entry is no longer "pending" — drop it from the dedup set so
-            // memory stays bounded at the number of truly in-flight writes.
-            pending_entry_ids.lock().unwrap().remove(&entry_id);
-        });
+        // Spawn per-bookie write tasks against the shared ctx.
+        for (pos, &ensemble_idx) in write_set.iter().enumerate() {
+            let conn = Arc::clone(&conns_for_write[pos]);
+            let entry = entry_bytes.clone();
+            spawn_send_to_bookie(
+                Arc::clone(&ctx),
+                ensemble_idx,
+                conn,
+                entry,
+                mk,
+                use_deferred_sync,
+                Arc::clone(&self.inner.closed),
+            );
+        }
 
         Ok(pending_add)
     }
