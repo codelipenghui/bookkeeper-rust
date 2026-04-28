@@ -458,10 +458,21 @@ impl RequestProcessor {
                     }
                     match self.storage.get_entry(ledger_id, lac).await {
                         Ok(data) => {
+                            // Echo the requested entry_id (LAST_ADD_CONFIRMED)
+                            // in the response header, matching Java's
+                            // ResponseBuilder.buildReadResponse which uses
+                            // r.getEntryId(). The actual LAC entry is in
+                            // `data`; the client extracts the real entry_id
+                            // by parsing it. The response-header field is
+                            // also what the V2 client matcher uses to
+                            // correlate the response to the pending
+                            // request — keeping it equal to the requested
+                            // value lets a single (op, ledger, entry_id)
+                            // key dispatch correctly.
                             return V2Response::Read {
                                 error_code: V2_EOK,
                                 ledger_id,
-                                entry_id: lac,
+                                entry_id: LAST_ADD_CONFIRMED,
                                 data: Some(data),
                             };
                         }

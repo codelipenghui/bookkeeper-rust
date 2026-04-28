@@ -332,14 +332,32 @@ impl ReadHandle {
 
         for result in responses {
             match result {
-                Ok(V2Response::Read { error_code, entry_id, .. }) => {
+                Ok(V2Response::Read { error_code, data, .. }) => {
                     let err = BKError::from_v2_code(error_code);
                     match err {
-                        BKError::Ok | BKError::NoEntry => {
-                            valid_count += 1;
-                            if entry_id > max_lac {
-                                max_lac = entry_id;
+                        BKError::Ok => {
+                            // The response header echoes the requested
+                            // sentinel (LAST_ADD_CONFIRMED = -1) — see
+                            // server processor's LAC-read special case.
+                            // The actual LAC value is the entry_id of
+                            // the LAC entry encoded in `data`. Parse
+                            // (and digest-verify) to extract it. Mirrors
+                            // Java's `ReadLastConfirmedOp.readEntryComplete`
+                            // which calls
+                            // `digestManager.verifyDigestAndReturnLastConfirmed`.
+                            if let Some(entry_data) = data {
+                                if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
+                                    valid_count += 1;
+                                    if entry.entry_id > max_lac {
+                                        max_lac = entry.entry_id;
+                                    }
+                                }
                             }
+                        }
+                        BKError::NoEntry => {
+                            // Empty ledger / no committed entries — counts
+                            // as a valid response, leaves max_lac at -1.
+                            valid_count += 1;
                         }
                         _ => {}
                     }
@@ -418,14 +436,28 @@ impl ReadHandle {
         let mut ok_count: usize = 0;
         let mut saw_any = false;
         while let Some(result) = futs.next().await {
-            if let Ok(V2Response::Read { error_code, entry_id, .. }) = result {
+            if let Ok(V2Response::Read { error_code, data, .. }) = result {
                 let err = BKError::from_v2_code(error_code);
                 match err {
-                    BKError::Ok | BKError::NoEntry => {
-                        saw_any = true;
-                        if entry_id > best_lac {
-                            best_lac = entry_id;
+                    BKError::Ok => {
+                        // See `read_last_confirmed`: response header echoes
+                        // the LAC sentinel; actual LAC value lives in the
+                        // parsed entry body.
+                        if let Some(entry_data) = data {
+                            if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
+                                saw_any = true;
+                                if entry.entry_id > best_lac {
+                                    best_lac = entry.entry_id;
+                                }
+                                ok_count += 1;
+                                if ok_count >= ack_quorum {
+                                    break;
+                                }
+                            }
                         }
+                    }
+                    BKError::NoEntry => {
+                        saw_any = true;
                         ok_count += 1;
                         if ok_count >= ack_quorum {
                             break;

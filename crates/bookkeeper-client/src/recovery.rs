@@ -97,23 +97,31 @@ impl RecoveryHandle {
 
         for result in responses {
             match result {
-                Ok(V2Response::Read { error_code, entry_id, data, .. }) => {
+                Ok(V2Response::Read { error_code, data, .. }) => {
                     let bk_err = BKError::from_v2_code(error_code);
                     match bk_err {
-                        BKError::Ok | BKError::NoEntry => {
-                            success_count += 1;
-                            if entry_id > max_lac {
-                                max_lac = entry_id;
-                            }
-                            if bk_err == BKError::Ok {
-                                if let Some(entry_data) = data {
-                                    if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
-                                        if entry.length > self.total_length {
-                                            self.total_length = entry.length;
-                                        }
+                        BKError::Ok => {
+                            // The response header echoes the requested
+                            // sentinel (LAST_ADD_CONFIRMED = -1). Extract
+                            // the actual LAC entry id from the parsed
+                            // entry body. Mirrors Java's
+                            // `ReadLastConfirmedOp.readEntryComplete`.
+                            if let Some(entry_data) = data {
+                                if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
+                                    success_count += 1;
+                                    if entry.entry_id > max_lac {
+                                        max_lac = entry.entry_id;
+                                    }
+                                    if entry.length > self.total_length {
+                                        self.total_length = entry.length;
                                     }
                                 }
                             }
+                        }
+                        BKError::NoEntry => {
+                            // Empty ledger — counts as a successful fence
+                            // response, leaves max_lac at -1.
+                            success_count += 1;
                         }
                         _ => {
                             // Fencing failed on this bookie — continue, need write quorum
