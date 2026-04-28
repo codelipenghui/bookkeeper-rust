@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use bytes::{Bytes, BytesMut};
@@ -12,7 +13,7 @@ use tokio_util::codec::{Decoder, Encoder};
 use bookkeeper_protocol::constants::*;
 use bookkeeper_protocol::framing::BookieCodec;
 use bookkeeper_protocol::v2::request::{V2Request, encode_request};
-use bookkeeper_protocol::v2::response::{V2Response, decode_response};
+use bookkeeper_protocol::v2::response::{CorrelationKey, V2Response, decode_response_with_key};
 
 /// TCP socket options applied to every bookie connection.
 /// Matches Java's `ClientConfiguration` TCP tuning knobs.
@@ -166,6 +167,12 @@ impl ClientError {
 }
 
 struct PendingRequest {
+    /// Correlation key under which this request's response will arrive.
+    /// The connection task uses it to dispatch the decoded response to
+    /// the matching `oneshot::Sender` instead of FIFO arrival-order
+    /// dispatch (which silently mis-routes when the bookie reorders
+    /// responses via its `FuturesUnordered` request handler).
+    key: CorrelationKey,
     data: Bytes,
     response_tx: oneshot::Sender<Result<V2Response, ClientError>>,
 }
@@ -188,6 +195,14 @@ struct BookieChannel {
     request_timeout: Duration,
     /// TCP socket options (keepalive, nodelay, etc.).
     tcp_config: TcpConfig,
+    /// Monotonic per-channel counter used to stamp each outgoing V3
+    /// request's `BkPacketHeader.txn_id`. The bookie echoes this value
+    /// in the response; the connection task's matcher routes by it.
+    /// Mirrors Java's `PerChannelBookieClient.txnIdGenerator: AtomicLong`
+    /// (starts at 0, monotonic per process). Per-channel rather than
+    /// per-process is fine because each channel has its own matcher;
+    /// values do not need to be globally unique.
+    txn_id_counter: Arc<AtomicU64>,
 }
 
 struct ChannelState {
@@ -220,7 +235,21 @@ impl BookieChannel {
             }),
             request_timeout,
             tcp_config,
+            // Start at 1 so a `txn_id == 0` on a response is observable
+            // as "server didn't echo the field" and treated as a
+            // protocol error rather than silently colliding with a
+            // legitimately-allocated txn_id.
+            txn_id_counter: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Allocate the next V3 `txn_id` for this channel. Used by `send_v3`
+    /// to stamp the request's `BkPacketHeader.txn_id` before encoding.
+    /// Wraps to 1 if the u64 ever overflows (>10^19 requests on a
+    /// single channel — a theoretical bound).
+    fn next_txn_id(&self) -> u64 {
+        let id = self.txn_id_counter.fetch_add(1, Ordering::Relaxed);
+        if id == 0 { self.txn_id_counter.fetch_add(1, Ordering::Relaxed) } else { id }
     }
 
     /// Connect eagerly (used during pool initialization when possible).
@@ -278,12 +307,13 @@ impl BookieChannel {
     /// Reconnects transparently if the previous connection is dead.
     /// Enforces a minimum backoff between reconnection attempts.
     async fn send_request(&self, req: V2Request) -> Result<V2Response, ClientError> {
+        let key = req.correlation_key();
         let req_bytes = encode_request(&req);
         let mut framed = BytesMut::new();
         BookieCodec::new(5 * 1024 * 1024)
             .encode(req_bytes.freeze(), &mut framed)
             .map_err(|e| ClientError::Protocol(format!("encode: {e}")))?;
-        let response_rx = self.enqueue(framed.freeze()).await?;
+        let response_rx = self.enqueue(key, framed.freeze()).await?;
         match tokio::time::timeout(self.request_timeout, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ClientError::ConnectionClosed),
@@ -295,8 +325,15 @@ impl BookieChannel {
     }
 
     /// Send pre-framed bytes and await a response with a specified timeout.
-    async fn send_raw(&self, data: Bytes, timeout: Duration) -> Result<V2Response, ClientError> {
-        let response_rx = self.enqueue(data).await?;
+    /// Caller is responsible for deriving the correlation key (V3 sends
+    /// allocate a fresh `txn_id` via `next_txn_id()`).
+    async fn send_raw(
+        &self,
+        key: CorrelationKey,
+        data: Bytes,
+        timeout: Duration,
+    ) -> Result<V2Response, ClientError> {
+        let response_rx = self.enqueue(key, data).await?;
         match tokio::time::timeout(timeout, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ClientError::ConnectionClosed),
@@ -315,6 +352,7 @@ impl BookieChannel {
     /// every concurrent caller waiting on the same `Mutex<ChannelState>`.
     async fn enqueue(
         &self,
+        key: CorrelationKey,
         data: Bytes,
     ) -> Result<oneshot::Receiver<Result<V2Response, ClientError>>, ClientError> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -335,7 +373,7 @@ impl BookieChannel {
         };
 
         sender
-            .send(PendingRequest { data, response_tx })
+            .send(PendingRequest { key, data, response_tx })
             .await
             .map_err(|_| ClientError::ConnectionClosed)?;
         Ok(response_rx)
@@ -478,19 +516,33 @@ impl BookieConnection {
     /// Frame a V3 protobuf Request and send it on the channel for `ledger_id`.
     /// Used for WriteLac, ReadLac, GetBookieInfo, and ForceLedger which must
     /// go over V3 protobuf for Java bookie compatibility.
+    ///
+    /// Stamps `v3_req.header.txn_id` with a unique value from the
+    /// chosen channel's allocator before encoding. The bookie echoes
+    /// the txn_id in the response's `BkPacketHeader.txn_id`; the
+    /// connection task's matcher uses it to route the response to this
+    /// caller's `oneshot::Sender`. Without the unique stamp every V3
+    /// response would carry `txn_id = 0` and silently mis-route under
+    /// any matcher scheme — server-side reorder via `FuturesUnordered`
+    /// is otherwise indistinguishable from request order.
     async fn send_v3(
         &self,
         ledger_id: i64,
-        v3_req: bookkeeper_proto::Request,
+        mut v3_req: bookkeeper_proto::Request,
         timeout: Duration,
     ) -> Result<V2Response, ClientError> {
         use prost::Message;
+        let channel = self.pick_channel(ledger_id);
+        let txn_id = channel.next_txn_id();
+        v3_req.header.txn_id = txn_id;
         let payload = Bytes::from(v3_req.encode_to_vec());
         let mut framed = BytesMut::new();
         BookieCodec::new(5 * 1024 * 1024)
             .encode(payload, &mut framed)
             .map_err(|e| ClientError::Protocol(format!("encode V3: {e}")))?;
-        self.pick_channel(ledger_id).send_raw(framed.freeze(), timeout).await
+        channel
+            .send_raw(CorrelationKey::V3 { txn_id }, framed.freeze(), timeout)
+            .await
     }
 
     /// Select channel by ledger ID (matching Java's signSafeMod).
@@ -848,6 +900,59 @@ async fn perform_starttls_inner(
     Ok(tls_stream)
 }
 
+/// Matcher table for in-flight requests on a single connection.
+///
+/// Outer map keys by [`CorrelationKey`]; inner [`VecDeque`] holds the
+/// waiters for that key. The deque exists for the V2 fall-through case
+/// where two requests can legitimately share the same key — e.g. two
+/// concurrent reads of the same `(ledger_id, entry_id)` on the same
+/// channel. Java solves this with a `SynchronizedHashMultiMap`
+/// (`completionObjectsV2Conflicts`); the Rust shape is equivalent.
+/// V3 requests have unique txn ids so the deque is always length 1.
+///
+/// `total` tracks the count across all buckets so the shutdown drain
+/// path can early-exit without iterating the entire map.
+struct PendingMatcher {
+    by_key: HashMap<CorrelationKey, VecDeque<oneshot::Sender<Result<V2Response, ClientError>>>>,
+    total: usize,
+}
+
+impl PendingMatcher {
+    fn new() -> Self {
+        Self { by_key: HashMap::new(), total: 0 }
+    }
+
+    fn push(&mut self, key: CorrelationKey, tx: oneshot::Sender<Result<V2Response, ClientError>>) {
+        self.by_key.entry(key).or_default().push_back(tx);
+        self.total += 1;
+    }
+
+    fn pop(&mut self, key: &CorrelationKey) -> Option<oneshot::Sender<Result<V2Response, ClientError>>> {
+        let bucket = self.by_key.get_mut(key)?;
+        let tx = bucket.pop_front()?;
+        if bucket.is_empty() {
+            self.by_key.remove(key);
+        }
+        self.total -= 1;
+        Some(tx)
+    }
+
+    fn is_empty(&self) -> bool { self.total == 0 }
+
+    /// Drain every pending waiter, sending `err_factory()` to each.
+    /// Used on connection close / protocol error to fail every
+    /// outstanding request rather than leak them as dropped oneshots
+    /// (which surface to callers as the less-helpful `RecvError`).
+    fn drain_with<F: FnMut() -> ClientError>(&mut self, mut err_factory: F) {
+        for (_key, mut bucket) in self.by_key.drain() {
+            for tx in bucket.drain(..) {
+                let _ = tx.send(Err(err_factory()));
+            }
+        }
+        self.total = 0;
+    }
+}
+
 async fn connection_task<R, W>(
     mut reader: R,
     mut writer: W,
@@ -857,7 +962,7 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    let mut pending: VecDeque<oneshot::Sender<Result<V2Response, ClientError>>> = VecDeque::new();
+    let mut pending = PendingMatcher::new();
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
     let mut codec = BookieCodec::new(5 * 1024 * 1024);
 
@@ -866,18 +971,30 @@ where
         loop {
             match codec.decode(&mut read_buf) {
                 Ok(Some(frame)) => {
-                    if let Some(tx) = pending.pop_front() {
-                        let resp = decode_response(frame.freeze())
-                            .map_err(|e| ClientError::Protocol(format!("decode: {e}")));
-                        let _ = tx.send(resp);
+                    match decode_response_with_key(frame.freeze()) {
+                        Ok((key, resp)) => {
+                            if let Some(tx) = pending.pop(&key) {
+                                let _ = tx.send(Ok(resp));
+                            } else {
+                                // No waiter for this key — server sent a
+                                // response we didn't ask for, or asked
+                                // for and timed out. Java's PerChannelBookieClient
+                                // logs and drops; mirror that.
+                                tracing::debug!(
+                                    "bookie response with no matching pending request: {:?}", key
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            pending.drain_with(|| ClientError::Protocol(format!("decode: {e}")));
+                            return;
+                        }
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
                     // Protocol error — drain all pending waiters and shut down
-                    for tx in pending.drain(..) {
-                        let _ = tx.send(Err(ClientError::Protocol(format!("frame: {e}"))));
-                    }
+                    pending.drain_with(|| ClientError::Protocol(format!("frame: {e}")));
                     return;
                 }
             }
@@ -890,19 +1007,17 @@ where
                     Some(first_req) => {
                         // Batch: gather first request + all immediately available
                         let mut batch = BytesMut::from(first_req.data.as_ref());
-                        pending.push_back(first_req.response_tx);
+                        pending.push(first_req.key, first_req.response_tx);
 
                         // Drain without blocking
                         while let Ok(more) = request_rx.try_recv() {
                             batch.extend_from_slice(&more.data);
-                            pending.push_back(more.response_tx);
+                            pending.push(more.key, more.response_tx);
                         }
 
                         if writer.write_all(&batch).await.is_err() {
                             // Fail all pending including the ones we just queued
-                            for tx in pending.drain(..) {
-                                let _ = tx.send(Err(ClientError::ConnectionClosed));
-                            }
+                            pending.drain_with(|| ClientError::ConnectionClosed);
                             return;
                         }
                     }
@@ -913,10 +1028,13 @@ where
                             loop {
                                 match codec.decode(&mut read_buf) {
                                     Ok(Some(frame)) => {
-                                        if let Some(tx) = pending.pop_front() {
-                                            let resp = decode_response(frame.freeze())
-                                                .map_err(|e| ClientError::Protocol(format!("decode: {e}")));
-                                            let _ = tx.send(resp);
+                                        match decode_response_with_key(frame.freeze()) {
+                                            Ok((key, resp)) => {
+                                                if let Some(tx) = pending.pop(&key) {
+                                                    let _ = tx.send(Ok(resp));
+                                                }
+                                            }
+                                            Err(_) => break,
                                         }
                                     }
                                     _ => break,
@@ -930,9 +1048,7 @@ where
                             ).await {
                                 Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
                                     // EOF, error, or timeout — fail remaining
-                                    for tx in pending.drain(..) {
-                                        let _ = tx.send(Err(ClientError::ConnectionClosed));
-                                    }
+                                    pending.drain_with(|| ClientError::ConnectionClosed);
                                     break;
                                 }
                                 Ok(Ok(_)) => continue,
@@ -947,9 +1063,7 @@ where
                 match result {
                     Ok(0) | Err(_) => {
                         // Connection closed — fail all pending
-                        for tx in pending.drain(..) {
-                            let _ = tx.send(Err(ClientError::ConnectionClosed));
-                        }
+                        pending.drain_with(|| ClientError::ConnectionClosed);
                         return;
                     }
                     Ok(_) => {
