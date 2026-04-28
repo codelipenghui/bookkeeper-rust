@@ -1,5 +1,5 @@
 use bookkeeper_client::distribution::{
-    AckSet, BookieResponse, QuorumCoverageSet, RoundRobinDistributionSchedule,
+    AckSet, BookieResponse, RoundRobinDistributionSchedule,
 };
 
 #[test]
