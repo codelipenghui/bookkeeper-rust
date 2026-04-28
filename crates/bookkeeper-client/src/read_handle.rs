@@ -13,7 +13,7 @@ use bookkeeper_protocol::digest::DigestManager;
 use bookkeeper_protocol::entry::{parse_entry, EntryError};
 use bookkeeper_protocol::v2::response::V2Response;
 use crate::bookie_connection::{BookieConnection, ClientError};
-use crate::distribution::RoundRobinDistributionSchedule;
+use crate::distribution::{BookieResponse, RoundRobinDistributionSchedule};
 
 /// Speculative read policy matching Java's DefaultSpeculativeRequestExecutionPolicy.
 /// When enabled, sends a speculative read to the next bookie after a timeout,
@@ -417,11 +417,13 @@ impl ReadHandle {
 
         let mut futs: FuturesUnordered<_> = conn_indices
             .into_iter()
-            .map(|idx| {
-                let conn = conns[idx].clone();
+            .map(|ensemble_idx| {
+                let conn = conns[ensemble_idx].clone();
                 async move {
-                    conn.send_read_entry(0, ledger_id, LAST_ADD_CONFIRMED, Some(master_key))
-                        .await
+                    let resp = conn
+                        .send_read_entry(0, ledger_id, LAST_ADD_CONFIRMED, Some(master_key))
+                        .await;
+                    (ensemble_idx, resp)
                 }
             })
             .collect();
@@ -430,41 +432,57 @@ impl ReadHandle {
         // ReadLastConfirmedOp returns the highest LAC seen across the
         // ack quorum, not whichever bookie answered first. A single
         // replica with a stale LAC could otherwise win against the
-        // up-to-date quorum.
-        let ack_quorum = self.schedule.ack_quorum_size();
+        // up-to-date quorum. Per-window coverage decides "enough" the
+        // same way the recovery fence does — a naive count gate could
+        // declare progress on a striped ensemble while leaving an
+        // ack-quorum-sized window unobserved.
         let mut best_lac: i64 = current_lac;
-        let mut ok_count: usize = 0;
         let mut saw_any = false;
-        while let Some(result) = futs.next().await {
-            if let Ok(V2Response::Read { error_code, data, .. }) = result {
-                let err = BKError::from_v2_code(error_code);
-                match err {
-                    BKError::Ok => {
-                        // See `read_last_confirmed`: response header echoes
-                        // the LAC sentinel; actual LAC value lives in the
-                        // parsed entry body.
-                        if let Some(entry_data) = data {
-                            if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
-                                saw_any = true;
-                                if entry.entry_id > best_lac {
-                                    best_lac = entry.entry_id;
+        let mut coverage = self.schedule.new_coverage_set();
+        while let Some((ensemble_idx, result)) = futs.next().await {
+            match result {
+                Ok(V2Response::Read { error_code, data, .. }) => {
+                    let err = BKError::from_v2_code(error_code);
+                    match err {
+                        BKError::Ok => {
+                            // See `read_last_confirmed`: response header echoes
+                            // the LAC sentinel; actual LAC value lives in the
+                            // parsed entry body.
+                            if let Some(entry_data) = data {
+                                if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
+                                    saw_any = true;
+                                    if entry.entry_id > best_lac {
+                                        best_lac = entry.entry_id;
+                                    }
+                                    coverage.add_bookie(ensemble_idx, BookieResponse::Ok);
+                                } else {
+                                    coverage.add_bookie(ensemble_idx, BookieResponse::Other);
                                 }
-                                ok_count += 1;
-                                if ok_count >= ack_quorum {
-                                    break;
-                                }
+                            } else {
+                                coverage.add_bookie(ensemble_idx, BookieResponse::Other);
                             }
                         }
-                    }
-                    BKError::NoEntry => {
-                        saw_any = true;
-                        ok_count += 1;
-                        if ok_count >= ack_quorum {
-                            break;
+                        BKError::NoEntry => {
+                            saw_any = true;
+                            coverage.add_bookie(ensemble_idx, BookieResponse::NoEntry);
                         }
+                        BKError::NoLedger => {
+                            saw_any = true;
+                            coverage.add_bookie(ensemble_idx, BookieResponse::NoLedger);
+                        }
+                        _ => coverage.add_bookie(ensemble_idx, BookieResponse::Other),
                     }
-                    _ => {}
                 }
+                _ => coverage.add_bookie(ensemble_idx, BookieResponse::Other),
+            }
+            // Early-return as soon as we can prove the LAC has
+            // genuinely advanced (covered + best_lac > current_lac).
+            // Returning as soon as covered without checking the LAC
+            // bump would race the slowest correct bookie out of its
+            // chance to push best_lac higher; we only short-circuit
+            // when the answer is already monotonically better.
+            if best_lac > current_lac && coverage.is_covered() {
+                break;
             }
         }
 

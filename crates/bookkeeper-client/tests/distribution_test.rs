@@ -1,4 +1,6 @@
-use bookkeeper_client::distribution::{RoundRobinDistributionSchedule, AckSet};
+use bookkeeper_client::distribution::{
+    AckSet, BookieResponse, QuorumCoverageSet, RoundRobinDistributionSchedule,
+};
 
 #[test]
 fn write_set_for_entry_0() {
@@ -131,5 +133,124 @@ fn duplicate_failure_from_same_bookie_is_idempotent() {
         !ack.fail_bookie(0),
         "duplicate failure from same bookie must not push past the \
          tolerable=1 threshold"
+    );
+}
+
+// --- per-window quorum coverage ---
+//
+// Mirrors Apache BookKeeper's
+// `RoundRobinDistributionSchedule.RRQuorumCoverageSet.checkCovered()`:
+// a fence / read-LAC operation is "covered" iff for every length-W
+// window of the round-robin schedule, the number of bookies whose
+// response is unknown (anything other than Ok / NoEntry / NoLedger)
+// is strictly less than the ack quorum. Otherwise the unknown
+// bookies could have together accepted an entry we never observed.
+
+#[test]
+fn coverage_e3_w3_a2_two_oks_suffice() {
+    // The only window of size 3 spans the whole ensemble. With 2 Ok
+    // and 1 unknown, nodesUnknown=1 < ackQuorum=2 — covered.
+    let sched = RoundRobinDistributionSchedule::new(3, 3, 2);
+    let mut cov = sched.new_coverage_set();
+    cov.add_bookie(0, BookieResponse::Ok);
+    cov.add_bookie(1, BookieResponse::Ok);
+    assert!(
+        cov.is_covered(),
+        "two known responses out of three must suffice for E=3,W=3,A=2"
+    );
+}
+
+#[test]
+fn coverage_e3_w3_a2_one_ok_insufficient() {
+    let sched = RoundRobinDistributionSchedule::new(3, 3, 2);
+    let mut cov = sched.new_coverage_set();
+    cov.add_bookie(0, BookieResponse::Ok);
+    assert!(
+        !cov.is_covered(),
+        "a single ok with two unknowns leaves an ack-quorum-sized \
+         window unobserved — those two could have committed an entry"
+    );
+}
+
+#[test]
+fn coverage_striped_unreachable_pair_is_not_covered() {
+    // E=5, W=3, A=2. The fence reads ok from {0, 1, 3}; bookies
+    // {2, 4} are silent. The window starting at i=2 spans bookies
+    // {2, 3, 4} — covered only at index 3, unknown at {2, 4} =
+    // 2 >= ackQuorum=2. Java's RRQuorumCoverageSet rejects this
+    // shape because {2, 4} alone is an ack quorum that could have
+    // committed an entry our scan never saw — silent ledger
+    // truncation if recovery proceeds against the partial view.
+    let sched = RoundRobinDistributionSchedule::new(5, 3, 2);
+    let mut cov = sched.new_coverage_set();
+    cov.add_bookie(0, BookieResponse::Ok);
+    cov.add_bookie(1, BookieResponse::Ok);
+    cov.add_bookie(3, BookieResponse::Ok);
+    assert!(
+        !cov.is_covered(),
+        "fence with the {{2,4}} pair unreachable must not declare \
+         coverage — those two together form an ack quorum that \
+         could have accepted an entry"
+    );
+}
+
+#[test]
+fn coverage_striped_three_consecutive_oks_window_at_end_uncovered() {
+    // E=5, W=3, A=2. Bookies 0,1,2 ok; 3,4 silent. Window 2..4 spans
+    // {2,3,4}: ok at 2, unknown at {3,4} = 2 >= ackQuorum=2.
+    // Window 3..0 spans {3,4,0}: ok at 0, unknown at {3,4} = 2.
+    // So not covered.
+    let sched = RoundRobinDistributionSchedule::new(5, 3, 2);
+    let mut cov = sched.new_coverage_set();
+    cov.add_bookie(0, BookieResponse::Ok);
+    cov.add_bookie(1, BookieResponse::Ok);
+    cov.add_bookie(2, BookieResponse::Ok);
+    assert!(!cov.is_covered());
+}
+
+#[test]
+fn coverage_full_ensemble_is_covered() {
+    let sched = RoundRobinDistributionSchedule::new(5, 3, 2);
+    let mut cov = sched.new_coverage_set();
+    for i in 0..5 {
+        cov.add_bookie(i, BookieResponse::Ok);
+    }
+    assert!(cov.is_covered());
+}
+
+#[test]
+fn coverage_no_entry_counts_as_known() {
+    // NoEntry / NoLedger are definitive responses too — the bookie
+    // genuinely doesn't have the entry. Java treats them the same as
+    // Ok for coverage purposes.
+    let sched = RoundRobinDistributionSchedule::new(3, 3, 2);
+    let mut cov = sched.new_coverage_set();
+    cov.add_bookie(0, BookieResponse::Ok);
+    cov.add_bookie(1, BookieResponse::NoEntry);
+    cov.add_bookie(2, BookieResponse::NoLedger);
+    assert!(cov.is_covered());
+}
+
+#[test]
+fn coverage_other_errors_count_as_unknown() {
+    // A timeout, fenced-error, or unauthorized response leaves us
+    // unable to know what that bookie has. They must NOT count as
+    // known for coverage — same conservative call Java makes.
+    let sched = RoundRobinDistributionSchedule::new(3, 3, 2);
+    let mut cov = sched.new_coverage_set();
+    cov.add_bookie(0, BookieResponse::Ok);
+    cov.add_bookie(1, BookieResponse::Other);
+    cov.add_bookie(2, BookieResponse::Ok);
+    assert!(
+        cov.is_covered(),
+        "two Ok and one Other in E=3,W=3,A=2: nodesUnknown=1 < 2 — covered"
+    );
+    let mut cov2 = sched.new_coverage_set();
+    cov2.add_bookie(0, BookieResponse::Ok);
+    cov2.add_bookie(1, BookieResponse::Other);
+    cov2.add_bookie(2, BookieResponse::Other);
+    assert!(
+        !cov2.is_covered(),
+        "one Ok and two Other in E=3,W=3,A=2: nodesUnknown=2 >= 2 — not covered"
     );
 }

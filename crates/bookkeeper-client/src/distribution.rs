@@ -29,6 +29,107 @@ impl RoundRobinDistributionSchedule {
     pub fn new_ack_set(&self) -> AckSet {
         AckSet::new(self.ensemble_size, self.write_quorum_size, self.ack_quorum_size)
     }
+
+    /// Create a new [`QuorumCoverageSet`] sized to this schedule's
+    /// ensemble. Used by fence / read-LAC paths to decide whether
+    /// enough bookies have given a definitive response (Ok / NoEntry
+    /// / NoLedger) that no length-W window of the round-robin
+    /// schedule could still hide an entry committed by an
+    /// ack-quorum-sized subset of unobserved bookies.
+    pub fn new_coverage_set(&self) -> QuorumCoverageSet {
+        QuorumCoverageSet::new(self.ensemble_size, self.write_quorum_size, self.ack_quorum_size)
+    }
+}
+
+/// Categorisation of a bookie's response for coverage purposes.
+/// Mirrors Apache BookKeeper's `RRQuorumCoverageSet.checkCovered`
+/// special-casing of `BKException.Code.OK`,
+/// `NoSuchEntryException`, and `NoSuchLedgerExistsException` as
+/// "known" — every other status (or timeout) is "unknown" because
+/// the bookie may still have accepted the entry and be unable to
+/// tell us right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookieResponse {
+    /// Bookie acknowledged the request — we know the contents.
+    Ok,
+    /// Bookie has the ledger but not this entry — definitive answer.
+    NoEntry,
+    /// Bookie does not have the ledger at all — definitive answer.
+    NoLedger,
+    /// Anything else: timeout, transport error, fenced reply,
+    /// unauthorized, etc. The bookie's contents are unknown to us.
+    Other,
+    /// Default state before any response has been recorded for this
+    /// ensemble index — also "unknown".
+    Uninitialized,
+}
+
+impl BookieResponse {
+    /// Whether this response is a definitive ("known") answer about
+    /// the bookie's contents. Per Java: Ok or NoEntry or NoLedger.
+    pub fn is_known(self) -> bool {
+        matches!(self, Self::Ok | Self::NoEntry | Self::NoLedger)
+    }
+}
+
+/// Per-bookie response tracker that decides when a fence / read-LAC
+/// has heard from enough bookies to rule out any
+/// ack-quorum-sized subset committing an entry our scan never saw.
+///
+/// Mirrors `RoundRobinDistributionSchedule.RRQuorumCoverageSet`. The
+/// naive "count >= write_quorum" check the previous code used is
+/// both too strict in some shapes (E=W common case rejects fences
+/// Java would accept on W-1 known responses) and too lax in others
+/// (E>W striped case can declare coverage while leaving an entire
+/// ack-quorum-sized window unobserved — silent ledger truncation if
+/// recovery proceeds).
+#[derive(Debug, Clone)]
+pub struct QuorumCoverageSet {
+    ensemble_size: usize,
+    write_quorum_size: usize,
+    ack_quorum_size: usize,
+    covered: Vec<BookieResponse>,
+}
+
+impl QuorumCoverageSet {
+    pub fn new(ensemble_size: usize, write_quorum_size: usize, ack_quorum_size: usize) -> Self {
+        Self {
+            ensemble_size,
+            write_quorum_size,
+            ack_quorum_size,
+            covered: vec![BookieResponse::Uninitialized; ensemble_size],
+        }
+    }
+
+    /// Record `response` against the bookie at ensemble index
+    /// `bookie_index`. Idempotent — re-recording overwrites the
+    /// prior value (matches Java's `addBookie`).
+    pub fn add_bookie(&mut self, bookie_index: usize, response: BookieResponse) {
+        if let Some(slot) = self.covered.get_mut(bookie_index) {
+            *slot = response;
+        }
+    }
+
+    /// Returns `true` iff for every length-W window starting at any
+    /// ensemble index, the count of bookies whose response is NOT
+    /// known is strictly less than the ack quorum. Equivalent to
+    /// "there is no ack-quorum-sized subset of bookies that could
+    /// have together accepted an entry we never observed".
+    pub fn is_covered(&self) -> bool {
+        for i in 0..self.ensemble_size {
+            let mut nodes_unknown = 0;
+            for j in 0..self.write_quorum_size {
+                let node_index = (i + j) % self.ensemble_size;
+                if !self.covered[node_index].is_known() {
+                    nodes_unknown += 1;
+                }
+            }
+            if nodes_unknown >= self.ack_quorum_size {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Tracks which bookies in an ensemble have acknowledged a write and

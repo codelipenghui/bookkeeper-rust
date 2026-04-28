@@ -10,7 +10,7 @@ use bookkeeper_protocol::digest::DigestManager;
 use bookkeeper_protocol::entry::{EntryBuilder, parse_entry};
 use bookkeeper_protocol::v2::response::V2Response;
 use crate::bookie_connection::{BookieConnection, ClientError};
-use crate::distribution::RoundRobinDistributionSchedule;
+use crate::distribution::{BookieResponse, RoundRobinDistributionSchedule};
 
 /// Handles ledger recovery after a writer crash.
 ///
@@ -68,12 +68,10 @@ impl RecoveryHandle {
         conns: &[Arc<BookieConnection>],
         last_ensemble_entry_id: i64,
     ) -> Result<i64, ClientError> {
-        let write_quorum = self.schedule.write_quorum_size();
-
         let ledger_id = self.ledger_id;
         let master_key = self.master_key;
 
-        // Send fencing read to ALL bookies in ensemble (not just write set) in parallel
+        // Send fencing read to ALL bookies in ensemble (not just write set) in parallel.
         let indices: Vec<usize> = (0..self.ensemble.len())
             .filter(|&idx| idx < conns.len())
             .collect();
@@ -81,63 +79,80 @@ impl RecoveryHandle {
         let futures: Vec<_> = indices.iter().map(|&idx| {
             let conn = &*conns[idx];
             async move {
-                conn.send_read_entry(
+                let resp = conn.send_read_entry(
                     FLAG_DO_FENCING,
                     ledger_id,
                     LAST_ADD_CONFIRMED,
                     Some(master_key),
-                ).await
+                ).await;
+                (idx, resp)
             }
         }).collect();
 
         let responses = join_all(futures).await;
 
         let mut max_lac: i64 = -1;
-        let mut success_count = 0;
+        let mut coverage = self.schedule.new_coverage_set();
 
-        for result in responses {
+        for (idx, result) in responses {
             match result {
                 Ok(V2Response::Read { error_code, data, .. }) => {
                     let bk_err = BKError::from_v2_code(error_code);
                     match bk_err {
                         BKError::Ok => {
-                            // The response header echoes the requested
-                            // sentinel (LAST_ADD_CONFIRMED = -1). Extract
-                            // the actual LAC entry id from the parsed
-                            // entry body. Mirrors Java's
-                            // `ReadLastConfirmedOp.readEntryComplete`.
+                            // Response header echoes the requested
+                            // LAST_ADD_CONFIRMED sentinel; the real LAC
+                            // entry id is in the parsed body. Mirrors
+                            // Java's `ReadLastConfirmedOp.readEntryComplete`
+                            // which calls
+                            // `digestManager.verifyDigestAndReturnLastConfirmed(buffer)`.
                             if let Some(entry_data) = data {
                                 if let Ok(entry) = parse_entry(&self.digest_manager, entry_data) {
-                                    success_count += 1;
+                                    coverage.add_bookie(idx, BookieResponse::Ok);
                                     if entry.entry_id > max_lac {
                                         max_lac = entry.entry_id;
                                     }
                                     if entry.length > self.total_length {
                                         self.total_length = entry.length;
                                     }
+                                } else {
+                                    // Body present but undecodable — we
+                                    // can't trust this bookie's view.
+                                    coverage.add_bookie(idx, BookieResponse::Other);
                                 }
+                            } else {
+                                coverage.add_bookie(idx, BookieResponse::Other);
                             }
                         }
-                        BKError::NoEntry => {
-                            // Empty ledger — counts as a successful fence
-                            // response, leaves max_lac at -1.
-                            success_count += 1;
-                        }
-                        _ => {
-                            // Fencing failed on this bookie — continue, need write quorum
-                        }
+                        BKError::NoEntry => coverage.add_bookie(idx, BookieResponse::NoEntry),
+                        BKError::NoLedger => coverage.add_bookie(idx, BookieResponse::NoLedger),
+                        _ => coverage.add_bookie(idx, BookieResponse::Other),
                     }
                 }
-                _ => {
-                    // Connection/transport error — continue, need write quorum
+                Ok(_) | Err(_) => {
+                    // Wrong response shape, transport error, or timeout —
+                    // we don't know what this bookie has. Leaving the
+                    // slot Uninitialized would have the same effect, but
+                    // recording explicitly keeps the intent obvious.
+                    coverage.add_bookie(idx, BookieResponse::Other);
                 }
             }
         }
 
-        if success_count < write_quorum {
-            return Err(ClientError::Protocol(format!(
-                "fencing quorum not reached: got {success_count}, need {write_quorum}"
-            )));
+        // Per-window coverage rather than naive count: a fence is safe
+        // to proceed only when no length-W window of the round-robin
+        // schedule has ack-quorum-many unobserved bookies. Mirrors
+        // Java's `RRQuorumCoverageSet.checkCovered`. The previous
+        // success-count gate could declare coverage on a striped
+        // ensemble (E>W) while leaving a whole ack-quorum-sized
+        // contiguous window unobserved — recovery would then truncate
+        // the ledger past any entry that pair had committed.
+        if !coverage.is_covered() {
+            return Err(ClientError::Protocol(
+                "fencing quorum coverage not reached — too many unreachable \
+                 bookies on at least one round-robin window to rule out a \
+                 silent committed entry".into(),
+            ));
         }
 
         self.recovery_lac = std::cmp::max(max_lac, last_ensemble_entry_id - 1);

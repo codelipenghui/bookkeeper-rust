@@ -127,25 +127,35 @@ async fn recovery_on_empty_ledger() {
 
 #[tokio::test]
 async fn fence_quorum_failure_when_too_many_bookies_down() {
-    // Verify recovery correctly fails when fewer than write quorum bookies
-    // can respond to fencing.
+    // Verify recovery correctly fails when too few bookies remain to
+    // rule out a silent committed entry. With E=3, W=3, A=2 (the
+    // typical config), an ack quorum is any 2 bookies; if 2 are dead
+    // and 1 is alive, the dead pair could have together accepted an
+    // entry the surviving bookie never saw — fence must refuse.
+    //
+    // (Earlier versions of this test used W=3, A=3 and asserted the
+    // same thing, but with A=W there is NO ack-quorum-sized subset
+    // smaller than the full ensemble — observing any single bookie
+    // is enough to know what was committed, so Java's
+    // RRQuorumCoverageSet.checkCovered correctly accepts that
+    // setup. The Rust port now matches that semantics.)
     let (mut bookies, _dirs, addrs) = spawn_bookies(3).await;
 
     {
         let mut client = BookKeeperClient::new(addrs.clone());
-        let mut wh = client.create_ledger(4, 3, 3, 3, DigestType::Crc32c, b"").await.unwrap();
+        let mut wh = client.create_ledger(4, 3, 3, 2, DigestType::Crc32c, b"").await.unwrap();
         for i in 0..6 {
             wh.append(client.connections(), format!("e{i}").as_bytes()).await.unwrap();
         }
     }
 
-    // Kill 2 of 3 bookies — fence cannot reach write quorum
+    // Kill 2 of 3 bookies — coverage cannot be reached.
     let dead1 = bookies.pop().unwrap();
     let dead2 = bookies.pop().unwrap();
     dead1.shutdown().await;
     dead2.shutdown().await;
 
-    let schedule = RoundRobinDistributionSchedule::new(3, 3, 3);
+    let schedule = RoundRobinDistributionSchedule::new(3, 3, 2);
     let dm = DigestManager::new(DigestType::Crc32c);
     let master_key = generate_master_key(b"");
 
@@ -168,12 +178,25 @@ async fn fence_quorum_failure_when_too_many_bookies_down() {
     }
 
     let mut recovery = RecoveryHandle::new(4, addrs.clone(), schedule, dm, master_key);
-    // With only 1/3 bookies alive and W=3, fence MUST fail (no quorum)
+    // With only 1/3 bookies alive and A=2, the two dead bookies
+    // together form an ack quorum that could have committed an entry
+    // we cannot observe — fence MUST refuse.
     let result = recovery.fence(&conns, 0).await;
-    assert!(result.is_err(), "fence should fail when fewer than write quorum bookies are alive");
+    assert!(result.is_err(), "fence must refuse when an ack-quorum-sized window is unobservable");
 
     for b in bookies { b.shutdown().await; }
 }
+
+// The striped-ensemble scenario (E=5, W=3, A=2 with bookies {2, 4}
+// silent — the round-robin window starting at index 2 leaves an
+// ack-quorum-sized subset unobservable) is asserted at the unit
+// level in `tests/distribution_test.rs`, where
+// `QuorumCoverageSet::is_covered` returns `false` for that shape
+// directly. Reproducing the same condition end-to-end requires a
+// way to leave a specific ensemble index "silent" — but the eager
+// `BookieConnection::connect` rejects a dead address up-front, and
+// a half-open TCP listener would block the test on the
+// 30-second per-request timeout. The unit-level proof is sufficient.
 
 #[tokio::test]
 async fn read_after_recovery_returns_all_entries() {
